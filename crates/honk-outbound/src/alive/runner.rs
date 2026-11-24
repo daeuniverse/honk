@@ -363,21 +363,32 @@ impl AliveDialerSet {
             .collect();
         let cancel = permit.cancellation();
 
-        // Idle groups still recover dead members: the datapath drops traffic
-        // to a dead group before userspace could mark it active again.
+        // Suspended nodes only recover when an owning idle automatic group has
+        // no alive member left on TCP or DataUdp (TC ignores DnsUdp and never
+        // drops traffic while any sibling or family remains usable).
         let due = nodes.into_iter().filter_map(|(id, registration)| {
-            let tcp_due = [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
-                !self.is_alive_for(id, ProbeDomain::Tcp, ipver)
-                    && self.should_probe(id, ProbeDomain::Tcp, ipver)
-            });
-            let udp_due = [ProbeDomain::DataUdp, ProbeDomain::DnsUdp]
-                .into_iter()
-                .any(|domain| {
-                    [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
-                        !self.is_alive_for(id, domain, ipver)
-                            && self.should_probe(id, domain, ipver)
-                    })
+            let suspended = self.is_probe_suspended(id);
+            let tcp_due = (!suspended || self.needs_idle_recovery(id, ProbeDomain::Tcp))
+                && [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
+                    !self.is_alive_for(id, ProbeDomain::Tcp, ipver)
+                        && self.should_probe(id, ProbeDomain::Tcp, ipver)
                 });
+            let udp_due = if suspended {
+                self.needs_idle_recovery(id, ProbeDomain::DataUdp)
+                    && [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
+                        !self.is_alive_for(id, ProbeDomain::DataUdp, ipver)
+                            && self.should_probe(id, ProbeDomain::DataUdp, ipver)
+                    })
+            } else {
+                [ProbeDomain::DataUdp, ProbeDomain::DnsUdp]
+                    .into_iter()
+                    .any(|domain| {
+                        [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
+                            !self.is_alive_for(id, domain, ipver)
+                                && self.should_probe(id, domain, ipver)
+                        })
+                    })
+            };
             if !tcp_due && !udp_due {
                 return None;
             }
@@ -394,6 +405,116 @@ impl AliveDialerSet {
         });
         self.run_probe_batch(due, timeout, concurrency, &cancel)
             .await;
+        if !cancel.is_cancelled() {
+            self.run_custom_url_recovery_cycle(timeout, concurrency)
+                .await;
+        }
+    }
+
+    async fn run_custom_url_recovery_cycle(
+        self: &Arc<Self>,
+        timeout: Duration,
+        concurrency: usize,
+    ) {
+        let group_urls = self.group_check_urls();
+        if group_urls.is_empty() {
+            return;
+        }
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+        let mut join_set = tokio::task::JoinSet::new();
+        let native_epoch = self.health_epoch();
+        for (group, url) in group_urls {
+            let members = self.url_members_for(&group);
+            if members.is_empty()
+                || members
+                    .iter()
+                    .all(|member| self.is_alive_for_url(&member.tag, &url))
+            {
+                continue;
+            }
+            let idle = self.is_group_idle(&group);
+            let all_dead = !members
+                .iter()
+                .any(|member| self.is_alive_for_url(&member.tag, &url));
+            let pinned = (idle && !all_dead).then(|| self.pinned_url_members_for(&group));
+            if pinned.as_ref().is_some_and(HashSet::is_empty) {
+                continue;
+            }
+            for member in members {
+                if self.is_alive_for_url(&member.tag, &url)
+                    || !self.should_probe_url(&member.tag, &url)
+                {
+                    continue;
+                }
+                if pinned
+                    .as_ref()
+                    .is_some_and(|pins| !pins.contains(&member.tag))
+                {
+                    continue;
+                }
+                let this = Arc::clone(self);
+                let url = url.clone();
+                let permit = Arc::clone(&semaphore);
+                join_set.spawn(async move {
+                    let _p = permit.acquire().await;
+                    this.probe_node_with_url(
+                        &member.tag,
+                        member.leaf,
+                        &url,
+                        timeout,
+                        member.native.zip(native_epoch),
+                    )
+                    .await;
+                });
+            }
+        }
+        while let Some(result) = join_set.join_next().await {
+            if result.is_err() {
+                self.health_worker_failed();
+            }
+        }
+    }
+
+    async fn probe_triggered_custom_urls(&self, node_id: Uuid, timeout: Duration) {
+        let group_urls = self.group_check_urls();
+        if group_urls.is_empty() {
+            return;
+        }
+        let native_epoch = self.health_epoch();
+        let now = Instant::now();
+        for (group, url) in group_urls {
+            let idle = self.is_group_idle(&group);
+            let pinned = idle.then(|| self.pinned_url_members_for(&group));
+            if pinned.as_ref().is_some_and(HashSet::is_empty) {
+                continue;
+            }
+            for member in self.url_members_for(&group) {
+                if member.leaf != node_id {
+                    continue;
+                }
+                if pinned
+                    .as_ref()
+                    .is_some_and(|pins| !pins.contains(&member.tag))
+                {
+                    continue;
+                }
+                if let Some(state) = self
+                    .url_states
+                    .write()
+                    .get_mut(&(member.tag.clone(), url.clone()))
+                {
+                    state.cooldown_until = now;
+                }
+                self.probe_node_with_url(
+                    &member.tag,
+                    member.leaf,
+                    &url,
+                    timeout,
+                    member.native.zip(native_epoch),
+                )
+                .await;
+            }
+        }
     }
 
     /// Run health check cycle with concurrent probing.
@@ -424,8 +545,6 @@ impl AliveDialerSet {
         let has_registered_nodes = !nodes.is_empty();
 
         let due = nodes.into_iter().filter_map(|(id, registration)| {
-            // Idle suspension: skip nodes whose groups are all idle
-            // (lazy start: never-active groups start suspended).
             if self.is_probe_suspended(id) {
                 tracing::trace!("Skipping health check for '{}' (groups idle)", id);
                 return None;
@@ -465,7 +584,9 @@ impl AliveDialerSet {
         // so nested groups rank correctly even as sub-picks change.
         let native_epoch = self.health_epoch();
         for (group, url) in self.group_check_urls() {
-            if self.is_group_idle(&group) {
+            let idle = self.is_group_idle(&group);
+            let pinned = idle.then(|| self.pinned_url_members_for(&group));
+            if pinned.as_ref().is_some_and(HashSet::is_empty) {
                 tracing::trace!(
                     "Skipping custom-URL health checks for idle group '{}'",
                     group
@@ -473,6 +594,12 @@ impl AliveDialerSet {
                 continue;
             }
             for member in self.url_members_for(&group) {
+                if pinned
+                    .as_ref()
+                    .is_some_and(|pins| !pins.contains(&member.tag))
+                {
+                    continue;
+                }
                 if !self.should_probe_url(&member.tag, &url) {
                     continue;
                 }
@@ -580,6 +707,7 @@ impl AliveDialerSet {
                             let this = Arc::clone(&this);
                             emergency_workers.spawn(async move {
                                 this.probe_node(id, timeout).await;
+                                this.probe_triggered_custom_urls(id, timeout).await;
                                 this.finish_trigger_probe(id);
                             });
                         }

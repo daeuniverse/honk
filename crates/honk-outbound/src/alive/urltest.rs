@@ -1,7 +1,8 @@
 use super::collection::DialerCollection;
 use super::{
-    AliveDialerSet, DEFAULT_GROUP_IDLE_TIMEOUT, ProbeDomain, RECOVERY_SUCCESSES_NEEDED,
-    UrlMemberResolver, UrlProbeMember, UrlProbeState, probe_backoff, probe_failure_threshold,
+    AliveDialerSet, DEFAULT_GROUP_IDLE_TIMEOUT, IpVersion, ProbeDomain, RECOVERY_SUCCESSES_NEEDED,
+    UrlMemberResolver, UrlProbeMember, UrlProbeState, alive_index, probe_backoff,
+    probe_failure_threshold,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -386,10 +387,30 @@ impl AliveDialerSet {
         if prev == 0 || now_ns.saturating_sub(prev) >= timeout_ns {
             let members = entry.members.clone();
             drop(idle);
-            if !members.is_empty() {
+            let custom_url = self.group_check_urls.read().get(group).cloned();
+            let custom_leaves: Vec<Uuid> = if let Some(url) = custom_url {
+                let url_members = self.url_members_for(group);
+                let now = Instant::now();
+                {
+                    let mut url_states = self.url_states.write();
+                    for member in &url_members {
+                        if let Some(state) = url_states.get_mut(&(member.tag.clone(), url.clone()))
+                        {
+                            state.cooldown_until = now;
+                        }
+                    }
+                }
+                url_members.into_iter().map(|m| m.leaf).collect()
+            } else {
+                Vec::new()
+            };
+            if !members.is_empty() || !custom_leaves.is_empty() {
                 tracing::debug!("Group '{}' active again — resuming member probes", group);
                 for member in members {
                     self.trigger_probe(member);
+                }
+                for leaf in custom_leaves {
+                    self.trigger_probe(leaf);
                 }
             }
         }
@@ -431,6 +452,83 @@ impl AliveDialerSet {
             return false;
         }
         self.is_groups_idle_for_node(node_id)
+    }
+
+    pub(super) fn needs_idle_recovery(&self, node_id: Uuid, domain: ProbeDomain) -> bool {
+        if !matches!(domain, ProbeDomain::Tcp | ProbeDomain::DataUdp) {
+            return false;
+        }
+        let idle = self.idle_groups.read();
+        let Some(groups) = idle.node_groups.get(&node_id) else {
+            return false;
+        };
+        let now_ns = self.now_ns();
+        let idx_v4 = alive_index(domain, IpVersion::V4);
+        let idx_v6 = alive_index(domain, IpVersion::V6);
+        let states = self.states.read();
+        groups.iter().any(|group| {
+            let Some(entry) = idle.groups.get(group) else {
+                return false;
+            };
+            entry.kind == IdleGroupKind::Automatic
+                && entry.is_idle(now_ns)
+                && !entry.members.iter().any(|member| {
+                    states.get(member).is_none_or(|state| {
+                        (state[idx_v4].alive && state.routed_udp_available(domain, idx_v4))
+                            || (state[idx_v6].alive && state.routed_udp_available(domain, idx_v6))
+                    })
+                })
+        })
+    }
+
+    pub(super) fn pinned_url_members_for(&self, group: &str) -> HashSet<String> {
+        self.pinned_url_members
+            .read()
+            .get(group)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Atomically replace per-group pinned member tags for custom `check_url`
+    /// probing and return newly added `(group, tag)` entries.
+    pub fn replace_pinned_url_members(
+        &self,
+        pinned: HashMap<String, HashSet<String>>,
+    ) -> Vec<(String, String)> {
+        let mut current = self.pinned_url_members.write();
+        let mut added = Vec::new();
+        for (group, tags) in &pinned {
+            let prev = current.get(group);
+            for tag in tags {
+                if prev.is_none_or(|existing| !existing.contains(tag)) {
+                    added.push((group.clone(), tag.clone()));
+                }
+            }
+        }
+        *current = pinned;
+        added
+    }
+
+    /// Clear custom-URL backoff and queue an immediate probe for newly pinned
+    /// custom-`check_url` members.
+    pub fn wake_pinned_url_members(&self, pins: &[(String, String)]) {
+        if pins.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for (group, tag) in pins {
+            let Some(url) = self.group_check_urls.read().get(group).cloned() else {
+                continue;
+            };
+            if let Some(state) = self.url_states.write().get_mut(&(tag.clone(), url)) {
+                state.cooldown_until = now;
+            }
+            for member in self.url_members_for(group) {
+                if member.tag == *tag {
+                    self.trigger_probe(member.leaf);
+                }
+            }
+        }
     }
 
     /// Replace the nodes groups hold fixed: a manual selection (Selector

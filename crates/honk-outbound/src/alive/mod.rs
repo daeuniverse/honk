@@ -467,6 +467,9 @@ pub struct AliveDialerSet {
     /// Nodes a group holds fixed (manual selection or non-builtin node `final`);
     /// they keep periodic probing while their groups are idle.
     selected_nodes: RwLock<HashSet<Uuid>>,
+    /// Automatic group name → pinned member tags that keep custom-`check_url`
+    /// probing while the group is idle.
+    pinned_url_members: RwLock<HashMap<String, HashSet<String>>>,
     /// Group → custom check URL for per-group health check targets
     /// (sing-box urltest `url` option). Members are resolved dynamically
     /// each probe cycle through `url_member_resolver` — sub-group picks
@@ -542,6 +545,7 @@ impl AliveDialerSet {
             started_at: Instant::now(),
             idle_groups: RwLock::default(),
             selected_nodes: RwLock::new(HashSet::new()),
+            pinned_url_members: RwLock::new(HashMap::new()),
             group_check_urls: RwLock::new(HashMap::new()),
             url_member_resolver: RwLock::new(None),
             url_states: RwLock::new(HashMap::new()),
@@ -940,8 +944,21 @@ impl AliveDialerSet {
                 }
             }
         }
+        {
+            let mut url_states = self.url_states.write();
+            for state in url_states.values_mut() {
+                state.cooldown_until = now;
+                if !state.alive {
+                    state.consecutive_successes = RECOVERY_SUCCESSES_NEEDED - 1;
+                }
+            }
+        }
         for node_id in node_ids {
-            self.trigger_probe(node_id);
+            if !self.is_probe_suspended(node_id)
+                || self.needs_idle_recovery(node_id, ProbeDomain::Tcp)
+            {
+                self.trigger_probe(node_id);
+            }
         }
     }
 

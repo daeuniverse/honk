@@ -486,18 +486,33 @@ impl GroupManager {
             return Vec::new();
         };
         let mut nodes = HashSet::new();
+        let mut pinned_urls: HashMap<String, HashSet<String>> = HashMap::new();
         {
             let state = self.selector_choice.read();
             for group in self.groups.values().map(|managed| &managed.group) {
-                let selected = [SelectionNetwork::Tcp, SelectionNetwork::Udp]
-                    .map(|network| self.selector_member_in(group, network, &state));
-                for member in selected.into_iter().chain([self.final_member(group)]) {
-                    if let Some(GroupMember::Node(node)) = member {
-                        nodes.insert(node.id);
+                for network in [SelectionNetwork::Tcp, SelectionNetwork::Udp] {
+                    if let Some(member) = self.selector_member_in(group, network, &state) {
+                        if let GroupMember::Node(node) = member {
+                            nodes.insert(node.id);
+                        }
+                        if network == SelectionNetwork::Tcp
+                            && group.policy != GroupPolicy::Selector
+                            && group.check_url.is_some()
+                        {
+                            pinned_urls
+                                .entry(group.name.clone())
+                                .or_default()
+                                .insert(member.tag().to_owned());
+                        }
                     }
+                }
+                if let Some(GroupMember::Node(node)) = self.final_member(group) {
+                    nodes.insert(node.id);
                 }
             }
         }
+        let added_pins = alive.replace_pinned_url_members(pinned_urls);
+        alive.wake_pinned_url_members(&added_pins);
         alive.set_selected_nodes(nodes)
     }
 
