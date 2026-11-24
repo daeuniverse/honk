@@ -34,6 +34,8 @@ STATE, CGROUP, PINS = map(Path, ('/run/honk-host-state', '/run/honk-host-cgroup'
 TCX_EGRESS = 47
 HOOKS = {2: 'host_create', 10: 'host_connect4', 11: 'host_connect6', 14: 'host_sendmsg4', 15: 'host_sendmsg6'}
 HOST_DNS_REALM = 4096
+PERSISTENT_HOST_MAPS = ('HOST_HOLD', 'honk_gw_stats', 'HOST_FLOW_META', 'HOST_DIRECT_TCP',
+                        'HOST_SK_IDENTIT', 'HOST_SK_DECISIO')
 HOSTS = ('up', 'hvlan.100', 'wwan0')
 LOCAL = ('10.77.0.3',)
 UPLINK = ('10.77.0.1', 'fd00:77::1')
@@ -467,9 +469,7 @@ routing {{
         record('host-cgroup-active', programs=active, links=daemon_cgroup_links(self.process.pid, active))
         self.primary = self.binding(0)
         program = self.primary['outer_link'][1]
-        self.maps = {name: wg.named_map(program, name) for name in (
-            'HOST_HOLD', 'honk_gw_stats', 'HOST_FLOW_META', 'HOST_DIRECT_TCP',
-            'HOST_SK_IDENTIT', 'HOST_SK_DECISIO', 'dns_epochs', 'dns_facts')}
+        self.maps = {name: wg.named_map(program, name) for name in (*PERSISTENT_HOST_MAPS, *wg.dns.SHADOW_MAPS)}
         assert self.maps['honk_gw_stats'][1:5] == (6, 4, 8, max(REASONS.values()) + 1)
         assert self.maps['HOST_FLOW_META'][1:5] == (1, 48, 88, 8192)
         assert self.maps['HOST_DIRECT_TCP'][1:5] == (1, 48, 32, 8192)
@@ -596,7 +596,7 @@ routing {{
             assert last_seen and incarnation == binding['incarnation']
             return dict(stamp=stamp, last_seen=last_seen, cookie=cookie, binding=incarnation)
 
-    def reload(self, rules):
+    def reload(self, rules, *, expect_dns=True):
         pending = self.config.with_suffix('.pending')
         pending.write_text(self.text(rules))
         pending.replace(self.config)
@@ -608,15 +608,25 @@ routing {{
         current = self.binding(0)
         assert current['incarnation'] == self.primary['incarnation'], (self.primary, current)
         program = current['outer_link'][1]
-        dns_maps = {}
-        for name, previous in self.maps.items():
+        for name in PERSISTENT_HOST_MAPS:
             observed = wg.named_map(program, name)
-            if name in ('dns_epochs', 'dns_facts'):
+            assert observed == self.maps[name], (name, self.maps[name], observed)
+        fd = wg.dns.probe.bpf(13, wg.dns.probe.Id(id=program))
+        try:
+            referenced = wg.dns.program_maps(fd)
+        finally:
+            os.close(fd)
+        dns_names = wg.dns.SHADOW_MAPS
+        if expect_dns:
+            assert dns_names <= referenced.keys(), (program, dns_names - referenced.keys())
+            for name in dns_names:
+                previous, observed = self.maps[name], referenced[name]
                 assert observed[1:] == previous[1:], (name, previous, observed)
-                dns_maps[name] = observed
-            else:
-                assert observed == previous, (name, previous, observed)
-        self.maps.update(dns_maps)
+            self.maps.update((name, referenced[name]) for name in dns_names)
+        else:
+            assert dns_names.isdisjoint(referenced), (program, dns_names.intersection(referenced))
+            for name in dns_names:
+                self.maps.pop(name, None)
         self.primary = current
 
     def mode(self, value):
@@ -1352,7 +1362,7 @@ def capacity(fixture):
         udp_trial(fixture, UPLINK[0], cached_proxy, 'proxy', sock=original)
         assert fixture.hold(fixture.primary, local(original), cached_proxy, socket.IPPROTO_UDP)['stamp'] == held
 
-        fixture.reload(f'dip({new_target[0]}/32) && dport({DIRECT}) -> block(must)')
+        fixture.reload(f'dip({new_target[0]}/32) && dport({DIRECT}) -> block(must)', expect_dns=False)
         assert occupancy(hold) == hold[4], 'hold pressure changed before reclassification'
         reclassified_at = fixture.counters('direct_unrecorded', 'hold_full')
         denied = os.urandom(37)
