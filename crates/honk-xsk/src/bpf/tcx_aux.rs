@@ -234,13 +234,8 @@ impl HostBroadcasts {
 
     fn new(budget: &Arc<MemoryBudget>) -> io::Result<Self> {
         let (inner, id) = Self::inner(&[])?;
-        let root = create_with_flags::<u32, u32>(
-            12,
-            1,
-            b"honk_bcast_root",
-            inner.as_raw_fd(),
-            BPF_F_RDONLY_PROG,
-        )?;
+        // ARRAY_OF_MAPS already permits only lookups from BPF; it rejects program-access flags.
+        let root = create_with_flags::<u32, u32>(12, 1, b"honk_bcast_root", inner.as_raw_fd(), 0)?;
         update(root.as_fd(), &0u32, &inner.as_raw_fd(), 0)?;
         if lookup(root.as_fd(), &0u32)? != Some(id) {
             return Err(invalid_data("Host broadcast root initialization failed"));
