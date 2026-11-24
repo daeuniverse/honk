@@ -35,7 +35,7 @@ TCX_EGRESS = 47
 HOOKS = {2: 'host_create', 10: 'host_connect4', 11: 'host_connect6', 14: 'host_sendmsg4', 15: 'host_sendmsg6'}
 HOST_DNS_REALM = 4096
 HOSTS = ('up', 'hvlan.100', 'wwan0')
-LOCAL = ('10.77.0.3', 'fd00:77::3')
+LOCAL = ('10.77.0.3',)
 UPLINK = ('10.77.0.1', 'fd00:77::1')
 SERVER = '10.77.0.2'
 TARGET = ('198.51.100.2', 'fd00:2::2')
@@ -371,8 +371,7 @@ class Router:
         foreign_cgroup(owned)
         self.foreign = cgroup_programs()
         self.namespace_inodes = wg.topology(owned, 2)
-        for lane, address in enumerate(LOCAL):
-            wg.add_address('dut', 'up', f'{address}/{64 if lane else 24}')
+        wg.add_address('dut', 'up', f'{LOCAL[0]}/24')
         addresses = {address for targets in tun.TARGETS.values() for address in targets} | set(PROXY_SOURCE) | {FILL_META, *FILL_HOLD}
         existing = {item['local'] for link in json.loads(wg.ip('server', '-j', 'addr', 'show')) for item in link['addr_info']}
         for address in sorted(addresses - existing):
