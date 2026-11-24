@@ -1,13 +1,7 @@
 use super::*;
-use crate::proxy::shadowsocks::{
-    AeadCipher, ShadowsocksHandler, hkdf_sha1_derive, increment_nonce, seal_chunks_into,
-};
 use bytes::{Buf, BytesMut};
 use honk_config::node::{StreamTransportOptions, TrojanConfig};
-use tokio::net::TcpStream;
-use tokio::sync::oneshot;
 
-const METHOD: &str = "aes-128-gcm";
 const EXIT: &str = "192.0.2.1";
 const PORT: u16 = 1080;
 const SETTINGS: &[u8] = b"\x00\x00\x00\x04\x00\x00\x00\x00\x00";
@@ -15,30 +9,6 @@ const SETTINGS: &[u8] = b"\x00\x00\x00\x04\x00\x00\x00\x00\x00";
 const RESPONSE: &[u8] = b"\x00\x00\x14\x01\x04\x00\x00\x00\x01\x88\x0f\x10\x10application/grpc";
 const PONG: &[u8] = b"\x00\x00\x0b\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x06\x0a\x04pong";
 const REFUSED_STREAM: &[u8] = b"\x00\x00\x04\x03\x00\x00\x00\x00\x01\x00\x00\x00\x07";
-
-fn cipher(master: &[u8], salt: &[u8]) -> AeadCipher {
-    let mut key = [0; 16];
-    hkdf_sha1_derive(master, salt, &mut key);
-    AeadCipher::new(METHOD, &key).unwrap()
-}
-
-async fn read_chunk(stream: &mut TcpStream, cipher: &AeadCipher, nonce: &mut [u8]) -> Vec<u8> {
-    let mut length = [0; 2 + 16];
-    stream.read_exact(&mut length).await.unwrap();
-    let length: [u8; 2] = cipher.open(nonce, &length).unwrap().try_into().unwrap();
-    increment_nonce(nonce);
-    let mut sealed = vec![0; usize::from(u16::from_be_bytes(length)) + 16];
-    stream.read_exact(&mut sealed).await.unwrap();
-    let body = cipher.open(nonce, &sealed).unwrap();
-    increment_nonce(nonce);
-    body
-}
-
-async fn write_chunk(stream: &mut TcpStream, cipher: &AeadCipher, nonce: &mut [u8], body: &[u8]) {
-    let mut wire = Vec::new();
-    seal_chunks_into(cipher, nonce, body, &mut wire).unwrap();
-    stream.write_all(&wire).await.unwrap();
-}
 
 async fn serve(
     listener: TcpListener,
@@ -104,7 +74,7 @@ async fn serve(
 
 #[tokio::test]
 async fn established_grpc_retains_shadowsocks_auth_failure_and_distinguishes_stream_reset() {
-    for corrupt in [true, false] {
+    for (corrupt, routed) in [(false, false), (true, false), (true, true)] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front = shadowsocks("front", "127.0.0.1", listener.local_addr().unwrap().port());
         let last = node(
@@ -120,6 +90,7 @@ async fn established_grpc_retains_shadowsocks_auth_failure_and_distinguishes_str
             }),
         );
         let via = chain(&[&front, &last]);
+        let route = route(&front, &[&front, &last]);
         let generation =
             Arc::new(OutboundRuntimeRegistry::build(&[via.clone(), front, last]).unwrap());
         let registry = ProxyRegistry::default_resolver().unwrap();
@@ -127,9 +98,13 @@ async fn established_grpc_retains_shadowsocks_auth_failure_and_distinguishes_str
         let (check, checked) = oneshot::channel();
         let client = async {
             let mut stream = registry
-                .dial_runtime(
+                .dial_ref(
                     Arc::clone(&generation),
-                    via.id,
+                    if routed {
+                        DialRef::Route(&route)
+                    } else {
+                        DialRef::Node(via.id)
+                    },
                     target(),
                     None,
                     Duration::from_secs(3),
@@ -150,6 +125,9 @@ async fn established_grpc_retains_shadowsocks_auth_failure_and_distinguishes_str
                     "{error}"
                 );
                 assert_eq!(outcome, ScoreOutcome::NodeFailure);
+                if routed {
+                    assert_eq!(dial_failure_scope(&error), DialFailureScope::Hop(0));
+                }
                 assert_score_failure_scope(&via, &[outcome], true, 1, 1);
             } else {
                 assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);

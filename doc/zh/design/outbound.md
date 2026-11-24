@@ -1031,6 +1031,15 @@ runtime 准入校验这些绑定。`build_reusing_with_admission` 先构建或�
 
 只有经隧道拨号的一跳返回 `RealityMaskCertificate` 才触发整链重拨。从入口重试一次，关闭 hybrid key share。失败尝试交还载体和它所持的物理拨号额度，下一次尝试独立获取和持有额度，并沿用原始拨号的准入范围、固定地址、开始时间、进度和绝对期限。入口自身的 REALITY 重试仍由它的 `dial_runtime` 处理。
 
+### 经组出口的路由
+
+组的 [`exit`](../reference/groups.md#出口) 把选中的叶节点变成一条路由（`honk_config::route::Route`）。
+`group_graph::compose` 从叶节点自身或配置链的各跳开始，按从内到外的顺序附加组出口；只合并相邻的相同跳点。
+路由是选择结果，不是配置中的节点，所以没有 `NodeRuntime`。
+`ProxyRegistry::dial_ref` 把 `DialRef::Route` 交给 `ChainHandler::dial_route_tcp`，在 `RouteRuntime`（`src/runtime/route.rs`）上拨号，
+`RouteRuntime` 借用发起拨号的 generation 中各跳的 runtime。每个 generation 最多缓存 `MAX_ROUTE_RUNTIMES`（4096）个，超出后用不缓存的 runtime 拨号。
+上述逐跳规则同样适用。路由不存入连接池，也不触发补充。
+
 ## 冷 URLTest speculative preparation
 
 冷 URLTest 是唯一会准备多个叶节点的选择路径。选择策略和 stagger 规则见[组设计](./groups.md)；

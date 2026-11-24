@@ -591,7 +591,7 @@ impl ControlPlaneHandle {
 
     /// Clash mode override (approximate clash semantics), applied after the
     /// eBPF handoff / userspace Router produced an outbound and before
-    /// `resolve_outbound_nodes`:
+    /// the outbound dial plan is resolved:
     ///
     /// - mode `Direct` forces `direct`;
     /// - mode `Global` forces the current GLOBAL selection (a group or node

@@ -719,7 +719,7 @@ async fn clash_ungrouped_delay_survives_publications_that_retain_its_physical_le
                     config.nodes.push(Config::builtin_direct_node());
                     reload(&control, config.clone()).await;
                 } else {
-                    control.reload_group_manager().await;
+                    control.reload_group_manager().await.unwrap();
                 }
                 assert_eq!(
                     control.runtime_registry.read().generation() != generation,
@@ -783,9 +783,9 @@ async fn clash_ungrouped_delay_cannot_credit_a_replaced_or_removed_leaf() {
             let mut absent = config.clone();
             absent.nodes.retain(|node| node.id != id);
             *control.config.write().await = Arc::new(absent);
-            control.reload_group_manager().await;
+            control.reload_group_manager().await.unwrap();
             *control.config.write().await = Arc::new(config.clone());
-            control.reload_group_manager().await;
+            control.reload_group_manager().await.unwrap();
         })
         .await;
     delay.success(response);
@@ -836,7 +836,7 @@ async fn clash_group_delay_cannot_credit_or_reselect_after_manager_only_rebuild(
             let runtime = tokio::runtime::Handle::current();
             let plane = Arc::clone(&control);
             let rebuild = tokio::task::spawn_blocking(move || {
-                runtime.block_on(plane.reload_group_manager());
+                runtime.block_on(plane.reload_group_manager()).unwrap();
             });
             unlocked.notified().await;
             (rebuild, resume_tx)

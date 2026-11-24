@@ -82,7 +82,7 @@ async fn health_push_re_resolves_after_reload_writer() {
     *config_writer = Arc::new(new_config.clone());
     *group_manager.write() = Arc::new(GroupManager::new(&new_config.groups, &new_config.nodes));
 
-    let update = tokio::spawn(Arc::clone(&health_publisher).publish(node.id, 1, 0));
+    let update = tokio::spawn(Arc::clone(&health_publisher).publish(Some(node.id), Some((1, 0))));
     tokio::task::yield_now().await;
     assert!(!update.is_finished());
     drop(config_writer);
@@ -3619,17 +3619,17 @@ fn resolve_selector_refusal_uses_only_explicit_final() {
         let context =
             crate::group::ScoreSelectionContext::aggregate(network, domain, IpVersion::V6);
         assert!(
-            super::reload::resolve_outbound_plan_for_target(
+            super::reload::resolve_outbound_plan_for_target::<honk_config::node::Node>(
                 &config,
                 &manager,
                 "selector",
                 &context,
                 crate::control::reload::OutboundConstraint::Any
             )
-            .nodes
+            .targets
             .is_empty()
         );
-        let plan = super::reload::resolve_outbound_plan_for_target(
+        let plan = super::reload::resolve_outbound_plan_for_target::<honk_config::node::Node>(
             &config,
             &manager,
             "selector-final",
@@ -3638,7 +3638,7 @@ fn resolve_selector_refusal_uses_only_explicit_final() {
         );
         assert_eq!(plan.mode, crate::group::SelectionPlanMode::Authoritative);
         assert_eq!(
-            plan.nodes
+            plan.targets
                 .iter()
                 .map(|node| node.name.as_str())
                 .collect::<Vec<_>>(),
@@ -4366,6 +4366,7 @@ fn preconnect_test_group(name: &str, policy: GroupPolicy, ids: Vec<uuid::Uuid>) 
         groups: vec![],
         default: None,
         final_outbound: None,
+        exit: None,
         check_url: None,
         check_interval: None,
         tolerance: 50,

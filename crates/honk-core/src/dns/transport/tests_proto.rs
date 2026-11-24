@@ -309,6 +309,7 @@ fn proxied_quic_fixture_for_protocol(
                 registry: Arc::new(registry),
                 generation: Some(generation),
                 node,
+                route: None,
             }),
         },
         active,
@@ -385,6 +386,119 @@ pub(super) fn spawn_doq_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         connection.closed().await;
     });
     (address, task)
+}
+
+#[tokio::test]
+async fn quic_dns_queries_distinguish_exit_refusals_from_packet_dials() {
+    use honk_config::Config;
+    use honk_config::node::Group;
+    use honk_outbound::group::GroupManager;
+    use honk_outbound::proxy::{PacketRejection, packet_rejection};
+    use honk_outbound::runtime::OutboundRuntimeRegistry;
+
+    for (protocol, alpn) in [
+        (DnsProtocol::Quic, &b"doq"[..]),
+        (DnsProtocol::H3, &b"h3"[..]),
+    ] {
+        let (peer, address) = quic_server_endpoint(alpn);
+        let target = address.to_string();
+        let fixture =
+            proxied_quic_fixture(DnsEndpoint::parse(&target, protocol, Some("localhost")).unwrap());
+        let proxy = fixture.dial.proxy.unwrap();
+        let relay = crate::test_support::socks5_relay().await;
+        let exit = Node::from_share_link(&format!("socks5://{}#exit", relay.addr)).unwrap();
+        let block = Config::builtin_block_node();
+        let group = |name: &str, member, has_exit: bool, final_outbound: Option<&str>| Group {
+            name: name.into(),
+            nodes: vec![member],
+            exit: has_exit.then(|| exit.name.clone()),
+            final_outbound: final_outbound.map(str::to_owned),
+            ..Default::default()
+        };
+        let groups = [
+            group("through-exit", proxy.node.id, true, None),
+            group("block-member", block.id, true, None),
+            group("block-final", proxy.node.id, true, Some("block")),
+            group("allowed", proxy.node.id, false, None),
+        ];
+        let upstreams = groups.each_ref().map(|group| DnsUpstream {
+            tls_server_name: Some("localhost".into()),
+            outbound: Some(group.name.clone()),
+            ..make_upstream(&group.name, &target, protocol)
+        });
+        let nodes = vec![proxy.node, exit, block];
+        let generation = Arc::new(OutboundRuntimeRegistry::build(&nodes).unwrap());
+        let manager = Arc::new(GroupManager::new(&groups, &nodes));
+        let pool = UpstreamPool::new_with_proxy(
+            &upstreams,
+            empty_router(),
+            Some(proxy.registry),
+            nodes,
+            Vec::from(groups),
+        )
+        .unwrap()
+        .with_group_manager_snapshot(manager)
+        .with_socket_budget(super::DnsSocketBudget::new(4))
+        .with_timeouts(Duration::from_secs(2), Duration::from_secs(2));
+        pool.set_runtime_generation(generation).unwrap();
+
+        let query = build_dns_query("example.com", 1);
+        let error = pool.query("through-exit", &query).await.unwrap_err();
+        assert_eq!(packet_rejection(&error), None, "{protocol:?}: {error:#}");
+        assert!(error.to_string().contains("no available node"), "{error:#}");
+        for group in ["block-member", "block-final"] {
+            let error = pool.query(group, &query).await.unwrap_err();
+            assert_eq!(
+                packet_rejection(&error),
+                Some(PacketRejection::Policy),
+                "{protocol:?}/{group}: {error:#}"
+            );
+        }
+        assert_eq!(pool.lifecycle_stats().init_count, 0);
+        assert_eq!(fixture.runtime_dials.load(Ordering::SeqCst), 0);
+        assert!(relay.requests.lock().is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), peer.accept())
+                .await
+                .is_err(),
+            "{protocol:?}: an exit refusal reached the QUIC peer"
+        );
+
+        let (result, handshakes) = tokio::time::timeout(Duration::from_secs(6), async {
+            tokio::join!(pool.query("allowed", &query), async {
+                let mut connections = [None, None];
+                for slot in &mut connections {
+                    let connection = slot.insert(peer.accept().await.unwrap().accept().unwrap());
+                    let handshake = connection
+                        .handshake_data()
+                        .await
+                        .unwrap()
+                        .downcast::<quinn::crypto::rustls::HandshakeData>()
+                        .unwrap();
+                    assert_eq!(handshake.protocol.as_deref(), Some(alpn));
+                }
+                connections
+            })
+        })
+        .await
+        .expect("the ordinary no-exit query must reach the peer and retry once");
+        // TLS unknown_ca (48) from the ordinary production certificate check.
+        let unknown_ca = quinn::TransportErrorCode::crypto(48);
+        let error = result.expect_err("server certificate must be verified");
+        assert!(
+            error.chain().any(|cause| matches!(
+                cause.downcast_ref::<quinn::ConnectionError>(),
+                Some(quinn::ConnectionError::TransportError(error)) if error.code == unknown_ca
+            )),
+            "{protocol:?}: {error:#}"
+        );
+        drop(handshakes);
+        assert_eq!(fixture.runtime_dials.load(Ordering::SeqCst), 2);
+        assert_eq!(pool.lifecycle_stats().init_count, 1);
+        pool.close().await;
+        assert_eq!(pool.lifecycle_stats().close_count, 1);
+        assert_eq!(fixture.active.load(Ordering::SeqCst), 0);
+    }
 }
 
 async fn serve_length_prefixed_dns(mut stream: impl AsyncReadExt + AsyncWriteExt + Unpin) {

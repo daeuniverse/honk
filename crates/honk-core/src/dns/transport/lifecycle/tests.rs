@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use honk_config::dns::{DnsRouting, DnsUpstream};
 use honk_config::node::Node;
-use honk_config::types::{DnsProtocol, NodeProtocol};
+use honk_config::types::DnsProtocol;
 use parking_lot::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::dns::forwarder::DnsUpstreamPool;
@@ -454,7 +454,7 @@ async fn concurrent_closer_cannot_close_a_replacement() {
 async fn assert_close_excludes_inflight_return() {
     // Given
     let lifecycle = Arc::new(tokio::sync::RwLock::new(IdlePoolState::Open));
-    let idle = Arc::new(Mutex::new(Vec::<DuplexStream>::new()));
+    let idle = Arc::new(Mutex::new(Vec::new()));
     let (client, mut server) = tokio::io::duplex(256);
     let (request_tx, request_rx) = tokio::sync::oneshot::channel();
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -482,6 +482,7 @@ async fn assert_close_excludes_inflight_return() {
             &[0_u8; 12],
             Duration::from_secs(1),
             None,
+            false,
         )
         .await
     });
@@ -516,6 +517,7 @@ async fn assert_close_excludes_inflight_return() {
         &[0_u8; 12],
         Duration::from_secs(1),
         None,
+        false,
     )
     .await
     .expect_err("closed pool rejects exchange");
@@ -616,57 +618,6 @@ async fn tcp_transport_lifecycle_is_single_flight_and_closes_once() {
 }
 
 #[tokio::test]
-async fn proxied_quic_transports_use_packet_outbound() {
-    let router = Arc::new(
-        DnsRouter::new(&DnsRouting {
-            fallback: "doq".to_string(),
-            ..Default::default()
-        })
-        .expect("router"),
-    );
-    let proxy = Node {
-        name: "proxy".to_string(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Block),
-        ..Default::default()
-    };
-    let upstreams = [
-        DnsUpstream {
-            name: "doq".to_string(),
-            address: "127.0.0.1:853".to_string(),
-            protocol: DnsProtocol::Quic,
-            tls_server_name: Some("dns.test".to_string()),
-            outbound: Some("proxy".to_string()),
-        },
-        DnsUpstream {
-            name: "doh3".to_string(),
-            address: "127.0.0.1:443/dns-query".to_string(),
-            protocol: DnsProtocol::H3,
-            tls_server_name: Some("dns.test".to_string()),
-            outbound: Some("proxy".to_string()),
-        },
-    ];
-    let registry = Arc::new(crate::proxy::ProxyRegistry::default_resolver().expect("registry"));
-    let pool =
-        UpstreamPool::new_with_proxy(&upstreams, router, Some(registry), vec![proxy], Vec::new())
-            .expect("pool");
-    let query = [0_u8; 12];
-
-    let doq = pool.query("doq", &query).await.expect_err("blocked DoQ");
-    let doh3 = pool.query("doh3", &query).await.expect_err("blocked DoH3");
-    let doq_chain = format!("{doq:#}");
-    let doh3_chain = format!("{doh3:#}");
-
-    assert!(doq_chain.contains("UDP connection blocked"), "{doq_chain}");
-    assert!(
-        doh3_chain.contains("UDP connection blocked"),
-        "{doh3_chain}"
-    );
-    assert!(!doq_chain.contains("does not support outbound"));
-    assert!(!doh3_chain.contains("does not support outbound"));
-    assert_eq!(pool.lifecycle_stats().init_count, 2);
-}
-
-#[tokio::test]
 async fn proxied_quic_without_registry_fails_closed() {
     let upstream = DnsUpstream {
         name: "doq".into(),
@@ -675,11 +626,7 @@ async fn proxied_quic_without_registry_fails_closed() {
         tls_server_name: Some("dns.test".into()),
         outbound: Some("proxy".into()),
     };
-    let proxy = Node {
-        name: "proxy".into(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Block),
-        ..Default::default()
-    };
+    let proxy = Node::from_share_link("socks5://127.0.0.1:9#proxy").unwrap();
     let router = Arc::new(
         DnsRouter::new(&DnsRouting {
             fallback: "doq".into(),
@@ -696,6 +643,10 @@ async fn proxied_quic_without_registry_fails_closed() {
         error_chain.contains("without a proxy registry"),
         "{error_chain}"
     );
+    assert!(!honk_outbound::proxy::is_packet_rejection(&error));
+    assert_eq!(pool.lifecycle_stats().init_count, 1);
+    pool.close().await;
+    assert_eq!(pool.lifecycle_stats().close_count, 0);
 }
 
 #[tokio::test]

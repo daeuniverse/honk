@@ -1,6 +1,9 @@
 use super::*;
 use crate::group::ScoreOutcome;
-use crate::proxy::{ProxyRegistry, TargetFailure, node_failure, target_failure};
+use crate::proxy::{
+    DialFailureScope, DialRef, NodeFailure, ProxyRegistry, TargetFailure, dial_failure_scope,
+    failed_hop, node_failure, target_failure,
+};
 use crate::runtime::OutboundRuntimeRegistry;
 use crate::test_support::{
     TCP_TARGET as TARGET, TCP_TARGET_HEADER, assert_legacy_bulk_echo, chain,
@@ -94,13 +97,77 @@ async fn an_earlier_hop_target_failure_is_a_chain_failure() {
     let relay = socks5_relay(Vec::new(), true).await;
     let front = socks5("front", "127.0.0.1", relay.addr.port());
     let land = shadowsocks("land", "127.0.0.1", 9);
+    let route = route(&front, &[&front, &land]);
+    let generation =
+        Arc::new(OutboundRuntimeRegistry::build(&[front.clone(), land.clone()]).unwrap());
     let error = dial_chain(&[chain(&[&front, &land]), front, land])
         .await
         .unwrap_err();
     assert!(!target_failure(&error), "{error:#}");
     assert!(node_failure(&error), "{error:#}");
+    assert!(failed_hop(&error).is_none());
     assert_eq!(ScoreOutcome::from_error(&error), ScoreOutcome::NodeFailure);
     assert!(error.chain().any(|cause| cause.is::<TargetFailure>()));
+
+    let error = dial_route(&generation, &route).await.unwrap_err();
+    assert_eq!(
+        dial_failure_scope(error.as_ref()),
+        DialFailureScope::Prefix(1)
+    );
+    assert_eq!(
+        failed_hop(&error).map(|failure| (failure.hop, failure.node)),
+        Some((1, route.exit())),
+    );
+    assert!(error.chain().any(|cause| cause.is::<TargetFailure>()));
+}
+
+#[tokio::test]
+async fn internal_refusals_charge_the_configured_chain_but_boundary_refusals_do_not() {
+    use crate::group::{OwnedTarget, RoutedTarget};
+    use std::sync::atomic::Ordering;
+
+    let ingress = socks5_relay(Vec::new(), true).await;
+    let middle = socks5_relay(Vec::new(), true).await;
+    let front = socks5("front", "127.0.0.1", ingress.addr.port());
+    let mid = socks5("mid", "127.0.0.1", middle.addr.port());
+    let exit = socks5("exit", "127.0.0.1", 9);
+    let configured = chain(&[&front, &mid]);
+    let route = route(&configured, &[&front, &mid, &exit]);
+    let standalone = OwnedTarget::node(configured.clone());
+    let mut routed = OwnedTarget::node(configured.clone());
+    routed.route = Some(Box::new(RoutedTarget {
+        route,
+        hop_names: [front.name.clone(), mid.name.clone(), exit.name.clone()].into(),
+    }));
+    let generation =
+        Arc::new(OutboundRuntimeRegistry::build(&[configured.clone(), front, mid, exit]).unwrap());
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    for (owner_target, scope, owner) in [
+        (
+            &standalone,
+            DialFailureScope::Prefix(1),
+            Some(configured.id),
+        ),
+        (&routed, DialFailureScope::Prefix(1), Some(configured.id)),
+        (&routed, DialFailureScope::Prefix(2), None),
+    ] {
+        ingress
+            .refuse
+            .store(scope == DialFailureScope::Prefix(1), Ordering::SeqCst);
+        let error = registry
+            .dial_ref(
+                Arc::clone(&generation),
+                owner_target.dial_ref(),
+                target(),
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(dial_failure_scope(error.as_ref()), scope);
+        assert_eq!(owner_target.failure_owner(&error), owner);
+    }
+    assert_eq!(middle.requests(), ["127.0.0.1:9"]);
 }
 
 #[tokio::test]
@@ -109,6 +176,9 @@ async fn the_last_hop_target_failure_stays_a_target_failure() {
     let relay = socks5_relay(Vec::new(), false).await;
     let front = socks5("front", "127.0.0.1", relay.addr.port());
     let land = socks5("land", "127.0.0.1", refusing.addr.port());
+    let route = route(&front, &[&front, &land]);
+    let generation =
+        Arc::new(OutboundRuntimeRegistry::build(&[front.clone(), land.clone()]).unwrap());
     let error = dial_chain(&[chain(&[&front, &land]), front, land])
         .await
         .unwrap_err();
@@ -117,15 +187,52 @@ async fn the_last_hop_target_failure_stays_a_target_failure() {
         ScoreOutcome::from_error(&error),
         ScoreOutcome::TargetFailure
     );
-    assert_eq!(refusing.requests(), [TARGET]);
+    let error = dial_route(&generation, &route).await.unwrap_err();
+    assert_eq!(dial_failure_scope(error.as_ref()), DialFailureScope::Target);
+    assert_eq!(failed_hop(&error).unwrap().node, route.exit());
+    assert_eq!(refusing.requests(), [TARGET, TARGET]);
+}
+
+#[tokio::test]
+async fn a_confirmed_socks_route_retains_splice_and_checks_generation() {
+    let application = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let destination = application.local_addr().unwrap();
+    let ingress = socks5_relay(Vec::new(), false).await;
+    let egress = socks5_relay(Vec::new(), false).await;
+    let front = socks5("front", "127.0.0.1", ingress.addr.port());
+    let exit = socks5("exit", "127.0.0.1", egress.addr.port());
+    let route = route(&front, &[&front, &exit]);
+    let incomplete = OutboundRuntimeRegistry::build(std::slice::from_ref(&exit)).unwrap();
+    let generation = Arc::new(OutboundRuntimeRegistry::build(&[front, exit]).unwrap());
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let stream = registry
+        .dial_ref(
+            Arc::clone(&generation),
+            DialRef::Route(&route),
+            destination,
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert!(stream.into_tcp_stream().is_ok());
+    assert_eq!(egress.requests(), [destination.to_string()]);
+    let exit = DialRef::Node(route.exit());
+    let dial = DialRef::Route(&route);
+    assert!(registry.confirms_target_on_open(&generation, exit));
+    assert!(registry.confirms_target_on_open(&generation, dial));
+    assert!(!registry.confirms_target_on_open(&incomplete, dial));
+    generation.begin_retirement();
+    assert!(!registry.confirms_target_on_open(&generation, exit));
+    assert!(!registry.confirms_target_on_open(&generation, dial));
 }
 
 #[tokio::test]
 async fn a_chain_without_its_generation_refuses_to_dial() {
     let fakes = Fakes::new(FakeHop::default(), FakeHop::default());
-    let handler = fakes.handler();
     assert!(
-        handler
+        fakes
+            .registry()
             .dial(&fakes.via, target(), None, Duration::from_secs(1))
             .await
             .is_err()
@@ -136,6 +243,106 @@ async fn a_chain_without_its_generation_refuses_to_dial() {
         Err(crate::runtime::RuntimeRegistryError::Admission(error))
             if error.diagnostic.code == "invalid-chain-hop-reference"
     ));
+}
+
+fn route(leaf: &Node, hops: &[&Node]) -> honk_config::route::Route {
+    let ids: Vec<_> = hops.iter().map(|hop| hop.id).collect();
+    let (exit, own) = ids.split_last().unwrap();
+    match honk_config::group_graph::compose(leaf.id, own, [*exit]) {
+        honk_config::group_graph::Composed::Routed(route) => route,
+        other => panic!("expected a route, got {other:?}"),
+    }
+}
+
+async fn dial_route(
+    generation: &Arc<OutboundRuntimeRegistry>,
+    route: &honk_config::route::Route,
+) -> anyhow::Result<ProxyStream> {
+    ProxyRegistry::default_resolver()
+        .unwrap()
+        .dial_ref(
+            Arc::clone(generation),
+            crate::proxy::DialRef::Route(route),
+            target(),
+            None,
+            Duration::from_secs(3),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn a_route_with_a_missing_hop_fails_closed() {
+    let relay = socks5_relay(Vec::new(), false).await;
+    let front = socks5("front", "127.0.0.1", relay.addr.port());
+    let land = shadowsocks("land", "127.0.0.1", 8388);
+    let generation =
+        Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&front)).unwrap());
+    let error = dial_route(&generation, &route(&front, &[&front, &land]))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("route is not in runtime generation"),
+        "{error:#}"
+    );
+    generation.begin_retirement();
+    let full = Arc::new(OutboundRuntimeRegistry::build(&[front.clone(), land.clone()]).unwrap());
+    full.begin_retirement();
+    let error = dial_route(&full, &route(&front, &[&front, &land]))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("generation is shut down"),
+        "{error:#}"
+    );
+    assert!(relay.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_full_route_cache_still_dials_uncached() {
+    for entries in [0, crate::runtime::MAX_ROUTE_RUNTIMES] {
+        let relay = socks5_relay(Vec::new(), false).await;
+        let server = shadowsocks_server().await;
+        let front = socks5("front", "127.0.0.1", relay.addr.port());
+        let land = shadowsocks("land", "127.0.0.1", server.port());
+        let generation =
+            Arc::new(OutboundRuntimeRegistry::build(&[front.clone(), land.clone()]).unwrap());
+        let mut leaf = front.clone();
+        for index in 0..entries {
+            leaf.id = uuid::Uuid::from_u128(index as u128 + 1);
+            generation
+                .route_runtime(&route(&leaf, &[&front, &land]))
+                .unwrap();
+        }
+        let mut stream = dial_route(&generation, &route(&front, &[&front, &land]))
+            .await
+            .unwrap();
+        assert_legacy_bulk_echo(&mut stream.stream).await;
+        assert_eq!(relay.requests(), [server.to_string()]);
+    }
+}
+
+/// A dialed route stream holds its hops' resources, not the route runtime,
+/// so it outlives a reload and the generation that cached the route.
+#[tokio::test]
+async fn a_route_flow_survives_reload_and_cache_drop() {
+    let relay = socks5_relay(Vec::new(), false).await;
+    let server = shadowsocks_server().await;
+    let front = socks5("front", "127.0.0.1", relay.addr.port());
+    let land = shadowsocks("land", "127.0.0.1", server.port());
+    let nodes = [front.clone(), land.clone()];
+    let old = Arc::new(OutboundRuntimeRegistry::build(&nodes).unwrap());
+    let route = route(&front, &[&front, &land]);
+    let mut stream = dial_route(&old, &route).await.unwrap();
+    let cached = Arc::downgrade(&old.route_runtime(&route).unwrap());
+    let (new, _) = OutboundRuntimeRegistry::build_reusing(&nodes, 8, Some(&old)).unwrap();
+    old.begin_retirement();
+    drop(old);
+    assert!(cached.upgrade().is_none());
+    assert_legacy_bulk_echo(&mut stream.stream).await;
+    let mut again = dial_route(&Arc::new(new), &route).await.unwrap();
+    assert_legacy_bulk_echo(&mut again.stream).await;
 }
 
 /// Records how the chain drives each hop and answers with a pass-through stream.
@@ -228,7 +435,10 @@ impl TcpOutbound for FakeHop {
     ) -> anyhow::Result<ProxyStream> {
         let mut call = Self::record(&runtime, target, target_domain);
         call.timeout = connect_timeout;
-        let (stream, peer) = tokio::io::duplex(64);
+        let (stream, peer) = crate::runtime::admit_physical_dial(async {
+            Ok::<_, anyhow::Error>(tokio::io::duplex(64))
+        })
+        .await?;
         self.peers.lock().unwrap().push(peer);
         self.act(call, Box::new(stream)).await
     }
@@ -275,27 +485,47 @@ impl Fakes {
             OutboundConfig::Trojan(Default::default()),
         );
         let via = chain(&[&anytls, &trojan]);
-        let generation =
-            Arc::new(OutboundRuntimeRegistry::build(&[via.clone(), anytls, trojan]).unwrap());
+        let (generation, _) =
+            OutboundRuntimeRegistry::build_reusing(&[via.clone(), anytls, trojan], 1, None)
+                .unwrap();
         Self {
-            generation,
+            generation: Arc::new(generation),
             via,
             front: Arc::new(front),
             land: Arc::new(land),
         }
     }
 
-    fn handler(&self) -> ChainHandler {
-        ChainHandler::new(&[
-            ProtocolEntry::new(NodeProtocol::AnyTLS, self.front.clone()),
-            ProtocolEntry::new(NodeProtocol::Trojan, self.land.clone()),
-        ])
+    fn registry(&self) -> ProxyRegistry {
+        let mut registry = ProxyRegistry::new();
+        registry.register(ProtocolEntry::new(NodeProtocol::AnyTLS, self.front.clone()));
+        registry.register(ProtocolEntry::new(NodeProtocol::Trojan, self.land.clone()));
+        registry.register_chain();
+        registry
+    }
+
+    fn route(&self) -> honk_config::route::Route {
+        let via = self.generation.get(&self.via.id).unwrap();
+        let [front, land] = via.chain_hops() else {
+            panic!("expected a two-hop chain");
+        };
+        route(&front.node, &[&front.node, &land.node])
     }
 
     async fn dial(&self, connect_timeout: Duration) -> anyhow::Result<ProxyStream> {
-        self.handler()
-            .dial_runtime(
-                self.generation.get(&self.via.id).unwrap(),
+        self.dial_ref(DialRef::Node(self.via.id), connect_timeout)
+            .await
+    }
+
+    async fn dial_ref(
+        &self,
+        dial: DialRef<'_>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        self.registry()
+            .dial_ref(
+                Arc::clone(&self.generation),
+                dial,
                 target(),
                 Some("example.com"),
                 connect_timeout,
@@ -306,6 +536,36 @@ impl Fakes {
     fn calls(&self) -> Vec<Call> {
         self.front.calls.lock().unwrap().clone()
     }
+}
+
+#[tokio::test]
+async fn a_custom_socks_handler_does_not_get_stock_confirmation() {
+    let custom = Arc::new(FakeHop::default());
+    let mut registry = ProxyRegistry::new();
+    registry.register(ProtocolEntry::new(NodeProtocol::Socks5, custom.clone()));
+    registry.register(ProtocolEntry::new(
+        NodeProtocol::Socks5,
+        Arc::new(crate::proxy::socks5::Socks5Handler::new()),
+    ));
+    registry.register_chain();
+    let front = socks5("front", "127.0.0.1", 1);
+    let exit = socks5("exit", "127.0.0.1", 2);
+    let route = route(&front, &[&front, &exit]);
+    let generation = Arc::new(OutboundRuntimeRegistry::build(&[front, exit]).unwrap());
+    for dial in [DialRef::Node(route.exit()), DialRef::Route(&route)] {
+        registry
+            .dial_ref(
+                Arc::clone(&generation),
+                dial,
+                target(),
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(!registry.confirms_target_on_open(&generation, dial));
+    }
+    assert_eq!(custom.calls.lock().unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -334,29 +594,58 @@ async fn the_front_dials_its_own_runtime_toward_the_next_server() {
 }
 
 #[tokio::test]
-async fn a_reality_mask_certificate_redials_the_chain_once_without_key_shares() {
-    let fakes = Fakes::new(
-        FakeHop::default(),
-        FakeHop {
-            masked: true,
-            ..Default::default()
-        },
-    );
-    fakes.dial(Duration::from_secs(1)).await.unwrap();
-    let hops: Vec<_> = fakes
-        .calls()
-        .into_iter()
-        .map(|call| (call.hop, call.key_shares))
-        .collect();
-    assert_eq!(
-        hops,
-        [
-            ("front/runtime".to_string(), None),
-            ("land/over".to_string(), Some(true)),
-            ("front/runtime".to_string(), None),
-            ("land/over".to_string(), Some(false)),
-        ]
-    );
+async fn a_reality_mask_certificate_redials_once_with_fresh_physical_credits() {
+    use futures_util::FutureExt as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for routed in [false, true] {
+        let fakes = Fakes::new(
+            FakeHop::default(),
+            FakeHop {
+                masked: true,
+                ..Default::default()
+            },
+        );
+        let route = fakes.route();
+        let dial = if routed {
+            DialRef::Route(&route)
+        } else {
+            DialRef::Node(fakes.via.id)
+        };
+        let starts = Arc::new(AtomicUsize::new(0));
+        let scope = fakes.generation.dial_scope({
+            let starts = Arc::clone(&starts);
+            move || {
+                starts.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        scope
+            .scope(fakes.dial_ref(dial, Duration::from_secs(1)))
+            .await
+            .unwrap();
+        let hops: Vec<_> = fakes
+            .calls()
+            .into_iter()
+            .map(|call| (call.hop, call.key_shares))
+            .collect();
+        assert_eq!(
+            hops,
+            [
+                ("front/runtime".to_string(), None),
+                ("land/over".to_string(), Some(true)),
+                ("front/runtime".to_string(), None),
+                ("land/over".to_string(), Some(false)),
+            ]
+        );
+        assert_eq!(starts.load(Ordering::Relaxed), 1);
+        assert!(
+            fakes
+                .generation
+                .acquire_dial_permit()
+                .now_or_never()
+                .is_some()
+        );
+    }
 }
 
 /// The first hop dials its server directly, where a REALITY dial has already
@@ -371,9 +660,28 @@ async fn a_reality_mask_certificate_on_the_first_hop_is_not_redialed() {
         FakeHop::default(),
     );
     let error = fakes.dial(Duration::from_secs(1)).await.unwrap_err();
-    assert!(reality_mask_certificate(&error), "{error:#}");
+    assert!(
+        error.is::<crate::reality::RealityMaskCertificate>(),
+        "{error:#}"
+    );
     let hops: Vec<_> = fakes.calls().into_iter().map(|call| call.hop).collect();
     assert_eq!(hops, ["front/runtime"]);
+
+    let fakes = Fakes::new(
+        FakeHop {
+            failure: Some(|| TargetFailure(crate::reality::RealityMaskCertificate.into()).into()),
+            ..Default::default()
+        },
+        FakeHop::default(),
+    );
+    let route = fakes.route();
+    let error = fakes
+        .dial_ref(DialRef::Route(&route), Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert_eq!(failed_hop(&error).unwrap().hop, 1);
+    assert!(reality_mask_certificate(&error));
+    assert_eq!(fakes.calls().len(), 1);
 }
 
 #[tokio::test]
@@ -390,17 +698,71 @@ async fn packet_rejections_pass_through_the_chain_unchanged() {
                 ..Default::default()
             },
         );
-        let error = fakes.dial(Duration::from_secs(1)).await.unwrap_err();
-        assert_eq!(
-            crate::proxy::packet_rejection(&error),
-            Some(crate::proxy::PacketRejection::Capacity),
-            "{error:#}"
-        );
-        assert!(!node_failure(&error), "{error:#}");
+        let route = fakes.route();
+        for dial in [DialRef::Node(fakes.via.id), DialRef::Route(&route)] {
+            let error = fakes
+                .dial_ref(dial, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                crate::proxy::packet_rejection(&error),
+                Some(crate::proxy::PacketRejection::Capacity),
+                "{error:#}"
+            );
+            assert_eq!(
+                dial_failure_scope(error.as_ref()),
+                DialFailureScope::LocalRejection
+            );
+            assert!(!node_failure(&error), "{error:#}");
+        }
     }
 }
 
-/// A cancelled dial must leave no transport evidence on the chain or its hops.
+#[tokio::test]
+async fn a_routed_failure_distinguishes_a_typed_hop_fault_from_ambiguous_io() {
+    fn closed() -> anyhow::Error {
+        io::Error::from(io::ErrorKind::UnexpectedEof).into()
+    }
+    let ambiguous: fn() -> anyhow::Error = closed;
+    let carrier_fault: fn() -> anyhow::Error = || NodeFailure(closed()).into();
+    for (hop, front, land, expected) in [
+        (0, Some(ambiguous), None, DialFailureScope::Hop(0)),
+        (1, None, Some(ambiguous), DialFailureScope::Unattributed),
+        (1, None, Some(carrier_fault), DialFailureScope::Hop(1)),
+    ] {
+        let fakes = Fakes::new(
+            FakeHop {
+                failure: front,
+                ..Default::default()
+            },
+            FakeHop {
+                failure: land,
+                ..Default::default()
+            },
+        );
+        let route = fakes.route();
+        let error = fakes
+            .dial_ref(DialRef::Route(&route), Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failed_hop(&error).map(|failure| (failure.hop, failure.node)),
+            Some((hop, route.hops()[hop])),
+            "{error:#}"
+        );
+        assert_eq!(dial_failure_scope(error.as_ref()), expected, "{error:#}");
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::UnexpectedEof,
+        );
+    }
+}
+
+/// A cancelled dial releases its carrier and leaves no transport evidence.
 #[tokio::test]
 async fn dropping_the_dial_after_the_first_hop_releases_everything() {
     let fakes = Fakes::new(
@@ -568,26 +930,42 @@ async fn the_chain_deadline_bounds_every_hop_together() {
 
 #[tokio::test(start_paused = true)]
 async fn reality_retry_uses_the_original_chain_deadline() {
-    let delay = Duration::from_millis(80);
-    let fakes = Fakes::new(
-        FakeHop {
-            delay,
-            ..Default::default()
-        },
-        FakeHop {
-            delay,
-            masked: true,
-            ..Default::default()
-        },
-    );
-    let started = Instant::now();
-    let error = fakes.dial(Duration::from_millis(100)).await.unwrap_err();
-    assert_eq!(started.elapsed(), Duration::from_millis(300));
-    assert_eq!(ScoreOutcome::from_error(&error), ScoreOutcome::Timeout);
-    let calls = fakes.calls();
-    assert_eq!(calls.len(), 4);
-    assert_eq!(calls[3].key_shares, Some(false));
-    assert_eq!(calls[3].timeout, Duration::from_millis(60));
+    for routed in [false, true] {
+        let delay = Duration::from_millis(80);
+        let fakes = Fakes::new(
+            FakeHop {
+                delay,
+                ..Default::default()
+            },
+            FakeHop {
+                delay,
+                masked: true,
+                ..Default::default()
+            },
+        );
+        let route = fakes.route();
+        let dial = if routed {
+            DialRef::Route(&route)
+        } else {
+            DialRef::Node(fakes.via.id)
+        };
+        let started = Instant::now();
+        let error = fakes
+            .dial_ref(dial, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert_eq!(started.elapsed(), Duration::from_millis(300));
+        assert_eq!(ScoreOutcome::from_error(&error), ScoreOutcome::Timeout);
+        assert_eq!(
+            dial_failure_scope(error.as_ref()),
+            DialFailureScope::Unattributed
+        );
+        assert!(failed_hop(&error).is_none());
+        let calls = fakes.calls();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[3].key_shares, Some(false));
+        assert_eq!(calls[3].timeout, Duration::from_millis(60));
+    }
 }
 
 /// The whole chain runs inside the generation's dial scope. A generation that
@@ -595,39 +973,36 @@ async fn reality_retry_uses_the_original_chain_deadline() {
 /// dropped, front connection included, instead of handed out.
 #[tokio::test(start_paused = true)]
 async fn a_generation_shut_down_during_the_dial_publishes_nothing() {
-    let fakes = Fakes::new(
-        FakeHop {
-            delay: Duration::from_millis(50),
-            ..Default::default()
-        },
-        FakeHop::default(),
-    );
-    let mut registry = ProxyRegistry::new();
-    registry.register(ProtocolEntry::new(
-        NodeProtocol::Chain,
-        Arc::new(fakes.handler()),
-    ));
-    let dial = registry.dial_runtime(
-        Arc::clone(&fakes.generation),
-        fakes.via.id,
-        target(),
-        None,
-        Duration::from_secs(1),
-    );
-    let shutdown = async {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        fakes.generation.begin_retirement();
-    };
-    let (result, ()) = tokio::join!(dial, shutdown);
-    let error = result.unwrap_err();
-    assert!(
-        error.to_string().contains("shut down during dial"),
-        "{error:#}"
-    );
-    let hops: Vec<_> = fakes.calls().into_iter().map(|call| call.hop).collect();
-    assert_eq!(hops, ["front/runtime", "land/over"]);
-    let mut peer = fakes.front.peers.lock().unwrap().pop().unwrap();
-    assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+    for routed in [false, true] {
+        let fakes = Fakes::new(
+            FakeHop {
+                delay: Duration::from_millis(50),
+                ..Default::default()
+            },
+            FakeHop::default(),
+        );
+        let route = fakes.route();
+        let dial = if routed {
+            DialRef::Route(&route)
+        } else {
+            DialRef::Node(fakes.via.id)
+        };
+        let dial = fakes.dial_ref(dial, Duration::from_secs(1));
+        let shutdown = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            fakes.generation.begin_retirement();
+        };
+        let (result, ()) = tokio::join!(dial, shutdown);
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("shut down during dial"),
+            "{error:#}"
+        );
+        let hops: Vec<_> = fakes.calls().into_iter().map(|call| call.hop).collect();
+        assert_eq!(hops, ["front/runtime", "land/over"]);
+        let mut peer = fakes.front.peers.lock().unwrap().pop().unwrap();
+        assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+    }
 }
 
 #[cfg(feature = "flow-observation")]

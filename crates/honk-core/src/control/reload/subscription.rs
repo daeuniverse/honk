@@ -15,8 +15,8 @@ pub(in crate::control) fn config_with_subscription_nodes(
     if nodes.is_empty() {
         return Ok(current.clone());
     }
-    let mut touches_chain = nodes.iter().any(|node| node.chain_hops().is_some());
-    if touches_chain {
+    let has_incoming_chain = nodes.iter().any(|node| node.chain_hops().is_some());
+    if has_incoming_chain {
         // Current declarations have unique bound IDs. An exact duplicate in
         // the new provider body will also fail the assembled ID check.
         let prior_chains: std::collections::HashMap<_, _> = current
@@ -36,9 +36,11 @@ pub(in crate::control) fn config_with_subscription_nodes(
         }
     }
     let mut config = current.clone();
+    let mut preserve_membership =
+        has_incoming_chain || config.groups.iter().any(|group| group.exit.is_some());
     config.nodes.retain(|node| {
         // Removing the last chain still has explicit chain memberships to prune.
-        touches_chain = touches_chain || node.chain_hops().is_some();
+        preserve_membership = preserve_membership || node.chain_hops().is_some();
         node.subscription_id != Some(subscription_id)
     });
     config.nodes.extend(nodes);
@@ -47,7 +49,7 @@ pub(in crate::control) fn config_with_subscription_nodes(
         for group in &mut *groups {
             group.nodes.retain(|id| live.contains(id));
         }
-        if touches_chain {
+        if preserve_membership {
             honk_config::parser::resolve_programmatic_groups(groups, nodes, subscriptions);
         } else {
             honk_config::parser::resolve_group_filters(groups, nodes, subscriptions);

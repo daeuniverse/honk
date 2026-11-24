@@ -186,7 +186,7 @@ pub(crate) async fn maybe_tls_wrap_concrete(
             }
             None => {
                 let addr = format!("{}:{}", node.host(), node.port);
-                crate::util::connect_outbound(&addr, connect_timeout).await
+                crate::util::connect_proxy(&addr, connect_timeout).await
             }
         }
     };
@@ -217,12 +217,9 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                             )
                             .into());
                         }
-                        let tcp = crate::util::connect_marked_addr(
-                            peer,
-                            Some(crate::util::bypass_mark()),
-                            connect_timeout.min(remaining),
-                        )
-                        .await?;
+                        let tcp =
+                            crate::util::connect_proxy_addr(peer, connect_timeout.min(remaining))
+                                .await?;
                         let tcp = ObservedTcp::new(tcp);
                         crate::reality::reality_connect_with_key_shares(
                             tcp, &reality, chrome, false, alpn,

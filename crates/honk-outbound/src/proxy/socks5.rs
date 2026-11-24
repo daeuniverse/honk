@@ -637,6 +637,10 @@ impl MultiTargetTransport for Socks5UdpTransport {
 
 #[async_trait]
 impl TcpOutbound for Socks5Handler {
+    fn confirms_target_on_open(&self) -> bool {
+        true
+    }
+
     async fn dial(
         &self,
         node: &Node,
@@ -646,7 +650,7 @@ impl TcpOutbound for Socks5Handler {
     ) -> anyhow::Result<ProxyStream> {
         let addr = format!("{}:{}", node.host(), node.port);
         debug!("SOCKS5: connecting to {} for target {}", addr, target);
-        let stream = crate::util::connect_outbound(&addr, connect_timeout).await?;
+        let stream = crate::util::connect_proxy(&addr, connect_timeout).await?;
         self.dial_with_tcp(node, target, target_domain, stream, connect_timeout)
             .await
     }

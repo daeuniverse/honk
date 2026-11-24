@@ -28,7 +28,7 @@ async fn resolve_dial_route_node_by_name() {
         .resolve_dial_route(&pool.entries["node"])
         .await
         .unwrap();
-    assert_eq!(route.node.unwrap().name, "hk-1");
+    assert_eq!(route.node.unwrap().node.name, "hk-1");
     assert!(
         pool.resolve_dial_route(&pool.entries["direct"])
             .await
@@ -73,6 +73,7 @@ async fn resolve_dial_route_group_uses_group_manager_selector() {
             .unwrap()
             .node
             .unwrap()
+            .node
             .name,
         "alpha"
     );
@@ -93,6 +94,7 @@ async fn resolve_dial_route_group_uses_group_manager_selector() {
             .unwrap()
             .node
             .unwrap()
+            .node
             .name,
         "beta"
     );
@@ -121,6 +123,7 @@ async fn resolve_dial_route_group_without_gm_uses_first_member() {
             .unwrap()
             .node
             .unwrap()
+            .node
             .name,
         "first"
     );

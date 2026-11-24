@@ -8,6 +8,7 @@ use md5::{Digest, Md5};
 use rand::Rng;
 use rand::RngExt;
 use sha2::Sha256;
+use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -145,6 +146,10 @@ fn fnv1a32(data: &[u8]) -> u32 {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VmessHandler;
 
+tokio::task_local! {
+    pub(super) static ROUTED_CARRIER: ();
+}
+
 /// Per-connection session material (`encoding.NewClientSession`).
 struct Session {
     req_key: [u8; 16],
@@ -152,10 +157,11 @@ struct Session {
     resp_key: [u8; 16],
     resp_iv: [u8; 16],
     resp_header: u8,
+    ambiguous_header_io: bool,
 }
 
 impl Session {
-    fn new() -> Self {
+    fn new(ambiguous_header_io: bool) -> Self {
         let mut rng = rand::rng();
         let mut req_key = [0u8; 16];
         let mut req_iv = [0u8; 16];
@@ -175,6 +181,7 @@ impl Session {
             resp_key,
             resp_iv,
             resp_header: rng.random(),
+            ambiguous_header_io,
         }
     }
 }
@@ -487,9 +494,10 @@ impl VmessHandler {
         stream: Box<dyn AsyncReadWrite>,
         target: SocketAddr,
         target_domain: Option<&str>,
+        ambiguous_header_io: bool,
     ) -> anyhow::Result<ProxyStream> {
         let cmd_key = Self::derive_cmd_key(uuid_bytes);
-        let session = Session::new();
+        let session = Session::new(ambiguous_header_io);
 
         let mut rng = rand::rng();
         let ts = SystemTime::now()
@@ -532,7 +540,7 @@ impl TcpOutbound for VmessHandler {
         let uuid = uuid(node)?;
 
         let stream = super::transport::wrap_transport(node, None, connect_timeout).await?;
-        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
+        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain, false)
     }
 
     async fn dial_with_tcp(
@@ -546,7 +554,7 @@ impl TcpOutbound for VmessHandler {
         let uuid = uuid(node)?;
 
         let stream = super::transport::wrap_transport(node, Some(tcp), connect_timeout).await?;
-        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
+        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain, false)
     }
 
     async fn dial_runtime(
@@ -559,7 +567,7 @@ impl TcpOutbound for VmessHandler {
         let uuid = uuid(&runtime.node)?;
         let stream =
             super::transport::wrap_transport_runtime(&runtime, None, connect_timeout).await?;
-        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
+        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain, false)
     }
 
     async fn dial_over(
@@ -572,7 +580,15 @@ impl TcpOutbound for VmessHandler {
     ) -> anyhow::Result<ProxyStream> {
         let uuid = uuid(&runtime.node)?;
         let stream = super::transport::wrap_tunnel(&runtime.node, carrier, options).await?;
-        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
+        // Capture the route context before spawning the relay that reads the header.
+        let ambiguous_header_io = ROUTED_CARRIER.try_with(|_| ()).is_ok();
+        Self::perform_handshake(
+            uuid.as_bytes(),
+            stream,
+            target,
+            target_domain,
+            ambiguous_header_io,
+        )
     }
 }
 
@@ -864,6 +880,41 @@ async fn vmess_relay(
     Ok(())
 }
 
+fn response_header_fault(error: anyhow::Error) -> anyhow::Error {
+    crate::proxy::NodeFailure(error.context("VMess response header")).into()
+}
+
+fn header_read_error(error: io::Error, ambiguous_header_io: bool) -> anyhow::Error {
+    if ambiguous_header_io {
+        // A raw carrier error can come from any preceding hop.
+        error.into()
+    } else {
+        response_header_fault(error.into())
+    }
+}
+
+async fn read_response_header_tail(
+    reader: &mut (impl AsyncRead + Unpin),
+    mut tail: &mut [u8],
+    ambiguous_header_io: bool,
+) -> anyhow::Result<()> {
+    while !tail.is_empty() {
+        let n = reader
+            .read(tail)
+            .await
+            .map_err(|error| header_read_error(error, ambiguous_header_io))?;
+        if n == 0 {
+            let error = io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated VMess response header",
+            );
+            return Err(header_read_error(error, ambiguous_header_io));
+        }
+        tail = &mut tail[n..];
+    }
+    Ok(())
+}
+
 /// `DecodeResponseHeader`: AEAD-sealed length then AEAD-sealed payload,
 /// keyed from the response body key/IV with no AAD.
 async fn read_response_header<R: AsyncReadExt + Unpin>(
@@ -871,50 +922,56 @@ async fn read_response_header<R: AsyncReadExt + Unpin>(
     session: &Session,
 ) -> anyhow::Result<bool> {
     let mut len_ct = [0u8; 2 + GCM_TAG_LEN];
-    let received = reader.read(&mut len_ct).await.map_err(|error| {
-        crate::proxy::NodeFailure(anyhow::Error::new(error).context("VMess response header"))
-    })?;
+    let received = reader
+        .read(&mut len_ct)
+        .await
+        .map_err(|error| header_read_error(error, session.ambiguous_header_io))?;
     // sing-vmess writes its response header lazily with the first target data;
     // no response bytes cannot distinguish target closure from a carrier fault.
     if received == 0 {
         return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
     }
-    async {
-        reader.read_exact(&mut len_ct[received..]).await?;
-        let len_plain = VmessHandler::open(
-            &kdf16(&session.resp_key, KDF_SALT_RESP_LEN_KEY, &[]),
-            &kdf12(&session.resp_iv, KDF_SALT_RESP_LEN_IV, &[]),
-            &len_ct,
-        )
-        .map_err(|e| anyhow::anyhow!("VMess response header length decrypt failed: {:?}", e))?;
-        let hdr_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
-        anyhow::ensure!(
-            (4..=256).contains(&hdr_len),
+    read_response_header_tail(reader, &mut len_ct[received..], session.ambiguous_header_io).await?;
+    let len_plain = VmessHandler::open(
+        &kdf16(&session.resp_key, KDF_SALT_RESP_LEN_KEY, &[]),
+        &kdf12(&session.resp_iv, KDF_SALT_RESP_LEN_IV, &[]),
+        &len_ct,
+    )
+    .map_err(|e| {
+        response_header_fault(anyhow::anyhow!(
+            "VMess response header length decrypt failed: {e:?}"
+        ))
+    })?;
+    let hdr_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
+    if !(4..=256).contains(&hdr_len) {
+        return Err(response_header_fault(anyhow::anyhow!(
             "invalid VMess response header length {hdr_len}"
-        );
+        )));
+    }
 
-        let mut hdr_ct = vec![0u8; hdr_len + GCM_TAG_LEN];
-        reader.read_exact(&mut hdr_ct).await?;
-        let hdr = VmessHandler::open(
-            &kdf16(&session.resp_key, KDF_SALT_RESP_KEY, &[]),
-            &kdf12(&session.resp_iv, KDF_SALT_RESP_IV, &[]),
-            &hdr_ct,
-        )
-        .map_err(|e| anyhow::anyhow!("VMess response header decrypt failed: {:?}", e))?;
-
-        anyhow::ensure!(
-            hdr[0] == session.resp_header,
+    let mut hdr_ct = vec![0u8; hdr_len + GCM_TAG_LEN];
+    read_response_header_tail(reader, &mut hdr_ct, session.ambiguous_header_io).await?;
+    let hdr = VmessHandler::open(
+        &kdf16(&session.resp_key, KDF_SALT_RESP_KEY, &[]),
+        &kdf12(&session.resp_iv, KDF_SALT_RESP_IV, &[]),
+        &hdr_ct,
+    )
+    .map_err(|e| {
+        response_header_fault(anyhow::anyhow!(
+            "VMess response header decrypt failed: {e:?}"
+        ))
+    })?;
+    if hdr[0] != session.resp_header {
+        return Err(response_header_fault(anyhow::anyhow!(
             "unexpected VMess response header byte {:#x}, expected {:#x}",
             hdr[0],
             session.resp_header
-        );
-        // hdr[1] option, hdr[2] command id, hdr[3] command data length; the
-        // command data rides inside the same header block and carries nothing
-        // a plain TCP outbound needs.
-        Ok::<bool, anyhow::Error>(hdr[2] == 0 || hdr.len() >= 4 + usize::from(hdr[3]))
+        )));
     }
-    .await
-    .map_err(|error| crate::proxy::NodeFailure(error.context("VMess response header")).into())
+    // hdr[1] option, hdr[2] command id, hdr[3] command data length; the
+    // command data rides inside the same header block and carries nothing
+    // a plain TCP outbound needs.
+    Ok(hdr[2] == 0 || hdr.len() >= 4 + usize::from(hdr[3]))
 }
 
 #[cfg(test)]

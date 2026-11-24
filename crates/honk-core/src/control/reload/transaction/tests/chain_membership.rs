@@ -148,6 +148,25 @@ async fn provider_refresh_keeps_legacy_membership_only_between_chain_free_snapsh
 }
 
 #[tokio::test]
+async fn provider_refresh_keeps_explicit_empty_group_with_exit_blocking() {
+    let mut config = explicit_block_config();
+    config.groups[0].exit = Some("land".into());
+    let cp = crate::control::tests::support::control_plane(config);
+    assert_eq!(selected_tcp_v4(&cp, "quarantine"), BLOCK_NODE_ID);
+
+    let provider = uuid::Uuid::new_v4();
+    let supplied = Node::from_share_link("socks5://127.0.0.1:1082#supplied").unwrap();
+    let supplied_id = supplied.id;
+    cp.merge_subscription_nodes(provider, vec![supplied], Vec::new())
+        .await;
+
+    let active = cp.config.read().await;
+    assert_eq!(named_node(&active, "supplied").id, supplied_id);
+    assert!(active.groups[0].nodes.is_empty());
+    assert_eq!(selected_tcp_v4(&cp, "quarantine"), BLOCK_NODE_ID);
+}
+
+#[tokio::test]
 async fn chain_reload_preserves_health_on_rename_and_dials_the_replacement() -> anyhow::Result<()> {
     use crate::control::tests::support::control_plane;
     use crate::test_support::socks5_relay;

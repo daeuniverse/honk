@@ -1,5 +1,34 @@
 use std::future::Future;
 
+use honk_outbound::alive::{IpVersion, RouteHealthRevision};
+use honk_outbound::group::{DialKey, ExitCollapse, GroupManager, OwnedTarget, ScoreOutcome};
+use honk_outbound::proxy::{DialFailureScope, dial_failure_scope};
+
+/// A DNS query can redial the same path in both its transport and address retry.
+#[derive(Default)]
+pub(crate) struct RouteFailures(Vec<(DialKey, IpVersion)>);
+
+pub(crate) struct RouteExchange<'a> {
+    pub(crate) manager: &'a GroupManager,
+    pub(crate) group: &'a str,
+    pub(crate) family: IpVersion,
+    pub(crate) revision: RouteHealthRevision,
+    pub(crate) target: &'a OwnedTarget,
+    pub(crate) reported_failures: &'a mut RouteFailures,
+}
+
+impl RouteExchange<'_> {
+    fn has_failure_cause(&self, error: &anyhow::Error) -> bool {
+        match dial_failure_scope(error.as_ref()) {
+            DialFailureScope::Hop(_) | DialFailureScope::Prefix(_) => true,
+            DialFailureScope::Unattributed if self.target.collapse != ExitCollapse::None => {
+                honk_outbound::proxy::node_failure(error)
+            }
+            _ => false,
+        }
+    }
+}
+
 fn should_retry(error: &anyhow::Error) -> bool {
     !honk_outbound::proxy::is_packet_rejection(error)
         && !error.chain().any(|cause| {
@@ -21,6 +50,24 @@ where
     Reset: FnOnce(&anyhow::Error) -> ResetFut,
     ResetFut: Future<Output = ()>,
 {
+    exchange_with_route_retry(label, raw_query, once, reset, feedback, None).await
+}
+
+pub(super) async fn exchange_with_route_retry<Once, Fut, Reset, ResetFut>(
+    label: &'static str,
+    raw_query: &[u8],
+    once: Once,
+    reset: Reset,
+    feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
+    route: Option<RouteExchange<'_>>,
+) -> anyhow::Result<Vec<u8>>
+where
+    Once: Fn(Option<honk_outbound::group::ScoreReporter>) -> Fut,
+    Fut: Future<Output = anyhow::Result<Vec<u8>>>,
+    Reset: FnOnce(&anyhow::Error) -> ResetFut,
+    ResetFut: Future<Output = ()>,
+{
+    let first_stamp = route.as_ref().map(|route| route.revision.admit());
     let reporter = feedback.map(honk_outbound::group::ScoreBusinessGuard::start);
     let first_result = {
         let exchange = once(reporter.clone());
@@ -28,31 +75,79 @@ where
         let exchange = crate::observe::flows::dns::transport_exchange_scope(raw_query, exchange);
         exchange.await
     };
-    let result = match first_result {
-        Ok(response) => Ok(response),
-        Err(first) if !should_retry(&first) => Err(first),
+    let (result, stamp, previous_error) = match first_result {
+        Ok(response) => (Ok(response), first_stamp, None),
+        Err(first) if !should_retry(&first) => (Err(first), first_stamp, None),
         Err(first) => {
             record_reset(label);
             reset(&first).await;
+            let retry_stamp = route.as_ref().map(|route| route.revision.admit());
             let exchange = once(reporter.clone());
             crate::observe::scope_pin!(exchange);
             let exchange =
                 crate::observe::flows::dns::transport_exchange_scope(raw_query, exchange);
-            exchange.await.map_err(|error| {
+            let result = exchange.await.map_err(|error| {
                 let detail = error.to_string();
                 error.context(format!(
                     "{label} failed after retry: {detail} (first: {first})"
                 ))
-            })
+            });
+            (result, retry_stamp, first_stamp.map(|stamp| (first, stamp)))
         }
     };
+    let valid = (reporter.is_some() || route.is_some())
+        && result
+            .as_ref()
+            .is_ok_and(|response| super::is_valid_response(raw_query, response));
     if let Some(reporter) = &reporter {
-        match &result {
-            Ok(response) if super::is_valid_response(raw_query, response) => {
-                reporter.finish(honk_outbound::group::ScoreOutcome::Success)
+        let outcome = match &result {
+            Ok(_) if valid => ScoreOutcome::Success,
+            Ok(_) if route.is_some() => ScoreOutcome::RouteFailure,
+            Ok(_) => ScoreOutcome::Other,
+            Err(error) => {
+                let outcome = ScoreOutcome::from_error(error);
+                route.as_ref().map_or(outcome, |route| {
+                    route.target.score_failure(outcome, error.as_ref())
+                })
             }
-            Ok(_) => reporter.finish(honk_outbound::group::ScoreOutcome::Other),
-            Err(error) => reporter.finish(honk_outbound::group::ScoreOutcome::from_error(error)),
+        };
+        reporter.finish(outcome);
+    }
+    if let (Some(route), Some(stamp)) = (route, stamp) {
+        if valid {
+            route.manager.report_route_response(
+                route.group,
+                route.target.key(),
+                route.family,
+                stamp,
+                None,
+            );
+        } else {
+            let failure = match &result {
+                Err(error)
+                    if dial_failure_scope(error.as_ref()) == DialFailureScope::LocalRejection =>
+                {
+                    None
+                }
+                Err(error) if route.has_failure_cause(error) => Some((error, stamp)),
+                _ => previous_error
+                    .as_ref()
+                    .filter(|(error, _)| route.has_failure_cause(error))
+                    .map(|(error, stamp)| (error, *stamp)),
+            };
+            let key = (route.target.key(), route.family);
+            if let Some((error, stamp)) = failure
+                && !route.reported_failures.0.contains(&key)
+                && route.manager.report_route_failure(
+                    route.group,
+                    route.target,
+                    route.family,
+                    stamp,
+                    error.as_ref(),
+                )
+            {
+                route.reported_failures.0.push(key);
+            }
         }
     }
     result

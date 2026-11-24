@@ -265,6 +265,12 @@ impl Doh3Client {
             .await;
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.session.is_inactive(|session| {
+            session.connection.close_reason().is_some() || session.driver.is_finished()
+        })
+    }
+
     pub(crate) fn tasks_failed(&self) -> bool {
         self.quic_ep.tasks_failed()
     }

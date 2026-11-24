@@ -24,7 +24,7 @@ use crate::group::{
     GroupManager, ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreSource,
     SelectionNetwork,
 };
-use crate::proxy::{ProxyRegistry, TcpOutbound};
+use crate::proxy::{AsyncReadWrite, ProxyRegistry, ProxyStream, TcpOutbound};
 use crate::runtime::SharedRuntimeRegistry;
 use anyhow::{Context, anyhow};
 use honk_config::check::{HttpCheckTarget, decode_health_http_target, decode_http_check_target};
@@ -36,7 +36,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod exchange;
-use exchange::{exchange_http1, exchange_http2};
+use exchange::{exchange_http1, exchange_http2, exchange_routed_http1};
+
+enum HttpProbeMode {
+    Warm,
+    Cold,
+    Routed,
+}
 
 fn start_feedback(feedback: Option<ScoreFeedback>) -> Option<ScoreReporter> {
     feedback.map(|feedback| feedback.start())
@@ -462,8 +468,6 @@ async fn measure_http_probe_mode(
     let target = request_target(request)?;
     let normalized_request = build_http_probe_request(&target, request.method().clone())?;
     let request = &normalized_request;
-    let host = target.host();
-    let is_https = target.is_https();
     let node = runtime.node.as_ref();
     let reporter = start_feedback(feedback.map(|feedback| {
         feedback.with_probe_identity(&request.uri().to_string(), request.method().as_str())
@@ -483,29 +487,20 @@ async fn measure_http_probe_mode(
             .map_err(|_| phase_timeout("HTTP probe dial timed out"))??;
         reporter_setup(&reporter);
         tracing::debug!(node = %node.name, %addr, "HTTP probe dial established");
-        let stream = proxy.stream;
-        if is_https {
-            let connector = https_connector()?;
-            let tls = tokio::time::timeout(timeout, connector.connect(host, stream))
-                .await
-                .map_err(|_| phase_timeout("HTTP probe TLS handshake timed out"))?
-                .context("HTTP probe TLS handshake failed")?;
-            tracing::debug!(
-                node = %node.name,
-                alpn = ?tls.ssl().selected_alpn_protocol().map(|p| String::from_utf8_lossy(p).into_owned()),
-                "HTTP probe TLS established"
-            );
-            match tls.ssl().selected_alpn_protocol() {
-                Some(b"h2") => exchange_http2(tls, request, &reporter, timeout, cold).await,
-                _ => {
-                    let mut tls = tls;
-                    exchange_http1(&mut tls, request, &reporter, timeout, cold).await
-                }
-            }
-        } else {
-            let mut stream = stream;
-            exchange_http1(&mut stream, request, &reporter, timeout, cold).await
-        }
+        exchange_http_probe(
+            proxy.stream,
+            &target,
+            request,
+            &reporter,
+            timeout,
+            if cold {
+                HttpProbeMode::Cold
+            } else {
+                HttpProbeMode::Warm
+            },
+            &node.name,
+        )
+        .await
     }
     .await;
     match result {
@@ -520,6 +515,61 @@ async fn measure_http_probe_mode(
             reporter_error(&reporter, &error);
             Err(error)
         }
+    }
+}
+
+/// Validate one configured HTTP request on an already connected route.
+/// The caller retains the absolute deadline. Host and verified TLS identity
+/// come from the request URI independently of the pinned dial address.
+pub async fn validate_routed_http_probe(
+    proxy: ProxyStream,
+    request: &http::Request<()>,
+    timeout: Duration,
+) -> anyhow::Result<ProbeMeasurement> {
+    let target = request_target(request)?;
+    exchange_http_probe(
+        proxy.stream,
+        &target,
+        request,
+        &None,
+        timeout,
+        HttpProbeMode::Routed,
+        "group exit route",
+    )
+    .await
+}
+
+async fn exchange_http_probe(
+    mut stream: Box<dyn AsyncReadWrite>,
+    target: &HttpCheckTarget,
+    request: &http::Request<()>,
+    reporter: &Option<ScoreReporter>,
+    timeout: Duration,
+    mode: HttpProbeMode,
+    node: &str,
+) -> anyhow::Result<ProbeMeasurement> {
+    let cold = !matches!(mode, HttpProbeMode::Warm);
+    let routed = matches!(mode, HttpProbeMode::Routed);
+    if !target.is_https() {
+        if routed {
+            return exchange_routed_http1(stream, request, timeout).await;
+        }
+        return exchange_http1(&mut stream, request, reporter, timeout, cold).await;
+    }
+    let connector = https_connector()?;
+    let mut tls = tokio::time::timeout(timeout, connector.connect(target.host(), stream))
+        .await
+        .map_err(|_| phase_timeout("HTTP probe TLS handshake timed out"))?
+        .context("HTTP probe TLS handshake failed")?;
+    tracing::debug!(
+        %node,
+        alpn = ?tls.ssl().selected_alpn_protocol().map(|p| String::from_utf8_lossy(p).into_owned()),
+        "HTTP probe TLS established"
+    );
+    match tls.ssl().selected_alpn_protocol() {
+        Some(b"h2") => exchange_http2(tls, request, reporter, timeout, cold).await,
+        _ if routed => exchange_routed_http1(tls, request, timeout).await,
+        _ => exchange_http1(&mut tls, request, reporter, timeout, cold).await,
     }
 }
 

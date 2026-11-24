@@ -5,6 +5,8 @@ use honk_outbound::alive::{HttpProbeResult, HttpProber, UdpProber};
 use honk_outbound::proxy::{ProtocolEntry, ProxyStream, TcpOutbound};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod route_recovery;
+
 struct LoopbackOutbound;
 
 #[async_trait::async_trait]

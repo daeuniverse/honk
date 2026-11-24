@@ -21,6 +21,7 @@ impl GroupManager {
                 let groups: Vec<_> = self
                     .groups
                     .values()
+                    .map(|entry| &entry.group)
                     .filter(|group| group.policy == honk_config::group::GroupPolicy::Score)
                     .filter(|group| self.group_reaches_node(&group.name, runtime.node.id))
                     .map(|group| group.name.clone())

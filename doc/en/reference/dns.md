@@ -228,6 +228,8 @@ Only unquoted `->` and `outbound:` suffixes select detours. Inside a quoted URI 
 | DoQ | Supported through the outbound's UDP-capable `PacketTransport`. |
 | DoH3 | Supported through the outbound's UDP-capable `PacketTransport`. |
 
+A group with an [`exit`](./groups.md#exit) carries the TCP-based upstreams above over its route. It offers no UDP candidates, so DoQ and DoH3 upstreams find none in it.
+
 ## DNS routing
 
 `routing` contains ordered `request` and `response` rules. The first matching rule wins. Arguments inside one condition are OR-ed; conditions joined with `&&` are AND-ed. Prefix a condition with `!` to negate it.

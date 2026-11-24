@@ -193,9 +193,8 @@ pub struct ControlPlane {
     degradations: Arc<crate::degradations::Degradations>,
     /// Built by `configure_health_loop`; a reload updates whether it is needed.
     quic_score_target: Option<Arc<probers::QuicScoreProbeTarget>>,
-    /// Node name → eBPF outbound id (push_routing_to_ebpf numbering),
-    /// shared with the alive set's outbound resolver; rebuilt on reload.
-    outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
+    /// Node ID → callback slot and route-dependency flag, published with the manager.
+    outbound_id_map: Arc<parking_lot::RwLock<OutboundHealthIndex>>,
     resource_budget: ResourceBudget,
     dns_socket_budget: crate::dns::transport::DnsSocketBudget,
     concurrency_limit: Arc<tokio::sync::Semaphore>,

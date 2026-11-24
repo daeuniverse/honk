@@ -61,9 +61,9 @@ async fn close_waits_for_query_admitted_before_transport_publication() {
     let slot_count = pool
         .entries
         .values()
-        .map(|entry| entry.transports.lock().len())
+        .map(|entry| entry.transports.lock().slots.len())
         .sum::<usize>();
-    assert_eq!(slot_count, 1);
+    assert_eq!(slot_count, 0);
     assert_eq!(
         pool.lifecycle_stats(),
         TransportLifecycleStats {

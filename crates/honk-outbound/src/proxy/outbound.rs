@@ -49,6 +49,11 @@ pub trait TcpOutbound: Send + Sync {
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream>;
 
+    /// Whether a successful TCP open always includes a proxy reply confirming the target.
+    fn confirms_target_on_open(&self) -> bool {
+        false
+    }
+
     /// The provided `tcp` stream is already connected to the proxy
     /// server. Handlers that support connection pooling override this to
     /// skip `TcpStream::connect()`; the default ignores `tcp` and delegates

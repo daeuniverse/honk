@@ -2,19 +2,22 @@
 
 use std::sync::Arc;
 
-use super::{DialContext, IdlePoolState, close_idle_pool, exchange_with_retry, idle_pool_exchange};
+use super::dial::CarrierIo;
+use super::idle_pool::IdleStream;
+use super::retry::exchange_with_route_retry;
+use super::{DialContext, IdlePoolState, RouteExchange, close_idle_pool, idle_pool_exchange};
 use honk_outbound::tls::{TlsConnector, TlsStream};
 use parking_lot::Mutex;
 
 /// TLS stream over either a direct or proxied base connection.
-type PooledStream = TlsStream<Box<dyn crate::proxy::AsyncReadWrite>>;
+type PooledStream = TlsStream<CarrierIo<Box<dyn crate::proxy::AsyncReadWrite>>>;
 
 /// Idle-pool DoT client for one upstream.
 pub struct DotPool {
     dial: DialContext,
     connector: TlsConnector,
     lifecycle: tokio::sync::RwLock<IdlePoolState>,
-    idle: Mutex<Vec<PooledStream>>,
+    idle: Mutex<Vec<IdleStream<PooledStream>>>,
 }
 
 impl DotPool {
@@ -33,12 +36,26 @@ impl DotPool {
         raw_query: &[u8],
         feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
-        exchange_with_retry(
+        self.exchange_routed(raw_query, feedback, None).await
+    }
+
+    pub(crate) async fn exchange_routed(
+        self: &Arc<Self>,
+        raw_query: &[u8],
+        feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
+        route: Option<RouteExchange<'_>>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let routed = route.is_some();
+        exchange_with_route_retry(
             "DoT",
             raw_query,
-            |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
+            |reporter| async move {
+                self.exchange_once(raw_query, reporter.as_ref(), routed)
+                    .await
+            },
             |_| async {},
             feedback,
+            route,
         )
         .await
     }
@@ -47,23 +64,32 @@ impl DotPool {
         &self,
         raw_query: &[u8],
         reporter: Option<&honk_outbound::group::ScoreReporter>,
+        routed: bool,
     ) -> anyhow::Result<Vec<u8>> {
         idle_pool_exchange(
             &self.lifecycle,
             &self.idle,
-            || self.dial_tls(),
+            || self.dial_tls(routed),
             raw_query,
             self.dial.query_timeout,
             reporter,
+            routed,
         )
         .await
     }
 
-    async fn dial_tls(&self) -> anyhow::Result<PooledStream> {
+    async fn dial_tls(&self, routed: bool) -> anyhow::Result<PooledStream> {
         let server_name = self.dial.endpoint.sni.clone();
         let via_proxy = self.dial.proxy.is_some();
         let deadline = tokio::time::Instant::now() + self.dial.dial_timeout;
         let tcp = self.dial.dial_tcp_boxed_until(deadline).await?;
+        let retain = routed
+            && self
+                .dial
+                .proxy
+                .as_ref()
+                .is_some_and(|proxy| proxy.route.is_none());
+        let (tcp, _) = CarrierIo::capture(tcp, retain);
         tokio::time::timeout_at(deadline, self.connector.connect(&server_name, tcp))
             .await
             .map_err(|_| {
@@ -74,8 +100,17 @@ impl DotPool {
             })?
             .map_err(|error| {
                 let route = if via_proxy { " (via proxy)" } else { "" };
-                anyhow::anyhow!("DoT TLS handshake{route}: {error}")
+                let context = format!("DoT TLS handshake{route}: {error}");
+                if routed {
+                    error.context(context)
+                } else {
+                    anyhow::Error::msg(context)
+                }
             })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.idle.lock().is_empty()
     }
 
     pub(crate) async fn close(&self) {

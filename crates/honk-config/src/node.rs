@@ -483,6 +483,9 @@ pub struct Group {
     /// Explicit fallback for the caller when the group's policy has no available selection.
     /// Can be "direct", "block", another group name, or a node name.
     pub final_outbound: Option<String>,
+    /// Append this proxy to the selected leaf's TCP hops. A terminal `block` never dials it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit: Option<String>,
     /// URL for health checks (overrides global tcp_check_url).
     pub check_url: Option<String>,
     /// Retained interval metadata; runtime checks use the global interval.
@@ -517,6 +520,7 @@ impl Default for Group {
             groups: Vec::new(),
             default: None,
             final_outbound: None,
+            exit: None,
             check_url: None,
             check_interval: None,
             tolerance: default_tolerance(),
@@ -585,6 +589,8 @@ impl<'de> Deserialize<'de> for Group {
             #[serde(default)]
             final_outbound: Option<String>,
             #[serde(default)]
+            exit: Option<String>,
+            #[serde(default)]
             check_url: Option<String>,
             #[serde(default)]
             check_interval: Option<u64>,
@@ -608,6 +614,7 @@ impl<'de> Deserialize<'de> for Group {
             groups: wire.groups,
             default: wire.default,
             final_outbound: wire.final_outbound,
+            exit: wire.exit,
             check_url: wire.check_url,
             check_interval: wire.check_interval,
             tolerance: wire.tolerance.unwrap_or_else(default_tolerance),

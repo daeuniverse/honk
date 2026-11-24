@@ -67,12 +67,13 @@ pub(crate) async fn scope_purpose<F: Future>(
 
 pub(crate) async fn outbound_dial_scope<F: Future>(
     node: &honk_config::node::Node,
+    routed: bool,
     future: F,
 ) -> F::Output {
     use honk_config::types::NodeProtocol;
     let future = std::pin::pin!(future);
 
-    if matches!(node.protocol(), NodeProtocol::Direct | NodeProtocol::Block) {
+    if !routed && matches!(node.protocol(), NodeProtocol::Direct | NodeProtocol::Block) {
         future.await
     } else {
         scope_purpose("proxy_server", future).await
@@ -811,7 +812,7 @@ pub(crate) fn selection_evaluated(
 pub(crate) fn selection_path(
     selections: &[super::record::Selection],
     chain: &[String],
-    node: &honk_config::node::Node,
+    dialed: &honk_outbound::group::OwnedTarget,
     family: honk_outbound::alive::IpVersion,
 ) -> SelectionPath {
     let Some(observer) = flow_observation::current() else {
@@ -822,24 +823,23 @@ pub(crate) fn selection_path(
         return Vec::new();
     };
     let family = Some(super::producer::ip_family(family));
-    if chain.len() > MAX_RULE_VALUES {
+    let (member_id, member_name) = dialed.selected_member();
+    let Some((_, groups)) = chain.split_last() else {
+        return Vec::new();
+    };
+    if groups.len() > MAX_RULE_VALUES {
         observer.publish(FlowEvent::Gap(GapReason::BufferOverflow));
     }
-    chain
+    groups
         .iter()
         .take(MAX_RULE_VALUES)
         .enumerate()
         .filter_map(|(index, name)| {
             let group_id = catalog.groups.get(name)?;
-            let (member_id, member_name) = chain
-                .get(index + 1)
-                .and_then(|name| {
-                    catalog
-                        .groups
-                        .get(name)
-                        .map(|id| (id.clone(), bounded(name)))
-                })
-                .unwrap_or_else(|| (node.id.to_string(), bounded(&node.name)));
+            let (member_id, member_name) = match groups.get(index + 1) {
+                Some(group) => (catalog.groups.get(group)?.clone(), bounded(group)),
+                None => (member_id.to_string(), bounded(member_name)),
+            };
             let Some(captured) = captured_selection(selections, group_id, family, &member_id)
             else {
                 observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
@@ -860,11 +860,15 @@ pub(crate) fn outbound_evidence(
     outbound: &str,
     routing_source: RoutingSource,
     evaluation_id: Option<String>,
-    node: Option<&honk_config::node::Node>,
+    dialed: Option<&honk_outbound::group::OwnedTarget>,
     target: SocketAddr,
     selection_path: SelectionPath,
 ) -> Option<super::record::OutboundAttempt> {
     let observer = flow_observation::current()?;
+    let node = dialed.map(|dialed| &dialed.node);
+    let direct = dialed.is_none_or(|dialed| {
+        dialed.route.is_none() && dialed.node.protocol() == honk_config::types::NodeProtocol::Direct
+    });
     Some(super::record::OutboundAttempt {
         parent_attempt_id: observer.context().attempt_id.map(|id| id.to_string()),
         kind: "leaf",
@@ -883,9 +887,7 @@ pub(crate) fn outbound_evidence(
         target: Some(target.to_string()),
         target_kind: "ip",
         dial_ip: Some(target.ip()),
-        server_addr: node
-            .is_none_or(|node| node.protocol() == honk_config::types::NodeProtocol::Direct)
-            .then_some(target),
+        server_addr: direct.then_some(target),
         resolution_location: honk_outbound::runtime::flow_observation::ResolutionLocation::Unknown,
     })
 }

@@ -2,6 +2,105 @@ use super::*;
 use crate::group::{
     ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreSource, SelectionNetwork,
 };
+use tokio::time::Instant as Deadline;
+
+/// Verifies a configured HTTP request over the ticket's published route.
+/// `None` is neutral. A sample requires a validated response on the routed
+/// stream. The health worker owns the absolute deadline and cancellation.
+#[async_trait::async_trait]
+pub trait RouteHttpProber: Send + Sync {
+    async fn probe_route_http(
+        &self,
+        alive: &AliveDialerSet,
+        ticket: &RouteProbeTicket,
+        deadline: Deadline,
+    ) -> anyhow::Result<Option<ProbeMeasurement>>;
+}
+
+impl AliveDialerSet {
+    pub fn set_route_http_probe(&self, prober: Arc<dyn RouteHttpProber>) {
+        *self.route_http_prober.write() = Some(prober);
+    }
+
+    /// Pin the ticket's configured target to addresses in its failed family.
+    pub async fn route_probe_addrs(
+        &self,
+        ticket: &RouteProbeTicket,
+    ) -> anyhow::Result<Vec<SocketAddr>> {
+        let target = honk_config::check::decode_health_http_target(ticket.url())?;
+        let port = target.port();
+        let v4 = ticket.family() == IpVersion::V4;
+        let mut addrs = Vec::new();
+        let mut push = |ip: std::net::IpAddr| {
+            let addr = SocketAddr::new(ip.to_canonical(), port);
+            if addrs.len() < 3 && addr.is_ipv4() == v4 && !addrs.contains(&addr) {
+                addrs.push(addr);
+            }
+            addrs.len() == 3
+        };
+        for addr in Self::parse_check_literals(ticket.url(), port) {
+            if push(addr.ip()) {
+                break;
+            }
+        }
+        if let Ok(ip) = target.host().parse::<std::net::IpAddr>() {
+            push(ip);
+            return Ok(addrs);
+        }
+
+        // Unlike legacy probes, recovery does not bootstrap around an empty
+        // or refused lookup and never bypasses a local policy refusal.
+        let resolver = self.resolver.read().clone();
+        if let Some(resolve) = resolver {
+            let resolved = resolve(target.host().to_owned(), port).await;
+            match resolved {
+                Ok(resolved) => {
+                    for addr in resolved {
+                        if push(addr.ip()) {
+                            break;
+                        }
+                    }
+                }
+                Err(error) if crate::proxy::is_packet_rejection(&error) || addrs.is_empty() => {
+                    return Err(error);
+                }
+                Err(_) => {}
+            }
+        }
+        Ok(addrs)
+    }
+
+    pub(super) async fn probe_failed_route(
+        &self,
+        prober: &dyn RouteHttpProber,
+        ticket: RouteProbeTicket,
+        deadline: Deadline,
+        cancel: ProbeCancellation,
+    ) {
+        if Deadline::now() >= deadline || !ticket.is_current() {
+            return;
+        }
+        let result = cancel
+            .run(tokio::time::timeout_at(
+                deadline,
+                prober.probe_route_http(self, &ticket, deadline),
+            ))
+            .await;
+        if cancel.is_cancelled() {
+            return;
+        }
+        let success = match result {
+            Some(Ok(Ok(Some(_)))) => Deadline::now() < deadline,
+            Some(Ok(Err(error))) if !crate::proxy::is_packet_rejection(&error) => {
+                tracing::debug!(%error, family = ?ticket.family(), "Routed HTTP recovery probe failed");
+                false
+            }
+            Some(Err(_)) => false,
+            _ => return,
+        };
+        ticket.finish(success);
+    }
+}
 
 impl AliveDialerSet {
     fn raw_probe_reporter(&self, node_id: Uuid, ipver: IpVersion) -> Option<ScoreReporter> {
@@ -53,16 +152,14 @@ impl AliveDialerSet {
                 latency,
                 domain != ProbeDomain::Tcp,
             ),
-            None => self.mark_unavailable_state(node_id, domain, ipver, false, false),
+            None => self.unavailable_change(node_id, domain, ipver, false, false),
         };
         // Removal and result mutation have one order. Notifications run unlocked;
         // a reentrant resolver/callback must not authorize another old update.
         drop(registered);
-        if changed {
-            self.notify_health_change(node_id, domain, ipver, latency.is_some(), || {
-                Self::same_registration(self.registered.read().nodes.get(&node_id), registration)
-            });
-        }
+        self.notify_probe_change(changed, node_id, domain, ipver, latency.is_some(), || {
+            Self::same_registration(self.registered.read().nodes.get(&node_id), registration)
+        });
     }
 
     /// Probe a single node's TCP reachability.

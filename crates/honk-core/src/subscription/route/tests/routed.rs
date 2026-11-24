@@ -68,39 +68,209 @@ async fn a_group_override_goes_through_the_group_whatever_the_rules_say() {
 async fn a_fetch_through_a_chain_crosses_every_hop() {
     use crate::test_support::{socks5_chain, socks5_relay};
 
-    let (address, requests) = server().await;
-    let front = socks5_relay().await;
-    let land = socks5_relay().await;
-    let nodes = socks5_chain(&front, &land).to_vec();
-    let config = Config {
-        groups: vec![Group {
-            name: "proxy".into(),
-            nodes: vec![nodes[0].id],
+    for group_exit in [false, true] {
+        let (address, requests) = server().await;
+        let front = socks5_relay().await;
+        let land = socks5_relay().await;
+        let [chain, leaf, exit] = socks5_chain(&front, &land);
+        let (nodes, exit) = if group_exit {
+            (vec![leaf, exit], Some("land".into()))
+        } else {
+            (vec![chain, leaf, exit], None)
+        };
+        let config = Config {
+            groups: vec![Group {
+                name: "proxy".into(),
+                nodes: vec![nodes[0].id],
+                exit,
+                ..Default::default()
+            }],
+            nodes,
             ..Default::default()
-        }],
-        nodes,
-        ..Default::default()
-    };
-    let routing = SharedOutbounds {
-        router: Arc::new(RwLock::new(Router::new(&[], "direct").unwrap())),
-        group_manager: Arc::new(parking_lot::RwLock::new(Arc::new(GroupManager::new(
-            &config.groups,
-            &config.nodes,
-        )))),
-        runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::new(
-            honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap(),
-        ))),
-        config: Arc::new(RwLock::new(Arc::new(config))),
-        proxy_registry: Arc::new(ProxyRegistry::default_resolver().unwrap()),
-    };
-    let nodes = manager(routing)
-        .fetch(&subscription(address, "proxy"))
-        .await
-        .unwrap();
-    assert_eq!(nodes.len(), 1);
-    assert_eq!(requests.lock().len(), 1);
-    assert_eq!(*front.requests.lock(), [land.addr]);
-    assert_eq!(*land.requests.lock(), [address]);
+        };
+        let routing = SharedOutbounds {
+            router: Arc::new(RwLock::new(Router::new(&[], "direct").unwrap())),
+            group_manager: Arc::new(parking_lot::RwLock::new(Arc::new(GroupManager::new(
+                &config.groups,
+                &config.nodes,
+            )))),
+            runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::new(
+                honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap(),
+            ))),
+            config: Arc::new(RwLock::new(Arc::new(config))),
+            proxy_registry: Arc::new(ProxyRegistry::default_resolver().unwrap()),
+        };
+        let fetched = manager(routing)
+            .fetch(&subscription(address, "proxy"))
+            .await
+            .unwrap();
+        assert!(matches!(fetched.as_slice(), [node] if node.name == "node"));
+        assert_eq!(requests.lock().len(), 1);
+        assert_eq!(*front.requests.lock(), [land.addr]);
+        assert_eq!(*land.requests.lock(), [address]);
+    }
+}
+
+async fn accept_prefix_request(listener: &TcpListener, exit: SocketAddr) -> tokio::net::TcpStream {
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let mut greeting = [0; 3];
+    peer.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [5, 1, 0]);
+    peer.write_all(&[5, 0]).await.unwrap();
+    let mut request = [0; 10];
+    peer.read_exact(&mut request).await.unwrap();
+    assert_eq!(&request[..4], &[5, 1, 0, 1]);
+    assert_eq!(
+        SocketAddr::from((
+            [request[4], request[5], request[6], request[7]],
+            u16::from_be_bytes([request[8], request[9]]),
+        )),
+        exit,
+    );
+    peer
+}
+
+#[tokio::test]
+async fn dns_and_downloads_share_current_prefix_failures_without_double_charging_retries() {
+    use crate::dns::forwarder::{DnsUpstreamPool, build_dns_query};
+    use crate::dns::routing::DnsRouter;
+    use crate::dns::upstream_pool::UpstreamPool;
+    use crate::test_support::{socks5_chain, socks5_relay};
+    use honk_config::dns::{DnsRouting, DnsUpstream};
+    use honk_config::group::GroupPolicy;
+    use honk_config::types::DnsProtocol;
+    use honk_outbound::alive::AliveDialerSet;
+    use honk_outbound::runtime::OutboundRuntimeRegistry;
+
+    const REFUSED: [u8; 10] = [5, 5, 0, 1, 0, 0, 0, 0, 0, 0];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let bad = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good = socks5_relay().await;
+        let exit = socks5_relay().await;
+        let [_, good_node, exit_node] = socks5_chain(&good, &exit);
+        let bad_node =
+            Node::from_share_link(&format!("socks5://{}#bad", bad.local_addr().unwrap())).unwrap();
+        let mut config = Config {
+            groups: vec![Group {
+                name: "control".into(),
+                policy: GroupPolicy::Fallback,
+                nodes: vec![bad_node.id, good_node.id],
+                exit: Some(exit_node.name.clone()),
+                final_outbound: Some("block".into()),
+                ..Default::default()
+            }],
+            nodes: vec![bad_node, good_node, exit_node],
+            ..Default::default()
+        };
+        config.ensure_builtin_nodes();
+        let config = Arc::new(config);
+        let alive = Arc::new(AliveDialerSet::new());
+        let publish = || {
+            let manager = Arc::new(GroupManager::with_alive_set(
+                &config.groups,
+                &config.nodes,
+                Some(Arc::clone(&alive)),
+            ));
+            manager.publish_route_health();
+            manager
+        };
+        let registry = Arc::new(ProxyRegistry::default_resolver().unwrap());
+        let generation = Arc::new(OutboundRuntimeRegistry::build(&config.nodes).unwrap());
+        let routing = SharedOutbounds {
+            router: Arc::new(RwLock::new(Router::new(&[], "direct").unwrap())),
+            group_manager: Arc::new(parking_lot::RwLock::new(publish())),
+            runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::clone(&generation))),
+            config: Arc::new(RwLock::new(Arc::clone(&config))),
+            proxy_registry: Arc::clone(&registry),
+        };
+        let client = manager(routing.clone());
+        let (origin, requests) = server().await;
+        let sub = subscription(origin, "control");
+
+        for cancelled in [true, false] {
+            let mut fetch = Box::pin(client.fetch(&sub));
+            let mut peer = tokio::select! {
+                peer = accept_prefix_request(&bad, exit.addr) => peer,
+                _ = &mut fetch => panic!("the first prefix must be attempted"),
+            };
+            if cancelled {
+                drop(fetch);
+                assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+            } else {
+                *routing.group_manager.write() = publish();
+                peer.write_all(&REFUSED).await.unwrap();
+                assert!(
+                    fetch
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("connection_failed")
+                );
+            }
+        }
+
+        let dns_origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dns = UpstreamPool::new_with_proxy(
+            &[DnsUpstream {
+                name: "dns".into(),
+                address: dns_origin.local_addr().unwrap().to_string(),
+                protocol: DnsProtocol::Udp,
+                tls_server_name: None,
+                outbound: Some("control".into()),
+            }],
+            Arc::new(DnsRouter::new(&DnsRouting::default()).unwrap()),
+            Some(registry),
+            config.nodes.clone(),
+            config.groups.clone(),
+        )
+        .unwrap()
+        .with_group_manager_snapshot(routing.group_manager.read().clone());
+        dns.set_runtime_generation(generation).unwrap();
+        let query = build_dns_query("control.example", 1);
+        let (answer, ()) = tokio::join!(dns.query("dns", &query), async {
+            for _ in 0..4 {
+                accept_prefix_request(&bad, exit.addr)
+                    .await
+                    .write_all(&REFUSED)
+                    .await
+                    .unwrap();
+            }
+        });
+        let error = answer.unwrap_err();
+        assert_eq!(
+            honk_outbound::proxy::dial_failure_scope(error.as_ref()),
+            honk_outbound::proxy::DialFailureScope::Prefix(1),
+        );
+        dns.close().await;
+
+        // TCP gates a failed prefix after ten distinct attempts. The four physical
+        // DNS dials above contribute one, and the retired fetch contributes none.
+        for _ in 0..9 {
+            let mut fetch = Box::pin(client.fetch(&sub));
+            let mut peer = tokio::select! {
+                peer = accept_prefix_request(&bad, exit.addr) => peer,
+                _ = &mut fetch => panic!("retries or an old download gated the prefix early"),
+            };
+            peer.write_all(&REFUSED).await.unwrap();
+            assert!(
+                fetch
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("connection_failed")
+            );
+        }
+        let fetched = tokio::select! {
+            fetched = client.fetch(&sub) => fetched.unwrap(),
+            _ = bad.accept() => panic!("the tenth distinct failure must gate the prefix"),
+        };
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(*good.requests.lock(), [exit.addr]);
+        assert_eq!(*exit.requests.lock(), [origin]);
+        assert_eq!(requests.lock().len(), 1);
+    })
+    .await
+    .expect("control traffic should select the remaining prefix");
 }
 
 /// Group `score` holds two nodes dialed through [`Tunnel`], and no rule applies.
@@ -172,7 +342,7 @@ async fn decide_score(
 
 async fn selected(routing: &SharedOutbounds) -> uuid::Uuid {
     match decide_score(routing, "127.0.0.1", None).await {
-        crate::download_route::Route::Proxy { node, .. } => node.id,
+        crate::download_route::Route::Proxy { proxy, .. } => proxy.target.node.id,
         _ => panic!("the Score group resolves to a proxy leaf"),
     }
 }

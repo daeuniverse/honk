@@ -138,6 +138,8 @@ pub enum ScoreOutcome {
     Timeout,
     Io(io::ErrorKind),
     TargetFailure,
+    /// This business failed without identifying a fault in the selected leaf or final target.
+    RouteFailure,
     NodeFailure,
     SharedNodeFailure(u64),
     Rejected,

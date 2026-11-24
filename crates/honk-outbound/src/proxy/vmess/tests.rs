@@ -122,6 +122,26 @@ async fn test_response_header_mismatch_fails() {
     assert!(read_response_header(&mut cursor, &session).await.is_err());
 }
 
+#[tokio::test]
+async fn a_truncated_vmess_response_does_not_identify_a_tunneled_group_hop() {
+    let complete = hex(RESP_HEADER_WIRE);
+    for routed_carrier in [false, true] {
+        let session = Session {
+            ambiguous_header_io: routed_carrier,
+            ..fixed_session()
+        };
+        for end in [1, complete.len() - 1] {
+            let mut partial = &complete[..end];
+            let error = read_response_header(&mut partial, &session)
+                .await
+                .unwrap_err();
+            let cause = error.root_cause().downcast_ref::<io::Error>().unwrap();
+            assert_eq!(cause.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(crate::proxy::node_failure(&error), !routed_carrier);
+        }
+    }
+}
+
 #[test]
 fn test_crc32_ieee() {
     // crc32.ChecksumIEEE("123456789") = 0xCBF43926 (classic vector).
@@ -163,7 +183,8 @@ async fn dropping_vmess_stream_closes_physical_transport() {
     let uuid = uuid::Uuid::parse_str(UUID).unwrap();
     let target = "93.184.216.34:53".parse().unwrap();
     let stream =
-        VmessHandler::perform_handshake(uuid.as_bytes(), Box::new(physical), target, None).unwrap();
+        VmessHandler::perform_handshake(uuid.as_bytes(), Box::new(physical), target, None, false)
+            .unwrap();
 
     let mut first = [0];
     tokio::time::timeout(
@@ -339,7 +360,13 @@ async fn runtime_shutdown_joins_vmess_relay_with_live_stream() -> anyhow::Result
     let target = "192.0.2.1:80".parse()?;
     let stream = runtime
         .scope_tasks(async {
-            VmessHandler::perform_handshake(uuid.as_bytes(), Box::new(physical), target, None)
+            VmessHandler::perform_handshake(
+                uuid.as_bytes(),
+                Box::new(physical),
+                target,
+                None,
+                false,
+            )
         })
         .await?;
     let mut first = [0];
@@ -469,7 +496,8 @@ async fn rejected_response_header_surfaces_as_stream_error() {
     let uuid = uuid::Uuid::parse_str(UUID).unwrap();
     let target = "93.184.216.34:53".parse().unwrap();
     let mut stream =
-        VmessHandler::perform_handshake(uuid.as_bytes(), Box::new(physical), target, None).unwrap();
+        VmessHandler::perform_handshake(uuid.as_bytes(), Box::new(physical), target, None, false)
+            .unwrap();
 
     let mut first = [0];
     peer.read_exact(&mut first).await.unwrap();
@@ -550,7 +578,8 @@ async fn response_header_eof_and_transport_failures_keep_scope_and_cause() {
         let uuid = uuid::Uuid::parse_str(UUID).unwrap();
         let target = "93.184.216.34:53".parse().unwrap();
         let mut stream =
-            VmessHandler::perform_handshake(uuid.as_bytes(), physical, target, None).unwrap();
+            VmessHandler::perform_handshake(uuid.as_bytes(), physical, target, None, false)
+                .unwrap();
 
         peer.read_exact(&mut [0]).await.unwrap();
         peer.write_all(&[0x5a; 3][..prefix_len]).await.unwrap();
@@ -712,6 +741,7 @@ async fn deferred_request_observation_follows_relay_write_not_stream_constructio
                 Box::new(physical),
                 "127.0.0.1:80".parse().unwrap(),
                 None,
+                false,
             )
             .unwrap()
         })
@@ -733,6 +763,47 @@ async fn deferred_request_observation_follows_relay_write_not_stream_constructio
     peer.read_to_end(&mut remaining).await.unwrap();
 }
 
+async fn read_request_header(wire: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
+    let cmd_key = VmessHandler::derive_cmd_key(uuid::Uuid::parse_str(UUID).unwrap().as_bytes());
+    let mut prefix = [0u8; 16 + 18 + 8];
+    wire.read_exact(&mut prefix).await.unwrap();
+    let auth_id: [u8; 16] = prefix[..16].try_into().unwrap();
+    let conn_nonce: [u8; 8] = prefix[34..].try_into().unwrap();
+    let extra: [&[u8]; 2] = [&auth_id, &conn_nonce];
+    let len_plain = VmessHandler::open_aad(
+        &kdf16(&cmd_key, KDF_SALT_HEADER_LEN_KEY, &extra),
+        &kdf12(&cmd_key, KDF_SALT_HEADER_LEN_IV, &extra),
+        &prefix[16..34],
+        &auth_id,
+    )
+    .unwrap();
+    let header_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
+    let mut sealed = vec![0u8; header_len + GCM_TAG_LEN];
+    wire.read_exact(&mut sealed).await.unwrap();
+    VmessHandler::open_aad(
+        &kdf16(&cmd_key, KDF_SALT_HEADER_KEY, &extra),
+        &kdf12(&cmd_key, KDF_SALT_HEADER_IV, &extra),
+        &sealed,
+        &auth_id,
+    )
+    .unwrap()
+}
+
+async fn read_first_chunk(wire: &mut (impl AsyncRead + Unpin), header: &[u8]) -> Vec<u8> {
+    let mut upload = BodyChunks::new(
+        header[17..33].try_into().unwrap(),
+        header[1..17].try_into().unwrap(),
+    )
+    .unwrap();
+    let mut len = [0u8; 2];
+    wire.read_exact(&mut len).await.unwrap();
+    let mut chunk = vec![0u8; upload.decode_len(len) as usize];
+    wire.read_exact(&mut chunk).await.unwrap();
+    let size = upload.open_chunk(&mut chunk).unwrap();
+    chunk.truncate(size);
+    chunk
+}
+
 /// A minimal AEAD server on the far end of a tunneled carrier: it opens the
 /// sealed request and one body chunk, then answers with a response header
 /// and one body chunk.
@@ -740,30 +811,7 @@ async fn deferred_request_observation_follows_relay_write_not_stream_constructio
 async fn dial_over_relays_through_the_carrier() {
     let (client, mut server) = tokio::io::duplex(64 * 1024);
     let server = tokio::spawn(async move {
-        let uuid = uuid::Uuid::parse_str(UUID).unwrap();
-        let cmd_key = VmessHandler::derive_cmd_key(uuid.as_bytes());
-        let mut prefix = [0u8; 16 + 18 + 8];
-        server.read_exact(&mut prefix).await.unwrap();
-        let auth_id: [u8; 16] = prefix[..16].try_into().unwrap();
-        let conn_nonce: [u8; 8] = prefix[34..].try_into().unwrap();
-        let extra: [&[u8]; 2] = [&auth_id, &conn_nonce];
-        let len_plain = VmessHandler::open_aad(
-            &kdf16(&cmd_key, KDF_SALT_HEADER_LEN_KEY, &extra),
-            &kdf12(&cmd_key, KDF_SALT_HEADER_LEN_IV, &extra),
-            &prefix[16..34],
-            &auth_id,
-        )
-        .unwrap();
-        let header_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
-        let mut sealed = vec![0u8; header_len + GCM_TAG_LEN];
-        server.read_exact(&mut sealed).await.unwrap();
-        let header = VmessHandler::open_aad(
-            &kdf16(&cmd_key, KDF_SALT_HEADER_KEY, &extra),
-            &kdf12(&cmd_key, KDF_SALT_HEADER_IV, &extra),
-            &sealed,
-            &auth_id,
-        )
-        .unwrap();
+        let header = read_request_header(&mut server).await;
         assert_eq!(
             &header[37..45],
             &[CMD_TCP, 0x00, 0x50, addr::ATYP_VMESS.ipv4, 93, 184, 216, 34]
@@ -773,13 +821,7 @@ async fn dial_over_relays_through_the_carrier() {
         let resp_key: [u8; 16] = Sha256::digest(req_key)[..16].try_into().unwrap();
         let resp_iv: [u8; 16] = Sha256::digest(req_iv)[..16].try_into().unwrap();
 
-        let mut upload = BodyChunks::new(&req_key, &req_iv).unwrap();
-        let mut len = [0u8; 2];
-        server.read_exact(&mut len).await.unwrap();
-        let mut chunk = vec![0u8; upload.decode_len(len) as usize];
-        server.read_exact(&mut chunk).await.unwrap();
-        let size = upload.open_chunk(&mut chunk).unwrap();
-        assert_eq!(&chunk[..size], b"ping");
+        assert_eq!(read_first_chunk(&mut server, &header).await, *b"ping");
 
         let response = [header[33], 0, 0, 0];
         let mut reply = VmessHandler::seal_aad(
@@ -843,6 +885,199 @@ async fn dial_over_relays_through_the_carrier() {
         .await
         .unwrap()
         .unwrap();
+}
+
+fn chain_vmess_node() -> Node {
+    crate::test_support::node(
+        "vmess",
+        "192.0.2.1",
+        1080,
+        honk_config::node::OutboundConfig::Vmess(honk_config::node::VmessConfig {
+            uuid: Some(UUID.into()),
+            ..Default::default()
+        }),
+    )
+}
+
+async fn accept_socks_for_vmess(listener: &tokio::net::TcpListener) -> TcpStream {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut greeting = [0; 3];
+    stream.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [5, 1, 0]);
+    stream.write_all(&[5, 0]).await.unwrap();
+    let mut request = [0; 10];
+    stream.read_exact(&mut request).await.unwrap();
+    assert_eq!(request, [5, 1, 0, 1, 192, 0, 2, 1, 4, 56]);
+    stream
+        .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    stream
+}
+
+#[tokio::test]
+async fn vmess_header_reset_after_open_respects_configured_chain_ownership() {
+    use crate::group::{OwnedTarget, RoutedTarget, ScoreOutcome};
+    use crate::proxy::{DialFailureScope, ProxyRegistry, dial_failure_scope};
+    use crate::runtime::OutboundRuntimeRegistry;
+    use crate::test_support::{assert_score_failure_scope, chain, socks5};
+    use honk_config::group_graph::{Composed, compose};
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front = socks5("front", "127.0.0.1", listener.local_addr().unwrap().port());
+    let vmess = chain_vmess_node();
+    let configured = chain(&[&front, &vmess]);
+    let Composed::Routed(route) = compose(configured.id, &[front.id, vmess.id], [vmess.id]) else {
+        panic!("expected a route with the same physical hops as the chain");
+    };
+    let standalone = OwnedTarget::node(configured.clone());
+    let mut routed = OwnedTarget::node(configured.clone());
+    routed.route = Some(Box::new(RoutedTarget {
+        route,
+        hop_names: [front.name.clone(), vmess.name.clone()].into(),
+    }));
+    let generation = Arc::new(OutboundRuntimeRegistry::build(&[configured, front, vmess]).unwrap());
+    let registry = ProxyRegistry::default_resolver().unwrap();
+
+    for (owned, expected, projected, hard_failures) in [
+        (
+            &standalone,
+            ScoreOutcome::NodeFailure,
+            ScoreOutcome::NodeFailure,
+            1,
+        ),
+        (
+            &routed,
+            ScoreOutcome::Io(io::ErrorKind::ConnectionReset),
+            ScoreOutcome::RouteFailure,
+            0,
+        ),
+    ] {
+        let client = async {
+            let mut stream = registry
+                .dial_ref(
+                    Arc::clone(&generation),
+                    owned.dial_ref(),
+                    "127.0.0.1:8080".parse().unwrap(),
+                    None,
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+            stream.stream.write_all(b"ping").await.unwrap();
+            stream.stream.read(&mut [0]).await.unwrap_err()
+        };
+        let peer = async {
+            let mut stream = accept_socks_for_vmess(&listener).await;
+            let header = read_request_header(&mut stream).await;
+            assert_eq!(
+                &header[37..45],
+                &[CMD_TCP, 31, 144, addr::ATYP_VMESS.ipv4, 127, 0, 0, 1]
+            );
+            assert_eq!(read_first_chunk(&mut stream, &header).await, *b"ping");
+            stream.set_zero_linger().unwrap();
+        };
+        let (error, ()) =
+            tokio::time::timeout(Duration::from_secs(8), async { tokio::join!(client, peer) })
+                .await
+                .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(dial_failure_scope(&error), DialFailureScope::Unattributed);
+        let outcome = ScoreOutcome::from_io_error(&error);
+        assert_eq!(outcome, expected);
+        let score = owned.score_failure(outcome, &error);
+        assert_eq!(score, projected);
+        assert_score_failure_scope(&owned.node, &[score], true, hard_failures, hard_failures);
+        let error = anyhow::Error::new(error);
+        let cause = error.root_cause().downcast_ref::<io::Error>().unwrap();
+        assert_eq!(cause.raw_os_error(), Some(libc::ECONNRESET));
+    }
+    generation.shutdown().await;
+}
+
+#[tokio::test]
+async fn three_hop_vmess_attributes_a_bad_header_but_not_a_socks_carrier_reset() {
+    use crate::group::{OwnedTarget, RoutedTarget, ScoreOutcome};
+    use crate::proxy::{DialFailureScope, ProxyRegistry, dial_failure_scope, failed_hop};
+    use crate::runtime::OutboundRuntimeRegistry;
+    use crate::test_support::{TCP_TARGET, socks5};
+    use honk_config::group_graph::{Composed, compose};
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    for corrupt in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = socks5("front", "127.0.0.1", listener.local_addr().unwrap().port());
+        let mid = chain_vmess_node();
+        let exit = socks5("exit", "192.0.2.2", 1081);
+        let Composed::Routed(route) = compose(front.id, &[front.id], [mid.id, exit.id]) else {
+            panic!("expected three hops");
+        };
+        let mut owned = OwnedTarget::node(front.clone());
+        owned.route = Some(Box::new(RoutedTarget {
+            route,
+            hop_names: [front.name.clone(), mid.name.clone(), exit.name.clone()].into(),
+        }));
+        let middle_id = mid.id;
+        let generation = Arc::new(OutboundRuntimeRegistry::build(&[front, mid, exit]).unwrap());
+        let registry = ProxyRegistry::default_resolver().unwrap();
+        let server = async {
+            let mut stream = accept_socks_for_vmess(&listener).await;
+
+            let header = read_request_header(&mut stream).await;
+            assert_eq!(
+                &header[37..45],
+                &[CMD_TCP, 4, 57, addr::ATYP_VMESS.ipv4, 192, 0, 2, 2]
+            );
+            // The final SOCKS handler is awaiting its greeting reply, not writing.
+            assert_eq!(read_first_chunk(&mut stream, &header).await, [5, 1, 0]);
+            if corrupt {
+                let resp_key = Sha256::digest(&header[17..33]);
+                let resp_iv = Sha256::digest(&header[1..17]);
+                let mut len = VmessHandler::seal_aad(
+                    &kdf16(&resp_key[..16], KDF_SALT_RESP_LEN_KEY, &[]),
+                    &kdf12(&resp_iv[..16], KDF_SALT_RESP_LEN_IV, &[]),
+                    &4u16.to_be_bytes(),
+                    &[],
+                );
+                len[2] ^= 1;
+                stream.write_all(&len).await.unwrap();
+            } else {
+                stream.set_zero_linger().unwrap();
+            }
+        };
+        let dial = registry.dial_ref(
+            Arc::clone(&generation),
+            owned.dial_ref(),
+            TCP_TARGET.parse().unwrap(),
+            None,
+            Duration::from_secs(2),
+        );
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(8), async { tokio::join!(dial, server) })
+                .await
+                .unwrap();
+        let error = result.unwrap_err();
+        if corrupt {
+            assert_eq!(dial_failure_scope(error.as_ref()), DialFailureScope::Hop(1));
+            let located = failed_hop(&error).unwrap();
+            assert_eq!((located.hop, located.node), (1, middle_id));
+            assert_eq!(owned.failure_owner(&error), Some(middle_id));
+            assert!(ScoreOutcome::from_error(&error).is_node_failure());
+        } else {
+            assert_eq!(
+                dial_failure_scope(error.as_ref()),
+                DialFailureScope::Unattributed
+            );
+            assert_eq!(owned.failure_owner(&error), None);
+            let cause = error.root_cause().downcast_ref::<io::Error>().unwrap();
+            assert_eq!(cause.raw_os_error(), Some(libc::ECONNRESET));
+            assert!(!ScoreOutcome::from_error(&error).is_node_failure());
+        }
+        generation.shutdown().await;
+    }
 }
 
 mod websocket;

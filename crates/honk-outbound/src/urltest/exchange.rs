@@ -236,6 +236,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn http1_round<S>(
     stream: &mut S,
     request: &http::Request<()>,
@@ -244,6 +245,7 @@ async fn http1_round<S>(
     reporter: &Option<ScoreReporter>,
     first_response: bool,
     timeout: Duration,
+    flush: bool,
 ) -> Result<(ProbeMeasurement, http::StatusCode), RoundError>
 where
     S: AsyncBufRead + AsyncWrite + Unpin,
@@ -255,6 +257,11 @@ where
         stream.write_all(wire.as_bytes()).await.map_err(|error| {
             RoundError::Transport(anyhow::Error::new(error).context("HTTP probe write failed"))
         })?;
+        if flush {
+            stream.flush().await.map_err(|error| {
+                RoundError::Transport(anyhow::Error::new(error).context("HTTP probe flush failed"))
+            })?;
+        }
         reporter_tx(reporter, wire.len());
         let status =
             read_response_head(stream, reporter, first_response, &mut response_started).await?;
@@ -293,6 +300,32 @@ pub(super) async fn exchange_http1<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    exchange_http1_inner(stream, request, reporter, timeout, cold, false).await
+}
+
+pub(super) async fn exchange_routed_http1<S>(
+    stream: S,
+    request: &http::Request<()>,
+    timeout: Duration,
+) -> anyhow::Result<ProbeMeasurement>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // A proxy codec can accept the complete request while retaining ciphertext.
+    exchange_http1_inner(stream, request, &None, timeout, true, true).await
+}
+
+async fn exchange_http1_inner<S>(
+    stream: S,
+    request: &http::Request<()>,
+    reporter: &Option<ScoreReporter>,
+    timeout: Duration,
+    cold: bool,
+    flush: bool,
+) -> anyhow::Result<ProbeMeasurement>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut stream = BufReader::new(stream);
     let warm = if cold {
         None
@@ -305,6 +338,7 @@ where
             reporter,
             true,
             timeout,
+            flush,
         )
         .await
         .map_err(RoundError::into_error)?;
@@ -319,6 +353,7 @@ where
         reporter,
         false,
         timeout,
+        flush,
     )
     .await
     {

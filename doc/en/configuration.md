@@ -277,7 +277,7 @@ routing {
 }
 ```
 
-Selector TCP and UDP follow the chosen member and never switch to a sibling because of health. The same-leaf TCP last resort does not bypass nested Selector choices. Group dials always resolve to one leaf node.
+Selector TCP and UDP follow the chosen member and never switch to a sibling because of health. The same-leaf TCP last resort does not bypass nested Selector choices. Group dials always resolve to one leaf node. A group with [`exit`](./reference/groups.md#exit) sends TCP connections from that leaf on through the exit node.
 
 A configuration may define at most 250 top-level user groups; the routing ABI reserves higher ordinals.
 

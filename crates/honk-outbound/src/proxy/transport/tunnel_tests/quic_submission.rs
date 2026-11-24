@@ -391,22 +391,36 @@ impl AsyncWrite for Retained {
 
 async fn dispatch_trojan(
     carrier: impl AsyncReadWrite + 'static,
-    via: Arc<crate::runtime::NodeRuntime>,
+    generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
+    dial: crate::proxy::DialRef<'_>,
 ) -> anyhow::Result<ProxyStream> {
-    use crate::proxy::{ProtocolEntry, chain::ChainHandler};
-    ChainHandler::new(&[
-        ProtocolEntry::new(
-            NodeProtocol::Hysteria2,
-            Arc::new(QuinnEntry(Mutex::new(Some(Box::new(carrier))))),
-        ),
-        ProtocolEntry::new(NodeProtocol::Trojan, Arc::new(TrojanHandler)),
-    ])
-    .dial_runtime(via, "192.0.2.1:443".parse().unwrap(), None, TIMEOUT)
-    .await
+    use crate::proxy::{ProtocolEntry, ProxyRegistry};
+    let mut registry = ProxyRegistry::new();
+    registry.register(ProtocolEntry::new(
+        NodeProtocol::Hysteria2,
+        Arc::new(QuinnEntry(Mutex::new(Some(Box::new(carrier))))),
+    ));
+    registry.register(ProtocolEntry::new(
+        NodeProtocol::Trojan,
+        Arc::new(TrojanHandler),
+    ));
+    registry.register_chain();
+    registry
+        .dial_ref(
+            Arc::clone(generation),
+            dial,
+            "192.0.2.1:443".parse().unwrap(),
+            None,
+            TIMEOUT,
+        )
+        .await
 }
 
 #[tokio::test]
 async fn cancelled_chain_receipts_do_not_publish_into_live_sibling() {
+    use crate::proxy::DialRef;
+    use honk_config::group_graph::{Composed, compose};
+
     timeout(TIMEOUT, async {
         let (client, server, gate) = connected().await;
         let entry = crate::test_support::node(
@@ -419,10 +433,16 @@ async fn cancelled_chain_receipts_do_not_publish_into_live_sibling() {
         exit.id = exit.derive_id();
         let chain = crate::test_support::chain(&[&entry, &exit]);
         let id = chain.id;
-        let generation =
-            crate::runtime::OutboundRuntimeRegistry::build(&[chain, entry, exit]).unwrap();
-        let via = generation.get(&id).unwrap();
-        for accepted in [0, 17, TROJAN.len()] {
+        let Composed::Routed(route) = compose(entry.id, &[entry.id], [exit.id]) else {
+            panic!("expected a QUIC-entry route");
+        };
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(&[chain, entry, exit]).unwrap(),
+        );
+        for (dial_ref, accepted) in [DialRef::Node(id), DialRef::Route(&route)]
+            .into_iter()
+            .flat_map(|dial| [0, 17, TROJAN.len()].map(|accepted| (dial, accepted)))
+        {
             let mut winner = stream(&client).await;
             winner.write_all(b"W").await.unwrap();
             let (_send, mut winner_rx) = server.accept_bi().await.unwrap();
@@ -462,7 +482,7 @@ async fn cancelled_chain_receipts_do_not_publish_into_live_sibling() {
                 }),
             );
             let win = loser.with_context(win_ctx);
-            let mut dial = Box::pin(loser.scope(dispatch_trojan(carrier, via.clone())));
+            let mut dial = Box::pin(loser.scope(dispatch_trojan(carrier, &generation, dial_ref)));
             if accepted == TROJAN.len() {
                 let returned = dial.await.unwrap();
                 gate.held().await;
@@ -477,7 +497,7 @@ async fn cancelled_chain_receipts_do_not_publish_into_live_sibling() {
             assert!(contexts.lock().is_empty());
             gate.release(None);
             let mut tunnel = win
-                .scope(dispatch_trojan(winner, via.clone()))
+                .scope(dispatch_trojan(winner, &generation, dial_ref))
                 .await
                 .unwrap();
             while contexts.lock().is_empty() {

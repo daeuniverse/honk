@@ -165,6 +165,13 @@ async fn budget_one_reclaims_idle_tcp_for_udp_and_back() {
         let first = pool.query("tcp", &mock_dns_query(0x2001)).await.unwrap();
         assert_eq!(first, mock_dns_response(0x2001));
         assert_eq!(budget.available_sockets(), 0);
+        pool.reap_idle_resources();
+        pool.join_retired_transports().await;
+        assert_eq!(
+            budget.available_sockets(),
+            0,
+            "routine reaping keeps live idle TCP"
+        );
 
         let udp = pool.query("udp", &mock_dns_query(0x2002)).await.unwrap();
         assert_eq!(udp, mock_dns_response(0x2002));

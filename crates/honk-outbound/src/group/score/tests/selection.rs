@@ -157,6 +157,75 @@ fn recovery_keeps_nested_selector_permissions_health_and_attribution() {
 }
 
 #[test]
+fn score_replacement_uses_the_current_nested_selector_permission_and_revision() {
+    use crate::group::{SelectorNetworks, Target};
+
+    let nodes = [node("a"), node("b"), node("exit")];
+    let score = group("score", &nodes[..2]);
+    let outer = Group {
+        exit: Some("exit".into()),
+        default: Some("score".into()),
+        ..selector_with_children("outer", &nodes[2..], &["score"])
+    };
+    let alive = Arc::new(crate::alive::AliveDialerSet::new());
+    let manager = Arc::new(GroupManager::with_alive_set(
+        &[outer, score],
+        &nodes,
+        Some(alive),
+    ));
+    manager.publish_route_health();
+    let context = context("retry.example", IpVersion::V4);
+    let (primary, original_revision) = manager.dial_plan_for_target("outer", &context, None);
+    let first = &primary.entries[0];
+    let business = first.feedback.as_ref().unwrap().begin().unwrap();
+    let original = business.continuation();
+    let retry = || {
+        manager.score_retry_dial_plan(
+            "outer",
+            &context,
+            first.node.id,
+            &first.final_owners,
+            &original,
+        )
+    };
+
+    manager
+        .set_selector_choice("outer", "exit", SelectorNetworks::Tcp)
+        .unwrap();
+    assert!(retry().0.entries.is_empty());
+    manager
+        .set_selector_choice("outer", "score", SelectorNetworks::Tcp)
+        .unwrap();
+    let (plan, revision) = retry();
+    let family = plan.health_family;
+    let replacement = plan.entries.into_iter().next().unwrap();
+    assert_ne!(replacement.node.id, first.node.id);
+    let target = manager.own_target(Target {
+        node: replacement.node,
+        route: replacement.route,
+    });
+    assert_eq!(
+        target.route().unwrap().hops(),
+        [replacement.node.id, nodes[2].id]
+    );
+    let refusal = crate::proxy::test_prefix_refusal(1);
+    assert!(!manager.report_route_failure(
+        "outer",
+        &target,
+        family,
+        original_revision.admit(),
+        refusal.as_ref(),
+    ));
+    assert!(manager.report_route_failure(
+        "outer",
+        &target,
+        family,
+        revision.admit(),
+        refusal.as_ref(),
+    ));
+}
+
+#[test]
 fn recovery_does_not_open_node_final_with_duplicate_display_name() {
     let mut nodes = [node("outside"), node("ordinary")];
     for node in &mut nodes {
@@ -583,7 +652,7 @@ fn publication_between_ranking_and_plan_construction_refuses_node_work() {
     );
     replacement.publish_score_membership();
     let published = replacement.score_budget_counters("score", SelectionNetwork::Tcp);
-    let plan = manager.score_selection_plan(candidates, mode, &context, None);
+    let plan = manager.score_selection_plan(candidates, mode, &context, None, manager.has_exits());
     assert!(
         !plan.entries[0]
             .feedback

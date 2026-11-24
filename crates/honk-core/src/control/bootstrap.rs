@@ -96,7 +96,7 @@ impl ControlPlane {
         // URL tests still measure their requested URL.
         let direct_target = direct_check_addr(&config.global.bootstrap_resolver);
         alive_set.set_direct_check_addr(direct_target.clone());
-        let reachable = build_outbound_id_map(&config);
+        let mut reachable = build_outbound_id_map(&config, OutboundHealthDependency::leaf);
         let (added, _) = alive_set.sync_registrations(health_registrations(&config, &reachable));
         info!(
             "Registered {}/{} nodes for health check ({} skipped: not in any group)",
@@ -110,15 +110,16 @@ impl ControlPlane {
         // groups are excluded — those are probed unconditionally.
         alive_set.sync_urltest_groups(&urltest_group_registrations(&config));
         alive_set.sync_group_check_urls(&group_check_url_registrations(&config));
+        let group_manager =
+            GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive_set.clone()));
+        extend_route_health_dependencies(&config, &group_manager, &mut reachable);
         let outbound_id_map = Arc::new(parking_lot::RwLock::new(reachable));
         {
             let map = outbound_id_map.clone();
             alive_set.set_outbound_resolver(Some(Arc::new(move |node_id: uuid::Uuid| {
-                map.read().get(&node_id).copied()
+                map.read().get(&node_id).map(|entry| entry.outbound)
             })));
         }
-        let group_manager =
-            GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive_set.clone()));
         // Custom-URL member resolution: a group's members are probed via
         // their current picks (delay_test_members = tag → representative
         // leaf), so sub-group members are measured through whatever leaf
@@ -186,6 +187,9 @@ impl ControlPlane {
         let initial_routing_plan = Arc::new(Self::compile_routing_plan(&config, &router)?);
         ebpf.publish_routing_plan(&initial_routing_plan, &[])
             .map_err(|error| anyhow::anyhow!("publish initial routing policy: {error:#}"))?;
+        pinned_groups.publish_route_health();
+        let snapshot = initial_route_connectivity(&config, &pinned_groups);
+        publish_group_connectivity(ebpf.as_mut(), &snapshot)?;
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
         let interrupt_groups = config.groups.clone();
@@ -347,6 +351,7 @@ impl ControlPlane {
         install_selector_warm_callback(
             &control_plane.group_manager.read(),
             &control_plane.selector_warm_notify,
+            &control_plane.alive_set,
         );
         // Node death may race an initializer before the listener/background
         // loops start, so this production lifecycle callback belongs to

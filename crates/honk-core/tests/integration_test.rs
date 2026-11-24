@@ -350,7 +350,7 @@ async fn test_reload_rebuilds_group_manager_preserving_choices() {
         ..Default::default()
     };
     *cp.config_handle().write().await = Arc::new(config_v2);
-    cp.reload_group_manager().await;
+    cp.reload_group_manager().await.unwrap();
 
     {
         let gm = cp.group_manager();
@@ -381,7 +381,7 @@ async fn test_reload_rebuilds_group_manager_preserving_choices() {
         ..Default::default()
     };
     *cp.config_handle().write().await = Arc::new(config_v3);
-    cp.reload_group_manager().await;
+    cp.reload_group_manager().await.unwrap();
 
     {
         let gm = cp.group_manager();

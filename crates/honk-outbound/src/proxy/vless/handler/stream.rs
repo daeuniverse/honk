@@ -739,11 +739,15 @@ pub struct VisionSplice {
 }
 
 impl ProxyStream {
+    pub(in crate::proxy) fn is_vision_splice_stream(stream: &dyn std::any::Any) -> bool {
+        stream.is::<VisionTls>()
+    }
+
     /// Returns the carrier as a [`VisionSplice`] when it is an unencrypted
     /// Vision TLS/REALITY stream owned by nothing else.
     pub fn into_vision_splice(self) -> Result<VisionSplice, Self> {
         // Vtable dispatch required — see `into_tcp_stream`.
-        if !(*self.stream).as_any().is::<VisionTls>() {
+        if !Self::is_vision_splice_stream((*self.stream).as_any()) {
             return Err(self);
         }
         let stream = self

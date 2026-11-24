@@ -101,6 +101,50 @@ pub(super) struct SelectorState {
     pub(super) revision: u64,
 }
 
+/// Routed plans can outlive a Selector write inside a synchronous policy callback.
+pub(super) enum SelectorStorage {
+    Inline(SelectorState),
+    Shared(Arc<SelectorState>),
+}
+
+impl SelectorStorage {
+    pub(super) fn new(has_exits: bool) -> Self {
+        if has_exits {
+            Self::Shared(Arc::default())
+        } else {
+            Self::Inline(SelectorState::default())
+        }
+    }
+
+    fn make_mut(&mut self) -> &mut SelectorState {
+        match self {
+            Self::Inline(state) => state,
+            Self::Shared(state) => Arc::make_mut(state),
+        }
+    }
+
+    pub(super) fn replace(&mut self, state: SelectorState) {
+        match self {
+            Self::Inline(current) => *current = state,
+            Self::Shared(current) => match Arc::get_mut(current) {
+                Some(slot) => *slot = state,
+                None => *current = Arc::new(state),
+            },
+        }
+    }
+}
+
+impl std::ops::Deref for SelectorStorage {
+    type Target = SelectorState;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Inline(state) => state,
+            Self::Shared(state) => state,
+        }
+    }
+}
+
 /// Invoked for each network whose explicit runtime choice changed.
 pub type PersistCallback = Arc<dyn Fn(&str, SelectionNetwork, &SelectorMember) + Send + Sync>;
 
@@ -188,6 +232,7 @@ impl GroupManager {
         let group = self
             .groups
             .get(group_name)
+            .map(|entry| &entry.group)
             .ok_or(SelectorError::GroupNotFound)?;
         if group.policy != GroupPolicy::Selector {
             return Err(SelectorError::NotSelector);
@@ -229,6 +274,7 @@ impl GroupManager {
                 .revision
                 .checked_add(1)
                 .ok_or(SelectorError::RevisionExhausted)?;
+            let state = state.make_mut();
             let choices = state.choices.entry(group_name.to_owned()).or_default();
             for network in [SelectionNetwork::Tcp, SelectionNetwork::Udp] {
                 if persisted_networks[network.slot()] {
@@ -290,6 +336,7 @@ impl GroupManager {
         let group = self
             .groups
             .get(group_name)
+            .map(|entry| &entry.group)
             .ok_or(SelectorError::GroupNotFound)?;
         if group.policy == GroupPolicy::Selector {
             return Err(SelectorError::IsSelector);
@@ -324,6 +371,7 @@ impl GroupManager {
             for network in &changed_networks {
                 pins[network.slot()] = member.cloned();
             }
+            let state = state.make_mut();
             if pins.iter().any(Option::is_some) {
                 state.overrides.insert(group.name.clone(), pins);
             } else {
@@ -370,7 +418,7 @@ impl GroupManager {
         group_name: &str,
         network: SelectionNetwork,
     ) -> Option<SelectorMember> {
-        self.selector_member(self.groups.get(group_name)?, network)
+        self.selector_member(&self.groups.get(group_name)?.group, network)
             .map(GroupMember::identity)
     }
 
@@ -381,7 +429,7 @@ impl GroupManager {
         group_name: &str,
         network: SelectionNetwork,
     ) -> Option<String> {
-        let group = self.groups.get(group_name)?;
+        let group = &self.groups.get(group_name)?.group;
         let state = self.selector_choice.read();
         let choices = if group.policy == GroupPolicy::Selector {
             &state.choices
@@ -413,7 +461,7 @@ impl GroupManager {
     pub fn has_interrupt_connections(&self) -> bool {
         self.groups
             .values()
-            .any(|group| group.interrupt_connections)
+            .any(|entry| entry.group.interrupt_connections)
     }
 
     /// Wake URLTest health checks when a group serves traffic.
@@ -429,7 +477,7 @@ impl GroupManager {
         let interrupt = self
             .groups
             .get(group_name)
-            .map(|g| g.interrupt_connections)
+            .map(|entry| entry.group.interrupt_connections)
             .unwrap_or(false);
         if !interrupt {
             return;

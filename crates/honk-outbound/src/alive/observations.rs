@@ -440,9 +440,9 @@ impl AliveDialerSet {
             false,
         );
         drop(authority);
-        if revived {
-            self.notify_health_change(ticket.node, domain, family, true, || current().is_some());
-        }
+        self.notify_probe_change(revived, ticket.node, domain, family, true, || {
+            current().is_some()
+        });
     }
 
     fn lock_probe_registration(

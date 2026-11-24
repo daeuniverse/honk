@@ -23,6 +23,7 @@ pub(super) fn fixed_session() -> Session {
         resp_key: hex(RESP_KEY).try_into().unwrap(),
         resp_iv: hex(RESP_IV).try_into().unwrap(),
         resp_header: 0x5a,
+        ambiguous_header_io: false,
     }
 }
 

@@ -1,14 +1,26 @@
 use super::handoff::HandoffResult;
 use crate::control::*;
-/// Clash-style `chains` lists the hops exit first, then the selected node and its groups.
+
+/// Clash lists captured hops exit first. A collapsed exit and the selected `direct` remain distinct.
 pub(super) fn connection_chains(
     mut selection_chain: Vec<String>,
     node: &honk_config::node::Node,
+    route_hops: Option<&[String]>,
+    collapsed_from_direct: bool,
 ) -> Vec<String> {
-    if selection_chain.last() != Some(&node.name) {
+    if collapsed_from_direct || selection_chain.last() != Some(&node.name) {
         selection_chain.push(node.name.clone());
     }
-    selection_chain.extend(node.chain_hops().into_iter().flatten().cloned());
+    match route_hops {
+        Some(hops) => {
+            let hops = match hops.split_first() {
+                Some((first, rest)) if *first == node.name => rest,
+                _ => hops,
+            };
+            selection_chain.extend(hops.iter().cloned());
+        }
+        None => selection_chain.extend(node.chain_hops().into_iter().flatten().cloned()),
+    }
     selection_chain.reverse();
     selection_chain
 }
@@ -388,13 +400,13 @@ mod sniffed_domain_routing_tests;
 #[cfg(test)]
 mod chains_tests {
     use super::connection_chains;
-    use honk_config::node::Node;
+    use honk_config::node::{Node, OutboundConfig};
 
     #[test]
     fn chain_hops_follow_the_selected_node_with_the_exit_first() {
         let node = Node::chain("via", vec!["front".into(), "land".into()]);
         assert_eq!(
-            connection_chains(vec!["proxy".into(), "via".into()], &node),
+            connection_chains(vec!["proxy".into(), "via".into()], &node, None, false),
             ["land", "front", "via", "proxy"]
         );
         let leaf = Node {
@@ -402,8 +414,40 @@ mod chains_tests {
             ..Node::default()
         };
         assert_eq!(
-            connection_chains(vec!["proxy".into()], &leaf),
+            connection_chains(vec!["proxy".into()], &leaf, None, false),
             ["hk", "proxy"]
+        );
+        let route_hops = ["hk".to_owned(), "land".to_owned()];
+        assert_eq!(
+            connection_chains(
+                vec!["proxy".into(), "hk".into()],
+                &leaf,
+                Some(&route_hops),
+                false,
+            ),
+            ["land", "hk", "proxy"]
+        );
+        let chain_hops = ["front".to_owned(), "land".to_owned(), "exit".to_owned()];
+        assert_eq!(
+            connection_chains(vec!["proxy".into()], &node, Some(&chain_hops), false),
+            ["exit", "land", "front", "via", "proxy"]
+        );
+    }
+
+    #[test]
+    fn collapsed_direct_keeps_a_same_name_exit_in_the_clash_chain() {
+        let exit = Node {
+            name: "direct".into(),
+            outbound: OutboundConfig::Socks5(Default::default()),
+            ..Node::default()
+        };
+        assert_eq!(
+            connection_chains(vec!["proxy".into(), "direct".into()], &exit, None, true),
+            ["direct", "direct", "proxy"]
+        );
+        assert_eq!(
+            connection_chains(vec!["proxy".into(), "direct".into()], &exit, None, false),
+            ["direct", "proxy"]
         );
     }
 }

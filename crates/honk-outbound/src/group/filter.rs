@@ -45,15 +45,45 @@ impl GroupManager {
     ///
     /// Capable, unprobed UDP leaves inherit TCP liveness; explicit failures in
     /// both UDP domains exclude them even while TCP remains alive.
+    ///
+    /// `routes` is false when selection from the root can produce no route,
+    /// so no exit on any candidate's path needs checking.
     pub(super) fn filter_alive_candidates<'a>(
         &self,
-        candidates: Vec<Candidate<'a>>,
+        mut candidates: Vec<Candidate<'a>>,
         domain: ProbeDomain,
         ipver: IpVersion,
-        check_url: Option<&str>,
+        group: &Group,
+        ancestors: &[&str],
+        routes: bool,
     ) -> Vec<Candidate<'a>> {
+        if routes && self.has_exits() {
+            // Children already checked the complete path with these ancestors.
+            candidates.retain(|candidate| {
+                let eligible = candidate.via.is_some()
+                    || self.leaf_route_available(
+                        candidate.node,
+                        group,
+                        ancestors,
+                        domain,
+                        Some(ipver),
+                    );
+                if !eligible {
+                    observation::candidate(candidate, false, "exit_unavailable");
+                }
+                eligible
+            });
+        } else {
+            debug_assert!(group.exit.is_none(), "group '{}' has an exit", group.name);
+            debug_assert!(
+                candidates.iter().all(|candidate| self
+                    .dials_its_leaf(candidate, SelectionNetwork::from_probe_domain(domain))),
+                "group '{}' has a candidate that does not dial its leaf",
+                group.name
+            );
+        }
         if domain == ProbeDomain::Tcp
-            && let Some(url) = check_url
+            && let Some(url) = group.check_url.as_deref()
             && let Some(alive) = &self.alive_set
         {
             // Per-URL state is keyed by member TAG (sing-box RealTag
@@ -64,7 +94,8 @@ impl GroupManager {
             return candidates
                 .into_iter()
                 .filter(|c| {
-                    let eligible = alive.is_alive_for_url(c.tag(), url);
+                    let eligible = c.node.protocol() == honk_config::types::NodeProtocol::Block
+                        || alive.is_alive_for_url(c.tag(), url);
                     observation::candidate(
                         c,
                         eligible,
@@ -81,7 +112,8 @@ impl GroupManager {
         candidates
             .into_iter()
             .filter(|c| {
-                let eligible = self.is_node_selectable_for_domain(c.node.id, domain, ipver);
+                let eligible = c.node.protocol() == honk_config::types::NodeProtocol::Block
+                    || self.is_node_selectable_for_domain(c.node.id, domain, ipver);
                 observation::candidate(
                     c,
                     eligible,

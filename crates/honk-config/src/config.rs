@@ -1,4 +1,5 @@
 mod diagnostics;
+mod overlong;
 mod seed;
 pub(crate) use seed::CONFIG_FIELDS;
 pub use seed::ConfigSeed;
@@ -1209,8 +1210,26 @@ impl Config {
         self.validate_references_detailed(&source)
     }
 
+    /// Index of the first group from which some leaf's route through group
+    /// exits is longer than `MAX_CHAIN_HOPS`. Each leaf is composed with the
+    /// exits on its path by [`group_graph::compose`], as selection dials it.
+    /// The walk reaches as far as selection does: the same depth limit, each
+    /// group once per path, only the first node a `final` names. It also counts
+    /// a zero-hop leaf in every group, so an exit stack alone counts.
+    ///
+    /// [`group_graph::compose`]: crate::group_graph::compose
+    fn overlong_group_route(&self) -> Option<usize> {
+        if self.groups.iter().all(|group| group.exit.is_none()) {
+            return None;
+        }
+        let graph = crate::group_graph::GroupGraph::new(&self.groups, &self.nodes);
+        let mut walk = overlong::Overlong::new(&graph);
+        (0..graph.len()).find(|root| walk.overlong(*root))
+    }
+
     /// Assemble an owned candidate with all provider nodes present. Membership
     /// is rebuilt only after identities and stored member aliases are final.
+    /// Group exits and route lengths are checked against the rebuilt snapshot.
     pub fn assemble(
         mut self,
         rebuild_membership: impl FnOnce(&mut [Group], &[Node], &[Subscription]),
@@ -1235,6 +1254,8 @@ impl Config {
     }
 
     /// Verify a fully assembled snapshot before admitting it to a runtime.
+    /// This checks the stored chain bindings before validating group exits and
+    /// the other references in the rebuilt membership.
     pub fn validate_assembled(&self) -> Result<(), DetailedConfigError> {
         let source = DiagnosticSources::new(None).root();
         self.validate_globals_detailed(&source)?;
@@ -1310,6 +1331,64 @@ impl Config {
                     group_index + 1,
                 ));
             }
+            if let Some(exit) = group.exit.as_deref() {
+                let reject = |code, message| {
+                    error(
+                        SettingPath::new("groups")
+                            .index(group_index + 1)
+                            .field("exit"),
+                        code,
+                        message,
+                        group_index + 1,
+                    )
+                };
+                if group_names.contains(exit)
+                    || matches!(exit, Self::BUILTIN_DIRECT_NODE | Self::BUILTIN_BLOCK_NODE)
+                {
+                    return Err(reject(
+                        "unsupported-group-exit-target",
+                        "group exit must be a proxy node, not a group or builtin",
+                    ));
+                }
+                let mut matches = self.nodes.iter().filter(|node| node.name == exit);
+                match (matches.next(), matches.next()) {
+                    (None, _) => {
+                        return Err(reject(
+                            "invalid-group-exit-target",
+                            "group exit is not an assembled node",
+                        ));
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(reject(
+                            "ambiguous-group-exit-target",
+                            "group exit name matches several assembled nodes",
+                        ));
+                    }
+                    (Some(node), None) if node.chain_hops().is_some() => {
+                        return Err(reject(
+                            "unsupported-group-exit-target",
+                            "group exit must not be a proxy chain",
+                        ));
+                    }
+                    (Some(node), None) if !node.supports_tunneled_dial() => {
+                        return Err(reject(
+                            "unsupported-group-exit-target",
+                            "group exit must support tunneled dial",
+                        ));
+                    }
+                    (Some(_), None) => {}
+                }
+            }
+        }
+        if let Some(group_index) = self.overlong_group_route() {
+            return Err(error(
+                SettingPath::new("groups")
+                    .index(group_index + 1)
+                    .field("exit"),
+                "group-exit-route-too-long",
+                "group exit makes a member's route longer than four hops",
+                group_index + 1,
+            ));
         }
         for (upstream_index, upstream) in self.dns.upstream.iter().enumerate() {
             if let Some(outbound) = upstream.outbound.as_deref()
@@ -1530,6 +1609,7 @@ fn setting_from_decode_path(path: &serde_path_to_error::Path) -> (SettingPath, O
                         "groups",
                         "default",
                         "final_outbound",
+                        "exit",
                         "check_url",
                         "check_interval",
                         "tolerance",

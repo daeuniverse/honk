@@ -301,6 +301,8 @@ SIGHUP 为每次尝试单独收集诊断。不管加载和配置校验成功与�
 
 `control/reload/transaction.rs` 在候选准备和提交之外持有 `reload_lock`。新 generation 发布时，依次取得 `router` → `config` → `datapath_flags.publication()`，这一项只在原生显式源激活时取，然后是 `ebpf`；随后是 DNS projection-publication guard → `group_manager` → `outbound_id_map` → `active_routing_plan` → `runtime_registry`。在这些 guard 内，provider 的 DNS publication guard 会等到 backend staging 完成后再取，紧挨着 registry 权限替换之前，并一直持有到原来的 DNS pointer 提交点。所以 backend staging 不再占着 provider admission 锁，而 registry 转移、回调安装和 Score 权限发布仍会阻止新的旧 generation DNS admission。原生 no-op 激活取 `config` → flags publication → `ebpf`，不替换 Router。`mode.rs` 的独立 mode/fence 更新按 flags mutex → `ebpf` 取锁；`reset_for_activation` 不会重新取这两个锁，也不 await。NFQUEUE fence/reopen 在 router/config 发布 guard 之外运行。这里只是记录现有的锁边，不代表允许新增锁边；改动仍要遵守 CONTRIBUTING §2/§11 和人工审查。
 
+已发布或待发布的组只要含有 `exit`，Rust 接口 `reload_group_manager()` 就会拒绝单独重建。请把候选配置直接传给 `reload_runtime_config`，或使用 SIGHUP，不要先覆盖运行中的配置。完整事务同时发布组健康状态与 DNS；已接纳的 DNS 查询继续使用原来的一代。
+
 完整重载在持有运行时注册表和 provider 发布锁时取得健康登记写锁。单独重建组则先释放注册表读锁，再在组管理器写锁内取得健康登记写锁。Clash 延迟测量完成时依次核对物理运行时和健康登记，释放两把锁后才通知健康状态变更，并在反馈前重新核对权限。只有原组管理器仍在使用时，URLTest 才能重选成员。
 
 `RoutingPushPlan::compile` 是唯一一条用户态 lowering 路径；调用方不选 slot，也没有独立的 domain-publication 握手。`routing_policy.rs` 的 ABI 是：`RoutingInput` 128 字节、`RoutingDecision` 24 字节、`RoutingPolicyDescriptor` 24 字节。真实 eBPF 要求 Linux 6.12+；生成的进程名匹配代码在固定偏移读取之前检查 `pname_len`，以符合 6.12 的 verifier。已加载路由 slot 的 BTF 必须暴露当前的输出布局。

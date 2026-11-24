@@ -5,6 +5,7 @@ mod health;
 pub mod latencies;
 mod observations;
 mod probe;
+pub(crate) mod route_health;
 mod runner;
 mod urltest;
 
@@ -19,6 +20,8 @@ pub use observations::{
     ProbeTicket, UrlProbeMember,
 };
 use parking_lot::{Mutex, RwLock};
+pub use probe::RouteHttpProber;
+pub use route_health::{RouteHealthRevision, RouteHealthStamp, RouteProbeTicket};
 pub use runner::{HealthCheckError, HealthProbePermit, ProbeCancellation};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -238,6 +241,8 @@ struct PerProtocolState {
     consecutive_successes: u32,
     /// Traffic-based consecutive failures (separate counter, higher thresholds).
     traffic_failures: u32,
+    /// A TCP traffic down edge confirmed by the routed outcome owner; zero otherwise.
+    route_down_at: u64,
     cooldown_until: Instant,
     /// When true, the node is in deep backoff: probes continue on the slow
     /// max_cooldown cadence until resuscitation.
@@ -252,6 +257,7 @@ impl PerProtocolState {
         self.consecutive_failures = 0;
         self.consecutive_successes = 0;
         self.traffic_failures = 0;
+        self.route_down_at = 0;
         self.stopped = false;
         self.cooldown_until = Instant::now();
     }
@@ -270,6 +276,7 @@ impl PerProtocolState {
             consecutive_failures: 0,
             consecutive_successes: 0,
             traffic_failures: 0,
+            route_down_at: 0,
             cooldown_until: Instant::now(),
             stopped: false,
         }
@@ -282,8 +289,30 @@ impl Default for PerProtocolState {
     }
 }
 
-fn fresh_states() -> [PerProtocolState; ALIVE_STATES_PER_NODE] {
-    std::array::from_fn(|_| PerProtocolState::new())
+fn fresh_states() -> NodeStates {
+    NodeStates {
+        protocols: std::array::from_fn(|_| PerProtocolState::new()),
+        route_tcp: Default::default(),
+    }
+}
+
+struct NodeStates {
+    protocols: [PerProtocolState; ALIVE_STATES_PER_NODE],
+    route_tcp: [route_health::Evidence; IpVersion::count()],
+}
+
+impl std::ops::Index<usize> for NodeStates {
+    type Output = PerProtocolState;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.protocols[index]
+    }
+}
+
+impl std::ops::IndexMut<usize> for NodeStates {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.protocols[index]
+    }
 }
 
 type EbpfAliveCallback = dyn Fn(Uuid, u8, u32, u32, bool) + Send + Sync;
@@ -360,10 +389,13 @@ pub type ResolveHook = Arc<
 pub struct AliveDialerSet {
     /// Uses parking_lot RwLock/Mutex for synchronous, uncontended access on the
     /// async runtime (parking_lot blocks OS threads without runtime awareness).
-    states: RwLock<HashMap<Uuid, [PerProtocolState; ALIVE_STATES_PER_NODE]>>,
+    states: RwLock<HashMap<Uuid, NodeStates>>,
     /// Per-node-per-domain latency collections (Go `collection` struct).
     collections: RwLock<HashMap<Uuid, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>>,
     registered: RwLock<Registrations>,
+    route_health: RwLock<route_health::RouteHealth>,
+    route_http_prober: RwLock<Option<Arc<dyn RouteHttpProber>>>,
+    connectivity_callback: RwLock<Option<Arc<health::ConnectivityCallback>>>,
     /// DIRECT also accepts delay evidence without a periodic registration.
     /// Removing its history invalidates those tickets under the registration lock.
     direct_removals: AtomicU64,
@@ -460,6 +492,9 @@ impl AliveDialerSet {
             states: RwLock::new(HashMap::new()),
             collections: RwLock::new(HashMap::new()),
             registered: RwLock::default(),
+            route_health: RwLock::default(),
+            route_http_prober: RwLock::default(),
+            connectivity_callback: RwLock::default(),
             direct_removals: AtomicU64::new(0),
             health_observations: RwLock::new(None),
             ebpf_callback: RwLock::new(None),
@@ -719,6 +754,11 @@ impl AliveDialerSet {
         states.entry(node_id).or_insert_with(fresh_states);
     }
 
+    /// Temporary registration lookup for group-exit selection and traffic reporting.
+    pub fn is_registered(&self, node_id: Uuid) -> bool {
+        self.registered.read().nodes.contains_key(&node_id)
+    }
+
     /// Install the accepted health targets, preserving the exact registration
     /// and grace period of each unchanged node. Returns `(added, removed)`.
     pub fn sync_registrations(
@@ -733,7 +773,35 @@ impl AliveDialerSet {
     pub fn sync_registrations_retaining_delays(
         &self,
         targets: HashMap<Uuid, (&str, Option<&str>)>,
+        retain: impl FnMut(&Uuid) -> bool,
+    ) -> (usize, usize) {
+        self.sync_registrations_inner(targets, retain, |id| {
+            self.states.write().remove(&id);
+        })
+    }
+
+    /// Stage proven routed hop failures while dropping old probe registrations.
+    /// The accepted manager revalidates their ordered paths at route publication.
+    pub fn sync_registrations_retaining_routes(
+        &self,
+        targets: HashMap<Uuid, (&str, Option<&str>)>,
+        retain: impl FnMut(&Uuid) -> bool,
+        mut routed: impl FnMut(&Uuid) -> bool,
+    ) -> (usize, usize) {
+        let mut route_health = self.route_health.write();
+        route_health.retire_owner();
+        let changes = self.sync_registrations_inner(targets, retain, |id| {
+            self.clear_registered_route_health(&mut route_health, id, routed(&id));
+        });
+        self.prune_unrouted_uuids(routed);
+        changes
+    }
+
+    fn sync_registrations_inner(
+        &self,
+        targets: HashMap<Uuid, (&str, Option<&str>)>,
         mut retain: impl FnMut(&Uuid) -> bool,
+        mut remove_state: impl FnMut(Uuid),
     ) -> (usize, usize) {
         let mut registered = self.registered.write();
         registered.manual_delays.retain(|id, _| retain(id));
@@ -749,6 +817,7 @@ impl AliveDialerSet {
                 if targets.contains_key(id) {
                     return true;
                 }
+                remove_state(*id);
                 self.clear_legacy_node_state(*id);
                 false
             });
@@ -800,6 +869,7 @@ impl AliveDialerSet {
         if let Some(observations) = self.health_observations.write().as_mut() {
             observations.remove_node(node_id);
         }
+        self.states.write().remove(&node_id);
         self.clear_legacy_node_state(node_id);
     }
 
@@ -807,7 +877,6 @@ impl AliveDialerSet {
         if node_id == honk_config::config::DIRECT_NODE_ID {
             self.direct_removals.fetch_add(1, Ordering::Relaxed);
         }
-        self.states.write().remove(&node_id);
         self.collections.write().remove(&node_id);
         self.node_registered_at.write().remove(&node_id);
         self.node_urltest_groups.write().remove(&node_id);
@@ -835,7 +904,7 @@ impl AliveDialerSet {
                 let Some(protocol_states) = states.get_mut(node_id) else {
                     continue;
                 };
-                for state in protocol_states {
+                for state in &mut protocol_states.protocols {
                     state.cooldown_until = now;
                     if !state.alive {
                         state.consecutive_successes = RECOVERY_SUCCESSES_NEEDED - 1;

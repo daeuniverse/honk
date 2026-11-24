@@ -336,6 +336,63 @@ async fn mask_retries_fresh_classical_and_only_authenticated_stream_carries_data
 }
 
 #[tokio::test]
+async fn refused_reality_replacement_counts_as_a_pinned_proxy_connect() {
+    use crate::group::ScoreOutcome;
+    use crate::proxy::{DialFailureScope, dial_failure_scope};
+    use std::io;
+
+    timeout(Duration::from_secs(10), async {
+        for supplied in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let decoy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let configured = if supplied {
+                decoy.local_addr().unwrap()
+            } else {
+                addr
+            };
+            let key = PKey::generate(Id::X25519).unwrap();
+            let node = node(configured, &key, false);
+            let (registry, _) =
+                OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, false, None)
+                    .unwrap();
+            let scope = registry.dial_scope(|| {});
+            let client = scope.scope(async {
+                let tcp = if supplied {
+                    Some(TcpStream::connect(addr).await.unwrap())
+                } else {
+                    None
+                };
+                exchange(&node, tcp).await
+            });
+            let server = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    registry.acquire_dial_permit().now_or_never().is_some(),
+                    supplied
+                );
+                // The accepted socket can deliver the mask after its listener closes.
+                drop(listener);
+                serve_stream(stream, Reply::Mask, &key).await;
+            };
+            let (result, ()) = tokio::join!(client, server);
+            assert!(decoy.accept().now_or_never().is_none());
+            let error = result.unwrap_err();
+            assert_eq!(dial_failure_scope(error.as_ref()), DialFailureScope::Hop(0));
+            assert_eq!(
+                ScoreOutcome::from_error(&error),
+                ScoreOutcome::Io(io::ErrorKind::ConnectionRefused)
+            );
+            let original = error.root_cause().downcast_ref::<io::Error>().unwrap();
+            assert_eq!(original.raw_os_error(), Some(libc::ECONNREFUSED));
+            assert!(registry.acquire_dial_permit().now_or_never().is_some());
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn chain_reality_mask_retries_through_socks5_at_dial_limit_one() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -343,7 +400,12 @@ async fn chain_reality_mask_retries_through_socks5_at_dial_limit_one() {
     const TROJAN_REQUEST: &[u8] = b"751843b5d9048eb239d6df153dd1b985b1209d8321522dc0a09b2a90\r\n\
         \x01\x01\x5d\xb8\xd8\x22\x00\x50\r\n";
     timeout(Duration::from_secs(10), async {
-        for second in [Reply::Authenticated, Reply::Mask] {
+        for (routed, second) in [
+            (false, Reply::Authenticated),
+            (false, Reply::Mask),
+            (true, Reply::Authenticated),
+            (true, Reply::Mask),
+        ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let key = PKey::generate(Id::X25519).unwrap();
@@ -355,6 +417,11 @@ async fn chain_reality_mask_retries_through_socks5_at_dial_limit_one() {
             let front = socks5("front", "127.0.0.1", relay.addr.port());
             let via = chain(&[&front, &exit]);
             let via_id = via.id;
+            let honk_config::group_graph::Composed::Routed(route) =
+                honk_config::group_graph::compose(front.id, &[front.id], [exit.id])
+            else {
+                panic!("two distinct physical hops")
+            };
             let (generation, _) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
                 &[via, front, exit],
                 1,
@@ -384,9 +451,13 @@ async fn chain_reality_mask_retries_through_socks5_at_dial_limit_one() {
             let registry = ProxyRegistry::default_resolver().unwrap();
             let client = scope.scope(async {
                 let mut stream = registry
-                    .dial_runtime(
+                    .dial_ref(
                         Arc::clone(&generation),
-                        via_id,
+                        if routed {
+                            crate::proxy::DialRef::Route(&route)
+                        } else {
+                            crate::proxy::DialRef::Node(via_id)
+                        },
                         TCP_TARGET.parse().unwrap(),
                         None,
                         CONNECT_TIMEOUT,
@@ -431,6 +502,11 @@ async fn chain_reality_mask_retries_through_socks5_at_dial_limit_one() {
             let (result, captured) = tokio::join!(client, server);
             if matches!(second, Reply::Authenticated) {
                 assert_eq!(result.unwrap(), SERVER_DATA);
+            } else if routed {
+                let error = result.unwrap_err();
+                let stage = crate::proxy::failed_hop(&error).unwrap();
+                assert_eq!(stage.hop, 1);
+                assert!(stage.error.is::<super::RealityMaskCertificate>());
             } else {
                 assert!(result.unwrap_err().is::<super::RealityMaskCertificate>());
             }

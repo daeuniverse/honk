@@ -37,6 +37,7 @@ group {
 | `filter: group(...)` | `[]` | Add nested group tags to `groups`; comma-separated arguments and pipe-separated tags are accepted. |
 | `default` | `null` | Initial or fallback member tag for `selector`. |
 | `final` | `null` | Target used when the policy has no eligible selection; see [`final`](#final). |
+| `exit` | `null` | Experimental. Append one proxy to the selected TCP path. It must be a [supported tunneled hop](./nodes.md#proxy-chains), not a group, chain or builtin. VLESS TCP mux and hostname-based ECH discovery are not supported on that hop. An exit provides no UDP forwarding candidate; an explicit `block` remains terminal. See [Exit](#exit). |
 | `check_url` | `null` | Per-group TCP health-check target for non-Selector policies; see [`check_url`](#check_url). |
 | `tolerance` | `50` | URLTest switch threshold in milliseconds; see [`tolerance`](#tolerance). |
 | `idle_timeout` | `null` | Seconds without a selection after which a URLTest group pauses member probes; see [`idle_timeout`](#idle_timeout). |
@@ -313,6 +314,40 @@ For nested groups, prefer `group('hk', 'jp')`; `group(hk|jp)` also works. Quotes
 Nested tags must name declared groups. An unknown tag rejects the configuration at startup or reload with `invalid-nested-group-reference`. When the group manager builds the graph, it removes each cycle-closing edge and logs a warning. Nested selection is capped at depth 8. Each nested group contributes the single leaf selected by its own policy, so every dial ends at one node.
 
 Clash-facing group output preserves member tags: the `all` field lists direct node names and nested group tags rather than expanding nested groups. Leaf-facing health and connectivity traversal expands the real nodes below those tags.
+
+## Exit
+
+A group with `exit: E` dials its selected leaf as a route: the leaf, then the exit of each group it was selected through, from the innermost group out.
+
+- A regular route needs an eligible leaf, reachable exits and a usable path between them. A parent checks the whole path, even when a child returns its `final`. Selector never switches to an unchosen sibling. If no regular path remains, the configured `final` applies; `block` is terminal and never dials an exit. A root with one TCP leaf and no `final` retains its existing last-resort attempt on that selected path.
+- [Exit liveness](#exit-liveness) distinguishes a failed proxy from a failed path to it. Only the outermost exit receives a confirmed fresh dial's setup latency; that latency covers all hops, not the application's response time.
+- DNS upstreams and shared downloads (subscriptions, geodata, the external UI) whose outbound is the group take the route too: UDP, TCP, DoT and DoH upstreams run over the route's TCP stream. DoQ and DoH3 upstreams need UDP, which a group with an `exit` does not offer.
+- Probes, delay tests and the latency shown for the group measure the leaf alone. Flows and DNS flows report the leaf captured when the route was selected; the Clash connection chain also lists the route's hops.
+- When `final: direct` collapses to a single exit, the Native TCP and DNS attempt's `selection_path` ends at the built-in `direct` member, and `leaf_node_id` and `leaf_node_name` identify the exit dialed. Health and Score retry exclusion use the exit. The Clash connection chain lists the exit, then `direct`, then the groups.
+- An appended exit equal to the preceding hop is not dialed twice. A later, nonadjacent occurrence is a separate hop; the leaf's own chain is unchanged.
+- Validation rejects a route longer than four hops. It uses selection's limits (eight nested groups at most, each group once on a path, only the first node a `final` names) but is stricter than selection: it walks the groups before cycles are cut, starts from every declared group, shadowed namesakes included, and counts a group's exit stack even when the group has no leaf. So it can reject a route selection never dials.
+
+### How many routes
+
+A route is composed only when a candidate is selected, and each runtime generation caches at most 4096 of them; a dial past that limit builds its route without caching it. The number of routes a configuration can produce is not linear in its size: nested exit groups multiply. Three levels of n groups, each group connected to every group of the next level and the lowest level sharing one leaf, give n³ distinct routes.
+
+The runtime cache is not a health-state limit. Honk keeps an ordering record for each physical path prefix and address family that actually returned a response, so late failures cannot erase newer proof. Positive-only records expire when a new configuration or group manager is published; confirmed failures on still-admitted paths are retained.
+
+### Exit liveness
+
+An exit does not need to accept a direct connection from honk. If front `A` repeatedly refuses to reach exit `E`, ten qualifying TCP failures on the same health address family close routes starting with `A → E`. This does not close `B → E` or a direct dial to `E`. A fault identified at a physical proxy counts against that proxy; inside a configured chain it counts against the logical chain. A final destination's refusal, an ambiguous downstream disconnect, local admission failure or cancellation does not mark a proxy down.
+
+Recovery checks use an existing HTTP health target through the authorized route. A valid response on the same health address family can reopen a failed prefix if the route traversed that prefix in order; a different front reaching the same exit does not qualify. Writes, a stream without a response, and checks from a retired configuration are not proof. Without an authorized check, the prefix stays closed until eligible traffic supplies that evidence. Independent checks on ordinary registered members are unchanged.
+
+### Exit validation
+
+A configuration, reload, or subscription refresh that fails one of these checks is rejected and the running configuration stays:
+
+| Check | Diagnostic code |
+| --- | --- |
+| `exit` names exactly one assembled node | `invalid-group-exit-target` when none matches, `ambiguous-group-exit-target` when several do |
+| The exit is not a group, `direct`, `block` or a chain, and supports tunneled dial | `unsupported-group-exit-target` |
+| No member's route is longer than four hops | `group-exit-route-too-long` |
 
 ## Related docs
 

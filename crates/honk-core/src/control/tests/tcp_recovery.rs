@@ -7,6 +7,97 @@ async fn tcp_authoritative_dial_failure_retries_with_replacement() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn tcp_urltest_retries_the_same_leaf_through_the_remaining_exit() -> anyhow::Result<()> {
+    use honk_config::group::GroupPolicy;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let destination = TcpListener::bind("127.0.0.1:0").await?;
+    let target = destination.local_addr()?;
+    let refusing = TcpListener::bind("127.0.0.1:0").await?;
+    let bad_addr = refusing.local_addr()?;
+    let front = crate::test_support::socks5_relay().await;
+    let good = crate::test_support::socks5_relay().await;
+    let node = |name, addr: SocketAddr| {
+        support::canonical_socks5(name, &addr.to_string(), addr.port(), None)
+    };
+    let leaf = node("leaf", front.addr);
+    let bad = node("bad", bad_addr);
+    let exit_group = |name: &str, exit: &str| Group {
+        name: name.into(),
+        nodes: vec![leaf.id],
+        exit: Some(exit.into()),
+        ..Default::default()
+    };
+    let groups = vec![
+        Group {
+            name: "proxy".into(),
+            policy: GroupPolicy::URLTest,
+            groups: vec!["first".into(), "second".into()],
+            ..Default::default()
+        },
+        exit_group("first", "bad"),
+        exit_group("second", "good"),
+    ];
+    let mut config = udp_test_config(
+        "proxy",
+        vec![leaf.clone(), bad.clone(), node("good", good.addr)],
+        groups,
+    );
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "ip".into();
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+    let handle = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::new(ProxyRegistry::default_resolver()?),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+        udp_test_forwarder(),
+    )?
+    .spawn_handle();
+    let retirement = support::TestRetirement::start(&handle);
+    handle
+        .alive_set
+        .register_node(bad.id, bad.name, Some(bad.address));
+    handle.alive_set.record_probe_latency(
+        leaf.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(1),
+    );
+
+    let mut client = TcpStream::connect(target).await?;
+    let (accepted, peer) = destination.accept().await?;
+    store_active_tcp_flow(&handle, target, peer).await?;
+    let serving = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.serve_connection(accepted, peer).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (failed, _) = refusing.accept().await?;
+        // Publish liveness while the primary is in flight so only the other route can retry.
+        handle
+            .alive_set
+            .report_unavailable_forced(bad.id, ProbeDomain::Tcp, IpVersion::V4);
+        drop(failed);
+        let (mut upstream, _) = destination.accept().await?;
+        client.write_u8(b'q').await?;
+        assert_eq!(upstream.read_u8().await?, b'q');
+        upstream.write_u8(b'r').await?;
+        assert_eq!(client.read_u8().await?, b'r');
+        assert_eq!(*front.requests.lock(), [bad_addr, good.addr]);
+        assert_eq!(*good.requests.lock(), [target]);
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("URLTest singleton alternative must relay through the other exit")??;
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), serving).await???;
+    retirement.join(&handle).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn tcp_score_recovers_while_failed_leaf_remains_ordinary_winner() -> anyhow::Result<()> {
     loopback_recovery(honk_config::group::GroupPolicy::Score, false).await
 }
