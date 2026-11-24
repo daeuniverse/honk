@@ -428,7 +428,7 @@ group {{ proxy {{
 dns {{
  bind: 'tcp+udp://0.0.0.0:53'
  optimistic_cache: false
- upstream {{ default: 'udp://{SERVER}:25353' }}
+ upstream {{ default: 'udp://{SERVER}:25353'{' -> direct' if self.mixed else ''} }}
 }}
 experimental {{
  clash_api {{ external_controller: '127.0.0.1:19090' }}
@@ -1545,9 +1545,14 @@ def dns_scopes(fixture):
                                                   'withheld.host-ci.test', delayed)
         old_policy = binding_udp(fixture, fixture.secondary, VLAN[0], (VLAN_PEER[0], 18110), 'native')
         mtu = fixture.secondary['mtu']
+        before_down = epoch(fixture)
+        before_fact = fact(fixture, '198.51.100.41')
+        assert before_down >= active and before_fact is not None
         wg.ip('dut', 'link', 'set', HOSTS[1], 'down')
         offline(fixture.secondary)
-        assert epoch(fixture) == active and fact(fixture, TARGET[0]), 'single binding loss withdrew shared active facts'
+        assert epoch(fixture) == before_down and fact(fixture, '198.51.100.41') == before_fact, (
+            'single binding loss withdrew shared active facts'
+        )
         wg.late_reply(upstream, remote, local(upstream), payload=response)
         pending.settimeout(0.8)
         try:
