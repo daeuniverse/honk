@@ -202,15 +202,49 @@ struct AuxiliaryRegistration {
     _charge: honk_netstack::MemoryReservation,
 }
 
+#[cfg(target_os = "linux")]
+struct HostPort {
+    source: crate::control::netstack::PacketScope,
+    stamp: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl HostPort {
+    fn active(&self) -> bool {
+        self.stamp & 1 == 0 && self.source.binding() == self.stamp
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct HostScopes {
+    shared: ScopeId,
+    standalone: ScopeId,
+    ports: Box<[HostPort]>,
+    _charge: honk_netstack::MemoryReservation,
+}
+
+#[cfg(target_os = "linux")]
+impl HostScopes {
+    fn port(&self, scope: ScopeId) -> Option<&HostPort> {
+        self.ports.iter().find(|port| port.source.scope() == scope)
+    }
+}
+
 #[derive(Default)]
 struct PacketScopes {
     entries: Box<[PacketFactScope]>,
     auxiliary_registration: Option<AuxiliaryRegistration>,
     #[cfg(target_os = "linux")]
+    host: Option<HostScopes>,
+    #[cfg(target_os = "linux")]
     bank: Option<Arc<super::GatewayDnsBank>>,
 }
 
 impl PacketScopes {
+    fn entry(&self, scope: ScopeId) -> Option<&PacketFactScope> {
+        self.entries.iter().find(|entry| entry.scope == scope)
+    }
+
     fn withdraw(&mut self, scope: u64) {
         #[cfg(target_os = "linux")]
         if let Some(bank) = &self.bank {
@@ -322,6 +356,60 @@ impl DesiredState {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn register_host_scopes(
+        &mut self,
+        shared: ScopeId,
+        standalone: ScopeId,
+        ports: &[crate::control::netstack::PacketScope],
+        budget: &Arc<honk_netstack::MemoryBudget>,
+    ) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+
+        if !self.packet_scopes.entries.is_empty()
+            || self.packet_scopes.host.is_some()
+            || shared == ScopeId::HOST
+            || standalone == ScopeId::HOST
+            || shared == standalone
+            || ports.is_empty()
+            || ports.iter().enumerate().any(|(i, port)| {
+                let scope = port.scope();
+                scope == shared
+                    || scope == standalone
+                    || port.binding() & 1 == 0
+                    || !Arc::ptr_eq(&port.budget(), budget)
+                    || ports[..i].iter().any(|earlier| earlier.scope() == scope)
+            })
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid Host DNS scope registration",
+            ));
+        }
+        let bytes = std::alloc::Layout::array::<HostPort>(ports.len())
+            .map_err(Error::other)?
+            .size();
+        let charge = budget.reserve(bytes).ok_or_else(|| {
+            Error::new(
+                ErrorKind::OutOfMemory,
+                "Host DNS scope registration memory capacity",
+            )
+        })?;
+        self.packet_scopes.host = Some(HostScopes {
+            shared,
+            standalone,
+            ports: ports
+                .iter()
+                .map(|source| HostPort {
+                    source: source.clone(),
+                    stamp: 1,
+                })
+                .collect(),
+            _charge: charge,
+        });
+        Ok(())
+    }
+
     pub(super) fn register_packet_scopes(
         &mut self,
         scopes: impl ExactSizeIterator<Item = ScopeId>,
@@ -330,11 +418,15 @@ impl DesiredState {
         if !self.packet_scopes.entries.is_empty() {
             anyhow::bail!("packet DNS scopes are already registered");
         }
-        let bytes = std::alloc::Layout::array::<PacketFactScope>(scopes.len())?.size();
+        let count = scopes.len();
+        #[cfg(target_os = "linux")]
+        let count = count + 2 * usize::from(self.packet_scopes.host.is_some());
+        let bytes = std::alloc::Layout::array::<PacketFactScope>(count)?.size();
         let charge = budget
             .reserve(bytes)
             .ok_or_else(|| anyhow::anyhow!("packet DNS scope registration memory capacity"))?;
-        let mut table: Box<[_]> = scopes.map(PacketFactScope::new).collect();
+        let mut table = Vec::with_capacity(count);
+        table.extend(scopes.map(PacketFactScope::new));
         if let Some(aux) = &self.packet_scopes.auxiliary_registration {
             anyhow::ensure!(
                 Arc::ptr_eq(&aux.root, budget),
@@ -349,36 +441,200 @@ impl DesiredState {
                     })?;
                 entry.binding = 1;
             }
-            self.packet_scopes.auxiliary_registration.take();
         }
-        self.packet_scopes.entries = table;
+        #[cfg(target_os = "linux")]
+        if let Some(host) = &self.packet_scopes.host {
+            anyhow::ensure!(
+                Arc::ptr_eq(&host.ports[0].source.budget(), budget)
+                    && table.iter().all(|entry| {
+                        entry.scope != host.shared && entry.scope != host.standalone
+                    })
+                    && host.ports.iter().all(|port| {
+                        table
+                            .iter()
+                            .any(|entry| entry.scope == port.source.scope() && entry.binding == 0)
+                    }),
+                "Host DNS scopes must be distinct and share the registered packet budget"
+            );
+            let mut shared = PacketFactScope::new(host.shared);
+            shared.binding = 1;
+            table.push(shared);
+            table.push(PacketFactScope::new(host.standalone));
+        }
+        self.packet_scopes.auxiliary_registration.take();
+        self.packet_scopes.entries = table.into_boxed_slice();
         self._packet_scope_charge = Some(charge);
         Ok(())
     }
 
     pub(super) fn owns_packet_scope(&self, scope: ScopeId) -> bool {
-        scope != ScopeId::HOST
-            && self
-                .packet_scopes
-                .entries
-                .iter()
-                .any(|entry| entry.scope == scope)
+        self.packet_scopes.entry(scope).is_some()
     }
 
     pub(super) fn packet_query_scope(&self, scope: ScopeId) -> Option<super::QueryScope> {
-        let entry = self
+        #[cfg(target_os = "linux")]
+        if let Some(host) = &self.packet_scopes.host {
+            if let Some(port) = host.port(scope) {
+                return port
+                    .active()
+                    .then(|| super::QueryScope::packet(host.shared, scope, port.stamp));
+            }
+            if scope == host.shared {
+                return None;
+            }
+        }
+        match self.packet_scopes.entry(scope)?.binding {
+            0 => Some(super::QueryScope::permanent(scope)),
+            stamp if stamp & 1 == 0 => Some(super::QueryScope::packet(scope, scope, stamp)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn query_scope_is_current(&self, query: super::QueryScope) -> bool {
+        match query.origin {
+            super::QueryOrigin::Permanent => true,
+            super::QueryOrigin::Packet { execution, .. } => {
+                self.packet_query_scope(execution) == Some(query)
+            }
+            #[cfg(target_os = "linux")]
+            super::QueryOrigin::HostListener { stamp } => {
+                self.host_fact_binding(query.fact_scope) == Some(stamp)
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn host_listener_query_scope(
+        &self,
+        standalone: ScopeId,
+    ) -> Option<super::QueryScope> {
+        let host = self
             .packet_scopes
-            .entries
+            .host
+            .as_ref()
+            .filter(|host| host.standalone == standalone)?;
+        Some(self.host_listener_scope(host.shared))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn host_listener_scope(&self, scope: ScopeId) -> super::QueryScope {
+        super::QueryScope {
+            fact_scope: scope,
+            origin: super::QueryOrigin::HostListener {
+                stamp: self.host_fact_binding(scope).unwrap_or(0),
+            },
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn host_fact_binding(&self, scope: ScopeId) -> Option<u64> {
+        let host = self
+            .packet_scopes
+            .host
+            .as_ref()
+            .filter(|host| host.shared == scope)?;
+        let stamp = self.packet_scopes.entry(scope)?.binding;
+        (stamp & 1 == 0 && host.ports.iter().any(HostPort::active)).then_some(stamp)
+    }
+
+    pub(super) fn packet_fact_destination(&self, scope: ScopeId) -> Option<ScopeId> {
+        #[cfg(target_os = "linux")]
+        if let Some(host) = &self.packet_scopes.host {
+            if let Some(port) = host.port(scope) {
+                return port.active().then_some(host.shared);
+            }
+            if scope == host.shared {
+                return self.host_fact_binding(scope).map(|_| scope);
+            }
+        }
+        Some(scope)
+    }
+
+    #[cfg(all(target_os = "linux", any(feature = "ebpf", test)))]
+    pub(super) fn set_host_binding(
+        &mut self,
+        scope: ScopeId,
+        stamp: u64,
+        active: bool,
+    ) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+
+        let invalid = || {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "invalid Host DNS execution binding",
+            )
+        };
+        let host = self.packet_scopes.host.as_ref().ok_or_else(invalid)?;
+        let index = host
+            .ports
             .iter()
-            .find(|entry| entry.scope == scope)?;
-        (entry.binding & 1 == 0).then_some(super::QueryScope {
-            scope,
-            binding: entry.binding,
-        })
+            .position(|port| port.source.scope() == scope)
+            .ok_or_else(invalid)?;
+        let port = &host.ports[index];
+        if stamp == 0 || stamp & 1 != 0 {
+            return Err(invalid());
+        }
+        if active {
+            if port.source.binding() != stamp || stamp < port.stamp {
+                return Err(invalid());
+            }
+            if stamp == port.stamp {
+                return Ok(());
+            }
+            if port.stamp & 1 == 0 {
+                return Err(invalid());
+            }
+        } else if stamp != port.stamp {
+            return if stamp < port.stamp {
+                Ok(())
+            } else {
+                Err(invalid())
+            };
+        }
+
+        let shared = host.shared;
+        let another = host
+            .ports
+            .iter()
+            .enumerate()
+            .any(|(i, port)| i != index && port.active());
+        if !another {
+            // The driver's source can close before its publisher reports withdrawal.
+            self.set_fact_binding(shared, false)?;
+            if active {
+                self.set_fact_binding(shared, true)?;
+            }
+        } else if !active && let Some(bank) = &self.packet_scopes.bank {
+            bank.discard_fill(super::QueryScope::packet(shared, scope, stamp));
+        }
+        self.packet_scopes
+            .host
+            .as_mut()
+            .expect("registered Host scopes")
+            .ports[index]
+            .stamp = stamp | u64::from(!active);
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
     pub(super) fn set_aux_binding(&mut self, scope: ScopeId, active: bool) -> std::io::Result<()> {
+        if self
+            .packet_scopes
+            .host
+            .as_ref()
+            .is_some_and(|host| host.shared == scope)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Host DNS binding requires a packet source stamp",
+            ));
+        }
+        self.set_fact_binding(scope, active)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_fact_binding(&mut self, scope: ScopeId, active: bool) -> std::io::Result<()> {
         let entry = self
             .packet_scopes
             .entries
@@ -432,6 +688,9 @@ impl DesiredState {
         now: Instant,
     ) -> anyhow::Result<(Option<DomainRouting>, super::FactStamp)> {
         self.try_expire(now)?;
+        let scope = self
+            .packet_fact_destination(scope)
+            .ok_or_else(|| anyhow::anyhow!("packet DNS fact scope is unavailable"))?;
         let revision = self
             .packet_scopes
             .entries
@@ -478,11 +737,22 @@ impl DesiredState {
     ) -> bool {
         debug_assert!(self.gateway_bank().is_none());
         let Some(bank) = bank else { return false };
-        if !allowed() || !bank.scopes().all(|scope| self.owns_packet_scope(scope)) {
+        if !allowed()
+            || !bank.scopes().all(|scope| {
+                self.owns_packet_scope(scope)
+                    && self
+                        .packet_scopes
+                        .host
+                        .as_ref()
+                        .is_none_or(|host| scope != host.standalone && host.port(scope).is_none())
+            })
+        {
             bank.close();
             return false;
         }
-        if !bank.activate(|scope| self.packet_query_scope(scope).is_some()) {
+        if !bank.activate(|scope| {
+            self.packet_query_scope(scope).is_some() || self.host_fact_binding(scope).is_some()
+        }) {
             return false;
         }
         self.packet_scopes.bank = Some(Arc::clone(bank));
@@ -542,6 +812,7 @@ impl DesiredState {
             return false;
         }
         stamp.revision != u64::MAX
+            && self.packet_fact_destination(stamp.scope) == Some(stamp.scope)
             && self
                 .packet_scopes
                 .entries

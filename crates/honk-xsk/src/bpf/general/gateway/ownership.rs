@@ -351,7 +351,7 @@ fn refund(b: &mut GatewayBuilder) {
 
 // Only writers already holding distinct guards can overshoot the logical ceiling. Even a full
 // u32-sized guard map leaves the raw u64 far from wraparound; the returned old value gates issue.
-fn issue_sequence(b: &mut GatewayBuilder, exhausted: Target) {
+pub(super) fn issue_sequence(b: &mut GatewayBuilder, exhausted: Target) {
     b.constant(3, HOLD_SEQUENCE_MAX);
     b.load(LDX_DW, 0, 8, 8);
     b.jump(JLE_X, 3, 0, 0, exhausted);

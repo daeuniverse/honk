@@ -193,12 +193,7 @@ fn bind_listener(
     config: &Config,
     connection_tracker: &crate::connection_tracker::ConnectionTracker,
 ) -> Option<tokio::net::TcpListener> {
-    let egress_mark = config
-        .datapath
-        .as_ref()
-        .is_some_and(|datapath| datapath.backend == honk_config::datapath::Backend::Tun)
-        .then(|| config.global.effective_so_mark());
-    match honk_outbound::util::bind_tcp_listener(listen, egress_mark)
+    match honk_outbound::util::bind_tcp_listener(listen, config.required_socket_mark())
         .and_then(tokio::net::TcpListener::from_std)
     {
         Ok(listener) => {

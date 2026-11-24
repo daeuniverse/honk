@@ -141,7 +141,7 @@ impl GatewayDnsBank {
         let invalid = || {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid gateway DNS LAN binding",
+                "invalid gateway DNS scope binding",
             )
         };
         let capacity = realms
@@ -288,6 +288,14 @@ impl GatewayDnsBank {
 
     pub(crate) fn take_fill(&self) -> Option<GatewayDnsFill> {
         self.state.lock().pending.take()
+    }
+
+    #[cfg(any(feature = "ebpf", test))]
+    pub(crate) fn discard_fill(&self, query: crate::dns::projection::QueryScope) {
+        let mut state = self.state.lock();
+        if state.pending.is_some_and(|fill| fill.query == query) {
+            state.pending = None;
+        }
     }
 
     pub(crate) fn close(&self) {
@@ -452,10 +460,10 @@ impl GatewayDnsBank {
     pub(crate) fn stats(&self) -> GatewayDnsCounters {
         let state = self.state.lock();
         GatewayDnsCounters {
-            revocations: state
-                .epochs
+            revocations: self
+                .bindings
                 .iter()
-                .map(|slot| slot.revocations)
+                .map(|&(_, realm)| state.epochs[realm as usize].revocations)
                 .fold(0, u64::saturating_add),
             ..state.counters
         }

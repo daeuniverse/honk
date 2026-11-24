@@ -135,12 +135,7 @@ fn bind_listener(config: &honk_config::Config) -> std::io::Result<tokio::net::Tc
         .listen
         .parse::<std::net::SocketAddr>()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let egress_mark = config
-        .datapath
-        .as_ref()
-        .is_some_and(|datapath| datapath.backend == honk_config::datapath::Backend::Tun)
-        .then(|| config.global.effective_so_mark());
-    honk_outbound::util::bind_tcp_listener(listen, egress_mark)
+    honk_outbound::util::bind_tcp_listener(listen, config.required_socket_mark())
         .and_then(tokio::net::TcpListener::from_std)
 }
 

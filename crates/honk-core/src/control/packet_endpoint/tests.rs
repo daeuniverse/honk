@@ -187,6 +187,7 @@ async fn tcp_routing_binds_receive_incarnation_not_accept_queue_order() {
             "tcp",
             0,
             None,
+            None,
             #[cfg(feature = "native-api")]
             false,
         )
@@ -218,6 +219,7 @@ async fn tcp_routing_binds_receive_incarnation_not_accept_queue_order() {
             destination,
             "tcp",
             0,
+            None,
             None,
             #[cfg(feature = "native-api")]
             false,

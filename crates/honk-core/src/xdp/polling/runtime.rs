@@ -50,13 +50,6 @@ impl Runtime {
                     rings: queue.io.get_ref().rings(),
                 })
         });
-        #[cfg(feature = "ebpf")]
-        let queues = queues.chain(self.host.iter().map(|host| super::testing::Queue {
-            device: host.capture.private_device().name.clone(),
-            id: 0,
-            counters: host.queue.io.get_ref().counters(),
-            rings: host.queue.io.get_ref().rings(),
-        }));
         let polling = &self.polling;
         super::testing::Snapshot {
             mode: polling.config.mode,
@@ -113,12 +106,6 @@ impl Runtime {
                 .realms
                 .iter()
                 .filter_map(|realm| realm.driver.protocol_deadline());
-            #[cfg(feature = "ebpf")]
-            let deadlines = deadlines.chain(
-                self.host
-                    .as_ref()
-                    .and_then(|host| host.driver.protocol_deadline()),
-            );
             control.note_driver_timer_wait(
                 deadlines.min(),
                 wait.armed_deadline,
@@ -130,8 +117,12 @@ impl Runtime {
     }
 
     pub(in crate::xdp) fn refresh_polling_context(&mut self) {
-        #[cfg(feature = "ebpf")]
-        if self.host.is_some() {
+        if self.devices.is_empty()
+            || self
+                .gateway_maps
+                .as_ref()
+                .is_some_and(|maps| !maps.host_realms().is_empty())
+        {
             self.polling_affinity = None;
             self.workers.polling_context(0, Err("context_unavailable"));
             self.polling.context(Err("context_unavailable"));
@@ -213,8 +204,6 @@ impl Runtime {
             .devices
             .iter_mut()
             .flat_map(|device| &mut device.queues);
-        #[cfg(feature = "ebpf")]
-        let queues = queues.chain(self.host.iter_mut().map(|host| &mut host.queue));
         for queue in queues {
             let counters = queue.io.get_ref().counters();
             let rings = queue.io.get_ref().rings();
@@ -249,25 +238,14 @@ impl Runtime {
     }
 
     fn queues(&self) -> impl Iterator<Item = &crate::xdp::Queue> {
-        let queues = self.devices.iter().flat_map(|device| &device.queues);
-        #[cfg(feature = "ebpf")]
-        let queues = queues.chain(self.host.iter().map(|host| &host.queue));
-        queues
+        self.devices.iter().flat_map(|device| &device.queues)
     }
 
     #[cfg(test)]
     fn has_pending_outputs(&self) -> bool {
-        let pending = self
-            .realms
+        self.realms
             .iter()
-            .any(|realm| realm.pending.iter().any(Option::is_some));
-        #[cfg(feature = "ebpf")]
-        let pending = pending
-            || self
-                .host
-                .as_ref()
-                .is_some_and(|host| host.pending.iter().any(Option::is_some));
-        pending
+            .any(|realm| realm.pending.iter().any(Option::is_some))
     }
 
     fn has_pollable_obligation(&self) -> bool {
@@ -283,8 +261,12 @@ impl Runtime {
         shutdown: &ShutdownIntent,
         reading: bool,
     ) -> Result<(), &'static str> {
-        #[cfg(feature = "ebpf")]
-        if self.host.is_some() {
+        if self.devices.is_empty()
+            || self
+                .gateway_maps
+                .as_ref()
+                .is_some_and(|maps| !maps.host_realms().is_empty())
+        {
             return Err("context_unavailable");
         }
         let deadline = self.next_deadline(Instant::now(), !reading);

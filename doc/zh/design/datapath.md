@@ -184,9 +184,9 @@ device-bound 程序必须以真实入站验证，不能使用 `BPF_PROG_TEST_RUN
 L2 group 地址不能让单播 IP 获得原生 socket 豁免。原生 ARP/ND 和 IP 特殊地址
 处理保留；定向广播取自最多 64 条精确的本地表 `RTN_BROADCAST` 路由，不猜后缀。
 
-物理捕获默认强制 ZeroCopy；`xsk_mode: copy` 指定 Copy，`xsk_mode: auto` 根据每个成员的能力与所需 segment 数选择模式。Auto 选择 ZeroCopy 后 bind 失败不会重试 Copy。每次 bind 均回读验证；模式变更需重启。Host 私有 queue 始终为 Copy。
+物理捕获默认强制 ZeroCopy；`xsk_mode: copy` 指定 Copy，`xsk_mode: auto` 根据每个成员的能力与所需 segment 数选择模式。Auto 选择 ZeroCopy 后 bind 失败不会重试 Copy。每次 bind 均回读验证；模式变更需重启。Host 不使用 AF_XDP 队列。
 
-只读启动准入最多汇总 256 条问题，额外问题计入 omitted，前置条件失败导致无法检查的项目标为 `NOT_CHECKED`。检查包含捕获布局、队列、设备能力、外来 XDP、拓扑、内存，以及 Endpoint 的 zone-0 CT 和上联条件。通过后才准备 VLAN feature、加载程序、创建 FD 持有的 link 并绑定队列；supervisor 就绪和拓扑验证之后激活。后续队列失败也会撤销已创建 link。物理 Endpoint/Core link 和程序不 pin；外来 XDP 会被拒绝。进程退出或 SIGKILL 关闭 link FD，内核恢复转发，但已有代理会话可能需要重连。Host 保留独立的持久托管。
+只读启动准入最多汇总 256 条问题，额外问题计入 omitted，前置条件失败导致无法检查的项目标为 `NOT_CHECKED`。检查包含捕获布局、队列、设备能力、外来 XDP、拓扑、内存，以及 Endpoint 的 zone-0 CT 和上联条件。通过后才准备 VLAN feature、加载程序、创建 FD 持有的 link 并绑定队列；supervisor 就绪和拓扑验证之后激活。后续队列失败也会撤销已创建 link。物理 Endpoint/Core link 和程序不 pin；外来 XDP 会被拒绝。进程退出或 SIGKILL 关闭 link FD，内核恢复转发，但已有代理会话可能需要重连。Host 出口独立使用 FD 持有的 TCX 绑定。
 
 物理协调器在 RTNL 就绪时排空通知。Core 若可能从 RX 队列 0 直接转发缓存命中的流量，仍在消费这批输入前做完整检查。链路静默时，协调器会在一秒后读回每个自有 link FD 的身份，不依赖 Core 策略读锁。该检查能发现自有链接脱离或所挂程序变化，不查询其他 XDP 模式，也不代表全量拓扑快照。每个存活的 RTNL watcher 都独立计费 64 KiB 接收缓冲，包括最终启动准入时新旧实例短暂重叠的时段。
 
@@ -268,61 +268,17 @@ profile 仍作为独立结果。
 
 ### Host 来源托管
 
-显式 [Host 块](../reference/global.md#xdp-host-endpoint) 添加普通 Host TCP/UDP
-Endpoint 捕获，可单独使用或与物理 Transit 捕获并存。两者使用同一个全局
-`direct: endpoint`；Host 不能与 Core Direct 组合。Host 要求启用 `ebpf` 的构建、
-内核 LSM 列表中活动的 `bpf` 与必需的 `sk_free_security` link、运行内核 BTF 中
-可准入的 socket/skb layout 和可见 `sock_wfree`，以及 x86-64 小端。当前、worker
-及 children time namespace 必须一致，且 MONOTONIC offset 为零。根 cgroup2 的
-create/connect/sendmsg 与 egress selector hook 必须在整个已检查 descendant tree
-中保持精确有效；外部竞争 hook 拒绝启动。identity canary 必须观察真实 socket
-创建与最终退休。
+Host TCX egress 位于原路由选择与 POSTROUTING 之后。转发包和恰好携带 honk bypass mark 的包原样继续。豁免本机服务回包需要**此 skb** 已跟踪的回复标识及同一个 zone 0 conntrack 对象；仅查到反向元组或 ORIGINAL 条目都不能豁免。非适配帧、非 TCP/UDP、DHCP、特殊地址及本机非 53 流量沿用内核路径。
 
-Host Endpoint 在共享 384 MiB capture 预算内固定计费 96 MiB。
+新流按有序网关策略分类。五个 FD 持有的 cgroup hook 将第一次取得的 argv0（不可用时取线程名）存入不随 clone 复制的 socket storage。只有 TCP 使用第二张 socket storage 保存本次连接的决策；断开后在同一 socket 上重连是新决策。UDP 始终按元组分流。Endpoint 的执行、回复和待释放工作都归最初出口及其绑定代。新流的进程信息需与 hold 核对，不是逐包来源凭据，也不恢复原系统调用。`backend: tun` 的 HostFacts 保持独立。 共享 UDP 接收者保留绑定和地址，不继承首个目标的进程事实；物理回复路径与经认证的 TUN 来源不因此被清除。
 
-`HostCapture` 在 capture 关闭时准备自有私有 namespace/veth pair、source TCX 捕获、
-私有 XDP/AF_XDP queue 与 return TCX 路径。私有 queue 始终使用经过回读验证的 Copy，
-独立于物理绑定模式。准入检查真实自有 XSK/namespace、就绪 Endpoint consumer、完整
-source/child custody 及 reader grace，再一次性打开 gate。journal 位于
-`data_dir/state/host-<source-netns-cookie>.json`，先记录变更 intent，再记 ACK/回读；
-pin 位于 `<bpf-pin-root>/host-<cookie>/`。已有 receipt 拒绝重启，不自动接管资源。
+已证明的 Direct 走原生路径。只有 hold 表确实已满时，**当前策略已经明确判为 Direct** 的新 UDP 包可以不记归属而放行；下一包重新判决。同键争用、未知结果或 Endpoint 容量不足均不能变为 Direct。8,192 行进程元数据表不限制 Direct；LAN 的 8,192 个 native-pending 名额另算。 原生 TCP 另有 8,192 个可按元组查询的归属槽，为没有完整 socket 的控制包保留依据。65,536 行 Host UDP/Endpoint 表满不挤占 TCP Direct 或物理、辅助 LAN 的 hold；TCP 专用表也满时拒绝新 SYN，不作无记录的 TCP 放行。
 
-托管覆盖整个 source namespace，而非仅列出的 Host 接口。只接纳 plain Ethernet、
-loopback 及精确自有私有 pair。当前拒绝普通 operator veth，同时拒绝 mastered/
-stacked/lower/tunnel link、route encapsulation、外部 XDP/TCX 或 legacy TC filter/
-action、XFRM state/policy 及 nftables table。即使 dormant nftables table 也拒绝准入。
-缺失、畸形、丢失或超限的 inventory 证据均 fail closed。
+每个出口单独使用一个私有单队列 TUN。连接空闲后新发的包不算迟到包；已重定向的包到达 TUN 驱动时若已滞留**超过 30 秒**，在进入私有 FIFO 前丢弃，内部时间戳不改 IP 负载。空闲回收要等内核读者通过 grace、唯一读者处理完此前可能已入队的记录，并核实协议、应用和输出都不再保留原归属。定时器触发或一次 TUN 写成功不算排空。不会改投其他出口或重放。
 
-唯一允许非空的 netfilter 情况是内核原生提供的 built-in `apparmor_ip_postroute`
-记录：AppArmor 必须活动，family/hook 精确对应 IPv4/IPv6 POSTROUTING、priority
-为 -225，每个适用地址族最多一条。原生 NFNL metadata 从实际注册的 callback 指针
-产生符号；拒绝 device、module、NFT/BPF chain descriptor、重复/缺失/未知/带 flag
-的 attribute 及畸形记录。其他 hook、NAT/transform、QUEUE 与 reinjection 组合仍拒绝。
-这依赖可信 stock kernel 的符号解析；`%ps` 不提供 offset，也不构成代码认证。
+外口 TCX link 由 FD 持有；回复从原活动出口 ingress 注入，以太网使用核验后的本机 MAC。重绑先撤回双向重定向并排空原工作；接口下线或 ifindex 复用不能接收旧回复。终态保护只随自建私有 TUN 存在，不创建 Host XSK、持久外口 pin 或 Host 收据，也不回退到 TC/NFQUEUE。内核防火墙、路由、NAT 与严格反向路径检查仍决定是否交付，不能仅凭它们存在就声称回包成功或失败。
 
-普通 AppArmor POSTROUTING 处理仍早于 source TCX 捕获；拒绝保留其编码错误，
-绝不变为成功 capture。生成回复仍是进入普通 Linux ingress 与安全处理的新包，
-不重建原 socket label/secmark，也不承诺重复相同的 AppArmor 权限决策。
-
-冷启动进入 namespace，准备 snapshot 与绑定该 namespace 的 netlink socket；后续
-custody 查询使用这些保留 socket。两个 namespace inventory 均保留真实 hook 数量与
-完整原生记录；完整 inventory 比较拒绝增加、移除及 identity/priority 漂移。发现
-topology、hook 或 offload 失效后关闭捕获。无 RTNL 活动时，快速检查可以跳过
-netfilter 查询。owner 契约排除并发 privileged topology/hook 变更或代码替换；
-通知交付不是原子变更屏障。
-
-经认证的 source receipt 在导入 Stack 前绑定 namespace、attachment、socket/operation
-incarnation、进程是否存在以及原 output/return identity，不能靠 tuple 猜测 Host 身份。
-普通 Direct 新建带 mark 的 outbound；生成回复经已准入接口进入普通 Linux
-demultiplexing，不选择 recipient FD，也不恢复原 socket operation。
-
-关闭先通过 gate、source/private guard 与 reader grace 围住新 capture，再 join
-Endpoint output/CQ。确认停止时若仍有已选中的 external socket owner，会记录
-`guarded-retained`，保留 custody、hook、pin 及 receipt；这是完成的 guarded stop，
-不代表完整资源移除。无此类 owner 时，确认拆卸会移除自有 pair、pin/hook 及 receipt。
-crash 或歧义/失败清理保留 custody，不宣称清理完成。FD close 或资源移除都不在进程
-退出前归还 retained kernel/UMEM 计费。此 XDP 路径不授予 TUN 能力，也不代表
-physical 或 13-size 验收。
+已关闭的 Host 绑定依次退役。队首删除自己的 gate 和设备映射时，不占捕获注册表或绑定锁。删除失败会保留原设备对及其预算；该出口的旧归属清理完毕前不得重绑。
 
 ### 物理捕获与 smoke
 

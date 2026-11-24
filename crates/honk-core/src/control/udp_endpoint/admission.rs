@@ -343,6 +343,10 @@ pub(super) struct ReadyEndpoint {
     pub(super) memory: Option<Arc<super::budget::EntryMemory>>,
 }
 
+// Retiring is inline in every UDP table entry, not just entries with Host metadata.
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64"))]
+const _: () = assert!(size_of::<EndpointEntry>() <= 208);
+
 pub(super) enum EndpointEntry {
     Initializing(Arc<InitializingEndpoint>),
     Ready(Arc<ReadyEndpoint>),
@@ -1022,6 +1026,21 @@ impl UdpEndpointPool {
                 stats.record_udp_global_payload_full();
                 return EndpointReservation::QueueFull;
             }
+        };
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        let packet_source = {
+            let mut packet_source = packet_source;
+            if let Some(source) = &mut packet_source {
+                let key = vacant.key();
+                if let Err(error) = source.admit_udp_process(
+                    SocketAddr::new(key.client_ip(), key.client_port),
+                    SocketAddr::new(key.dst_ip(), key.dst_port),
+                ) {
+                    tracing::debug!(%error, "gateway Host UDP admission refused");
+                    return EndpointReservation::IdentityMismatch;
+                }
+            }
+            packet_source
         };
         let raw_dns_route = raw_dns_route.map(RawDnsRoute::into_owned);
         let (queue_tx, queue_rx) = mpsc::channel(FLOW_QUEUE_CAPACITY);

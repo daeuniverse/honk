@@ -8,7 +8,7 @@ pub(super) struct Arbitration {
 }
 
 impl Arbitration {
-    fn new(budget: &Arc<MemoryBudget>, last_issued: u64) -> io::Result<Arc<Self>> {
+    pub(super) fn new(budget: &Arc<MemoryBudget>, last_issued: u64) -> io::Result<Arc<Self>> {
         let allocation = budget
             .reserve(size_of::<Self>() + 2 * size_of::<usize>())
             .ok_or_else(|| {
@@ -34,6 +34,12 @@ fn optional_map_failure(error: io::Error) -> (&'static str, io::Error) {
     (reason, error)
 }
 
+fn needs_lan_arbitration(realms: &[(ScopeId, u32)], host_enabled: bool) -> bool {
+    realms.iter().any(|&(_, realm)| {
+        !host_enabled || realm != honk_ebpf_common::xdp_gateway::GATEWAY_REALM_CAPACITY
+    })
+}
+
 impl GatewayPublisher {
     fn build_generation(
         &self,
@@ -43,33 +49,39 @@ impl GatewayPublisher {
         arbitration: Option<Arc<Arbitration>>,
         status: DnsProjectionState,
     ) -> Result<(Generation, Candidates), PrepareError> {
-        let policy = GatewayPolicy::prepare(plan, bank.is_some()).map_err(PrepareError::Policy)?;
-        let mut memory = Vec::with_capacity(inner.members.len() + 1);
-        memory.push(
-            reserve_objects(&self.budget, policy.fact_fds()).map_err(PrepareError::Candidate)?,
+        let host = !self.maps.host_realms().is_empty();
+        let policy = GatewayPolicy::prepare(
+            plan,
+            bank.is_some() && arbitration.is_some(),
+            host.then_some(bank.is_some()),
+        )
+        .map_err(PrepareError::Policy)?;
+        let mut generation = Generation {
+            policy,
+            bank,
+            arbitration,
+            status,
+            memory: Vec::with_capacity(inner.members.len() + 1),
+        };
+        generation.memory.push(
+            reserve_objects(&self.budget, generation.policy.fact_fds())
+                .map_err(PrepareError::Candidate)?,
         );
         let mut candidates = Vec::with_capacity(inner.members.len());
-        let load = || GatewayLoad {
-            routing: &policy.bytecode.insns,
-            maps: &self.maps,
-            conntrack: &self.conntrack,
-            dns: bank.as_ref().map(|bank| bank.maps()),
-            arbitration: arbitration.as_ref().map(|arb| &arb.kernel),
-        };
         for member in &inner.members {
             drop(self.state.open_links().map_err(PrepareError::Authority)?);
             let program = member
                 .programs
-                .reload_general_gateway(load())
+                .reload_general_gateway(self.gateway_load(&generation))
                 .map_err(PrepareError::Candidate)?;
-            memory.push(
+            generation.memory.push(
                 reserve_objects(&self.budget, program.object_fds().into_iter().skip(2))
                     .map_err(PrepareError::Candidate)?,
             );
             candidates.push(program);
         }
-        let mut auxiliary = Vec::new();
         let mut auxiliary_memory = None;
+        let mut auxiliary = Vec::new();
         if let Some(aux) = inner.auxiliary.as_mut() {
             let count = aux.members.iter().filter(|m| m.link.is_some()).count();
             if count != 0 {
@@ -87,13 +99,7 @@ impl GatewayPublisher {
                     continue;
                 }
                 drop(self.state.open_links().map_err(PrepareError::Authority)?);
-                match self.load_auxiliary(
-                    &member.pair,
-                    member.realm,
-                    &member.broadcasts[..member.broadcast_count],
-                    load(),
-                    &aux.conntrack,
-                ) {
+                match self.load_auxiliary(member, &generation, aux.conntrack.as_ref()) {
                     Ok(program) => auxiliary.push((member.realm, program)),
                     Err(error) if Self::device_gone(&member.pair) => {
                         tracing::debug!(realm = member.realm, errno = ?error.raw_os_error(), %error, "auxiliary device left during gateway preparation");
@@ -105,13 +111,7 @@ impl GatewayPublisher {
             }
         }
         Ok((
-            Generation {
-                policy,
-                bank,
-                arbitration,
-                status,
-                memory,
-            },
+            generation,
             Candidates {
                 physical: candidates,
                 auxiliary,
@@ -134,9 +134,16 @@ impl GatewayPublisher {
         }
         let candidate = GatewayDnsBank::new(&self.budget, plan.fingerprint, &self.shadow.realms)
             .and_then(|bank| {
-                let arb = match &inner.current.arbitration {
-                    Some(arb) => Arc::clone(arb),
-                    None => Arbitration::new(&self.budget, inner.last_issued)?,
+                let arb = if needs_lan_arbitration(
+                    &self.shadow.realms,
+                    !self.maps.host_realms().is_empty(),
+                ) {
+                    Some(match &inner.current.arbitration {
+                        Some(arb) => Arc::clone(arb),
+                        None => Arbitration::new(&self.budget, inner.last_issued)?,
+                    })
+                } else {
+                    None
                 };
                 Ok((bank, arb))
             });
@@ -146,7 +153,7 @@ impl GatewayPublisher {
                 inner,
                 plan,
                 Some(bank),
-                Some(arb),
+                arb,
                 DnsProjectionState::Staged,
             ) {
                 Ok((generation, programs)) => {
@@ -242,6 +249,25 @@ impl GatewayPublisher {
                 "gateway publication is awaiting commit or rollback",
             ));
         }
+        let host_enabled = !self.maps.host_realms().is_empty();
+        #[cfg(feature = "ebpf")]
+        let prepared = self.host.is_some();
+        #[cfg(not(feature = "ebpf"))]
+        let prepared = false;
+        if host_enabled != prepared || host_enabled != inner.current.policy.host_bytecode.is_some()
+        {
+            return Err(self.fail_capture(io::Error::other("Host gateway preparation mismatch")));
+        }
+        #[cfg(feature = "ebpf")]
+        if let Some(host) = &self.host
+            && host.identity.pname_support() == crate::ebpf::PnameSupport::Unavailable
+            && plan.features & honk_ebpf_common::ROUTING_FEATURE_PROCESS != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Host gateway process-name rules require cgroup socket identity",
+            ));
+        }
         for member in &inner.members {
             if member.reload.capture.authority.ifindex != member.ifindex
                 || member.reload.queues == 0
@@ -262,7 +288,7 @@ impl GatewayPublisher {
                 .auxiliary
                 .as_ref()
                 .is_none_or(|aux| aux.members.is_empty())
-            && inner.current.arbitration.is_none()
+            && inner.current.bank.is_none()
             && inner.current.policy.bytecode.fingerprint == plan.fingerprint
         {
             for (index, member) in inner.members.iter().enumerate() {
@@ -495,7 +521,8 @@ impl GatewayPublisher {
                 if unavailable {
                     Ok(false)
                 } else {
-                    link.verify(target.program.id()).map(|()| true)
+                    link.verify(target.program.id())?;
+                    member.pair.verify().map(|()| true)
                 }
             });
             match verified {
@@ -637,5 +664,21 @@ impl GatewayPublisher {
             inner.previous.take();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use honk_ebpf_common::xdp_gateway::GATEWAY_REALM_CAPACITY;
+
+    #[test]
+    fn host_only_dns_allocates_no_lan_arbitration() {
+        let first = (ScopeId::allocate().unwrap(), 1);
+        let last = (ScopeId::allocate().unwrap(), GATEWAY_REALM_CAPACITY);
+        assert!(!needs_lan_arbitration(&[], true));
+        assert!(!needs_lan_arbitration(&[last], true));
+        assert!(needs_lan_arbitration(&[first, last], true));
+        assert!(needs_lan_arbitration(&[last], false));
     }
 }

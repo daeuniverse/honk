@@ -69,7 +69,7 @@ routing {
 
 只有该地址的本机 listener 应接收 53 流量时才需要 DNS 规则，并须放在域名规则之前。见[网关准入与限制](./design/datapath.md#full-xdp-启动)。
 
-XDP Endpoint LAN 默认可用本 LAN 学到的 DNS 应答，将符合条件的 TCP SYN 或完整 UDP 数据报交给内核路由。需要重组的 IP 分片不能建立 DNS 原生 UDP 流。除物理捕获口外，还可声明 `wg0: l3_lan` 作为独立的[辅助 LAN](./reference/global.md#辅助-l3-lan)。设置 `datapath.dns_projection: false` 并重启可对两个协议关闭 [DNS 派生路由](./reference/global.md#xdp-endpoint-dns-投影)。
+XDP Endpoint LAN 默认可用本 LAN 学到的 DNS 应答，将符合条件的 TCP SYN 或完整 UDP 数据报交给内核路由。需要重组的 IP 分片不能建立 DNS 原生 UDP 流。除物理捕获口外，还可声明 `wg0: l3_lan` 作为独立的[辅助 LAN](./reference/global.md#辅助-l3-lan)。设置 `datapath.dns_projection: false` 并重启可对两个协议关闭 [DNS 派生路由](./reference/global.md#xdp-endpoint-dns-投影)。 可另配[本机出口](./reference/global.md#xdp-host-endpoint)，共用独立的 Host DNS 域；它不授予 LAN DNS 事实。
 
 ## 运行时数据目录
 

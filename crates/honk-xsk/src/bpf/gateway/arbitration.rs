@@ -18,6 +18,8 @@ pub struct GatewayArbitration {
     pub(in crate::bpf) guards: OwnedFd,
     pub(in crate::bpf) control: OwnedFd,
     grace: AuxReaderGrace,
+    // All userspace operations share the one guard slot reserved in addition to the CPUs.
+    userspace: Mutex<()>,
     slot: NonNull<Control>,
 }
 
@@ -79,8 +81,8 @@ impl GatewayArbitration {
                 "unsupported gateway arbitration atomic architecture",
             ));
         }
-        // Each non-sleepable XDP invocation owns at most one key per CPU. The single
-        // userspace collector may hold one more while any of those CPUs is active.
+        // Each non-sleepable writer owns at most one key per CPU. Userspace serializes
+        // admissions, the idle collector and offline cleanup into one additional slot.
         let cpus = possible_cpu_count(&std::fs::read_to_string(
             "/sys/devices/system/cpu/possible",
         )?)?;
@@ -96,6 +98,7 @@ impl GatewayArbitration {
             guards,
             control,
             grace,
+            userspace: Mutex::new(()),
             slot,
         };
         arbitration
@@ -132,17 +135,21 @@ impl GatewayArbitration {
         self.grace.synchronize()
     }
 
-    pub(super) fn with_guard(
+    pub(super) fn with_guard<T>(
         &self,
         key: &GatewayKey,
-        retire: impl FnOnce() -> io::Result<bool>,
-    ) -> io::Result<bool> {
+        operation: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<Option<T>> {
+        let _user = self
+            .userspace
+            .lock()
+            .map_err(|_| invalid_data("gateway userspace guard poisoned"))?;
         match update(self.guards.as_fd(), key, &1u32, 1) {
             Ok(()) => (),
-            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => return Ok(false),
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => return Ok(None),
             Err(error) => return Err(error),
         }
-        let result = retire();
+        let result = operation();
         if let Err(release) = bpf(
             BPF_MAP_DELETE_ELEM,
             &mut elem(self.guards.as_fd(), key, 0, 0),
@@ -150,11 +157,11 @@ impl GatewayArbitration {
             return Err(io::Error::other(match result {
                 Ok(_) => format!("gateway hold guard release failed: {release}"),
                 Err(error) => format!(
-                    "gateway hold retirement failed: {error}; guard release failed: {release}"
+                    "gateway hold operation failed: {error}; guard release failed: {release}"
                 ),
             }));
         }
-        result
+        result.map(Some)
     }
 
     pub(super) fn refund(&self) -> io::Result<()> {

@@ -18,8 +18,8 @@ fn admit(
         structured["workers"] = json!(workers);
     }
     if host {
-        text.push_str("host { xsk_mode: copy\n interface { host0 } }\n");
-        structured["host"] = json!({"xsk_mode": "copy", "interfaces": ["host0"]});
+        text.push_str("host { interface { host0 } }\n");
+        structured["host"] = json!({"interfaces": ["host0"]});
     }
     text.push_str("interface {\n");
     for (name, role) in interfaces {
@@ -49,9 +49,25 @@ fn auxiliary_interface_admission_matches_across_adapters() {
         ("tc", "endpoint", false, 1),
         ("tun", "endpoint", false, 1),
         ("xdp", "core", false, 1),
-        ("xdp", "endpoint", true, 1),
     ] {
         assert!(admit(backend, direct, &physical_and_aux, host, workers).is_none());
+    }
+    assert!(admit("xdp", "endpoint", &physical_and_aux, true, 1).is_some());
+    assert!(admit("xdp", "endpoint", &physical_and_aux, true, 2).is_some());
+    for role in ["lan", "wan", "l3_lan"] {
+        assert!(
+            admit(
+                "xdp",
+                "endpoint",
+                &[("lan0", "lan"), ("host0", role)],
+                true,
+                1
+            )
+            .is_none()
+        );
+    }
+    for workers in [1, 2] {
+        assert!(admit("xdp", "endpoint", &[("wg0", "l3_lan")], true, workers).is_none());
     }
     for (names, workers) in [
         (&[("wg0", "l3_lan")][..], 1),

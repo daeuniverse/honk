@@ -697,7 +697,7 @@ fn receive_one(receiver: &Receiver, target: u32, expected: &[u8]) -> io::Result<
     message.msg_iov = &mut vector;
     message.msg_iovlen = 1;
     message.msg_control = ancillary.as_mut_ptr().cast();
-    message.msg_controllen = size_of_val(&ancillary);
+    message.msg_controllen = size_of_val(&ancillary) as _;
     // SAFETY: message describes complete live writable extents; DONTWAIT bounds this observation.
     let received = unsafe {
         libc::recvmsg(
@@ -765,8 +765,8 @@ fn receive_one(receiver: &Receiver, target: u32, expected: &[u8]) -> io::Result<
             if (*cmsg).cmsg_level == libc::IPPROTO_IP && (*cmsg).cmsg_type == libc::IP_PKTINFO {
                 ensure(
                     !receiver.local.is_ipv6()
-                        && (*cmsg).cmsg_len
-                            == libc::CMSG_LEN(size_of::<libc::in_pktinfo>() as u32) as usize,
+                        && (*cmsg).cmsg_len as u64
+                            == u64::from(libc::CMSG_LEN(size_of::<libc::in_pktinfo>() as u32)),
                     "IPv4 pktinfo extent",
                 )?;
                 let info =
@@ -783,8 +783,8 @@ fn receive_one(receiver: &Receiver, target: u32, expected: &[u8]) -> io::Result<
             {
                 ensure(
                     receiver.local.is_ipv6()
-                        && (*cmsg).cmsg_len
-                            == libc::CMSG_LEN(size_of::<libc::in6_pktinfo>() as u32) as usize,
+                        && (*cmsg).cmsg_len as u64
+                            == u64::from(libc::CMSG_LEN(size_of::<libc::in6_pktinfo>() as u32)),
                     "IPv6 pktinfo extent",
                 )?;
                 let info =

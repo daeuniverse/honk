@@ -58,7 +58,6 @@ impl Fixture {
 
     async fn start_config_inner(mut config: Config, defer_gateway: bool) -> anyhow::Result<Self> {
         guard();
-        let pins = guarded_pin_root();
         let artifacts = PathBuf::from(std::env::var_os("HONK_XDP_ARTIFACT_ROOT").unwrap());
         let direct = config
             .datapath
@@ -105,16 +104,8 @@ impl Fixture {
         let shutdown = plane.shutdown_intent();
         let router = plane.traffic_router();
         let authority = plane.core_forward_policy(Execution::MixedEndpoints).await?;
-        let (runtime, owner) = start_runtime(
-            plane,
-            &config,
-            &pins,
-            &artifacts,
-            admission,
-            pname,
-            defer_gateway,
-        )
-        .await?;
+        let (runtime, owner) =
+            start_runtime(plane, &config, &artifacts, admission, pname, defer_gateway).await?;
         ensure!(runtime.gateway.is_some() == (direct == DirectProfile::Endpoint));
         ensure!(runtime.core.is_some() == (direct == DirectProfile::Core));
         Ok(Self {
@@ -187,7 +178,7 @@ impl Fixture {
         }
         result?;
         drain_transmit(
-            || self.runtime.complete_transmit(),
+            || self.runtime.complete_physical_tx(None),
             Instant::now(),
             &mut warned,
         )

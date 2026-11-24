@@ -1,5 +1,29 @@
 use super::*;
 
+/// Proves the bypass mark sticks on real TCP and UDP sockets and returns the
+/// cookie of the namespace they were created in.
+#[cfg(target_os = "linux")]
+pub(crate) fn probe_socket_marks(mark: u32) -> anyhow::Result<u64> {
+    use anyhow::Context as _;
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::os::fd::AsRawFd as _;
+
+    let mut cookie = 0;
+    for (label, kind, protocol) in [
+        ("TCP", Type::STREAM, Protocol::TCP),
+        ("UDP", Type::DGRAM, Protocol::UDP),
+    ] {
+        let socket = Socket::new(Domain::IPV4, kind, Some(protocol))
+            .with_context(|| format!("create {label} SO_MARK probe"))?;
+        honk_outbound::util::set_mark_verified(&socket, mark).with_context(|| {
+            format!("capture requires SO_MARK {mark:#x} on {label} sockets (CAP_NET_ADMIN)")
+        })?;
+        cookie = crate::netlink::fib::namespace_cookie(socket.as_raw_fd())
+            .context("read SO_NETNS_COOKIE (Linux 5.14 or newer)")?;
+    }
+    Ok(cookie)
+}
+
 #[cfg(target_os = "linux")]
 const IPV6_ORIGDSTADDR_OPT: libc::c_int = 74;
 #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]

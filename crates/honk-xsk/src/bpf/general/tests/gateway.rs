@@ -69,7 +69,7 @@ impl Fixture {
             &GatewayLoad {
                 routing: &routing,
                 maps: &self.maps,
-                conntrack: &self.ct,
+                conntrack: Some(&self.ct),
                 dns: None,
                 arbitration: None,
             },
@@ -878,7 +878,7 @@ fn load_dns_fixture(
         GatewayLoad {
             routing: &routing,
             maps: &fixture.maps,
-            conntrack: &fixture.ct,
+            conntrack: Some(&fixture.ct),
             dns: Some(dns),
             arbitration,
         },
@@ -1073,7 +1073,7 @@ fn kernel_gateway_reload_preserves_xsk_and_counter_map_identity() {
         GatewayLoad {
             routing: &endpoint,
             maps: &fixture.maps,
-            conntrack: &fixture.ct,
+            conntrack: Some(&fixture.ct),
             dns: None,
             arbitration: None,
         },
@@ -1085,7 +1085,7 @@ fn kernel_gateway_reload_preserves_xsk_and_counter_map_identity() {
         .reload_general_gateway(GatewayLoad {
             routing: &direct,
             maps: &fixture.maps,
-            conntrack: &fixture.ct,
+            conntrack: Some(&fixture.ct),
             dns: None,
             arbitration: None,
         })

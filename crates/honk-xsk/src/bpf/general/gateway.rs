@@ -1,4 +1,6 @@
 mod auxiliary;
+mod host;
+pub(super) use host::build as build_host;
 mod ownership;
 
 use super::*;
@@ -74,6 +76,7 @@ struct GatewayBuilder {
     labels: Vec<Option<usize>>,
     jumps: Vec<(usize, Target)>,
     auxiliary: Option<auxiliary::Ingress>,
+    host_broadcasts: Option<RawFd>,
 }
 
 impl GatewayBuilder {
@@ -83,6 +86,7 @@ impl GatewayBuilder {
             labels: Vec::new(),
             jumps: Vec::new(),
             auxiliary: None,
+            host_broadcasts: None,
         }
     }
 
@@ -595,6 +599,10 @@ fn parse_ip(
             b.goto(advance);
             b.bind(fragment);
             b.prefix(8, remaining, bad);
+            if b.host_broadcasts.is_some() {
+                b.load(LDX_B, 0, 6, 0);
+                b.store(STX_W, 10, FRAGMENT + 44, 0);
+            }
             b.load(LDX_W, 0, 10, ext_bytes);
             b.emit(AND_K, 0, 0, 0, 511);
             b.jump(JGT_K, 0, 0, MAX_EXTENSION_BYTES - 8, bad);
@@ -709,6 +717,9 @@ fn parse_ip(
             b.store(STX_W, 10, FRAGMENT + 40, 0);
             for offset in [12, 16] {
                 b.load(LDX_H, 0, 6, offset);
+                if b.host_broadcasts.is_some() {
+                    b.jump(JEQ_K, 0, 0, u16::from_be(0xa9fe) as i32, targets.pass);
+                }
                 b.jump(
                     JEQ_K,
                     0,
@@ -723,6 +734,20 @@ fn parse_ip(
             }
             if b.auxiliary.is_some() {
                 special_ipv4(b, broadcasts, targets.pass);
+                if let Some(root) = b.host_broadcasts {
+                    // Preserve the checked IHL and reload the saved next protocol
+                    // after the lookup clobbers argument registers.
+                    b.mov(8, 2);
+                    b.word(INDEX, 0);
+                    b.lookup(root, INDEX);
+                    b.jump(JEQ_K, 0, 0, 0, bad);
+                    b.mov(1, 0);
+                    b.address(2, KEY + 36);
+                    b.helper(1);
+                    b.jump(JNE_K, 0, 0, 0, targets.pass);
+                    b.mov(2, 8);
+                    b.load(LDX_W, 5, 10, KEY + 44);
+                }
             }
         }
         b.load(LDX_H, 0, 6, 6);
@@ -770,12 +795,11 @@ fn special_ipv4(b: &mut GatewayBuilder, broadcasts: &[Ipv4Addr], pass: Target) {
 
 fn check_packet_length(b: &mut GatewayBuilder, bad: Target) {
     b.load(LDX_W, 1, 10, FULL_LEN);
+    b.load(LDX_W, 4, 10, L2_LEN);
+    b.emit(SUB_X, 1, 4, 0, 0);
     if b.auxiliary.is_some() {
-        // The private TUN delivers a raw IP record with its exact aggregate extent.
         b.jump(JNE_X, 0, 1, 0, bad);
     } else {
-        b.load(LDX_W, 4, 10, L2_LEN);
-        b.emit(SUB_X, 1, 4, 0, 0);
         b.jump(JGT_X, 0, 1, 0, bad);
     }
 }
@@ -801,30 +825,7 @@ fn conntrack(
     original: Target,
     reply: Target,
 ) {
-    b.zero(TUPLE, 36);
-    b.zero(OPTS, 16);
-    b.word(OPTS, -1);
-    b.load(LDX_B, 0, 10, KEY + 44);
-    b.store(STX_B, 10, OPTS + 8, 0);
-    let ipv6 = b.target();
-    let ready = b.target();
-    b.load(LDX_W, 0, 10, KEY + 4);
-    b.jump(JEQ_K, 0, 0, 6, ipv6);
-    b.copy(10, TUPLE, 10, KEY + 20, 4);
-    b.copy(10, TUPLE + 4, 10, KEY + 36, 4);
-    b.copy(10, TUPLE + 8, 10, KEY + 40, 4);
-    b.imm(3, 12);
-    b.goto(ready);
-    b.bind(ipv6);
-    b.copy(10, TUPLE, 10, KEY + 8, 32);
-    b.copy(10, TUPLE + 32, 10, KEY + 40, 4);
-    b.imm(3, 36);
-    b.bind(ready);
-    b.mov(1, 9);
-    b.address(2, TUPLE);
-    b.address(4, OPTS);
-    b.imm(5, 16);
-    b.emit(CALL, 0, 2, ct.lookup_offset, ct.lookup as i32);
+    lookup_conntrack(b, ct, false);
     let missing = b.target();
     b.jump(JEQ_K, 0, 0, 0, missing);
     b.mov(1, 0);
@@ -837,6 +838,46 @@ fn conntrack(
     b.load(LDX_W, 0, 10, OPTS + 4);
     b.jump(JEQ32_K, 0, 0, -libc::ENOENT, miss);
     b.goto(error);
+}
+
+fn lookup_conntrack(b: &mut GatewayBuilder, ct: &ConntrackKfuncs, reverse: bool) {
+    b.zero(TUPLE, 36);
+    b.zero(OPTS, 16);
+    b.word(OPTS, -1);
+    b.load(LDX_B, 0, 10, KEY + 44);
+    b.store(STX_B, 10, OPTS + 8, 0);
+    let ipv6 = b.target();
+    let ready = b.target();
+    b.load(LDX_W, 0, 10, KEY + 4);
+    b.jump(JEQ_K, 0, 0, 6, ipv6);
+    let (src, dst) = if reverse { (24, 8) } else { (8, 24) };
+    b.copy(10, TUPLE, 10, KEY + src + 12, 4);
+    b.copy(10, TUPLE + 4, 10, KEY + dst + 12, 4);
+    copy_ct_ports(b, TUPLE + 8, reverse);
+    b.imm(3, 12);
+    b.goto(ready);
+    b.bind(ipv6);
+    b.copy(10, TUPLE, 10, KEY + src, 16);
+    b.copy(10, TUPLE + 16, 10, KEY + dst, 16);
+    copy_ct_ports(b, TUPLE + 32, reverse);
+    b.imm(3, 36);
+    b.bind(ready);
+    b.mov(1, 9);
+    b.address(2, TUPLE);
+    b.address(4, OPTS);
+    b.imm(5, 16);
+    b.emit(CALL, 0, 2, ct.lookup_offset, ct.lookup as i32);
+}
+
+fn copy_ct_ports(b: &mut GatewayBuilder, output: i16, reverse: bool) {
+    if reverse {
+        for (from, to) in [(42, 0), (40, 2)] {
+            b.load(LDX_H, 0, 10, KEY + from);
+            b.store(STX_H, 10, output + to, 0);
+        }
+    } else {
+        b.copy(10, output, 10, KEY + 40, 4);
+    }
 }
 
 fn release_dns_scratch(b: &mut GatewayBuilder, double_exchange: bool) {
@@ -929,6 +970,121 @@ fn dns_shadow(
     call
 }
 
+fn routing_call(
+    b: &mut GatewayBuilder,
+    maps: &GatewayMaps,
+    scratch: RawFd,
+    classify_bad: Target,
+    identity: Option<i16>,
+) -> usize {
+    b.stat(maps, GatewayReason::D1Evaluated);
+    b.word(INDEX, 0);
+    b.lookup(scratch, INDEX);
+    b.jump(JEQ_K, 0, 0, 0, classify_bad);
+    b.mov(8, 0);
+    b.imm(0, 0);
+    b.imm(1, 1);
+    b.emit(ATOMIC_ADD_DW, 8, 1, 0, CMPXCHG);
+    b.jump(JNE_K, 0, 0, 0, classify_bad);
+    // Only cold classification initializes the canonical input. The callee owns output initialization.
+    for offset in (0..128).step_by(4) {
+        b.emit(ST_W, 8, 0, SCRATCH_INPUT + offset, 0);
+    }
+    b.copy(8, SCRATCH_INPUT, 10, KEY + 8, 32);
+    if b.auxiliary.is_none() {
+        for half in 0..3 {
+            b.load(LDX_H, 0, 10, MAC + half * 2);
+            b.store(STX_H, 8, SCRATCH_INPUT + 42 + half * 2, 0);
+        }
+    }
+    if let Some(identity) = identity {
+        b.copy(
+            8,
+            SCRATCH_INPUT + 48,
+            10,
+            identity + 8,
+            honk_ebpf_common::ROUTING_PROCESS_MAX_LEN as i16,
+        );
+        b.load(LDX_B, 0, 10, identity + 4);
+        b.store(STX_W, 8, SCRATCH_INPUT + 120, 0);
+    }
+    for (source, destination) in [(KEY + 40, 96), (KEY + 42, 100)] {
+        b.load(LDX_H, 0, 10, source);
+        b.emit(BE16, 0, 0, 0, 16);
+        b.store(STX_W, 8, SCRATCH_INPUT + destination, 0);
+    }
+    for (source, wire_first, first, other, destination) in [
+        (
+            KEY + 44,
+            6,
+            L4ProtoType::Tcp as i32,
+            L4ProtoType::Udp as i32,
+            104,
+        ),
+        (
+            KEY + 4,
+            4,
+            IpVersionType::V4 as i32,
+            IpVersionType::V6 as i32,
+            108,
+        ),
+    ] {
+        b.load(LDX_W, 0, 10, source);
+        b.imm(1, other);
+        let converted = b.target();
+        b.jump(JNE_K, 0, 0, wire_first, converted);
+        b.imm(1, first);
+        b.bind(converted);
+        b.store(STX_W, 8, SCRATCH_INPUT + destination, 1);
+    }
+    b.load(LDX_W, 0, 10, DSCP);
+    b.store(STX_W, 8, SCRATCH_INPUT + 112, 0);
+    b.lookup(maps.mode_flags.as_raw_fd(), INDEX);
+    let flags_present = b.target();
+    b.jump(JNE_K, 0, 0, 0, flags_present);
+    b.emit(ST_DW, 8, 0, 0, 0);
+    b.goto(classify_bad);
+    b.bind(flags_present);
+    b.load(LDX_W, 0, 0, 0);
+    b.emit(AND_K, 0, 0, 0, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as i32);
+    let no_finality = b.target();
+    let mac_flag = if b.auxiliary.is_none() {
+        ROUTING_INPUT_MAC_PRESENT as i32
+    } else {
+        0
+    };
+    b.imm(1, mac_flag);
+    b.jump(JEQ_K, 0, 0, 0, no_finality);
+    b.emit(OR_K, 1, 0, 0, ROUTING_INPUT_ALLOW_DIRECT_FINALITY as i32);
+    b.bind(no_finality);
+    b.store(STX_W, 8, SCRATCH_INPUT + 124, 1);
+    // Discard parser history before the shared canonical call, including its saved caller frame.
+    for slot in [
+        REMAIN,
+        EXT_BYTES,
+        L2_LEN,
+        FULL_LEN,
+        IS_QUOTE,
+        HOP_LIMIT,
+        TCP_FLAGS,
+        DSCP,
+        INNER_FRAG,
+        INNER_REMAIN,
+        QUOTE_AVAILABLE,
+        CURSOR,
+    ] {
+        b.word(slot, 0);
+    }
+    for register in 0..=7 {
+        b.imm(register, 0);
+    }
+    b.mov(1, 8);
+    b.add(1, i32::from(SCRATCH_INPUT));
+    b.mov(2, 8);
+    b.add(2, i32::from(SCRATCH_OUTPUT));
+    b.emit(CALL, 0, 1, 0, 0)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::bpf) fn build(
     capture: &GeneralCapture,
@@ -959,7 +1115,9 @@ pub(in crate::bpf) fn build(
             vlan_kfunc,
         },
         gateway,
-        gateway.conntrack,
+        gateway
+            .conntrack
+            .ok_or_else(|| invalid_data("physical gateway requires XDP conntrack"))?,
     )
 }
 
@@ -1323,101 +1481,7 @@ fn build_ingress(
         .as_ref()
         .and_then(|owner| owner.stale)
         .unwrap_or(unknown);
-    b.stat(maps, GatewayReason::D1Evaluated);
-    b.word(INDEX, 0);
-    b.lookup(scratch, INDEX);
-    b.jump(JEQ_K, 0, 0, 0, classify_bad);
-    b.mov(8, 0);
-    b.imm(0, 0);
-    b.imm(1, 1);
-    b.emit(ATOMIC_ADD_DW, 8, 1, 0, CMPXCHG);
-    b.jump(JNE_K, 0, 0, 0, classify_bad);
-    // Only cold classification initializes the canonical input. The callee owns output initialization.
-    for offset in (0..128).step_by(4) {
-        b.emit(ST_W, 8, 0, SCRATCH_INPUT + offset, 0);
-    }
-    b.copy(8, SCRATCH_INPUT, 10, KEY + 8, 32);
-    if auxiliary.is_none() {
-        for half in 0..3 {
-            b.load(LDX_H, 0, 10, MAC + half * 2);
-            b.store(STX_H, 8, SCRATCH_INPUT + 42 + half * 2, 0);
-        }
-    }
-    for (source, destination) in [(KEY + 40, 96), (KEY + 42, 100)] {
-        b.load(LDX_H, 0, 10, source);
-        b.emit(BE16, 0, 0, 0, 16);
-        b.store(STX_W, 8, SCRATCH_INPUT + destination, 0);
-    }
-    for (source, wire_first, first, other, destination) in [
-        (
-            KEY + 44,
-            6,
-            L4ProtoType::Tcp as i32,
-            L4ProtoType::Udp as i32,
-            104,
-        ),
-        (
-            KEY + 4,
-            4,
-            IpVersionType::V4 as i32,
-            IpVersionType::V6 as i32,
-            108,
-        ),
-    ] {
-        b.load(LDX_W, 0, 10, source);
-        b.imm(1, other);
-        let converted = b.target();
-        b.jump(JNE_K, 0, 0, wire_first, converted);
-        b.imm(1, first);
-        b.bind(converted);
-        b.store(STX_W, 8, SCRATCH_INPUT + destination, 1);
-    }
-    b.load(LDX_W, 0, 10, DSCP);
-    b.store(STX_W, 8, SCRATCH_INPUT + 112, 0);
-    b.lookup(maps.mode_flags.as_raw_fd(), INDEX);
-    let flags_present = b.target();
-    b.jump(JNE_K, 0, 0, 0, flags_present);
-    b.emit(ST_DW, 8, 0, 0, 0);
-    b.goto(classify_bad);
-    b.bind(flags_present);
-    b.load(LDX_W, 0, 0, 0);
-    b.emit(AND_K, 0, 0, 0, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as i32);
-    let no_finality = b.target();
-    let mac_flag = if auxiliary.is_none() {
-        ROUTING_INPUT_MAC_PRESENT as i32
-    } else {
-        0
-    };
-    b.imm(1, mac_flag);
-    b.jump(JEQ_K, 0, 0, 0, no_finality);
-    b.emit(OR_K, 1, 0, 0, ROUTING_INPUT_ALLOW_DIRECT_FINALITY as i32);
-    b.bind(no_finality);
-    b.store(STX_W, 8, SCRATCH_INPUT + 124, 1);
-    // Discard parser history before the shared canonical call, including its saved caller frame.
-    for slot in [
-        REMAIN,
-        EXT_BYTES,
-        L2_LEN,
-        FULL_LEN,
-        IS_QUOTE,
-        HOP_LIMIT,
-        TCP_FLAGS,
-        DSCP,
-        INNER_FRAG,
-        INNER_REMAIN,
-        QUOTE_AVAILABLE,
-        CURSOR,
-    ] {
-        b.word(slot, 0);
-    }
-    for register in 0..=7 {
-        b.imm(register, 0);
-    }
-    b.mov(1, 8);
-    b.add(1, i32::from(SCRATCH_INPUT));
-    b.mov(2, 8);
-    b.add(2, i32::from(SCRATCH_OUTPUT));
-    let routing_call = b.emit(CALL, 0, 1, 0, 0);
+    let routing_call = routing_call(&mut b, maps, scratch, classify_bad, None);
     if let Some(auxiliary) = auxiliary {
         let stale = b.target();
         let active = b.target();

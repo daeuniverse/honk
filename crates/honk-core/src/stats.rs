@@ -568,7 +568,7 @@ pub(crate) mod xdp {
         would_pass: Option<u64>,
     }
 
-    const DNS_DECISIONS: [(&str, GatewayReason); 8] = [
+    const DNS_DECISIONS: [(&str, GatewayReason); 12] = [
         ("pass_dns_d1", GatewayReason::PassDnsD1),
         (
             "pass_dns_d1_pending_retry",
@@ -589,6 +589,19 @@ pub(crate) mod xdp {
             GatewayReason::HoldGuardReleaseFailed,
         ),
         ("hold_retire_failed", GatewayReason::HoldRetireFailed),
+        (
+            "host_meta_insert_failed",
+            GatewayReason::HostMetaInsertFailed,
+        ),
+        (
+            "host_direct_unrecorded",
+            GatewayReason::HostDirectUnrecorded,
+        ),
+        ("host_late_packet", GatewayReason::HostLatePacket),
+        (
+            "host_direct_tcp_insert_failed",
+            GatewayReason::HostDirectTcpInsertFailed,
+        ),
     ];
 
     #[derive(Debug)]

@@ -155,6 +155,18 @@ pub(super) struct SourceOwner {
 }
 
 impl SourceOwner {
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub(super) fn delivering_foreign_reply(
+        &self,
+        scope: ScopeId,
+        client: SocketAddr,
+        destination: SocketAddr,
+    ) -> bool {
+        self.scope.domain == scope
+            && self.scope.client == normalize_socket_addr(client)
+            && self.state.lock().active_foreign_reply == Some(normalize_socket_addr(destination))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         id: u64,
@@ -186,7 +198,7 @@ impl SourceOwner {
             id,
             scope,
             transport,
-            packet_source,
+            packet_source: packet_source.map(SourceWork::into_shared_reply_source),
             _runtime: runtime,
             state: Mutex::new(SourceState {
                 retirement: None,

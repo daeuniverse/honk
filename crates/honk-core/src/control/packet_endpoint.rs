@@ -422,6 +422,29 @@ impl PacketEndpoints {
         }
     }
 
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub(crate) fn retains_host_flow(
+        &self,
+        scope: ScopeId,
+        client: SocketAddr,
+        destination: SocketAddr,
+        protocol: u8,
+    ) -> bool {
+        let Some(realm) = self.realm(scope) else {
+            return true;
+        };
+        // A live application may hand its last obligation to Stack or an exported frame.
+        (protocol == honk_netstack::wire::PROTO_UDP
+            && self
+                .shared
+                .udp_pool
+                .retains_host_udp(scope, client, destination))
+            || realm
+                .owners()
+                .iter()
+                .any(|owner| owner.retains_host_work(client, destination, protocol))
+    }
+
     /// Includes protocol, initializer/retirement, queued work and actual output owners.
     /// Call outside the receive callback, which already holds the scope mutex.
     pub(crate) fn retains_source(&self, scope: ScopeId, address: std::net::IpAddr) -> bool {
@@ -908,6 +931,13 @@ impl PacketEndpoints {
         }
         let (scope, _claim) =
             self.execution_owner(scope, honk_netstack::wire::PacketView::from_slice(packet))?;
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        if admission.is_some() && scope.is_gateway_host() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "gateway Host requires its own flow admission",
+            ));
+        }
         let auxiliary = scope.auxiliary_work()?;
         if auxiliary.is_some() && !self.shared.auxiliary_admission_open() {
             return Err(io::Error::new(
@@ -1208,6 +1238,12 @@ impl PacketEndpoints {
             Some(source) => source.hold(scope)?,
             None => scope.hold_source(source.ip())?,
         };
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        let source_work = {
+            let mut work = source_work;
+            work.admit_udp_process(source, destination)?;
+            work
+        };
         if routing
             .as_ref()
             .is_some_and(|admission| admission.source_context() != source_work.optional_context())
@@ -1505,7 +1541,7 @@ impl EndpointRuntime {
                         ));
                     }
                 }
-                let egress_mark = tun.then(|| config.global.effective_so_mark());
+                let egress_mark = config.required_socket_mark();
                 let authorizations = if configured_packet {
                     match crate::subscription::SubscriptionAuthorizations::new(
                         &config.subscriptions,
@@ -1544,8 +1580,9 @@ impl EndpointRuntime {
                 };
                 if let Some(mark) = egress_mark {
                     let prepared = self.prepared_dns_addresses.take().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "TUN dns.bind requires addresses prepared before routing setup"
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "marked dns.bind requires addresses prepared before capture",
                         )
                     })?;
                     anyhow::ensure!(
@@ -1876,11 +1913,11 @@ impl EndpointRuntime {
                         destination,
                     ),
                 );
-                if let Some(facts) = source_work.optional_facts() {
+                if let Some((process, mark)) = source_work.packet_input() {
                     packet_observation
                         .as_mut()
                         .unwrap()
-                        .packet_facts(&facts, dscp);
+                        .packet_facts(process, dscp, mark);
                 }
                 packet_observation.as_ref().unwrap().routing_started();
             }
@@ -1895,6 +1932,7 @@ impl EndpointRuntime {
                         "udp",
                         dscp,
                         packet_source,
+                        None,
                         #[cfg(feature = "native-api")]
                         packet_observation.as_ref().unwrap().is_recording(),
                     );

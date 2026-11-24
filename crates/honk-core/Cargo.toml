@@ -26,6 +26,7 @@ aya-obj.workspace = true
 # eBPF (optional; enable with the `ebpf` feature)
 aya = { workspace = true, optional = true }
 aya-log = { workspace = true, optional = true }
+object = { version = "0.40", default-features = false, features = ["read_core", "elf"], optional = true }
 
 # Async runtime
 tokio.workspace = true
@@ -117,7 +118,7 @@ zip = { workspace = true, optional = true }
 [features]
 default = ["clash-api", "jemalloc", "rprx"]
 # Enable real eBPF support (requires Linux kernel 6.12+)
-ebpf = ["aya", "aya-log", "dep:honk-nfqueue", "honk-xsk/host"]
+ebpf = ["aya", "aya-log", "dep:honk-nfqueue", "dep:object", "honk-xsk/host"]
 # Enable the Clash-compatible REST API (experimental.clash_api)
 clash-api = ["dep:axum", "axum/ws", "dep:tower-http", "dep:zip"]
 native-api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:subtle", "dep:hmac", "dep:serde_path_to_error", "honk-outbound/flow-observation", "honk-outbound/owned-tasks"]

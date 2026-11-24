@@ -2,7 +2,7 @@ use super::*;
 use honk_datapath::ScopeId;
 
 fn permanent(scope: ScopeId) -> QueryScope {
-    QueryScope { scope, binding: 0 }
+    QueryScope::permanent(scope)
 }
 
 #[tokio::test(start_paused = true)]

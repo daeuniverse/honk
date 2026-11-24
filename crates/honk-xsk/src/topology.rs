@@ -15,7 +15,7 @@ use honk_netstack::{MemoryBudget, MemoryReservation};
 use crate::bpf::{attributes, wait_netlink};
 
 mod auxiliary;
-pub use auxiliary::{AuxLinkInfo, AuxLinkWatch};
+pub use auxiliary::{AuxLinkInfo, AuxLinkWatch, HostLinkChange};
 
 const IFLA_GSO_IPV4_MAX_SIZE: u16 = 63;
 const IFLA_GRO_IPV4_MAX_SIZE: u16 = 64;
@@ -1356,11 +1356,13 @@ struct Link {
     loopback: bool,
     name: Option<[u8; 16]>,
     mtu: Option<u32>,
+    tx_queue_len: Option<u32>,
     kind: Option<[u8; 16]>,
     flags: u32,
     master: u32,
     arphrd: u16,
     parent: u32,
+    foreign_parent: bool,
     mac: [u8; 6],
     rx_queues: u32,
     tx_queues: u32,
@@ -1612,11 +1614,13 @@ impl Snapshot {
                     loopback: flags & 8 != 0,
                     name: None,
                     mtu: None,
+                    tx_queue_len: None,
                     kind: None,
                     flags,
                     master: 0,
                     arphrd,
                     parent: index,
+                    foreign_parent: false,
                     mac: [0; 6],
                     rx_queues: 0,
                     tx_queues: 0,
@@ -1631,7 +1635,9 @@ impl Snapshot {
                 let mut info_data = None;
                 attributes(&body[16..], |kind, value| {
                     match kind {
-                        1 | 3 | 4 | 5 | 10 | 18 | 31 | 32 => unique_attribute(&mut seen, kind)?,
+                        1 | 3 | 4 | 5 | 10 | libc::IFLA_TXQLEN | 18 | 31 | 32 => {
+                            unique_attribute(&mut seen, kind)?
+                        }
                         _ => {}
                     }
                     match kind {
@@ -1649,11 +1655,16 @@ impl Snapshot {
                         3 => link.name = Some(netlink_name(value)?),
                         4 => link.mtu = Some(exact_u32(value)?),
                         5 => parent = exact_u32(value)?,
+                        libc::IFLA_TXQLEN => link.tx_queue_len = Some(exact_u32(value)?),
+                        libc::IFLA_LINK_NETNSID => {
+                            exact_u32(value)?;
+                            link.foreign_parent = true;
+                        }
                         libc::IFLA_GSO_MAX_SIZE
                         | libc::IFLA_GRO_MAX_SIZE
                         | IFLA_GSO_IPV4_MAX_SIZE
                         | IFLA_GRO_IPV4_MAX_SIZE
-                            if arphrd == libc::ARPHRD_NONE =>
+                            if matches!(arphrd, libc::ARPHRD_NONE | libc::ARPHRD_ETHER) =>
                         {
                             unique_attribute(&mut seen_offload, kind - libc::IFLA_GSO_MAX_SIZE)?;
                             link.big_tcp |= exact_u32(value)? > LEGACY_OFFLOAD_MAX_SIZE;

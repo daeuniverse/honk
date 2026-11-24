@@ -1,4 +1,4 @@
-//! Each configured L3 LAN keeps its scope, but no packet device or application incarnation crosses a rebind.
+//! The auxiliary TUN task keeps each LAN or Host execution scope across device rebinds.
 mod io;
 
 use self::io::Records;
@@ -15,7 +15,7 @@ use honk_datapath::ScopeId;
 use honk_netstack::{MemoryBudget, MemoryReservation};
 use honk_xsk::{
     AuxDevicePair, AuxReturnLink, AuxTunGuard,
-    topology::{AuxLinkInfo, AuxLinkWatch},
+    topology::{AuxLinkInfo, AuxLinkWatch, HostLinkChange},
 };
 use std::{
     any::Any,
@@ -64,6 +64,8 @@ struct PrivateTun {
     guard: AuxTunGuard,
     mtu: u32,
     _guard_memory: MemoryReservation,
+    #[cfg(feature = "ebpf")]
+    _host_fifo: Option<honk_xsk::HostFifo>,
 }
 
 impl AsRawFd for PrivateTun {
@@ -73,18 +75,35 @@ impl AsRawFd for PrivateTun {
 }
 
 impl PrivateTun {
-    fn new(name: &str, mtu: u32, budget: &Arc<MemoryBudget>) -> anyhow::Result<Self> {
+    fn new(
+        name: &str,
+        mtu: u32,
+        budget: &Arc<MemoryBudget>,
+        host_budget: Option<&Arc<MemoryBudget>>,
+        watch: &AuxLinkWatch,
+    ) -> anyhow::Result<Self> {
+        #[cfg(feature = "ebpf")]
+        let host_fifo = host_budget.map(honk_xsk::HostFifo::reserve).transpose()?;
+        #[cfg(not(feature = "ebpf"))]
+        let _ = (host_budget, watch);
         let device = TunDevice::new_auxiliary(name).context("create exclusive private TUN")?;
         let guard = AuxTunGuard::install(device.ifindex(), device.as_fd(), budget)?;
         let memory = budget
             .reserve(guard.memory_bytes()?)
-            .context("L3 LAN terminal guard capacity")?;
+            .context("private TUN terminal guard capacity")?;
+        #[cfg(feature = "ebpf")]
+        if let Some(fifo) = &host_fifo {
+            device.prepare_host_fifo(name, fifo.slots())?;
+            watch.verify_host_fifo(name, device.ifindex(), fifo.slots())?;
+        }
         device.configure_auxiliary(name, mtu)?;
         Ok(Self {
             device,
             guard,
             mtu,
             _guard_memory: memory,
+            #[cfg(feature = "ebpf")]
+            _host_fifo: host_fifo,
         })
     }
 
@@ -111,7 +130,8 @@ struct Binding {
     io: Option<AsyncFd<PrivateTun>>,
     return_link: Option<(AuxReturnLink, MemoryReservation)>,
     pair: Arc<AuxDevicePair>,
-    resumed: bool,
+    host_binding: Option<u64>,
+    resumed: Option<u64>,
 }
 
 impl Binding {
@@ -119,13 +139,41 @@ impl Binding {
         self.io.as_ref().expect("bound private TUN").get_ref()
     }
 
+    fn return_link(&self) -> &AuxReturnLink {
+        &self.return_link.as_ref().expect("bound return link").0
+    }
+
+    fn refresh_outer(
+        &mut self,
+        watch: &AuxLinkWatch,
+        name: &str,
+        info: AuxLinkInfo,
+    ) -> std::io::Result<()> {
+        if self.outer.local_mac != info.local_mac {
+            self.return_link().update_host_mac(watch, name, &info)?;
+        }
+        self.outer = info;
+        Ok(())
+    }
+
+    fn refresh_broadcasts(&self, watch: &AuxLinkWatch) -> std::io::Result<()> {
+        match watch.ipv4_broadcasts() {
+            Ok((broadcasts, count)) => self.pair.replace_host_broadcasts(&broadcasts[..count]),
+            Err(error) if error.kind() == ErrorKind::Unsupported => {
+                // An invalid namespace snapshot cannot grant native broadcast exemptions.
+                self.pair.suspend_host_broadcasts()?;
+                Err(std::io::Error::new(ErrorKind::WouldBlock, error))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn verify_custody(&self, name: &str) -> anyhow::Result<()> {
         self.tun().verify_fd(name)?;
-        self.return_link
-            .as_ref()
-            .expect("bound return link")
-            .0
-            .verify()?;
+        if self.host_binding.is_some() {
+            self.tun().guard.verify()?;
+        }
+        self.return_link().verify()?;
         Ok(())
     }
 }
@@ -153,6 +201,7 @@ pub(super) struct PreparedAux {
     realm: u32,
     scope: ScopeId,
     budget: Arc<MemoryBudget>,
+    host_budget: Option<Arc<MemoryBudget>>,
     watch: Option<AuxLinkWatch>,
     // An absent configured link starts with a virgin guarded TUN. Once used, it is destroyed.
     virgin: Option<PrivateTun>,
@@ -164,6 +213,19 @@ pub(super) struct PreparedAux {
 impl PreparedAux {
     pub(super) fn device_name(index: usize) -> String {
         format!("honk-l3-{index}")
+    }
+    pub(super) fn host_device_name(index: usize) -> String {
+        format!("honk-host-{index}")
+    }
+    pub(super) fn is_host(&self) -> bool {
+        self.host_budget.is_some()
+    }
+    fn kind(&self) -> &'static str {
+        if self.is_host() {
+            "Host egress"
+        } else {
+            "L3 LAN"
+        }
     }
     pub(super) fn scope(&self) -> ScopeId {
         self.scope
@@ -178,20 +240,55 @@ impl PreparedAux {
         index: usize,
         root: &Arc<MemoryBudget>,
     ) -> anyhow::Result<(Self, PacketScope, PacketOwner)> {
-        let watch = AuxLinkWatch::new(root)?;
-        let link = watch
-            .read_l3(name)
-            .with_context(|| format!("admit L3 LAN {name}"))?;
+        Self::prepare(
+            name,
+            realm,
+            Self::device_name(index),
+            false,
+            AuxLinkWatch::new(root)?,
+            root,
+        )
+    }
+
+    pub(super) fn new_host<'a>(
+        name: &str,
+        realm: u32,
+        index: usize,
+        capture_interfaces: impl ExactSizeIterator<Item = &'a str>,
+        root: &Arc<MemoryBudget>,
+    ) -> anyhow::Result<(Self, PacketScope, PacketOwner)> {
+        ensure!(
+            cfg!(feature = "ebpf"),
+            "Host egress requires the ebpf feature"
+        );
+        Self::prepare(
+            name,
+            realm,
+            Self::host_device_name(index),
+            true,
+            AuxLinkWatch::new_host(root, capture_interfaces)?,
+            root,
+        )
+    }
+
+    fn prepare(
+        name: &str,
+        realm: u32,
+        inner_name: String,
+        host: bool,
+        watch: AuxLinkWatch,
+        root: &Arc<MemoryBudget>,
+    ) -> anyhow::Result<(Self, PacketScope, PacketOwner)> {
+        let link = Self::read_link(&watch, name, host)
+            .with_context(|| format!("admit auxiliary interface {name}"))?;
         let mtu = link.map_or(1280, |link| link.mtu);
         let (scope, owner) = auxiliary_scope(mtu, root)?;
-        let inner_name = Self::device_name(index);
-        let records = Records::new(
-            scope
-                .auxiliary_budget()
-                .context("missing auxiliary slice")?,
-            inner_name.capacity() + name.len(),
-        )?;
-        let virgin = PrivateTun::new(&inner_name, mtu, root)?;
+        let auxiliary_budget = scope
+            .auxiliary_budget()
+            .context("missing auxiliary slice")?;
+        let records = Records::new(auxiliary_budget, inner_name.capacity() + name.len())?;
+        let host_budget = host.then(|| Arc::clone(auxiliary_budget));
+        let virgin = PrivateTun::new(&inner_name, mtu, root, host_budget.as_ref(), &watch)?;
         virgin.verify(&inner_name, &watch)?;
         Ok((
             Self {
@@ -200,6 +297,7 @@ impl PreparedAux {
                 realm,
                 scope: scope.scope(),
                 budget: Arc::clone(root),
+                host_budget,
                 watch: Some(watch),
                 virgin: Some(virgin),
                 binding: None,
@@ -209,6 +307,34 @@ impl PreparedAux {
             scope,
             owner,
         ))
+    }
+
+    fn read_link(
+        watch: &AuxLinkWatch,
+        name: &str,
+        host: bool,
+    ) -> std::io::Result<Option<AuxLinkInfo>> {
+        if host {
+            watch.read_host(name)
+        } else {
+            watch.read_l3(name)
+        }
+    }
+
+    fn link_change(
+        watch: &mut AuxLinkWatch,
+        name: &str,
+        host: bool,
+        previous: Option<AuxLinkInfo>,
+        inner: Option<(&str, u32, u32)>,
+    ) -> std::io::Result<HostLinkChange> {
+        if host {
+            watch.changed_host(name, previous, inner)
+        } else if watch.changed(name, previous, inner)? {
+            Ok(HostLinkChange::Rebind)
+        } else {
+            Ok(HostLinkChange::Unchanged)
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -230,6 +356,7 @@ impl PreparedAux {
             shutdown,
         };
         let mut ready = Some(ready);
+        let kind = self.kind();
         // Unwind serving before releasing the owner, which still owes kernel and scope cleanup.
         let serving = AssertUnwindSafe(self.serve(&mut owner, activate, &mut ready))
             .catch_unwind()
@@ -238,7 +365,7 @@ impl PreparedAux {
             Ok(result) => result.err(),
             Err(payload) => Some(
                 anyhow::Error::new(ServicePanic::new(payload))
-                    .context(format!("L3 LAN {}", self.name)),
+                    .context(format!("{kind} {}", self.name)),
             ),
         };
         if let Some(ready) = ready {
@@ -246,7 +373,7 @@ impl PreparedAux {
                 || "capture closed before activation".into(),
                 |error| format!("{error:#}"),
             );
-            let _ = ready.send(Err(anyhow::anyhow!("L3 LAN {}: {why}", self.name)));
+            let _ = ready.send(Err(anyhow::anyhow!("{kind} {}: {why}", self.name)));
         }
         if failure.is_some() {
             owner.shutdown.request();
@@ -275,13 +402,7 @@ impl PreparedAux {
         .await;
         let joined = owner.driver.wait_auxiliary_work().await;
         if can_unbind && joined.is_ok() && self.binding.is_some() {
-            super::fold_capture_result(
-                &mut failure,
-                owner
-                    .gateway
-                    .unbind_auxiliary(self.realm)
-                    .map_err(Into::into),
-            );
+            super::fold_capture_result(&mut failure, self.unbind(&owner.gateway).await);
         }
         super::fold_capture_result(&mut failure, joined.map_err(Into::into));
         failure.map_or(Ok(()), Err)
@@ -296,12 +417,14 @@ impl PreparedAux {
         let watch = self.watch.take().expect("prepared auxiliary watcher");
         let mut watch = Self::register_watch(watch)?;
         let shutdown = Arc::clone(&owner.shutdown);
+        let kind = self.kind();
+        let host = self.is_host();
         let timer = None;
         tokio::pin!(timer);
         tokio::select! {
             biased;
             _ = shutdown.wait() => return Ok(()),
-            result = activate => result.context("L3 LAN activation cancelled")?,
+            result = activate => result.with_context(|| format!("{kind} activation cancelled"))?,
             _ = poll_fn(|cx| {
                 let more = owner.driver.service(cx, Instant::now());
                 if owner.endpoints.is_closing() { return Poll::Ready(()); }
@@ -315,7 +438,8 @@ impl PreparedAux {
                 return Ok(());
             }
             if matches!(state, State::Scan) {
-                state = match self.prepare_binding(watch.get_mut(), ready.is_some()) {
+                state = match self.prepare_binding(watch.get_mut(), ready.is_some(), &owner.gateway)
+                {
                     Ok(state) => state,
                     Err(error) if ready.is_some() && !device_gone(&error) => return Err(error),
                     Err(error) => {
@@ -345,7 +469,7 @@ impl PreparedAux {
             {
                 ready
                     .send(Ok(()))
-                    .map_err(|_| anyhow::anyhow!("L3 LAN readiness receiver dropped"))?;
+                    .map_err(|_| anyhow::anyhow!("{kind} readiness receiver dropped"))?;
             }
             let due = state.check_after().map(|delay| Instant::now() + delay);
             let check = None;
@@ -362,9 +486,20 @@ impl PreparedAux {
                             State::Offline(link) => link,
                             _ => self.binding.as_ref().map(|b| b.outer),
                         };
-                        let inner = self.binding.as_ref().map(|b| (self.inner_name.as_str(), b.tun().device.ifindex(), b.outer.mtu));
-                        match tun::poll_topology(&mut watch, cx, |w| w.changed(&self.name, identity, inner)) {
-                            Ok(Poll::Ready(true)) => return Poll::Ready(Event::Changed),
+                        let inner = self.binding.as_ref().map(|b| {
+                            let tun = b.tun();
+                            (self.inner_name.as_str(), tun.device.ifindex(), tun.mtu)
+                        });
+                        let mut change = HostLinkChange::Unchanged;
+                        match tun::poll_topology(&mut watch, cx, |watch| {
+                            change = Self::link_change(watch, &self.name, host, identity, inner)?;
+                            Ok(change != HostLinkChange::Unchanged)
+                        }) {
+                            Ok(Poll::Ready(true)) => return Poll::Ready(match change {
+                                HostLinkChange::Refresh(info) => Event::Refresh(info),
+                                HostLinkChange::Rebind => Event::Changed,
+                                HostLinkChange::Unchanged => unreachable!("reported topology change"),
+                            }),
                             Ok(Poll::Ready(false)) => cx.waker().wake_by_ref(),
                             Ok(Poll::Pending) => {},
                             Err(e) => return Poll::Ready(Event::Lost(e.into())),
@@ -373,10 +508,19 @@ impl PreparedAux {
                     if tun::poll_deadline(check.as_mut(), due, cx).is_ready() {
                         return Poll::Ready(Event::Check);
                     }
-                    let more = if matches!(state, State::Active) {
+                    let more = if matches!(state, State::Active | State::Refreshing) {
                         let binding = self.binding.as_ref().expect("active device pair");
                         match self.records.service(binding.io.as_ref().expect("active TUN"), owner, cx) {
-                            Ok(more) => more,
+                            Ok(more) => {
+                                #[cfg(feature = "ebpf")]
+                                if let Some(cutoff) = self.records.take_drained_cutoff() {
+                                    let id = binding.host_binding.expect("Host input drain");
+                                    if let Err(e) = owner.gateway.host_input_drained(self.realm, id, cutoff) {
+                                        return Poll::Ready(Event::Lost(e.into()));
+                                    }
+                                }
+                                more
+                            }
                             Err(error) => return Poll::Ready(Event::Lost(error)),
                         }
                     } else { owner.driver.service(cx, Instant::now()) };
@@ -386,6 +530,21 @@ impl PreparedAux {
             };
             state = match event {
                 Event::Stop => return Ok(()),
+                Event::Refresh(info) => {
+                    if let Some(binding) = &mut self.binding {
+                        match binding.refresh_outer(watch.get_ref(), &self.name, info) {
+                            Ok(()) if matches!(state, State::Publishing) => State::Publishing,
+                            Ok(()) => self.refresh_broadcasts(owner, watch.get_ref()).await?,
+                            Err(error) => {
+                                self.retire(owner).await?;
+                                self.warn_wait(&error.to_string());
+                                State::Resync
+                            }
+                        }
+                    } else {
+                        State::Scan
+                    }
+                }
                 Event::Changed => {
                     self.retire(owner).await?;
                     State::Scan
@@ -396,9 +555,12 @@ impl PreparedAux {
                     State::Resync
                 }
                 Event::Check => match state {
-                    State::Active => {
+                    State::Active | State::Refreshing => {
                         let result = self.check_active(&owner.gateway);
                         match result {
+                            Ok(()) if matches!(state, State::Refreshing) => {
+                                self.refresh_broadcasts(owner, watch.get_ref()).await?
+                            }
                             Ok(()) => State::Active,
                             Err(error) => {
                                 self.retire(owner).await?;
@@ -409,7 +571,11 @@ impl PreparedAux {
                     }
                     State::Resync => {
                         // A fresh subscription precedes the snapshot after observation loss.
-                        match AuxLinkWatch::new(&self.budget).and_then(Self::register_watch) {
+                        match watch
+                            .get_ref()
+                            .resubscribe(&self.budget)
+                            .and_then(Self::register_watch)
+                        {
                             Ok(replacement) => {
                                 watch = replacement;
                                 State::Scan
@@ -433,8 +599,12 @@ impl PreparedAux {
         &mut self,
         watch: &mut AuxLinkWatch,
         startup: bool,
+        gateway: &GatewayPublisher,
     ) -> anyhow::Result<State> {
-        let current = match watch.read_l3(&self.name) {
+        #[cfg(not(feature = "ebpf"))]
+        let _ = gateway;
+        let host = self.is_host();
+        let current = match Self::read_link(watch, &self.name, host) {
             Ok(current) => current,
             Err(error) if !startup && error.kind() == ErrorKind::Unsupported => {
                 // The watch retains the actual link index and policy selector on refusal.
@@ -443,7 +613,7 @@ impl PreparedAux {
             }
             Err(error) => return Err(error.into()),
         };
-        let Some(outer) = current.filter(|link| link.up) else {
+        let Some(mut outer) = current.filter(|link| link.up) else {
             self.warn_wait(if current.is_some() {
                 "interface down"
             } else {
@@ -451,30 +621,76 @@ impl PreparedAux {
             });
             return Ok(State::Offline(current));
         };
+        #[cfg(feature = "ebpf")]
+        let private_mtu = if host && outer.is_l2 {
+            // SAFETY: sysconf takes only the supported page-size selector.
+            let page = u32::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })?;
+            ethernet_return_mtu(
+                outer.mtu,
+                page,
+                gateway.host_conntrack()?.skb_shared_info_size(),
+            )?
+        } else {
+            outer.mtu
+        };
+        #[cfg(not(feature = "ebpf"))]
+        let private_mtu = outer.mtu;
         let mut tun = match self.virgin.take() {
             Some(tun) => tun,
-            None => PrivateTun::new(&self.inner_name, outer.mtu, &self.budget)?,
+            None => PrivateTun::new(
+                &self.inner_name,
+                private_mtu,
+                &self.budget,
+                self.host_budget.as_ref(),
+                watch,
+            )?,
         };
-        if tun.mtu != outer.mtu {
+        if tun.mtu != private_mtu {
             tun.device
-                .configure_auxiliary(&self.inner_name, outer.mtu)?;
-            tun.mtu = outer.mtu;
+                .configure_auxiliary(&self.inner_name, private_mtu)?;
+            tun.mtu = private_mtu;
         }
         // Drop our private setup events, then prove the full inner topology before publication.
-        if watch.changed(&self.name, Some(outer), None)? {
-            return Err(std::io::Error::from_raw_os_error(libc::ENODEV).into());
+        match Self::link_change(watch, &self.name, host, Some(outer), None)? {
+            HostLinkChange::Unchanged => (),
+            HostLinkChange::Refresh(info) => outer = info,
+            HostLinkChange::Rebind => {
+                return Err(std::io::Error::from_raw_os_error(libc::ENODEV).into());
+            }
         }
         tun.verify(&self.inner_name, watch)?;
-        let pair = Arc::new(AuxDevicePair::new(
-            outer.ifindex,
-            tun.device.ifindex(),
-            &self.budget,
-        )?);
-        let return_link = tun.guard.attach_return(&pair)?;
+        let inner = tun.device.ifindex();
+        let pair = Arc::new(if host {
+            AuxDevicePair::new_host(outer.ifindex, inner, &self.budget)?
+        } else {
+            AuxDevicePair::new(outer.ifindex, inner, &self.budget)?
+        });
+        let (return_link, host_binding) = if host {
+            let binding = ScopeId::allocate().context("Host binding identities exhausted")?;
+            #[cfg(feature = "ebpf")]
+            {
+                tun.guard.install_host_delay_filter(
+                    tun.device.as_fd(),
+                    &pair,
+                    gateway.maps(),
+                    &self.budget,
+                    gateway.host_conntrack()?,
+                )?;
+                // A reader that saw the old filter may still be inserting a TUN record.
+                gateway.synchronize_host_input()?;
+            }
+            (
+                tun.guard
+                    .attach_host_return(&pair, &outer, watch, &self.name)?,
+                Some(binding.as_u64()),
+            )
+        } else {
+            (tun.guard.attach_return(&pair)?, None)
+        };
         let return_memory = self
             .budget
             .reserve(return_link.memory_bytes()?)
-            .context("L3 LAN return program/link capacity")?;
+            .context("private TUN return program/link capacity")?;
         // SAFETY: the only TUN descriptor is never changed while registered on this reactor.
         let io = unsafe { AsyncFd::register(tun) }.map_err(std::io::Error::from)?;
         self.binding = Some(Binding {
@@ -482,21 +698,40 @@ impl PreparedAux {
             io: Some(io),
             return_link: Some((return_link, return_memory)),
             pair,
-            resumed: false,
+            host_binding,
+            resumed: None,
         });
         Ok(State::Publishing)
     }
 
     fn publish(&mut self, watch: &mut AuxLinkWatch, owner: &mut Owner) -> anyhow::Result<State> {
+        let kind = self.kind();
         let b = self.binding.as_mut().expect("prepared device pair");
         b.pair.verify()?;
         b.verify_custody(&self.inner_name)?;
-        let outer = b.outer;
-        if !b.resumed {
+        let private_mtu = b.tun().mtu;
+        if b.resumed.is_none() {
+            #[cfg(feature = "ebpf")]
+            if b.host_binding.is_some()
+                && !self.records.discard_before_host_open(b.tun().as_raw_fd())?
+            {
+                return Ok(State::Publishing);
+            }
             owner
                 .endpoints
-                .resume_auxiliary(&mut owner.driver, outer.mtu)?;
-            b.resumed = true;
+                .resume_auxiliary(&mut owner.driver, private_mtu)?;
+            let scope = owner.driver.sole_owner().expect("auxiliary scope");
+            let stamp = scope.binding();
+            b.resumed = Some(stamp);
+            #[cfg(feature = "ebpf")]
+            if let Some(binding) = b.host_binding {
+                scope.install_host_process_lookup(
+                    self.realm,
+                    stamp,
+                    binding,
+                    owner.gateway.host_process_lookup()?,
+                )?;
+            }
         }
         if !owner.open() {
             return Ok(State::Publishing);
@@ -504,22 +739,48 @@ impl PreparedAux {
         let inner = Some((
             self.inner_name.as_str(),
             b.tun().device.ifindex(),
-            outer.mtu,
+            private_mtu,
         ));
-        if watch.changed(&self.name, Some(outer), inner)? {
-            return Err(std::io::Error::from_raw_os_error(libc::ENODEV).into());
+        match Self::link_change(
+            watch,
+            &self.name,
+            b.host_binding.is_some(),
+            Some(b.outer),
+            inner,
+        )? {
+            HostLinkChange::Unchanged => (),
+            HostLinkChange::Refresh(info) => b.refresh_outer(watch, &self.name, info)?,
+            HostLinkChange::Rebind => {
+                return Err(std::io::Error::from_raw_os_error(libc::ENODEV).into());
+            }
         }
+        let outer = b.outer;
         let (broadcasts, count) = watch.ipv4_broadcasts()?;
-        match owner.gateway.bind_auxiliary(
-            self.realm,
-            self.scope,
-            outer.ifindex,
-            Arc::clone(&b.pair),
-            &broadcasts[..count],
-        ) {
+        let result = match b.host_binding {
+            #[cfg(feature = "ebpf")]
+            Some(binding) => owner.gateway.bind_host(
+                self.realm,
+                self.scope,
+                b.resumed.expect("resumed Host execution"),
+                binding,
+                outer,
+                Arc::clone(&b.pair),
+                &broadcasts[..count],
+            ),
+            #[cfg(not(feature = "ebpf"))]
+            Some(_) => anyhow::bail!("Host egress requires the ebpf feature"),
+            None => owner.gateway.bind_auxiliary(
+                self.realm,
+                self.scope,
+                outer.ifindex,
+                Arc::clone(&b.pair),
+                &broadcasts[..count],
+            ),
+        };
+        match result {
             Ok(()) => {
                 self.waiting = false;
-                tracing::info!(interface = %self.name, realm = self.realm, ifindex = outer.ifindex, mtu = outer.mtu, "L3 LAN active");
+                tracing::info!(interface = %self.name, realm = self.realm, binding_id = b.host_binding, ifindex = outer.ifindex, mtu = outer.mtu, private_mtu, "{kind} active");
                 Ok(State::Active)
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(State::Publishing),
@@ -527,17 +788,44 @@ impl PreparedAux {
         }
     }
 
-    fn check_active(&self, gateway: &GatewayPublisher) -> anyhow::Result<()> {
+    async fn refresh_broadcasts(
+        &mut self,
+        owner: &mut Owner,
+        watch: &AuxLinkWatch,
+    ) -> anyhow::Result<State> {
+        let binding = self.binding.as_ref().expect("active Host pair");
+        match binding.refresh_broadcasts(watch) {
+            Ok(()) => Ok(State::Active),
+            // The pair cleared the root slot and verified its identity before returning WouldBlock.
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(State::Refreshing),
+            Err(error) => {
+                self.retire(owner).await?;
+                self.warn_wait(&error.to_string());
+                Ok(State::Resync)
+            }
+        }
+    }
+
+    fn check_active(&mut self, gateway: &GatewayPublisher) -> anyhow::Result<()> {
         let binding = self.binding.as_ref().expect("active device pair");
         binding.pair.verify_open()?;
         binding.verify_custody(&self.inner_name)?;
         gateway.verify_auxiliary(self.realm, &binding.pair)?;
+        #[cfg(feature = "ebpf")]
+        if let Some(id) = binding.host_binding
+            && !self.records.draining()
+            && let Some(cutoff) = gateway.host_pending_drain(self.realm, id)?
+        {
+            let passed = binding.tun().guard.admitted_records().ok();
+            self.records.request_drain(cutoff, passed);
+        }
         Ok(())
     }
 
     fn warn_wait(&mut self, reason: &str) {
         if !self.waiting {
-            tracing::warn!(interface = %self.name, reason, "L3 LAN waiting_link");
+            let kind = self.kind();
+            tracing::warn!(interface = %self.name, reason, "{kind} waiting_link");
             self.waiting = true;
         }
     }
@@ -568,21 +856,35 @@ impl PreparedAux {
         failure.map_or(Ok(()), Err)
     }
 
+    async fn unbind(&mut self, gateway: &GatewayPublisher) -> anyhow::Result<()> {
+        loop {
+            match gateway.unbind_auxiliary(self.realm) {
+                Ok(()) => {
+                    drop(self.binding.take());
+                    return Ok(());
+                }
+                Err(error) if self.is_host() && error.kind() == ErrorKind::WouldBlock => {
+                    // An active sibling can briefly own the cross-realm tuple guard.
+                    tokio::time::sleep(PUBLISH_RETRY).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     async fn retire(&mut self, owner: &mut Owner) -> anyhow::Result<()> {
         if self.binding.is_none() {
             return Ok(());
         }
         self.withdraw(&owner.gateway)?;
-        if self.binding.as_ref().is_some_and(|b| b.resumed) {
+        if self.binding.as_ref().is_some_and(|b| b.resumed.is_some()) {
             let result = owner.endpoints.pause_auxiliary(&mut owner.driver).await;
             if owner.stopping() {
                 return Ok(());
             }
             result?;
         }
-        owner.gateway.unbind_auxiliary(self.realm)?;
-        drop(self.binding.take());
-        Ok(())
+        self.unbind(&owner.gateway).await
     }
 }
 
@@ -592,13 +894,14 @@ enum State {
     Offline(Option<AuxLinkInfo>),
     Publishing,
     Active,
+    Refreshing,
     Resync,
 }
 
 impl State {
     fn check_after(&self) -> Option<Duration> {
         match self {
-            Self::Publishing => Some(PUBLISH_RETRY),
+            Self::Publishing | Self::Refreshing => Some(PUBLISH_RETRY),
             Self::Active => Some(CUSTODY_CHECK),
             Self::Resync => Some(RESYNC_DELAY),
             Self::Scan | Self::Offline(_) => None,
@@ -609,8 +912,29 @@ impl State {
 enum Event {
     Check,
     Changed,
+    Refresh(AuxLinkInfo),
     Lost(anyhow::Error),
     Stop,
+}
+
+#[cfg(any(feature = "ebpf", test))]
+fn ethernet_return_mtu(outer_mtu: u32, page: u32, shared_info_size: usize) -> anyhow::Result<u32> {
+    ensure!(
+        page.is_power_of_two() && shared_info_size != 0,
+        "invalid kernel skb geometry"
+    );
+    // SKB_MAX_ALLOC uses four pages minus cache-aligned skb_shared_info. Rounding up to
+    // a full page covers the kernel cache alignment on both supported architectures.
+    let overhead = u32::try_from(shared_info_size)?
+        .checked_next_multiple_of(page)
+        .context("skb_shared_info alignment overflow")?;
+    let limit = page
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_sub(overhead))
+        .and_then(|bytes| bytes.checked_sub(14))
+        .filter(|&mtu| mtu >= 1280)
+        .context("kernel skb change-head limit below the minimum Host Ethernet MTU")?;
+    Ok(outer_mtu.min(limit))
 }
 
 fn device_gone(error: &anyhow::Error) -> bool {
@@ -622,6 +946,61 @@ fn device_gone(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_ethernet_return_budget_leaves_room_for_the_mac_header() {
+        assert_eq!(ethernet_return_mtu(1500, 4096, 384).unwrap(), 1500);
+        assert_eq!(ethernet_return_mtu(20000, 4096, 384).unwrap(), 12274);
+        assert_eq!(ethernet_return_mtu(20000, 4096, 4097).unwrap(), 8178);
+        assert_eq!(ethernet_return_mtu(65535, 65536, 384).unwrap(), 65535);
+        assert!(ethernet_return_mtu(20000, 4096, 16384).is_err());
+        assert!(ethernet_return_mtu(20000, 0, 384).is_err());
+        assert!(ethernet_return_mtu(20000, 4096, 0).is_err());
+    }
+
+    #[test]
+    fn ethernet_private_mtu_accepts_a_jumbo_datagram_and_fragments_its_reply() {
+        use honk_netstack::{Config, Mode, Rx, Stack};
+
+        let now = Instant::now();
+        let stack = |mtu| {
+            let mut cfg = Config::new([17; 32]);
+            cfg.mode = Mode::Transparent {
+                exclude: Default::default(),
+            };
+            cfg.mtu = mtu;
+            Stack::new(cfg, now)
+        };
+        let private_mtu = ethernet_return_mtu(20_000, 4096, 384).unwrap() as u16;
+        let mut client = stack(20_000);
+        let mut host = stack(private_mtu);
+        let client_addr = "192.0.2.1:40000".parse().unwrap();
+        let host_addr = "198.51.100.2:443".parse().unwrap();
+        let bytes = vec![0x7a; 19_000];
+        let mut wire = vec![0; 20_000];
+        let len = client
+            .udp_send_from(client_addr, host_addr, &bytes, &mut wire)
+            .unwrap();
+        assert!(len > usize::from(private_mtu));
+        let Rx::Transparent { payload, .. } = host.receive(now, &wire[..len]) else {
+            panic!("oversized ingress datagram did not reach the Host stack");
+        };
+        assert_eq!(&wire[payload], bytes);
+        let first = host
+            .udp_send_from(host_addr, client_addr, &bytes, &mut wire)
+            .unwrap();
+        assert!(first <= usize::from(private_mtu));
+        assert_eq!(client.receive(now, &wire[..first]), Rx::Consumed);
+        let last = host.poll_transmit(now, &mut wire).unwrap();
+        assert!(last <= usize::from(private_mtu));
+        let Rx::TransparentOwned {
+            packet, payload, ..
+        } = client.receive(now, &wire[..last])
+        else {
+            panic!("fragmented Host reply did not reassemble");
+        };
+        assert_eq!(&packet[payload], bytes);
+    }
 
     #[test]
     fn offline_links_have_no_topology_poll_deadline() {

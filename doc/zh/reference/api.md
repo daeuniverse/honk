@@ -1144,6 +1144,8 @@ XDP 另以 `x-honk.xdp` 返回 capture owner 最新观测。默认 summary 包�
 `dns_decisions` 是本次捕获累计计数的低频采样。`pass_dns_d1` 计首次原生授权；`pass_dns_d1_pending_retry` 计命中 conntrack 前仍获授权的包。两者都不含 CT 命中，也不证明已送达。`drop_native_pending_conflict` 计已有 pending 但无法重新授权而丢弃的包；`dns_native_pending_capped` 是原生名额已满，不等于丢包。`drop_hold_contention`、`drop_hold_unavailable`、`hold_guard_release_failed` 分别表示同键竞争未决、归属保护资源不可用、已持有的 guard 释放失败。计数以十进制字符串表示，null 表示未取得读数，不是零。
 `hold_retire_failed` 独立记录 pending 清理或计费失败；已确认的 CT 放行不是原生名额已归还的证据。
 
+对 XDP Host，`host_meta_insert_failed` 计 Endpoint 元数据发布被拒的次数。`host_direct_unrecorded` 计当前策略已明确判为 Direct、但因表满不能记录新 UDP 归属的包，不是建连成功数。`host_late_packet` 计私有 TUN 因准入时间戳缺失、无效、来自未来或已超过 30 秒而拒绝的输入，不表示 TCP 空闲超时或网卡丢包。
+
 每队列保留真实 `namespace_cookie`、`attachment_generation`、`ifindex`、`queue_id`、实际 `mode`（`copy` 或 `zerocopy`）、`ring_capacity` 以及 RX/control/bulk frame 容量。一个物理队列可服务多个逻辑 realm。`sequence`、`attempted_at_unix_ms` 和 `last_success_at_unix_ms` 分别标识采样次数、最近尝试与最近成功的 socket 读取；时间为十进制 Unix 毫秒字符串，所有完整宽度整数均为十进制字符串，序列和错误计数饱和。`socket` 保存六项原始累计 XDP_STATISTICS：`rx_dropped`、`rx_invalid_descs`、`tx_invalid_descs`、`rx_ring_full`、`rx_fill_ring_empty_descs`、`tx_ring_empty_descs`。`rings` 保存 `rx`、`tx`、`fill`、`cq` 的原始 u32 `producer`/`consumer` 索引；索引会回绕，单位为 descriptor，不是包数。
 
 采样不受 DEBUG 过滤影响，只在既有 owner turn 中至多每秒执行一次，正常 socket 关闭前另取最终样本。不增加空闲 timer，安静队列可能保留较旧样本。Socket、ring、各队列均顺序读取，不是跨计数器/ring/队列的原子快照。`socket_available: false` 且 `socket: null` 表示尚未观测或不可用，不代表零丢包；尝试失败后 `socket_error` 为 `statistics_unavailable`，`socket_errno` 有值时保留数字 errno，即使错误无 errno 也增加 `socket_read_errors`。失败可保留旧 `last_success_at_unix_ms`，但不会将旧成功计数冒充本次数据。统计读取失败不终止 capture。`rx_fill_ring_empty_descs` 是内核空 FILL 事件，不是丢包率；当前 FILL 有内容不能否定历史饥饿。不会相加为总丢包，也不推导速率或增量。

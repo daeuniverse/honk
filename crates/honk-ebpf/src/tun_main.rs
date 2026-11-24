@@ -9,7 +9,9 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 mod cgroup;
 #[path = "tun_connect.rs"]
 mod host_connect;
+#[path = "tun_identity.rs"]
 mod host_identity;
+#[path = "tun_kernel.rs"]
 mod host_kernel;
 #[path = "tun_maps.rs"]
 mod host_maps;

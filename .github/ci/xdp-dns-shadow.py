@@ -241,7 +241,7 @@ def snapshot(device, enabled, *, tcp=False):
             maps = program_maps(program)
             assert SHADOW_MAPS.intersection(maps) == (SHADOW_MAPS if enabled else set()), maps
             stats = maps['honk_gw_stats']
-            assert stats[1:5] == (6, 4, 8, 27), stats
+            assert stats[1:5] == (6, 4, 8, 32), stats
             counter = maps['honk_xdp_count']
             length = 8 * possible_cpus()
             reasons = [('pass_d1', 8), ('xsk_new', 9), ('would_pass_dns', 18), ('pass_dns_d1', 19), ('dns_retry', 20)]

@@ -545,6 +545,42 @@ impl NlSock {
         )
     }
 
+    #[cfg(feature = "ebpf")]
+    pub(crate) fn set_host_tun_queue_len(
+        &mut self,
+        ifindex: u32,
+        slots: u32,
+    ) -> Result<(), MutationError> {
+        self.request_owned(
+            RTM_NEWLINK,
+            NLM_F_REQUEST | NLM_F_ACK,
+            pod_bytes(&ifinfo(ifindex as i32, 0, 0)),
+            &[(libc::IFLA_TXQLEN, Attr::U32(slots))],
+        )
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub(crate) fn add_host_tun_fifo(
+        &mut self,
+        ifindex: u32,
+        slots: u32,
+    ) -> Result<(), MutationError> {
+        // With an explicit major and no REPLACE flag, an existing foreign root returns EEXIST.
+        let mut header = [0u8; 20];
+        header[4..8].copy_from_slice(&ifindex.to_ne_bytes());
+        header[8..12].copy_from_slice(&0x0001_0000u32.to_ne_bytes());
+        header[12..16].copy_from_slice(&u32::MAX.to_ne_bytes());
+        self.request_owned(
+            libc::RTM_NEWQDISC,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+            &header,
+            &[
+                (libc::TCA_KIND, Attr::Str("pfifo".into())),
+                (libc::TCA_OPTIONS, Attr::U32(slots)),
+            ],
+        )
+    }
+
     pub(crate) fn set_tun_link_up(&mut self, ifindex: u32) -> Result<(), MutationError> {
         self.request_owned(
             RTM_NEWLINK,

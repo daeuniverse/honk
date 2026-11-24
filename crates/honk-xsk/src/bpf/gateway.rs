@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod arbitration;
+mod host;
 pub use arbitration::{AuxReaderGrace, GatewayArbitration};
 
 const GATEWAY_HOLD_ENTRIES: u32 = 65_536;
@@ -23,7 +24,7 @@ pub type HoldValue = GatewayHold;
 pub struct GatewayLoad<'a> {
     pub routing: &'a [aya_obj::generated::bpf_insn],
     pub maps: &'a GatewayMaps,
-    pub conntrack: &'a ConntrackKfuncs,
+    pub conntrack: Option<&'a ConntrackKfuncs>,
     pub dns: Option<&'a GatewayDnsMaps>,
     pub arbitration: Option<&'a GatewayArbitration>,
 }
@@ -40,15 +41,26 @@ struct MapInfo {
     name: [u8; 16],
 }
 
+pub(super) fn map_id(fd: BorrowedFd<'_>) -> io::Result<u32> {
+    let mut info = MapInfo::default();
+    object_info(fd, &mut info)?;
+    (info.id != 0)
+        .then_some(info.id)
+        .ok_or_else(|| invalid_data("missing kernel map ID"))
+}
+
 impl GatewayLoad<'_> {
     pub(super) fn validate_and_retain(&self) -> io::Result<Vec<OwnedFd>> {
         let mut retained = self.validate_routing()?;
-        if self.conntrack.lookup == 0
-            || self.conntrack.release == 0
-            || ![0, 1].contains(&self.conntrack.lookup_offset)
-            || ![0, 1].contains(&self.conntrack.release_offset)
-            || (self.conntrack.btf.is_none()
-                && (self.conntrack.lookup_offset != 0 || self.conntrack.release_offset != 0))
+        let conntrack = self
+            .conntrack
+            .ok_or_else(|| invalid_data("physical gateway requires XDP conntrack"))?;
+        if conntrack.lookup == 0
+            || conntrack.release == 0
+            || ![0, 1].contains(&conntrack.lookup_offset)
+            || ![0, 1].contains(&conntrack.release_offset)
+            || (conntrack.btf.is_none()
+                && (conntrack.lookup_offset != 0 || conntrack.release_offset != 0))
         {
             return Err(invalid_data("invalid gateway conntrack FD-array authority"));
         }
@@ -68,7 +80,7 @@ impl GatewayLoad<'_> {
             retained.push(arbitration.guards.try_clone()?);
             retained.push(arbitration.control.try_clone()?);
         }
-        if let Some(fd) = &self.conntrack.btf {
+        if let Some(fd) = &conntrack.btf {
             retained.push(fd.try_clone()?);
         }
         Ok(retained)
@@ -165,7 +177,7 @@ pub fn gateway_dns_load_failure(error: &io::Error) -> Option<&'static str> {
 }
 
 const DNS_FACTS: u32 = 4096;
-const BPF_F_MMAPABLE: u32 = 1 << 10;
+pub(super) const BPF_F_MMAPABLE: u32 = 1 << 10;
 
 #[repr(C, align(64))]
 struct EpochSlot {
@@ -411,7 +423,7 @@ impl GatewayDnsMaps {
     }
 }
 
-fn mmap_slots<T>(fd: BorrowedFd<'_>, count: u32) -> io::Result<NonNull<T>> {
+pub(super) fn mmap_slots<T>(fd: BorrowedFd<'_>, count: u32) -> io::Result<NonNull<T>> {
     let bytes = count as usize * size_of::<T>();
     // SAFETY: callers map the array's bounded value area, starting at its page-aligned first slot.
     let ptr = unsafe {
@@ -443,10 +455,12 @@ pub struct GatewayMaps {
     pub(super) stats: OwnedFd,
     pub(super) scratch: OwnedFd,
     pub(super) mode_flags: OwnedFd,
+    host: Option<Box<host::HostFlows>>,
     auxiliary: Option<Box<AuxRegistry>>,
     cursor: Mutex<Option<GatewayKey>>,
     lookup_scratch: Mutex<Vec<u64>>,
     lookup_scratch_bytes: usize,
+    memory: Option<honk_netstack::MemoryReservation>,
 }
 
 type RealmBinding = (u32, Option<Arc<AuxDevicePair>>);
@@ -566,9 +580,35 @@ impl GatewayMaps {
         size_of::<Self>()
             + self.lookup_scratch_bytes
             + self.auxiliary.as_ref().map_or(0, |r| r.bytes)
+            + self
+                .host
+                .as_ref()
+                .map_or(0, |_| size_of::<host::HostFlows>())
     }
 
-    pub fn object_fds(&self) -> [BorrowedFd<'_>; 7] {
+    pub fn account(mut self, budget: &Arc<MemoryBudget>) -> io::Result<Self> {
+        if self.memory.is_some() {
+            return Err(invalid_data("gateway maps already accounted"));
+        }
+        let userspace = self.memory_bytes() + 2 * size_of::<usize>();
+        let bytes = self
+            .object_fds()
+            .into_iter()
+            .try_fold(userspace, |total, fd| {
+                total
+                    .checked_add(kernel_memory_bytes(fd)?)
+                    .ok_or_else(|| invalid_data("gateway map memory overflow"))
+            })?;
+        self.memory = Some(budget.reserve(bytes).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "gateway map memory capacity")
+        })?);
+        if let Some(host) = &mut self.host {
+            host.prepare_scans(budget)?;
+        }
+        Ok(self)
+    }
+
+    pub fn object_fds(&self) -> impl IntoIterator<Item = BorrowedFd<'_>> {
         [
             &self.realms,
             &self.local_root,
@@ -579,6 +619,12 @@ impl GatewayMaps {
             &self.mode_flags,
         ]
         .map(AsFd::as_fd)
+        .into_iter()
+        .chain(self.host_meta_fd())
+        .chain(self.host_hold_fd())
+        .chain(self.host_direct_tcp_fd())
+        .chain(self.host_bindings_fd())
+        .chain(self.host_devices_fd())
     }
 
     pub fn stats_fd(&self) -> BorrowedFd<'_> {
@@ -622,8 +668,28 @@ impl GatewayMaps {
         addresses: &[LocalAddressKey],
         aux_realms: &[u32],
     ) -> io::Result<Self> {
-        if realms.is_empty()
-            || realms.len().saturating_add(aux_realms.len()) > GATEWAY_REALM_CAPACITY as usize
+        Self::new_with_host(realms, addresses, aux_realms, &[])
+    }
+
+    pub fn new_with_host(
+        realms: &[(CaptureRealmKey, u32)],
+        addresses: &[LocalAddressKey],
+        aux_realms: &[u32],
+        host_realms: &[u32],
+    ) -> io::Result<Self> {
+        if (realms.is_empty() && host_realms.is_empty())
+            || realms
+                .len()
+                .saturating_add(aux_realms.len())
+                .saturating_add(host_realms.len())
+                > GATEWAY_REALM_CAPACITY as usize
+            || host_realms.len() > host::MAX_HOST_REALMS
+            || host_realms.iter().enumerate().any(|(i, id)| {
+                *id == 0
+                    || realms.iter().any(|(_, r)| r == id)
+                    || aux_realms.contains(id)
+                    || host_realms[..i].contains(id)
+            })
             || aux_realms.len() > 8
             || aux_realms.iter().enumerate().any(|(i, id)| {
                 *id == 0 || realms.iter().any(|(_, r)| r == id) || aux_realms[..i].contains(id)
@@ -649,11 +715,15 @@ impl GatewayMaps {
             .map_err(|_| io::Error::other("gateway per-CPU scratch capacity"))?;
         lookup_scratch.resize(cpus, 0);
         let lookup_scratch_bytes = lookup_scratch.capacity() * size_of::<u64>();
-        let auxiliary = if aux_realms.is_empty() {
+        let auxiliary = if aux_realms.is_empty() && host_realms.is_empty() {
             None
         } else {
             let physical: Box<[_]> = realms.iter().map(|(k, _)| k.physical_ifindex).collect();
-            let bindings: Box<[_]> = aux_realms.iter().map(|&id| (id, None)).collect();
+            let bindings: Box<[_]> = aux_realms
+                .iter()
+                .chain(host_realms)
+                .map(|&id| (id, None))
+                .collect();
             let bytes = size_of::<AuxRegistry>()
                 + std::mem::size_of_val(&*physical)
                 + std::mem::size_of_val(&*bindings);
@@ -686,6 +756,8 @@ impl GatewayMaps {
         Ok(Self {
             realms: realms_fd,
             auxiliary,
+            host: host::HostFlows::new(host_realms)?,
+            memory: None,
             local_root,
             hold: create::<GatewayKey, GatewayHold>(1, GATEWAY_HOLD_ENTRIES, b"honk_gw_hold", -1)?,
             fragments: create::<FragmentKey, FragmentVerdict>(
@@ -770,6 +842,25 @@ impl GatewayMaps {
         Ok(())
     }
 
+    fn require_realm_binding(
+        &self,
+        realm: u32,
+        bound: bool,
+    ) -> io::Result<std::sync::MutexGuard<'_, Box<[RealmBinding]>>> {
+        let bindings = self
+            .aux_registry()?
+            .bindings
+            .lock()
+            .map_err(|_| invalid_data("gateway binding registry poisoned"))?;
+        if !bindings
+            .iter()
+            .any(|(id, owner)| *id == realm && owner.is_some() == bound)
+        {
+            return Err(invalid_data("gateway capture realm binding state changed"));
+        }
+        Ok(bindings)
+    }
+
     /// Close both gates, unbind the capture key and synchronize kernel readers before retirement.
     pub fn clear_aux_realm(
         &self,
@@ -777,17 +868,12 @@ impl GatewayMaps {
         arbitration: Option<&GatewayArbitration>,
         budget: &Arc<MemoryBudget>,
     ) -> io::Result<()> {
-        let bindings = self
-            .aux_registry()?
-            .bindings
-            .lock()
-            .map_err(|_| invalid_data("auxiliary registry poisoned"))?;
-        if !bindings
-            .iter()
-            .any(|(id, owner)| *id == realm && owner.is_none())
-        {
-            return Err(invalid_data("auxiliary realm is not offline"));
+        if self.host_realms().contains(&realm) {
+            return Err(invalid_data(
+                "Host cleanup requires its binding incarnation",
+            ));
         }
+        let _bindings = self.require_realm_binding(realm, false)?;
         {
             // The periodic userspace sweep can also remove holds and refund native credits.
             let _collector = self
@@ -806,6 +892,10 @@ impl GatewayMaps {
                 },
             )?;
         }
+        self.clear_fragments(realm, budget)
+    }
+
+    fn clear_fragments(&self, realm: u32, budget: &Arc<MemoryBudget>) -> io::Result<()> {
         scan_hash(
             self.fragments.as_fd(),
             GATEWAY_FRAGMENT_ENTRIES,
@@ -900,11 +990,7 @@ impl GatewayMaps {
             let Some(before) = self.lookup_hold(&next)? else {
                 continue;
             };
-            if !is_idle(before, now_ns, idle_ns) || (!before.is_native_pending() && retained(&next))
-            {
-                continue;
-            }
-            if self.retire_observed(&next, before, now_ns, idle_ns, arbitration)? {
+            if self.retire_observed(&next, before, now_ns, idle_ns, arbitration, &mut retained)? {
                 removed += 1;
                 *cursor = previous;
             }
@@ -919,7 +1005,14 @@ impl GatewayMaps {
         now_ns: u64,
         idle_ns: u64,
         arbitration: Option<&GatewayArbitration>,
+        retained: impl FnOnce(&GatewayKey) -> bool,
     ) -> io::Result<bool> {
+        if !is_idle(before, now_ns, idle_ns) {
+            return Ok(false);
+        }
+        if !before.is_native_pending() && retained(key) {
+            return Ok(false);
+        }
         let retire = || {
             let Some(latest) = self.lookup_hold(key)? else {
                 return Ok(false);
@@ -930,7 +1023,7 @@ impl GatewayMaps {
             self.delete_hold(key, latest, arbitration)
         };
         match arbitration {
-            Some(arbitration) => arbitration.with_guard(key, retire),
+            Some(arbitration) => Ok(arbitration.with_guard(key, retire)?.unwrap_or(false)),
             None => retire(),
         }
     }
@@ -949,13 +1042,16 @@ impl GatewayMaps {
         } else {
             None
         };
+        let removed = self.remove_hold_row(key)?;
+        if removed && let Some(arbitration) = refund {
+            arbitration.refund()?;
+        }
+        Ok(removed)
+    }
+
+    fn remove_hold_row(&self, key: &GatewayKey) -> io::Result<bool> {
         match bpf(BPF_MAP_DELETE_ELEM, &mut elem(self.hold.as_fd(), key, 0, 0)) {
-            Ok(_) => {
-                if let Some(arbitration) = refund {
-                    arbitration.refund()?;
-                }
-                Ok(true)
-            }
+            Ok(_) => Ok(true),
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(false),
             Err(error) => Err(error),
         }
@@ -972,6 +1068,62 @@ struct LookupBatchAttr {
     map_fd: u32,
     elem_flags: u64,
     flags: u64,
+}
+
+enum HashBatch {
+    Rows { count: usize, next: u32 },
+    ShortBucket(u32),
+}
+
+fn lookup_hash_batch<K, V>(
+    fd: BorrowedFd<'_>,
+    entries: u32,
+    cursor: u32,
+    keys: &mut [K],
+    values: &mut [V],
+) -> io::Result<HashBatch> {
+    debug_assert_eq!(keys.len(), values.len());
+    let batch = keys.len() as u32;
+    let mut next = 0u32;
+    let mut attr = LookupBatchAttr {
+        in_batch: if cursor == 0 {
+            0
+        } else {
+            std::ptr::from_ref(&cursor) as u64
+        },
+        out_batch: &mut next as *mut u32 as u64,
+        keys: keys.as_mut_ptr() as u64,
+        values: values.as_mut_ptr() as u64,
+        count: batch,
+        map_fd: fd.as_raw_fd() as u32,
+        elem_flags: 0,
+        flags: 0,
+    };
+    match bpf(BPF_MAP_LOOKUP_BATCH, &mut attr) {
+        Ok(_) if attr.count != 0 && cursor < next && next < entries => (),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) && next == entries => (),
+        Err(e) if e.raw_os_error() == Some(libc::ENOSPC) && batch < entries => {
+            if attr.count != 0 || next < cursor || next >= entries {
+                return Err(invalid_data(
+                    "invalid gateway cleanup bucket capacity readback",
+                ));
+            }
+            return Ok(HashBatch::ShortBucket(next));
+        }
+        Err(e) => return Err(e),
+        Ok(_) => {
+            return Err(invalid_data(
+                "gateway cleanup bucket cursor did not advance",
+            ));
+        }
+    }
+    if attr.count > batch {
+        return Err(invalid_data("invalid gateway cleanup batch count"));
+    }
+    Ok(HashBatch::Rows {
+        count: attr.count as usize,
+        next,
+    })
 }
 
 fn scan_hash<K: Copy + Default, V: Copy + Default>(
@@ -1000,50 +1152,20 @@ fn scan_hash<K: Copy + Default, V: Copy + Default>(
         values.resize(len, V::default());
 
         loop {
-            let mut next = 0u32;
-            let mut attr = LookupBatchAttr {
-                in_batch: if cursor == 0 {
-                    0
-                } else {
-                    std::ptr::from_ref(&cursor) as u64
-                },
-                out_batch: &mut next as *mut u32 as u64,
-                keys: keys.as_mut_ptr() as u64,
-                values: values.as_mut_ptr() as u64,
-                count: batch,
-                map_fd: fd.as_raw_fd() as u32,
-                elem_flags: 0,
-                flags: 0,
-            };
-            let terminal = match bpf(BPF_MAP_LOOKUP_BATCH, &mut attr) {
-                Ok(_) if attr.count != 0 && cursor < next && next < entries => false,
-                Err(e) if e.raw_os_error() == Some(libc::ENOENT) && next == entries => true,
-                Err(e) if e.raw_os_error() == Some(libc::ENOSPC) && batch < entries => {
-                    if attr.count != 0 || next < cursor || next >= entries {
-                        return Err(invalid_data(
-                            "invalid gateway cleanup bucket capacity readback",
-                        ));
+            let (count, next) =
+                match lookup_hash_batch(fd, entries, cursor, &mut keys, &mut values)? {
+                    HashBatch::Rows { count, next } => (count, next),
+                    HashBatch::ShortBucket(at) => {
+                        // The kernel never splits a bucket. Retry it with larger charged buffers.
+                        cursor = at;
+                        batch = batch.saturating_mul(2).min(entries);
+                        break;
                     }
-                    // The kernel never splits a bucket. Retry it with larger charged buffers.
-                    cursor = next;
-                    batch = batch.saturating_mul(2).min(entries);
-                    break;
-                }
-                Err(e) => return Err(e),
-                Ok(_) => {
-                    return Err(invalid_data(
-                        "gateway cleanup bucket cursor did not advance",
-                    ));
-                }
-            };
-            if attr.count > batch {
-                return Err(invalid_data("invalid gateway cleanup batch count"));
-            }
-            let count = attr.count as usize;
+                };
             for (key, value) in keys[..count].iter().zip(values[..count].iter().copied()) {
                 visit(key, value)?;
             }
-            if terminal {
+            if next == entries {
                 return Ok(());
             }
             cursor = next;
@@ -1525,7 +1647,7 @@ pub(super) mod tests {
         let now = HOLD_IDLE_NS + 2;
         assert!(
             !maps
-                .retire_observed(&key, observed, now, HOLD_IDLE_NS, Some(&arb))
+                .retire_observed(&key, observed, now, HOLD_IDLE_NS, Some(&arb), |_| false)
                 .unwrap()
         );
         assert_eq!(maps.lookup_hold(&key).unwrap(), Some(reused));
@@ -1551,7 +1673,7 @@ pub(super) mod tests {
         assert_eq!(arb.pending(), 0);
         assert!(
             !maps
-                .retire_observed(&key, reused, now, HOLD_IDLE_NS, Some(&arb))
+                .retire_observed(&key, reused, now, HOLD_IDLE_NS, Some(&arb), |_| false)
                 .unwrap()
         );
         assert_eq!(arb.pending(), 0);
@@ -1613,7 +1735,7 @@ pub(super) mod tests {
         update(maps.hold.as_fd(), &key, &refreshed, 1).unwrap();
         assert!(
             !maps
-                .retire_observed(&key, observed, now, HOLD_IDLE_NS, Some(&arb))
+                .retire_observed(&key, observed, now, HOLD_IDLE_NS, Some(&arb), |_| false)
                 .unwrap()
         );
         assert_eq!(maps.lookup_hold(&key).unwrap(), Some(refreshed));
@@ -1621,7 +1743,7 @@ pub(super) mod tests {
         let later = now + HOLD_IDLE_NS + 1;
         assert!(
             !maps
-                .retire_observed(&key, observed, later, HOLD_IDLE_NS, Some(&arb))
+                .retire_observed(&key, observed, later, HOLD_IDLE_NS, Some(&arb), |_| false)
                 .unwrap()
         );
         assert_eq!(lookup::<_, u32>(arb.guards.as_fd(), &key).unwrap(), None);

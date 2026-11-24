@@ -134,7 +134,7 @@ async fn observed_routing_admission_funds_its_real_route_and_transfers_the_charg
     let budget = MemoryBudget::new(1 << 20);
     let scope = ScopeId::allocate().unwrap();
     let plain = handle
-        .prepare_packet_routing_snapshot(scope, source, destination, "tcp", 0, None, false)
+        .prepare_packet_routing_snapshot(scope, source, destination, "tcp", 0, None, None, false)
         .await
         .unwrap();
     let plain = EndpointAdmission::new(plain, &budget).unwrap();
@@ -142,7 +142,7 @@ async fn observed_routing_admission_funds_its_real_route_and_transfers_the_charg
     drop(plain);
     assert_eq!(budget.used(), 0);
     let observed = handle
-        .prepare_packet_routing_snapshot(scope, source, destination, "tcp", 0, None, true)
+        .prepare_packet_routing_snapshot(scope, source, destination, "tcp", 0, None, None, true)
         .await
         .unwrap();
     let insufficient = MemoryBudget::new(plain_bytes);
@@ -150,7 +150,7 @@ async fn observed_routing_admission_funds_its_real_route_and_transfers_the_charg
     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     assert_eq!(insufficient.used(), 0);
     let observed = handle
-        .prepare_packet_routing_snapshot(scope, source, destination, "tcp", 0, None, true)
+        .prepare_packet_routing_snapshot(scope, source, destination, "tcp", 0, None, None, true)
         .await
         .unwrap();
     let admission = EndpointAdmission::new(observed, &budget).unwrap();
@@ -337,6 +337,75 @@ async fn udp_qualification_requires_ready_enqueue_not_pending_or_refused_work() 
 }
 
 #[tokio::test]
+async fn udp_initializer_keeps_its_process_on_the_existing_transport() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        use crate::control::netstack::ProcessMeta;
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = upstream.local_addr().unwrap();
+        let client: SocketAddr = "192.0.2.10:41000".parse().unwrap();
+        let (plane, _health) =
+            local_plane_with(|config| {
+                config.routing = honk_config::parser::parse_dae_config(
+                "routing {\n pname(curl) -> direct\n !pname(curl) -> block\n fallback: block\n}",
+            ).unwrap().routing;
+            })
+            .await;
+        let tracker = Arc::clone(&plane.connection_tracker);
+        tracker.enable();
+        let budget = MemoryBudget::new(32 << 20);
+        let (scope, owner) = scope(&budget);
+        let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope.clone(), owner)], 2)
+            .await
+            .unwrap();
+        let process = ProcessMeta::test_gateway(417, "curl");
+        let missing = ProcessMeta::test_gateway(418, "");
+        let submit = |client: SocketAddr, process, payload: &[u8]| {
+            let work = scope
+                .hold_source(client.ip())
+                .unwrap()
+                .with_process_input(process);
+            endpoints
+                .queue_datagram(
+                    &scope,
+                    client,
+                    target,
+                    0,
+                    None,
+                    Some(PacketSource::Completed(work)),
+                    None,
+                    |budget| FundedDatagram::copy_from(payload, budget),
+                )
+                .unwrap()
+        };
+        let mut buf = [0; 32];
+        assert!(submit(client, process, b"first").1);
+        let (n, first_peer) = upstream.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"first");
+        assert!(submit(client, missing, b"retained").1);
+        let (n, peer) = upstream.recv_from(&mut buf).await.unwrap();
+        assert_eq!((peer, &buf[..n]), (first_peer, b"retained".as_slice()));
+        assert_eq!(tracker.snapshot()[0].process.as_deref(), Some("curl"));
+        assert!(
+            submit(
+                SocketAddr::new(client.ip(), client.port() + 1),
+                missing,
+                b"blocked"
+            )
+            .1
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), upstream.recv_from(&mut buf))
+                .await
+                .is_err()
+        );
+        endpoints.shutdown().await.unwrap();
+        owner.run().await.unwrap();
+    })
+    .await
+    .expect("UDP initializer process fixture must join");
+}
+
+#[tokio::test]
 async fn host_udp_keeps_original_reply_facts_across_snapshot_changes_and_tuple_aliases() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let budget = MemoryBudget::new(64 << 20);
@@ -513,6 +582,7 @@ async fn host_dns_rejects_routing_captured_before_source_cell_reuse() {
                 "udp",
                 0,
                 Some(&original),
+                None,
                 #[cfg(feature = "native-api")]
                 false,
             )

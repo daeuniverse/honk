@@ -22,10 +22,15 @@ pub struct FlowIo {
     open: bool,
     routing: Option<crate::control::packet_endpoint::EndpointAdmission>,
     packet_source: Option<super::SourceWork>,
+    process: Option<super::ProcessMeta>,
 }
 
 impl FlowIo {
-    pub(super) fn new(scope: PacketScope, syn: SynInfo) -> Self {
+    pub(super) fn new(
+        scope: PacketScope,
+        syn: SynInfo,
+        process: Option<super::ProcessMeta>,
+    ) -> Self {
         Self {
             binding: scope.binding(),
             scope,
@@ -36,7 +41,18 @@ impl FlowIo {
             open: true,
             routing: None,
             packet_source: None,
+            process,
         }
+    }
+
+    pub(in crate::control) fn process(&self) -> Option<super::ProcessMeta> {
+        self.process
+    }
+
+    #[cfg(test)]
+    pub(in crate::control) fn with_process_input(mut self, process: super::ProcessMeta) -> Self {
+        self.process = Some(process);
+        self
     }
 
     pub fn scope(&self) -> ScopeId {

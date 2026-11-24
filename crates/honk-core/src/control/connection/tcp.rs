@@ -122,6 +122,7 @@ impl ControlPlaneHandle {
         Ok(PacketRoutingSnapshot {
             source: None,
             source_mac: None,
+            process: None,
             mode: super::handoff::ModeDecision {
                 name: decision.outbound.clone(),
                 constraint: Default::default(),
@@ -285,17 +286,14 @@ impl ControlPlaneHandle {
     ) -> anyhow::Result<()> {
         let (direct, credit) = direct.unzip();
         let (auxiliary, task_cancel) = auxiliary.unzip();
-        let admitted_route = match &mut input {
-            TcpInput::Packet(stream) => stream.take_routing(),
-            TcpInput::Kernel(_) => None,
-        };
-        let packet_dscp = match &input {
-            TcpInput::Packet(stream) => Some(stream.dscp()),
-            TcpInput::Kernel(_) => None,
-        };
-        let packet_scope = match &input {
-            TcpInput::Packet(stream) => Some(stream.scope()),
-            TcpInput::Kernel(_) => None,
+        let (admitted_route, packet_scope, packet_dscp, gateway_process) = match &mut input {
+            TcpInput::Packet(stream) => (
+                stream.take_routing(),
+                Some(stream.scope()),
+                Some(stream.dscp()),
+                stream.process(),
+            ),
+            TcpInput::Kernel(_) => (None, None, None, None),
         };
         let mut observation = ConnectionObservation::begin(
             self.native.as_deref(),
@@ -340,13 +338,15 @@ impl ControlPlaneHandle {
                         None,
                     ),
                 };
-                let packet_facts = flow
-                    .packet_source()
-                    .and_then(|source| source.optional_facts());
-                if let Some(facts) = &packet_facts {
+                let packet_input = gateway_process.map(|process| (process, None)).or_else(|| {
+                    flow.packet_source()
+                        .and_then(|source| source.packet_input())
+                });
+                if let Some((process, mark)) = packet_input {
                     observation.packet_facts(
-                        facts,
+                        process,
                         packet_dscp.expect("packet stream carries admitted DSCP"),
+                        mark,
                     );
                 }
                 if flow.is_kernel() {
@@ -365,6 +365,7 @@ impl ControlPlaneHandle {
                                 "tcp",
                                 packet_dscp.expect("packet stream carries admitted DSCP"),
                                 flow.packet_source(),
+                                gateway_process,
                                 #[cfg(feature = "native-api")]
                                 observation.is_recording(),
                             )
@@ -527,9 +528,6 @@ impl ControlPlaneHandle {
                     "tcp",
                     handoff.as_ref(),
                 );
-                if let Some(facts) = &packet_facts {
-                    conn_info.process_name = super::routing::packet_process_name(facts);
-                }
                 if let Some(dscp) = packet_dscp {
                     conn_info.dscp = Some(dscp);
                 }
@@ -982,8 +980,8 @@ impl ControlPlaneHandle {
                                 start_time: std::time::Instant::now(),
                                 domain: target_domain.clone(),
                                 network: "tcp".to_string(),
-                                process: match &packet_facts {
-                                    Some(facts) => super::routing::packet_process_name(facts),
+                                process: match packet_input {
+                                    Some((process, _)) => process.name(),
                                     None => handoff.as_ref().and_then(|ho| ho.process_name()),
                                 },
                                 process_path: None,

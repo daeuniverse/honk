@@ -154,6 +154,104 @@ pub struct ConntrackKfuncs {
     pub btf: Option<OwnedFd>,
 }
 
+/// Running-kernel fields used for the association attached to this outgoing skb.
+pub struct HostConntrack {
+    pub(super) cast: i32,
+    pub(super) sk: i16,
+    pub(super) nfct: i16,
+    pub(super) zone: Option<i16>,
+    skb_shared_info_size: usize,
+    pub(super) skb_truesize: i16,
+    pub(super) skb_end: i16,
+    pub(super) lookup: SkbConntrackKfuncs,
+    pub(super) disconnects: i32,
+    pub(super) kernel_socket: (i32, i32),
+    pub(super) mac_header: i16,
+    pub(super) network_header: i16,
+    pub(super) encapsulation: (i16, i32),
+}
+
+impl HostConntrack {
+    pub fn skb_shared_info_size(&self) -> usize {
+        self.skb_shared_info_size
+    }
+
+    pub(super) fn skb_end_limit(&self) -> io::Result<i32> {
+        use honk_ebpf_common::xdp_gateway::HOST_SKB_CHARGE_MAX;
+
+        // SKB_DATA_ALIGN rounds the tail to SMP_CACHE_BYTES. A page upper-bounds
+        // that alignment on the supported kernels without assuming a cache line size.
+        let page = super::tcx_aux::kernel_page_size()?;
+        self.skb_shared_info_size
+            .checked_next_multiple_of(page)
+            .and_then(|tail| (HOST_SKB_CHARGE_MAX as usize).checked_sub(tail))
+            .and_then(|end| i32::try_from(end).ok())
+            .filter(|end| *end > 0)
+            .ok_or_else(|| invalid_data("skb shared tail exceeds Host queue capacity"))
+    }
+
+    pub fn discover_accounted(root: &Arc<MemoryBudget>) -> io::Result<Self> {
+        let bounds = Bounds::read()?;
+        let _memory = reserve_btf(root, bounds.construction_bytes())?;
+        let base = Types::parse(read_bounded(VMLINUX, bounds.base)?)?;
+        let (types, module, base_types) =
+            base.with_conntrack(bounds.module, "bpf_skb_ct_lookup")?;
+        let lookup = SkbConntrackKfuncs(ConntrackKfuncs::from_types(
+            &types,
+            module,
+            base_types,
+            "bpf_skb_ct_lookup",
+            "__sk_buff",
+        )?);
+        let (_, skb) = types.named("sk_buff", 4)?;
+        let (headers_offset, headers_type) = types
+            .member(skb, "headers", 0)?
+            .ok_or_else(|| invalid_data("missing sk_buff.headers"))?;
+        let headers = types.resolve(headers_type)?;
+        let (_, device) = types.named("net_device", 4)?;
+        // __dev_queue_xmit sets this bit around TC redirect so the private hop
+        // skips netfilter egress writers before the TUN's timestamp check.
+        if types.member(device, "nf_hooks_egress", 0)?.is_some() {
+            types.bit(headers, "nf_skip_egress")?;
+        }
+        let (encap, mask) = types.bit(headers, "encapsulation")?;
+        let encap = i16::try_from(i64::from(headers_offset) + i64::from(encap))
+            .map_err(|_| invalid_data("skb encapsulation offset overflow"))?;
+        let (_, sock) = types.named("sock", 4)?;
+        let (_, ct) = types.named("nf_conn", 4)?;
+        let (_, shinfo) = types.named("skb_shared_info", 4)?;
+        let skb_shared_info_size = types.word(shinfo + 8)? as usize;
+        if skb_shared_info_size == 0 || types.field(ct, "ct_general", 4)? != 0 {
+            return Err(invalid_data(
+                "incompatible skb_shared_info or nf_conn reference",
+            ));
+        }
+        let cast = types.named("bpf_cast_to_kern_ctx", 12)?.0;
+        Ok(Self {
+            cast: i32::try_from(cast).map_err(|_| invalid_data("BTF function ID overflow"))?,
+            nfct: i16::try_from(types.field(skb, "_nfct", 8)?)
+                .map_err(|_| invalid_data("skb CT offset overflow"))?,
+            mac_header: i16::try_from(types.field(skb, "mac_header", 2)?)
+                .map_err(|_| invalid_data("skb MAC offset overflow"))?,
+            network_header: i16::try_from(types.field(skb, "network_header", 2)?)
+                .map_err(|_| invalid_data("skb network offset overflow"))?,
+            encapsulation: (encap, mask),
+            sk: i16::try_from(types.field(skb, "sk", 8)?)
+                .map_err(|_| invalid_data("skb socket offset overflow"))?,
+            lookup,
+            zone: types.ct_zone_offset(ct)?,
+            skb_shared_info_size,
+            skb_truesize: i16::try_from(types.field(skb, "truesize", 4)?)
+                .map_err(|_| invalid_data("skb truesize offset overflow"))?,
+            skb_end: i16::try_from(types.field(skb, "end", 4)?)
+                .map_err(|_| invalid_data("skb end offset overflow"))?,
+            disconnects: i32::try_from(types.field(sock, "sk_disconnects", 4)?)
+                .map_err(|_| invalid_data("TCP disconnect offset overflow"))?,
+            kernel_socket: types.bit(sock, "sk_kern_sock")?,
+        })
+    }
+}
+
 /// Conntrack lookup authority for a `SCHED_CLS` skb context.
 pub struct SkbConntrackKfuncs(pub(super) ConntrackKfuncs);
 
@@ -190,6 +288,16 @@ impl ConntrackKfuncs {
             let _ = TCX_STRUCT_SIZES.set(sizes);
         }
         let (btf, module, base_types) = base.with_conntrack(bounds.module, lookup_name)?;
+        Self::from_types(&btf, module, base_types, lookup_name, context)
+    }
+
+    fn from_types(
+        btf: &Types,
+        module: Option<OwnedFd>,
+        base_types: u32,
+        lookup_name: &str,
+        context: &str,
+    ) -> io::Result<Self> {
         let (_, opts) = btf.named("bpf_ct_opts", 4)?;
         if btf.word(opts + 8)? as usize != size_of::<CtOptions>() {
             return Err(io::Error::new(
@@ -294,6 +402,96 @@ impl Types {
             }
         }
         Ok(sizes)
+    }
+
+    fn ct_zone_offset(&self, ct: usize) -> io::Result<Option<i16>> {
+        // In both stock layouts the declarations are timeout, [zone], tuplehash.
+        // Checking the adjacent names also rejects an unexpected bitfield or a
+        // renamed member where a disabled CONFIG_NF_CONNTRACK_ZONES has no field.
+        let count = (self.word(ct + 4)? & 0xffff) as usize;
+        let mut previous = "";
+        for index in 0..count {
+            let member = ct + 12 + index * 12;
+            let name = self.name(self.word(member)?)?;
+            if name == "tuplehash" {
+                let timeout_end = self
+                    .field(ct, "timeout", 4)?
+                    .checked_add(4)
+                    .ok_or_else(|| invalid_data("CT timeout offset overflow"))?;
+                let (tuple_offset, tuple_type) = self
+                    .member(ct, "tuplehash", 0)?
+                    .ok_or_else(|| invalid_data("invalid nf_conn.tuplehash"))?;
+                let array = self.resolve(tuple_type)?;
+                if tuple_offset < timeout_end
+                    || tuple_offset >= self.word(ct + 8)?
+                    || self.word(array + 4)? >> 24 & 31 != 3
+                    || self.word(array + 20)? != 2
+                {
+                    return Err(invalid_data("invalid nf_conn timeout or tuplehash"));
+                }
+                return match previous {
+                    "timeout"
+                        if self.member(ct, "zone", 0)?.is_none()
+                            && timeout_end.checked_next_multiple_of(8) == Some(tuple_offset) =>
+                    {
+                        Ok(None)
+                    }
+                    "zone" => {
+                        let (base, ty) = self
+                            .member(ct, "zone", 0)?
+                            .ok_or_else(|| invalid_data("invalid nf_conn.zone"))?;
+                        let zone = self.resolve(ty)?;
+                        if self.word(zone + 4)? >> 24 & 31 != 4
+                            || self.name(self.word(zone)?)? != "nf_conntrack_zone"
+                        {
+                            return Err(invalid_data("incompatible nf_conn.zone type"));
+                        }
+                        let size = self.word(zone + 8)?;
+                        if base < timeout_end
+                            || base.checked_add(size).is_none_or(|end| end > tuple_offset)
+                        {
+                            return Err(invalid_data("nf_conn.zone overlaps adjacent fields"));
+                        }
+                        let id = self.field(zone, "id", 2)?;
+                        if id.checked_add(2).is_none_or(|end| end > size) {
+                            return Err(invalid_data("CT zone id outside its structure"));
+                        }
+                        let offset = base
+                            .checked_add(id)
+                            .and_then(|offset| i16::try_from(offset).ok())
+                            .ok_or_else(|| invalid_data("CT zone offset overflow"))?;
+                        Ok(Some(offset))
+                    }
+                    _ => Err(invalid_data("unrecognized nf_conn zone layout")),
+                };
+            }
+            previous = name;
+        }
+        Err(invalid_data("missing nf_conn tuplehash"))
+    }
+
+    fn bit(&self, root: usize, name: &str) -> io::Result<(i32, i32)> {
+        let info = self.word(root + 4)?;
+        for index in 0..info & 0xffff {
+            let member = root + 12 + index as usize * 12;
+            if self.name(self.word(member)?)? != name {
+                continue;
+            }
+            let bits = self.word(member + 8)?;
+            let bit = bits & 0xffffff;
+            if info >> 31 == 1 && bits >> 24 == 1 && bit / 8 < self.word(root + 8)? {
+                let shift = if cfg!(target_endian = "little") {
+                    bit % 8
+                } else {
+                    7 - bit % 8
+                };
+                return Ok(((bit / 8) as i32, 1 << shift));
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("missing or incompatible kernel flag {name}"),
+        ))
     }
 
     fn member(&self, at: usize, name: &str, depth: usize) -> io::Result<Option<(u32, u32)>> {
@@ -699,6 +897,72 @@ mod tests {
         assert!(types.field(root, "hooks", 20).is_err());
         assert!(types.resolve(0).is_err());
         assert!(types.resolve(types.records.len() as u32).is_err());
+    }
+
+    #[test]
+    fn implicit_zone_requires_the_stock_zone_less_layout() {
+        fn offset(
+            zone_member: Option<(&str, u32, u32)>,
+            tuple_bit: u32,
+        ) -> io::Result<Option<i16>> {
+            let strings =
+                b"\0u32\0u16\0nf_conntrack_zone\0id\0timeout\0zone\0other\0tuplehash\0nf_conn\0";
+            let name = |s: &str| {
+                strings
+                    .windows(s.len() + 1)
+                    .position(|n| n.starts_with(s.as_bytes()) && n[s.len()] == 0)
+                    .unwrap() as u32
+            };
+            let mut words = vec![
+                name("u32"),
+                1 << 24,
+                4,
+                32,
+                name("u16"),
+                1 << 24,
+                2,
+                16,
+                name("nf_conntrack_zone"),
+                (4 << 24) | 1,
+                4,
+                name("id"),
+                2,
+                0,
+                0,
+                3 << 24,
+                0,
+                1,
+                1,
+                2,
+                name("nf_conn"),
+                (4 << 24) | (2 + u32::from(zone_member.is_some())),
+                32,
+                name("timeout"),
+                1,
+                64,
+            ];
+            if let Some((field, ty, bit)) = zone_member {
+                words.extend([name(field), ty, bit]);
+            }
+            words.extend([name("tuplehash"), 4, tuple_bit]);
+            let len = (words.len() * 4) as u32;
+            let mut bytes = vec![0x9f, 0xeb, 1, 0];
+            for word in [24, 0, len, len, strings.len() as u32]
+                .into_iter()
+                .chain(words)
+            {
+                bytes.extend(word.to_ne_bytes());
+            }
+            bytes.extend(strings);
+            let types = Types::parse(bytes)?;
+            types.ct_zone_offset(types.named("nf_conn", 4)?.1)
+        }
+        assert_eq!(offset(None, 128).unwrap(), None);
+        assert_eq!(offset(Some(("zone", 3, 96)), 128).unwrap(), Some(12));
+        assert!(offset(Some(("other", 3, 96)), 128).is_err());
+        assert!(offset(Some(("zone", 1, 96)), 128).is_err());
+        assert!(offset(Some(("zone", 3, 104)), 128).is_err());
+        assert!(offset(None, 192).is_err());
     }
 
     #[test]

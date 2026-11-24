@@ -8,6 +8,8 @@ pub(crate) use hold::HoldCollector;
 pub(crate) use policy::GatewayPolicy;
 pub(crate) use zones::ZoneAdmission;
 
+#[cfg(feature = "ebpf")]
+use super::host_identity::HostIdentity;
 use crate::control::routing_matcher::RoutingPushPlan;
 use crate::control::{ControlPlane, ShutdownIntent};
 use crate::dns::projection::RoutingProjection;
@@ -15,12 +17,16 @@ use crate::stats::xdp::{Diagnostics, DnsProjectionState};
 use dns::GatewayDnsBank;
 use generation::Arbitration;
 use honk_datapath::ScopeId;
-use honk_ebpf_common::xdp_gateway::GatewayReason;
+#[cfg(feature = "ebpf")]
+use honk_ebpf_common::xdp_gateway::{GATEWAY_REALM_CAPACITY, HostFlowMeta};
+use honk_ebpf_common::xdp_gateway::{GatewayKey, GatewayReason};
 use honk_netstack::{MemoryBudget, MemoryReservation};
 use honk_xsk::{
     AuxDevicePair, AuxGatewayProgram, AuxReaderGrace, AuxTcxLink, ConntrackKfuncs, GatewayLoad,
     GatewayMaps, GeneralCapture, OwnedXdpLink, Programs, SkbConntrackKfuncs,
 };
+#[cfg(feature = "ebpf")]
+use honk_xsk::{HostConntrack, HostGatewayLoad, topology::AuxLinkInfo};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use std::{
     io,
@@ -65,19 +71,100 @@ struct AuxProgram {
     _memory: MemoryReservation,
 }
 
+#[derive(Clone, Copy)]
+enum AuxDirection {
+    LanIngress,
+    #[cfg(feature = "ebpf")]
+    HostEgress {
+        stamp: u64,
+        binding: u64,
+        is_l2: bool,
+    },
+}
+
+impl AuxDirection {
+    fn matches_dns_scope(self, scope: ScopeId, realm: u32, realms: &[(ScopeId, u32)]) -> bool {
+        match self {
+            Self::LanIngress => !realms
+                .iter()
+                .any(|&(s, r)| (s == scope || r == realm) && (s, r) != (scope, realm)),
+            #[cfg(feature = "ebpf")]
+            Self::HostEgress { .. } => {
+                realm != GATEWAY_REALM_CAPACITY
+                    && !realms.iter().any(|&(s, r)| s == scope || r == realm)
+            }
+        }
+    }
+}
+
 struct AuxMember {
     realm: u32,
     scope: ScopeId,
+    direction: AuxDirection,
     pair: Arc<AuxDevicePair>,
     broadcasts: [Ipv4Addr; 64],
     broadcast_count: usize,
     link: Option<(AuxTcxLink, MemoryReservation)>,
     program: Option<AuxProgram>,
     key_bound: bool,
+    dns_active: bool,
+    #[cfg(feature = "ebpf")]
+    host_bound: bool,
+    #[cfg(feature = "ebpf")]
+    retiring: bool,
+}
+
+impl AuxMember {
+    fn new(
+        realm: u32,
+        scope: ScopeId,
+        direction: AuxDirection,
+        pair: Arc<AuxDevicePair>,
+        addresses: &[Ipv4Addr],
+    ) -> io::Result<Self> {
+        let mut broadcasts = [Ipv4Addr::UNSPECIFIED; 64];
+        broadcasts
+            .get_mut(..addresses.len())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "auxiliary broadcast capacity exceeded",
+                )
+            })?
+            .copy_from_slice(addresses);
+        Ok(Self {
+            realm,
+            scope,
+            direction,
+            pair,
+            broadcasts,
+            broadcast_count: addresses.len(),
+            link: None,
+            program: None,
+            key_bound: false,
+            dns_active: false,
+            #[cfg(feature = "ebpf")]
+            host_bound: false,
+            #[cfg(feature = "ebpf")]
+            retiring: false,
+        })
+    }
+
+    fn set_dns_binding(&mut self, projection: &RoutingProjection, active: bool) -> io::Result<()> {
+        match self.direction {
+            AuxDirection::LanIngress => projection.set_aux_binding(self.scope, active)?,
+            #[cfg(feature = "ebpf")]
+            AuxDirection::HostEgress { stamp, .. } => {
+                projection.set_host_binding(self.scope, stamp, active)?;
+            }
+        }
+        self.dns_active = active;
+        Ok(())
+    }
 }
 
 struct Auxiliary {
-    conntrack: SkbConntrackKfuncs,
+    conntrack: Option<SkbConntrackKfuncs>,
     grace: AuxReaderGrace,
     members: Vec<AuxMember>,
     _objects: MemoryReservation,
@@ -85,13 +172,19 @@ struct Auxiliary {
 }
 
 impl Auxiliary {
-    fn new(budget: &Arc<MemoryBudget>) -> io::Result<Box<Self>> {
-        // Eight explicit L3 interfaces is the configuration limit. Keep rebinds allocation-free.
-        let capacity = 8;
+    fn new(
+        budget: &Arc<MemoryBudget>,
+        lan_count: usize,
+        host_count: usize,
+    ) -> io::Result<Box<Self>> {
+        // Retired bindings occupy their slots until the owner has joined its work.
+        let capacity = lan_count + host_count;
         let allocation = budget
             .reserve(size_of::<Self>() + capacity * size_of::<AuxMember>())
             .ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))?;
-        let conntrack = SkbConntrackKfuncs::read_accounted(budget)?;
+        let conntrack = (lan_count != 0)
+            .then(|| SkbConntrackKfuncs::read_accounted(budget))
+            .transpose()?;
         let grace = AuxReaderGrace::new()?;
         let objects = reserve_objects(budget, grace.object_fds())?;
         Ok(Box::new(Self {
@@ -101,6 +194,59 @@ impl Auxiliary {
             _objects: objects,
             _allocation: allocation,
         }))
+    }
+}
+
+#[cfg(feature = "ebpf")]
+pub(super) struct HostResources {
+    identity: HostIdentity,
+    bypass_mark: u32,
+    conntrack: HostConntrack,
+    arbitration: Arc<Arbitration>,
+}
+
+#[cfg(feature = "ebpf")]
+impl HostResources {
+    pub(super) fn prepare(
+        identity: HostIdentity,
+        bypass_mark: u32,
+        budget: &Arc<MemoryBudget>,
+    ) -> io::Result<Self> {
+        if bypass_mark == 0 || bypass_mark & 0xc800_0000 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Host gateway bypass mark",
+            ));
+        }
+        Ok(Self {
+            identity,
+            bypass_mark,
+            conntrack: HostConntrack::discover_accounted(budget)?,
+            arbitration: Arbitration::new(budget, 0)?,
+        })
+    }
+
+    pub(super) fn arbitration(&self) -> &honk_xsk::GatewayArbitration {
+        &self.arbitration.kernel
+    }
+}
+
+#[cfg(feature = "ebpf")]
+#[derive(Clone)]
+pub(crate) struct HostProcessLookup {
+    maps: Arc<GatewayMaps>,
+    arbitration: Arc<Arbitration>,
+}
+
+#[cfg(feature = "ebpf")]
+impl HostProcessLookup {
+    pub(crate) fn lookup(
+        &self,
+        key: &GatewayKey,
+        binding: u64,
+    ) -> io::Result<Option<HostFlowMeta>> {
+        self.maps
+            .lookup_host_meta(&self.arbitration.kernel, key, binding)
     }
 }
 
@@ -177,9 +323,9 @@ enum LinkCustody<L> {
 }
 
 struct PublisherState<P, L> {
-    inner: Mutex<P>,
-    // While open, link indices match the members in `inner`.
+    // Link indices match `inner.members`. Drop custody before refunding program charges.
     links: Mutex<LinkCustody<L>>,
+    inner: Mutex<P>,
 }
 
 impl<P, L> PublisherState<P, L> {
@@ -366,7 +512,9 @@ impl GatewayShadow {
 pub(crate) struct GatewayPublisher {
     state: PublisherState<PublisherInner, OwnedXdpLink>,
     maps: Arc<GatewayMaps>,
-    conntrack: Arc<ConntrackKfuncs>,
+    conntrack: Option<Arc<ConntrackKfuncs>>,
+    #[cfg(feature = "ebpf")]
+    host: Option<HostResources>,
     budget: Arc<MemoryBudget>,
     active_plan: Arc<parking_lot::RwLock<Arc<RoutingPushPlan>>>,
     failure: std::sync::OnceLock<Arc<io::Error>>,
@@ -380,7 +528,7 @@ impl GatewayPublisher {
     pub(super) fn new(
         initial: (GatewayPolicy, MemoryReservation),
         maps: Arc<GatewayMaps>,
-        conntrack: Arc<ConntrackKfuncs>,
+        conntrack: Option<Arc<ConntrackKfuncs>>,
         budget: Arc<MemoryBudget>,
         shadow: GatewayShadow,
         active_plan: Arc<parking_lot::RwLock<Arc<RoutingPushPlan>>>,
@@ -407,6 +555,8 @@ impl GatewayPublisher {
             },
             maps,
             conntrack,
+            #[cfg(feature = "ebpf")]
+            host: None,
             budget,
             shadow,
             active_plan,
@@ -446,14 +596,19 @@ impl GatewayPublisher {
 
     #[cfg(all(test, feature = "ebpf"))]
     pub(super) fn check_unhealthy_auxiliary_retry(&self) -> io::Result<()> {
-        let (realm, scope, pair) = {
+        let (realm, scope, direction, pair) = {
             let inner = self.state.inner.lock();
             let member = inner
                 .auxiliary
                 .as_ref()
                 .and_then(|aux| aux.members.first())
                 .ok_or_else(lost_capture)?;
-            (member.realm, member.scope, Arc::clone(&member.pair))
+            (
+                member.realm,
+                member.scope,
+                member.direction,
+                Arc::clone(&member.pair),
+            )
         };
         let outer = pair.outer_ifindex();
         let was_healthy = {
@@ -462,7 +617,7 @@ impl GatewayPublisher {
         };
         // A legitimate published member would otherwise report AlreadyExists. Busy proves
         // cancellation was observed before the membership check, program load or TCX attach.
-        let attempt = self.bind_auxiliary(realm, scope, outer, pair, &[]);
+        let attempt = self.bind_member(realm, scope, direction, outer, pair, &[]);
         {
             let _start = self.shadow.shutdown.lock_capture_start()?;
             self.shadow.healthy.store(was_healthy, Ordering::Release);
@@ -518,7 +673,7 @@ impl GatewayPublisher {
             GatewayLoad {
                 routing: &generation.policy.bytecode.insns,
                 maps: &self.maps,
-                conntrack: &self.conntrack,
+                conntrack: self.conntrack.as_deref(),
                 dns: Some(bank.maps()),
                 arbitration: Some(&arb.kernel),
             },
@@ -553,9 +708,92 @@ impl GatewayPublisher {
         self.publish_inner(plan, true)
     }
 
-    pub(super) fn prepare_auxiliary(&mut self) -> io::Result<()> {
-        self.state.inner.get_mut().auxiliary = Some(Auxiliary::new(&self.budget)?);
+    pub(super) fn prepare_auxiliary(&mut self, lan_count: usize) -> io::Result<()> {
+        let inner = self.state.inner.get_mut();
+        if inner.auxiliary.is_some()
+            || !(1..=honk_config::datapath::MAX_L3_LANS).contains(&lan_count)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid auxiliary preparation",
+            ));
+        }
+        inner.auxiliary = Some(Auxiliary::new(
+            &self.budget,
+            lan_count,
+            self.maps.host_realms().len(),
+        )?);
         Ok(())
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub(super) fn prepare_host(&mut self, host: HostResources) -> io::Result<()> {
+        let inner = self.state.inner.get_mut();
+        let count = self.maps.host_realms().len();
+        if count == 0
+            || self.host.is_some()
+            || inner.current.policy.host_bytecode.is_none()
+            || inner.current.arbitration.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Host gateway preparation",
+            ));
+        }
+        if inner.auxiliary.is_none() {
+            inner.auxiliary = Some(Auxiliary::new(&self.budget, 0, count)?);
+        }
+        self.host = Some(host);
+        Ok(())
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub(super) fn maps(&self) -> &GatewayMaps {
+        &self.maps
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub(super) fn host_conntrack(&self) -> io::Result<&HostConntrack> {
+        self.host
+            .as_ref()
+            .map(|host| &host.conntrack)
+            .ok_or_else(lost_capture)
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub(super) fn synchronize_host_input(&self) -> io::Result<()> {
+        self.host
+            .as_ref()
+            .ok_or_else(lost_capture)?
+            .arbitration()
+            .synchronize_readers()
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub(crate) fn host_process_lookup(&self) -> io::Result<HostProcessLookup> {
+        let host = self
+            .host
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Host gateway was not prepared"))?;
+        Ok(HostProcessLookup {
+            maps: Arc::clone(&self.maps),
+            arbitration: Arc::clone(&host.arbitration),
+        })
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub(super) fn host_pending_drain(&self, realm: u32, binding: u64) -> io::Result<Option<u64>> {
+        self.maps.host_pending_drain(realm, binding)
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub(super) fn host_input_drained(
+        &self,
+        realm: u32,
+        binding: u64,
+        cutoff: u64,
+    ) -> io::Result<()> {
+        self.maps.host_input_drained(realm, binding, cutoff)
     }
 
     pub(crate) fn pause_auxiliary(&self) {
@@ -577,15 +815,69 @@ impl GatewayPublisher {
         Ok(())
     }
 
+    fn gateway_load<'a>(&'a self, generation: &'a Generation) -> GatewayLoad<'a> {
+        GatewayLoad {
+            routing: &generation.policy.bytecode.insns,
+            maps: &self.maps,
+            conntrack: self.conntrack.as_deref(),
+            dns: generation
+                .bank
+                .as_ref()
+                .filter(|_| generation.arbitration.is_some())
+                .map(|bank| bank.maps()),
+            arbitration: generation.arbitration.as_ref().map(|arb| &arb.kernel),
+        }
+    }
+
     fn load_auxiliary(
         &self,
-        pair: &Arc<AuxDevicePair>,
-        realm: u32,
-        broadcasts: &[Ipv4Addr],
-        load: GatewayLoad<'_>,
-        ct: &SkbConntrackKfuncs,
+        member: &AuxMember,
+        generation: &Generation,
+        lan_ct: Option<&SkbConntrackKfuncs>,
     ) -> io::Result<AuxProgram> {
-        let program = AuxGatewayProgram::load(pair, realm, broadcasts, load, ct)?;
+        let load = GatewayLoad {
+            conntrack: None,
+            ..self.gateway_load(generation)
+        };
+        let broadcasts = &member.broadcasts[..member.broadcast_count];
+        let program = match member.direction {
+            AuxDirection::LanIngress => AuxGatewayProgram::load(
+                &member.pair,
+                member.realm,
+                broadcasts,
+                load,
+                lan_ct.ok_or_else(lost_capture)?,
+            )?,
+            #[cfg(feature = "ebpf")]
+            AuxDirection::HostEgress { binding, is_l2, .. } => {
+                let host = self.host.as_ref().ok_or_else(lost_capture)?;
+                let bytecode = generation
+                    .policy
+                    .host_bytecode
+                    .as_ref()
+                    .ok_or_else(lost_capture)?;
+                AuxGatewayProgram::load_host(
+                    &member.pair,
+                    member.realm,
+                    GatewayLoad {
+                        routing: &bytecode.insns,
+                        dns: generation.bank.as_ref().map(|bank| bank.maps()),
+                        arbitration: Some(host.arbitration()),
+                        ..load
+                    },
+                    HostGatewayLoad {
+                        binding,
+                        is_l2,
+                        bypass_mark: host.bypass_mark,
+                        honk_pid: host.identity.self_pid(),
+                        identity: host.identity.identity_fd(),
+                        decision: host.identity.decision_fd(),
+                        dns_realm: GATEWAY_REALM_CAPACITY,
+                        ct: &host.conntrack,
+                    },
+                )?
+            }
+        };
         let memory = reserve_objects(&self.budget, program.object_fds())?;
         Ok(AuxProgram {
             program,
@@ -600,6 +892,45 @@ impl GatewayPublisher {
         outer: u32,
         pair: Arc<AuxDevicePair>,
         ipv4_broadcasts: &[Ipv4Addr],
+    ) -> io::Result<()> {
+        self.bind_member(
+            realm,
+            scope,
+            AuxDirection::LanIngress,
+            outer,
+            pair,
+            ipv4_broadcasts,
+        )
+    }
+
+    #[cfg(feature = "ebpf")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bind_host(
+        &self,
+        realm: u32,
+        scope: ScopeId,
+        stamp: u64,
+        binding: u64,
+        outer: AuxLinkInfo,
+        pair: Arc<AuxDevicePair>,
+        broadcasts: &[Ipv4Addr],
+    ) -> io::Result<()> {
+        let direction = AuxDirection::HostEgress {
+            stamp,
+            binding,
+            is_l2: outer.is_l2,
+        };
+        self.bind_member(realm, scope, direction, outer.ifindex, pair, broadcasts)
+    }
+
+    fn bind_member(
+        &self,
+        realm: u32,
+        scope: ScopeId,
+        direction: AuxDirection,
+        outer: u32,
+        pair: Arc<AuxDevicePair>,
+        broadcasts: &[Ipv4Addr],
     ) -> io::Result<()> {
         let plan = self.active_plan.try_read().ok_or_else(publisher_busy)?;
         let mut inner = self.state.inner.try_lock().ok_or_else(publisher_busy)?;
@@ -617,12 +948,11 @@ impl GatewayPublisher {
         {
             return Err(publisher_busy());
         }
+        let host_realm = self.maps.host_realms().contains(&realm);
         if pair.outer_ifindex() != outer
-            || self
-                .shadow
-                .realms
-                .iter()
-                .any(|&(s, r)| (s == scope || r == realm) && (s, r) != (scope, realm))
+            || scope == ScopeId::HOST
+            || host_realm == matches!(direction, AuxDirection::LanIngress)
+            || !direction.matches_dns_scope(scope, realm, &self.shadow.realms)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -633,19 +963,11 @@ impl GatewayPublisher {
             .auxiliary
             .as_ref()
             .ok_or_else(|| io::Error::other("auxiliary capture was not prepared"))?;
-        let mut broadcasts = [Ipv4Addr::UNSPECIFIED; 64];
-        let addresses = broadcasts.get_mut(..ipv4_broadcasts.len()).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "auxiliary broadcast capacity exceeded",
-            )
-        })?;
-        addresses.copy_from_slice(ipv4_broadcasts);
         if aux.members.len() == aux.members.capacity()
-            || aux.members.iter().any(|member| {
-                member.realm == realm
-                    || member.scope == scope
-                    || (member.key_bound && member.pair.outer_ifindex() == outer)
+            || aux.members.iter().any(|existing| {
+                existing.realm == realm
+                    || existing.scope == scope
+                    || (existing.key_bound && existing.pair.outer_ifindex() == outer)
             })
         {
             return Err(io::Error::new(
@@ -653,55 +975,63 @@ impl GatewayPublisher {
                 "gateway auxiliary binding still owned",
             ));
         }
-        pair.verify()?;
-        let generation = &inner.current;
-        let program = self.load_auxiliary(
-            &pair,
-            realm,
-            ipv4_broadcasts,
-            GatewayLoad {
-                routing: &generation.policy.bytecode.insns,
-                maps: &self.maps,
-                conntrack: &self.conntrack,
-                dns: generation.bank.as_ref().map(|b| b.maps()),
-                arbitration: generation.arbitration.as_ref().map(|a| &a.kernel),
-            },
-            &aux.conntrack,
-        )?;
+        #[cfg(feature = "ebpf")]
+        // Host policy generations retain the same atomic root for the lifetime of the pair.
+        let broadcasts = if matches!(direction, AuxDirection::HostEgress { .. }) {
+            pair.replace_host_broadcasts(broadcasts)?;
+            &[]
+        } else {
+            broadcasts
+        };
+        let mut member = AuxMember::new(realm, scope, direction, pair, broadcasts)?;
+        member.pair.verify()?;
+        let program = self.load_auxiliary(&member, &inner.current, aux.conntrack.as_ref())?;
         let _links = self.state.open_links()?;
         let _start = self.shadow.shutdown.lock_capture_start()?;
         if !self.shadow.capture_ready() {
             return Err(publisher_busy());
         }
         let projection = self.shadow.projection.upgrade().ok_or_else(lost_capture)?;
-        if pair.unavailable()? {
-            pair.verify()?;
+        if member.pair.unavailable()? {
+            member.pair.verify()?;
             return Err(publisher_busy());
         }
         // Keep the neutral-to-data replacement inside the same authority as the gate open.
-        let (link, charge) = AuxTcxLink::outer(&pair, program.program.as_fd(), &self.budget)?;
-        self.maps.bind_aux_realm(&pair, realm)?;
+        let fd = program.program.as_fd();
+        let link = match direction {
+            AuxDirection::LanIngress => AuxTcxLink::outer(&member.pair, fd, &self.budget)?,
+            #[cfg(feature = "ebpf")]
+            AuxDirection::HostEgress { .. } => {
+                AuxTcxLink::host_egress(&member.pair, fd, &self.budget)?
+            }
+        };
+        member.link = Some(link);
+        member.program = Some(program);
         let aux = inner.auxiliary.as_mut().unwrap();
-        aux.members.push(AuxMember {
-            realm,
-            scope,
-            pair,
-            broadcasts,
-            broadcast_count: ipv4_broadcasts.len(),
-            link: Some((link, charge)),
-            program: Some(program),
-            key_bound: true,
-        });
+        aux.members.push(member);
         let member = aux.members.last_mut().unwrap();
-        let opened = projection
-            .set_aux_binding(scope, true)
-            .and_then(|()| member.pair.set_open(true));
+        let opened = (|| {
+            self.maps.bind_aux_realm(&member.pair, realm)?;
+            member.key_bound = true;
+            #[cfg(feature = "ebpf")]
+            if let AuxDirection::HostEgress { binding, .. } = member.direction {
+                self.maps.bind_host_realm(realm, binding)?;
+                member.host_bound = true;
+            }
+            member.set_dns_binding(&projection, true)?;
+            member.pair.set_open(true)
+        })();
         if let Err(error) = opened {
             tracing::debug!(realm, errno = ?error.raw_os_error(), %error, "auxiliary gate activation failed");
             drop(_start);
             drop(_links);
-            self.close_member(member, &aux.grace)?;
-            return Err(error);
+            self.close_member(member, &aux.grace)
+                .map_err(|failure| self.fail_capture(failure))?;
+            return if error.kind() == io::ErrorKind::WouldBlock {
+                Err(io::Error::other(error))
+            } else {
+                Err(error)
+            };
         }
         Ok(())
     }
@@ -710,14 +1040,23 @@ impl GatewayPublisher {
         if member.program.is_none() {
             return Ok(());
         }
+        self.revoke_member(member).and(grace.synchronize())?;
+        member.program.take();
+        Ok(())
+    }
+
+    fn revoke_member(&self, member: &mut AuxMember) -> io::Result<()> {
         let gate = member.pair.set_open(false);
-        let dns = self
-            .shadow
-            .projection
-            .upgrade()
-            .map_or(Ok(()), |projection| {
-                projection.set_aux_binding(member.scope, false)
-            });
+        let dns = if member.dns_active {
+            if let Some(projection) = self.shadow.projection.upgrade() {
+                member.set_dns_binding(&projection, false)
+            } else {
+                member.dns_active = false;
+                Ok(())
+            }
+        } else {
+            Ok(())
+        };
         let detached = member
             .link
             .as_ref()
@@ -732,10 +1071,7 @@ impl GatewayPublisher {
         } else {
             Ok(())
         };
-        let readers = grace.synchronize();
-        gate.and(dns).and(detached).and(key).and(readers)?;
-        member.program.take();
-        Ok(())
+        gate.and(dns).and(detached).and(key)
     }
 
     pub(crate) fn verify_auxiliary(&self, realm: u32, pair: &Arc<AuxDevicePair>) -> io::Result<()> {
@@ -752,7 +1088,8 @@ impl GatewayPublisher {
             .ok_or_else(missing)?;
         let (link, _) = member.link.as_ref().ok_or_else(missing)?;
         let program = member.program.as_ref().ok_or_else(lost_capture)?;
-        link.verify(program.program.id())
+        link.verify(program.program.id())?;
+        pair.verify_open()
     }
 
     pub(crate) fn close_auxiliary(&self, realm: u32) -> io::Result<()> {
@@ -760,6 +1097,25 @@ impl GatewayPublisher {
         if let Some(aux) = inner.auxiliary.as_mut()
             && let Some(member) = aux.members.iter_mut().find(|m| m.realm == realm)
         {
+            #[cfg(feature = "ebpf")]
+            if matches!(member.direction, AuxDirection::HostEgress { .. }) {
+                if member.program.is_none() {
+                    return Ok(());
+                }
+                self.revoke_member(member)?;
+                let pair = Arc::clone(&member.pair);
+                drop(inner);
+                self.synchronize_host_input()?;
+                let mut inner = self.state.inner.lock();
+                if let Some(member) = inner.auxiliary.as_mut().and_then(|aux| {
+                    aux.members
+                        .iter_mut()
+                        .find(|m| m.realm == realm && Arc::ptr_eq(&m.pair, &pair))
+                }) {
+                    member.program.take();
+                }
+                return Ok(());
+            }
             self.close_member(member, &aux.grace)?;
         }
         Ok(())
@@ -768,32 +1124,61 @@ impl GatewayPublisher {
     /// The scope owner has now closed its old TUN FD and joined every application and output.
     pub(crate) fn unbind_auxiliary(&self, realm: u32) -> io::Result<()> {
         let mut inner = self.state.inner.lock();
-        let Some(aux) = inner.auxiliary.as_deref() else {
+        let Some(aux) = inner.auxiliary.as_deref_mut() else {
             return Ok(());
         };
         let Some(index) = aux.members.iter().position(|m| m.realm == realm) else {
             return Ok(());
         };
-        if aux.members[index].key_bound || aux.members[index].link.is_some() {
+        let member = &mut aux.members[index];
+        if member.key_bound || member.link.is_some() || member.dns_active {
             return Err(io::Error::other(
                 "gateway auxiliary binding has not been closed",
             ));
         }
-        if aux.members[index].program.is_some() {
+        if member.program.is_some() {
             return Err(io::Error::other(
                 "gateway auxiliary readers have not drained",
             ));
         }
-        if !aux.members[index].pair.inner_gone()? {
+        if !member.pair.inner_gone()? {
             return Err(io::Error::other(
                 "gateway auxiliary TUN device is still registered",
             ));
         }
-        self.maps.clear_aux_realm(
-            realm,
-            inner.current.arbitration.as_ref().map(|a| &a.kernel),
-            &self.budget,
-        )?;
+        let index = match member.direction {
+            AuxDirection::LanIngress => {
+                let arbitration = inner.current.arbitration.as_ref().map(|a| &a.kernel);
+                self.maps
+                    .clear_aux_realm(realm, arbitration, &self.budget)?;
+                index
+            }
+            #[cfg(feature = "ebpf")]
+            AuxDirection::HostEgress { binding, .. } if member.host_bound => {
+                if member.retiring {
+                    return Err(publisher_busy());
+                }
+                let host = self.host.as_ref().ok_or_else(lost_capture)?;
+                // Keep the closed row in the membership table while other realms publish.
+                let pair = Arc::clone(&member.pair);
+                member.retiring = true;
+                drop(inner);
+                let result =
+                    self.maps
+                        .clear_host_binding(realm, binding, host.arbitration(), &self.budget);
+                inner = self.state.inner.lock();
+                let members = &mut inner.auxiliary.as_mut().ok_or_else(lost_capture)?.members;
+                let index = members
+                    .iter()
+                    .position(|m| m.realm == realm && Arc::ptr_eq(&m.pair, &pair))
+                    .ok_or_else(lost_capture)?;
+                members[index].retiring = false;
+                result?;
+                index
+            }
+            #[cfg(feature = "ebpf")]
+            AuxDirection::HostEgress { .. } => index,
+        };
         if let Some(previous) = &mut inner.previous {
             previous.programs.auxiliary.retain(|(r, _)| *r != realm);
         }
@@ -913,7 +1298,7 @@ impl GatewayPublisher {
         &self,
         collector: &mut HoldCollector,
         now_ns: u64,
-        retains: &mut dyn FnMut(u32, std::net::IpAddr) -> bool,
+        retains: &mut dyn FnMut(&GatewayKey) -> bool,
     ) -> io::Result<()> {
         let Some(mut inner) = self.state.inner.try_lock() else {
             return Ok(());
@@ -921,26 +1306,35 @@ impl GatewayPublisher {
         if let Some(error) = self.capture_error() {
             return Err(error);
         }
-        if let Some(arb) = &inner.current.arbitration {
+        #[cfg(feature = "ebpf")]
+        let host = self.host.as_ref().map(HostResources::arbitration);
+        #[cfg(not(feature = "ebpf"))]
+        let host = None;
+        let lan = inner.current.arbitration.as_ref().map(|a| &a.kernel);
+        if lan.is_some() || host.is_some() {
             self.shadow.diagnostics.sample_dns_decisions(&self.maps);
             self.check_hold_custody()?;
-            collector
-                .sweep(&self.maps, now_ns, Some(&arb.kernel), retains)
-                .map_err(|error| self.fail_capture(error))?;
-            if let Some(bank) = &inner.current.bank
-                && !self.shadow.notrack_latched()
-            {
-                self.shadow.diagnostics.sample_dns(
-                    bank,
-                    self.maps.reason_count(GatewayReason::WouldPassDns).ok(),
-                );
-            } else if inner.previous.is_none()
-                && (inner.current.bank.is_some() || arb.kernel.pending() == 0)
-            {
-                self.compact_static(&mut inner)?;
-            }
-        } else {
-            collector.sweep(&self.maps, now_ns, None, retains)?;
+        }
+        collector
+            .sweep(&self.maps, now_ns, lan, host, &self.budget, retains)
+            .map_err(|error| {
+                if lan.is_some() || host.is_some() {
+                    self.fail_capture(error)
+                } else {
+                    error
+                }
+            })?;
+        if let Some(bank) = &inner.current.bank
+            && !self.shadow.notrack_latched()
+        {
+            self.shadow.diagnostics.sample_dns(
+                bank,
+                self.maps.reason_count(GatewayReason::WouldPassDns).ok(),
+            );
+        } else if inner.previous.is_none()
+            && (inner.current.bank.is_some() || lan.is_some_and(|arb| arb.pending() == 0))
+        {
+            self.compact_static(&mut inner)?;
         }
         Ok(())
     }
@@ -1022,19 +1416,7 @@ mod tests {
             .find(|member| member.link.is_some())
             .ok_or_else(lost_capture)?;
         let current = member.program.as_ref().ok_or_else(lost_capture)?;
-        let next = publisher.load_auxiliary(
-            &member.pair,
-            member.realm,
-            &member.broadcasts[..member.broadcast_count],
-            GatewayLoad {
-                routing: &inner.current.policy.bytecode.insns,
-                maps: &publisher.maps,
-                conntrack: &publisher.conntrack,
-                dns: inner.current.bank.as_ref().map(|bank| bank.maps()),
-                arbitration: inner.current.arbitration.as_ref().map(|arb| &arb.kernel),
-            },
-            &aux.conntrack,
-        )?;
+        let next = publisher.load_auxiliary(member, &inner.current, aux.conntrack.as_ref())?;
         member
             .link
             .as_ref()
@@ -1071,6 +1453,30 @@ mod tests {
         publisher.close_member(member, &aux.grace)?;
         assert!(member.program.is_none());
         Ok(())
+    }
+
+    #[cfg(feature = "ebpf")]
+    #[test]
+    fn host_execution_scopes_are_distinct_from_the_shared_dns_scope() {
+        let host_scope = ScopeId::allocate().unwrap();
+        let first = ScopeId::allocate().unwrap();
+        let second = ScopeId::allocate().unwrap();
+        let lan = ScopeId::allocate().unwrap();
+        let bindings = [(lan, 1), (host_scope, GATEWAY_REALM_CAPACITY)];
+        let egress = AuxDirection::HostEgress {
+            stamp: 2,
+            binding: 1,
+            is_l2: true,
+        };
+
+        assert!(egress.matches_dns_scope(first, 2, &bindings));
+        assert!(egress.matches_dns_scope(second, 3, &bindings));
+        assert!(egress.matches_dns_scope(first, 2, &[]));
+        assert!(!egress.matches_dns_scope(host_scope, 2, &bindings));
+        assert!(!egress.matches_dns_scope(first, GATEWAY_REALM_CAPACITY, &[]));
+        assert!(!egress.matches_dns_scope(first, 1, &bindings));
+        assert!(!egress.matches_dns_scope(lan, 2, &bindings));
+        assert!(AuxDirection::LanIngress.matches_dns_scope(lan, 1, &bindings));
     }
 
     #[test]

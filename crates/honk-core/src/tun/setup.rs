@@ -118,6 +118,26 @@ impl TunDevice {
         Ok(())
     }
 
+    #[cfg(feature = "ebpf")]
+    pub(crate) fn prepare_host_fifo(&self, name: &str, slots: u32) -> anyhow::Result<()> {
+        ensure!(slots != 0, "private Host FIFO capacity is zero");
+        let mut netlink = NlSock::new()?;
+        self.verify_auxiliary(name)?;
+        ensure!(
+            netlink.dump_links()?.iter().any(|link| {
+                link.ifindex.get() == self.ifindex
+                    && link.name == name
+                    && link.flags & libc::IFF_UP as u32 == 0
+            }),
+            "private Host TUN must be down before FIFO setup"
+        );
+        self.verify_auxiliary(name)?;
+        netlink.set_host_tun_queue_len(self.ifindex, slots)?;
+        self.verify_auxiliary(name)?;
+        netlink.add_host_tun_fifo(self.ifindex, slots)?;
+        self.verify_auxiliary(name)
+    }
+
     pub(crate) fn configure_auxiliary(&self, name: &str, mtu: u32) -> anyhow::Result<()> {
         self.verify_auxiliary(name)?;
         // Open the device's sysctl first; a later rename cannot retarget this write.
@@ -278,27 +298,6 @@ fn admit_all_rp_filter(
             "unrecognized net.ipv4.conf.all.rp_filter value {other:?}; set it to 0 or 2 before starting backend tun"
         ),
     }
-}
-
-/// Proves the bypass mark sticks on real TCP and UDP sockets and returns the
-/// cookie of the namespace they were created in.
-fn probe_marks(mark: u32) -> anyhow::Result<u64> {
-    use socket2::{Domain, Protocol, Socket, Type};
-
-    let mut cookie = 0;
-    for (label, kind, protocol) in [
-        ("TCP", Type::STREAM, Protocol::TCP),
-        ("UDP", Type::DGRAM, Protocol::UDP),
-    ] {
-        let socket = Socket::new(Domain::IPV4, kind, Some(protocol))
-            .with_context(|| format!("create {label} SO_MARK probe"))?;
-        honk_outbound::util::set_mark_verified(&socket, mark).with_context(|| {
-            format!("backend tun requires SO_MARK {mark:#x} on {label} sockets (CAP_NET_ADMIN)")
-        })?;
-        cookie = crate::netlink::fib::namespace_cookie(socket.as_raw_fd())
-            .context("read SO_NETNS_COOKIE (Linux 5.14 or newer)")?;
-    }
-    Ok(cookie)
 }
 
 fn process_starttime() -> io::Result<u64> {
@@ -798,7 +797,7 @@ impl TunSetup {
         admit_all_rp_filter(plan.address4.is_some(), || {
             std::fs::read_to_string("/proc/sys/net/ipv4/conf/all/rp_filter")
         })?;
-        let netns_cookie = probe_marks(plan.mark)?;
+        let netns_cookie = crate::control::probe_socket_marks(plan.mark)?;
         let netlink = NlSock::new().context("open rtnetlink")?;
         let preflight = Topology::preflight_tun(&plan.spec()).context("TUN resource preflight")?;
         let directory = state::state_directory(data_dir, true, state::private)

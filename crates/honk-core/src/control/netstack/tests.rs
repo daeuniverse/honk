@@ -180,6 +180,44 @@ fn handshake_with_class(
 }
 
 #[test]
+fn host_process_is_bound_only_to_the_new_flow_id() {
+    let now = Instant::now();
+    let (scope, _owner, _) = runtime(now);
+    let first = "192.0.2.1:40000".parse().unwrap();
+    let other = "192.0.2.1:40001".parse().unwrap();
+    let metadata = |pid| ProcessMeta::test_gateway(pid, "");
+    let receive = |client, result: Option<io::Result<ProcessMeta>>| {
+        let syn = segment(client, 100, 0, tcp::SYN, &[]);
+        scope.0.with(|inner| {
+            let (rx, report) = inner.receive_checked(&syn, RxMeta::VERIFY, now, now, |_| true);
+            inner
+                .bind_host_process(rx, report, |_, source| {
+                    assert_eq!(source.src, client);
+                    result.expect("retransmitted SYN performed another lookup")
+                })
+                .0
+        })
+    };
+    assert_eq!(
+        receive(first, Some(Err(io::ErrorKind::WouldBlock.into()))),
+        Rx::Dropped(DropReason::Stale)
+    );
+    assert!(scope.poll_accept().is_none());
+    assert_eq!(receive(other, Some(Ok(metadata(42)))), Rx::Consumed);
+    assert_eq!(receive(first, Some(Ok(metadata(19)))), Rx::Consumed);
+    assert_eq!(receive(other, None), Rx::Consumed);
+    let mut flows = [
+        scope.poll_accept().unwrap().1,
+        scope.poll_accept().unwrap().1,
+    ];
+    flows.sort_by_key(FlowIo::peer_addr);
+    assert_eq!(flows[0].peer_addr(), first);
+    assert_eq!(flows[0].process(), Some(metadata(19)));
+    assert_eq!(flows[1].process(), Some(metadata(42)));
+    assert!(flows.iter().all(|flow| flow.packet_source().is_none()));
+}
+
+#[test]
 fn flow_io_retains_the_first_admitted_syn_dscp_for_both_families() {
     for client in ["10.0.0.2:40000", "[fd00::2]:40000"] {
         let client: SocketAddr = client.parse().unwrap();

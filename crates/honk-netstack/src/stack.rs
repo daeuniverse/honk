@@ -1722,6 +1722,25 @@ impl Stack {
             })
     }
 
+    /// Unfinished reassembly lacks ports. Unpulled transport replies retain their wire tuple.
+    pub fn retains_packet_obligation(
+        &self,
+        client: SocketAddr,
+        destination: SocketAddr,
+        protocol: u8,
+    ) -> bool {
+        self.reasm
+            .obligations()
+            .any(|key| key == (client.ip(), destination.ip(), protocol))
+            || match protocol {
+                wire::PROTO_TCP => self.controls.iter().any(|control| {
+                    control.tuple.remote == client && control.tuple.local == destination
+                }),
+                wire::PROTO_UDP => self.udp_tx.retains_tuple(destination, client),
+                _ => false,
+            }
+    }
+
     /// Whether this peer still owns protocol state or an unpulled reply. Packets already
     /// exported to an adapter and its application work need separate retention there.
     pub fn retains_source(&self, address: IpAddr) -> bool {

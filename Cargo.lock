@@ -1789,6 +1789,7 @@ dependencies = [
  "lru",
  "md-5",
  "nix 0.31.3",
+ "object",
  "parking_lot 0.13.0",
  "percent-encoding",
  "pin-project-lite",

@@ -135,6 +135,7 @@ jobs:
               - '.github/ci/pins.env'
               - '.github/ci/run-vm-gate.sh'
               - '.github/ci/ebpf-vm-tests.sh'
+              - '.github/ci/host-daemon-*'
               - '.github/ci/xdp*'
               - 'rust-toolchain.toml'
               - '.cargo/**'

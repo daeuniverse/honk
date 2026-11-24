@@ -1,4 +1,4 @@
-use super::kernel::KernelLayout;
+use super::{kernel::KernelLayout, receipt::Receipt, sys};
 use crate::ebpf::{
     PnameSupport,
     host_bank::{self, HostSocketBank},
@@ -8,7 +8,6 @@ use crate::ebpf::{
         syscall,
     },
 };
-use crate::xdp::host::{receipt::Receipt, sys};
 use anyhow::{Context as _, ensure};
 use aya::{
     Ebpf, EbpfLoader,

@@ -49,9 +49,23 @@ fn emit_quote(cursor: i32, available: i32) -> GatewayBuilder {
 fn run(
     b: &GatewayBuilder,
     packet: &[u8],
+    linear: usize,
+    extend: bool,
+    gso_size: u32,
+) -> (i32, Vec<usize>) {
+    run_with_broadcasts(b, packet, linear, extend, gso_size, Some(&[]))
+}
+
+const BROADCAST_ROOT: u64 = 101;
+const BROADCAST_INNER: u64 = 102;
+
+fn run_with_broadcasts(
+    b: &GatewayBuilder,
+    packet: &[u8],
     mut linear: usize,
     extend: bool,
     gso_size: u32,
+    broadcasts: Option<&[Ipv4Addr]>,
 ) -> (i32, Vec<usize>) {
     let mut frame = [0; 512];
     let mut registers = [0; 11];
@@ -105,6 +119,32 @@ fn run(
                 let at = x.checked_add_signed(i64::from(i.off)).unwrap() as usize;
                 let word = (if i.code == ST_W { k } else { y }) as u32;
                 frame[at..at + 4].copy_from_slice(&word.to_le_bytes());
+                false
+            }
+            LD_MAP => {
+                assert_eq!(src, 1);
+                registers[dst] = k;
+                pc += 1;
+                false
+            }
+            CALL if i.imm == 1 => {
+                let key = registers[2] as usize;
+                let bytes: [u8; 4] = frame[key..key + 4].try_into().unwrap();
+                registers[0] = match registers[1] {
+                    BROADCAST_ROOT => {
+                        assert_eq!(bytes, [0; 4]);
+                        if broadcasts.is_some() {
+                            BROADCAST_INNER
+                        } else {
+                            0
+                        }
+                    }
+                    BROADCAST_INNER => {
+                        u64::from(broadcasts.unwrap().contains(&Ipv4Addr::from(bytes)))
+                    }
+                    other => panic!("unexpected lookup map {other}"),
+                };
+                registers[1..=5].fill(u64::MAX);
                 false
             }
             CALL => {
@@ -177,11 +217,16 @@ fn nonlinear_quote_pulls_only_required_ipv6_extension_and_port_prefixes() {
 }
 
 fn emit_ipv4(broadcasts: &[Ipv4Addr], verdict: i32) -> GatewayBuilder {
+    emit_ipv4_frame(broadcasts, verdict, false, 0)
+}
+
+fn emit_ipv4_frame(broadcasts: &[Ipv4Addr], verdict: i32, host: bool, l2: i32) -> GatewayBuilder {
     let mut b = builder();
     let bad = b.target();
     let classified = b.target();
     let native = b.target();
-    b.word(L2_LEN, 0);
+    b.host_broadcasts = host.then_some(BROADCAST_ROOT as RawFd);
+    b.word(L2_LEN, l2);
     b.word(IS_QUOTE, 0);
     b.load(LDX_W, 7, 9, SKB_DATA_END);
     b.load(LDX_W, 0, 9, SKB_LEN);
@@ -262,4 +307,32 @@ fn aux_directed_broadcasts_use_the_supplied_snapshot() {
         run(&exact, &packet, packet.len(), true, 0).0,
         VERDICT_ENDPOINT,
     );
+}
+
+#[test]
+fn host_ipv4_length_excludes_ethernet_and_link_local_precedes_fragments() {
+    let program = emit_ipv4_frame(&[], VERDICT_ENDPOINT, true, 14);
+    let mut frame = vec![0; 14];
+    frame.extend(udp_ip([192, 0, 2, 9]));
+    assert_eq!(run(&program, &frame, 14, true, 1448).0, VERDICT_ENDPOINT);
+    frame[16..18].copy_from_slice(&58u16.to_be_bytes());
+    assert_eq!(run(&program, &frame, 14, true, 1448).0, VERDICT_DROP);
+    frame[16..18].copy_from_slice(&44u16.to_be_bytes());
+    frame[20..22].copy_from_slice(&1u16.to_be_bytes());
+    frame[30..34].copy_from_slice(&[169, 254, 1, 2]);
+    assert_eq!(run(&program, &frame, 14, true, 0).0, VERDICT_PASS);
+}
+
+#[test]
+fn host_broadcast_change_reaches_existing_program_before_fragment_lookup() {
+    let program = emit_ipv4_frame(&[], VERDICT_ENDPOINT, true, 0);
+    let destination = [192, 0, 2, 63];
+    let mut packet = udp_ip(destination);
+    packet[6..8].copy_from_slice(&1u16.to_be_bytes());
+    let classify = |set: Option<&[Ipv4Addr]>| {
+        run_with_broadcasts(&program, &packet, packet.len(), true, 0, set).0
+    };
+    assert_eq!(classify(Some(&[destination.into()])), VERDICT_PASS);
+    assert_eq!(classify(Some(&[])), VERDICT_ENDPOINT);
+    assert_eq!(classify(None), VERDICT_DROP);
 }

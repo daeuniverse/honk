@@ -14,6 +14,7 @@ const RTM_DELNEXTHOP: u16 = 105;
 const RTM_GETNEXTHOP: u16 = 106;
 const RTM_NEWNEXTHOPBUCKET: u16 = 116;
 const RTM_DELNEXTHOPBUCKET: u16 = 117;
+const ARPHRD_IP6GRE: u16 = 823;
 
 type InterfaceName = [u8; 16];
 
@@ -24,6 +25,25 @@ pub struct AuxLinkInfo {
     pub is_l2: bool,
     pub local_mac: [u8; 6],
     pub up: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostLinkChange {
+    Unchanged,
+    Refresh(AuxLinkInfo),
+    Rebind,
+}
+
+impl HostLinkChange {
+    fn compare(old: AuxLinkInfo, new: AuxLinkInfo, host: bool, broadcasts_changed: bool) -> Self {
+        if old == new && !broadcasts_changed {
+            Self::Unchanged
+        } else if host && old.same_geometry(new) {
+            Self::Refresh(new)
+        } else {
+            Self::Rebind
+        }
+    }
 }
 
 impl AuxLinkInfo {
@@ -58,6 +78,82 @@ impl AuxLinkInfo {
             up: link.flags & libc::IFF_UP as u32 != 0,
         })
     }
+
+    fn from_host_link(link: &Link) -> io::Result<Self> {
+        let kind = link.kind.unwrap_or_default();
+        let kind = std::ffi::CStr::from_bytes_until_nul(&kind)
+            .map_err(|_| malformed("invalid Host link kind"))?
+            .to_bytes();
+        if link.loopback
+            || matches!(
+                link.arphrd,
+                libc::ARPHRD_PPP | libc::ARPHRD_IPGRE | ARPHRD_IP6GRE
+            )
+            || matches!(
+                kind,
+                b"ppp" | b"gre" | b"ip6gre" | b"gretap" | b"ip6gretap" | b"erspan" | b"ip6erspan"
+            )
+        {
+            return Err(unsupported("Host egress cannot use loopback, PPP or GRE"));
+        }
+        let ethernet = matches!(
+            kind,
+            b"" | b"veth"
+                | b"dummy"
+                | b"vlan"
+                | b"bridge"
+                | b"bond"
+                | b"team"
+                | b"tun"
+                | b"macvlan"
+                | b"macvtap"
+                | b"ipvlan"
+        );
+        if matches!(kind, b"vlan" | b"macvlan" | b"macvtap" | b"ipvlan")
+            && (link.parent == 0 || (!link.foreign_parent && link.parent == link.index))
+        {
+            return Err(unsupported("Host egress has no verifiable lower device"));
+        }
+        let is_l2 = match link.arphrd {
+            libc::ARPHRD_NONE
+                if !link.has_hardware_address
+                    && matches!(kind, b"tun" | b"wireguard" | b"ovpn" | b"xfrm") =>
+            {
+                false
+            }
+            libc::ARPHRD_ETHER if ethernet && link.mac != [0; 6] && link.mac[0] & 1 == 0 => true,
+            _ => {
+                return Err(unsupported(
+                    "Host egress requires Ethernet with a unicast MAC or bare IP ARPHRD_NONE",
+                ));
+            }
+        };
+        let mtu = link
+            .mtu
+            .ok_or_else(|| malformed("Host egress has no MTU"))?;
+        if link.index == 0 || link.index > i32::MAX as u32 {
+            return Err(malformed("invalid Host ifindex"));
+        }
+        if !(1280..=u32::from(u16::MAX)).contains(&mtu) || link.big_tcp {
+            return Err(unsupported(
+                "Host egress requires MTU 1280..65535 and ordinary GRO/GSO sizes",
+            ));
+        }
+        Ok(Self {
+            ifindex: link.index,
+            mtu,
+            is_l2,
+            local_mac: link.mac,
+            up: link.flags & libc::IFF_UP as u32 != 0,
+        })
+    }
+
+    fn same_geometry(self, new: Self) -> bool {
+        Self {
+            local_mac: new.local_mac,
+            ..self
+        } == new
+    }
 }
 
 /// Read-only RTNL authority for one configured auxiliary link.
@@ -65,6 +161,12 @@ pub struct AuxLinkWatch {
     fd: OwnedFd,
     netns_cookie: u64,
     state: Mutex<WatchState>,
+    host_capture: Option<Arc<HostCaptures>>,
+}
+
+struct HostCaptures {
+    names: Box<[InterfaceName]>,
+    _memory: MemoryReservation,
 }
 
 struct WatchState {
@@ -81,6 +183,30 @@ struct ObservedAuxLink {
     ingress: Option<LegacyIngress>,
     default_refused: bool,
     broadcasts_refused: bool,
+    host: bool,
+    host_fifo: Option<(u32, u32)>,
+    host_lower: Option<HostLower>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HostLower {
+    parent: u32,
+    foreign_parent: bool,
+    master: u32,
+    kind: Option<InterfaceName>,
+    vlan: Option<(u16, u16)>,
+}
+
+impl From<&Link> for HostLower {
+    fn from(link: &Link) -> Self {
+        Self {
+            parent: link.parent,
+            foreign_parent: link.foreign_parent,
+            master: link.master,
+            kind: link.kind,
+            vlan: link.vlan,
+        }
+    }
 }
 
 impl AuxLinkWatch {
@@ -91,12 +217,52 @@ impl AuxLinkWatch {
         Ok(Self {
             netns_cookie: netns_cookie(fd.as_fd())?,
             fd,
+            host_capture: None,
             state: Mutex::new(WatchState {
                 buffer: CaptureBuffer::new(budget)?,
                 observed: ObservedAuxLink::default(),
                 broadcasts: None,
             }),
         })
+    }
+
+    /// Capture roots include both physical and auxiliary configured names; their live
+    /// lower/upper relationships are resolved anew on each admission.
+    pub fn new_host<'a>(
+        budget: &Arc<MemoryBudget>,
+        capture_interfaces: impl ExactSizeIterator<Item = &'a str>,
+    ) -> io::Result<Self> {
+        let mut watch = Self::new(budget)?;
+        let bytes = capture_interfaces
+            .len()
+            .checked_mul(size_of::<InterfaceName>())
+            .and_then(|bytes| bytes.checked_add(size_of::<HostCaptures>() + 2 * size_of::<usize>()))
+            .ok_or_else(|| malformed("Host capture name capacity overflow"))?;
+        let memory = budget
+            .reserve(bytes)
+            .ok_or_else(|| io::Error::other("Host capture name capacity"))?;
+        let mut names = Vec::with_capacity(capture_interfaces.len());
+        for name in capture_interfaces {
+            names.push(interface_name(name.as_bytes())?);
+        }
+        watch.host_capture = Some(Arc::new(HostCaptures {
+            names: names.into_boxed_slice(),
+            _memory: memory,
+        }));
+        watch.state.get_mut().map_err(watch_poisoned)?.observed.host = true;
+        Ok(watch)
+    }
+
+    pub fn resubscribe(&self, budget: &Arc<MemoryBudget>) -> io::Result<Self> {
+        let mut fresh = Self::new(budget)?;
+        if fresh.netns_cookie != self.netns_cookie {
+            return Err(unsupported(
+                "auxiliary resubscription crossed network namespaces",
+            ));
+        }
+        fresh.host_capture.clone_from(&self.host_capture);
+        fresh.state.get_mut().map_err(watch_poisoned)?.observed.host = self.host_capture.is_some();
+        Ok(fresh)
     }
 
     fn dump_socket(&self) -> io::Result<OwnedFd> {
@@ -111,6 +277,45 @@ impl AuxLinkWatch {
 
     /// A missing name is waiting. A valid administratively down link has `up == false`.
     pub fn read_l3(&self, name: &str) -> io::Result<Option<AuxLinkInfo>> {
+        if self.host_capture.is_some() {
+            return Err(malformed("Host watch cannot admit an L3 LAN"));
+        }
+        self.read_outer(name, true)
+    }
+
+    pub fn read_host(&self, name: &str) -> io::Result<Option<AuxLinkInfo>> {
+        if self.host_capture.is_none() {
+            return Err(malformed(
+                "Host admission requires the configured capture roots",
+            ));
+        }
+        self.read_outer(name, true)
+    }
+
+    pub(crate) fn verify_host_outer(&self, name: &str, expected: AuxLinkInfo) -> io::Result<bool> {
+        if self.host_capture.is_none() {
+            return Err(malformed("Host verification requires its Host watch"));
+        }
+        let previous = self
+            .state
+            .lock()
+            .map_err(watch_poisoned)?
+            .observed
+            .host_lower;
+        let actual = self.read_outer(name, false)?;
+        let current = self
+            .state
+            .lock()
+            .map_err(watch_poisoned)?
+            .observed
+            .host_lower;
+        Ok(actual == Some(expected) && previous.is_some() && current == previous)
+    }
+    pub(crate) fn read_outer(
+        &self,
+        name: &str,
+        require_broadcasts: bool,
+    ) -> io::Result<Option<AuxLinkInfo>> {
         let name = interface_name(name.as_bytes())?;
         let fd = self.dump_socket()?;
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -136,6 +341,8 @@ impl AuxLinkWatch {
         if observed.index != index {
             *observed = ObservedAuxLink {
                 index,
+                host: self.host_capture.is_some(),
+                host_fifo: observed.host_fifo,
                 ..ObservedAuxLink::default()
             };
             *broadcasts = None;
@@ -143,7 +350,13 @@ impl AuxLinkWatch {
         let Some(link) = link else {
             return Ok(None);
         };
-        let info = AuxLinkInfo::from_link(link)?;
+        let info = if let Some(captures) = &self.host_capture {
+            snapshot.check_host_overlap(link.index, &captures.names)?;
+            observed.host_lower = Some(HostLower::from(link));
+            AuxLinkInfo::from_host_link(link)?
+        } else {
+            AuxLinkInfo::from_link(link)?
+        };
         dump_with_buffer(
             fd.as_fd(),
             2,
@@ -153,10 +366,11 @@ impl AuxLinkWatch {
             deadline,
             buffer,
         )?;
-        if snapshot
-            .routes
-            .iter()
-            .any(|route| route.is_ip_default() && route.nexthop.is_some())
+        if self.host_capture.is_none()
+            && snapshot
+                .routes
+                .iter()
+                .any(|route| route.is_ip_default() && route.nexthop.is_some())
         {
             dump_with_buffer(
                 fd.as_fd(),
@@ -168,20 +382,25 @@ impl AuxLinkWatch {
                 buffer,
             )?;
         }
-        let defaults = snapshot.check_aux_defaults(info.ifindex);
-        observed.default_refused = defaults.is_err();
-        defaults?;
-        let (ingress, has_filter) = legacy_ingress(fd.as_fd(), info.ifindex, deadline, buffer)?;
-        observed.ingress = ingress;
-        if has_filter {
-            return Err(unsupported(
-                "l3_lan has a conflicting legacy ingress filter",
-            ));
+        if self.host_capture.is_none() {
+            let defaults = snapshot.check_aux_defaults(info.ifindex);
+            observed.default_refused = defaults.is_err();
+            defaults?;
+            let (ingress, has_filter) = legacy_ingress(fd.as_fd(), info.ifindex, deadline, buffer)?;
+            observed.ingress = ingress;
+            if has_filter {
+                return Err(unsupported(
+                    "l3_lan has a conflicting legacy ingress filter",
+                ));
+            }
         }
         let verified = snapshot.ipv4_broadcasts();
         observed.broadcasts_refused = verified.is_err();
-        *broadcasts = None;
-        *broadcasts = Some(verified?);
+        *broadcasts = if require_broadcasts {
+            Some(verified?)
+        } else {
+            verified.ok()
+        };
         Ok(Some(info))
     }
 
@@ -194,12 +413,52 @@ impl AuxLinkWatch {
             .ok_or_else(|| unsupported("auxiliary IPv4 broadcasts are not verified"))
     }
 
+    /// Initial readback before the first IFF_UP, while only the owned root pfifo is allowed.
+    pub fn verify_host_fifo(&self, name: &str, index: u32, slots: u32) -> io::Result<()> {
+        if self.host_capture.is_none() || !(1..=8).contains(&slots) {
+            return Err(malformed("invalid Host FIFO admission"));
+        }
+        let name = interface_name(name.as_bytes())?;
+        let tun = interface_name(b"tun")?;
+        let fd = self.dump_socket()?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut state = self.state.lock().map_err(watch_poisoned)?;
+        let buffer = &mut state.buffer.bytes;
+        let mut snapshot = Snapshot::default();
+        dump_with_buffer(
+            fd.as_fd(),
+            1,
+            libc::RTM_GETLINK,
+            16,
+            &mut snapshot,
+            deadline,
+            buffer,
+        )?;
+        if !snapshot.links.iter().any(|l| {
+            l.index == index
+                && l.name == Some(name)
+                && l.kind == Some(tun)
+                && l.arphrd == libc::ARPHRD_NONE
+                && l.master == 0
+                && l.flags & libc::IFF_UP as u32 == 0
+                && l.tx_queue_len == Some(slots)
+        }) {
+            return Err(unsupported(
+                "private Host FIFO requires its down TUN and admitted ring size",
+            ));
+        }
+        private_host_qdiscs(fd.as_fd(), index, slots, true, deadline, buffer)?;
+        state.observed.host_fifo = Some((index, slots));
+        Ok(())
+    }
+
     /// Confirm the private TUN still has only the daemon-owned link identity.
     pub fn verify_inner(&self, name: &str, ifindex: u32, mtu: u32) -> io::Result<()> {
         let name_key = interface_name(name.as_bytes())?;
         let fd = self.dump_socket()?;
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut state = self.state.lock().map_err(watch_poisoned)?;
+        let fifo = state.observed.host_fifo;
         let buffer = &mut state.buffer.bytes;
         let mut snapshot = snapshot_with_buffer(fd.as_fd(), Some(deadline), buffer)?;
         if snapshot.routes.iter().any(|route| route.nexthop.is_some()) {
@@ -235,6 +494,19 @@ impl AuxLinkWatch {
                 return Err(unsupported("private auxiliary TUN appears in a route"));
             }
         }
+        if self.host_capture.is_some() {
+            let (index, slots) = fifo
+                .filter(|(i, _)| *i == ifindex)
+                .ok_or_else(|| unsupported("private Host TUN FIFO was not admitted"))?;
+            if !snapshot
+                .links
+                .iter()
+                .any(|l| l.index == index && l.tx_queue_len == Some(slots))
+            {
+                return Err(unsupported("private Host TUN FIFO length changed"));
+            }
+            private_host_qdiscs(fd.as_fd(), ifindex, slots, false, deadline, buffer)?;
+        }
         Ok(())
     }
 
@@ -246,27 +518,72 @@ impl AuxLinkWatch {
         previous: Option<AuxLinkInfo>,
         inner: Option<(&str, u32, u32)>,
     ) -> io::Result<bool> {
+        Ok(self.changed_outer(name, previous, inner)? != HostLinkChange::Unchanged)
+    }
+
+    pub fn changed_host(
+        &mut self,
+        name: &str,
+        previous: Option<AuxLinkInfo>,
+        inner: Option<(&str, u32, u32)>,
+    ) -> io::Result<HostLinkChange> {
+        if self.host_capture.is_none() {
+            return Err(malformed(
+                "Host notification requires the configured capture roots",
+            ));
+        }
+        self.changed_outer(name, previous, inner)
+    }
+
+    fn changed_outer(
+        &mut self,
+        name: &str,
+        previous: Option<AuxLinkInfo>,
+        inner: Option<(&str, u32, u32)>,
+    ) -> io::Result<HostLinkChange> {
         let outer_name = interface_name(name.as_bytes())?;
         let inner_key = inner
             .map(|(name, index, mtu)| interface_name(name.as_bytes()).map(|key| (key, index, mtu)))
             .transpose()?;
         let changes = self.drain(outer_name, previous, inner_key)?;
-        if changes.invalidated {
-            return Ok(true);
-        }
-        if changes.broadcasts_dirty && previous.is_none() {
-            return Ok(true);
+        if changes.invalidated
+            || (changes.broadcasts_dirty || (self.host_capture.is_some() && changes.recheck))
+                && previous.is_none()
+        {
+            return Ok(HostLinkChange::Rebind);
         }
         if changes.recheck
             && let Some((name, index, mtu)) = inner
         {
             self.verify_inner(name, index, mtu)?;
         }
-        if (changes.recheck || changes.broadcasts_dirty) && previous.is_some() {
-            let broadcasts = self.ipv4_broadcasts()?;
-            return Ok(self.read_l3(name)? != previous || self.ipv4_broadcasts()? != broadcasts);
+        if (changes.recheck || changes.broadcasts_dirty)
+            && let Some(old) = previous
+        {
+            let host = self.host_capture.is_some();
+            let before = self.state.get_mut().map_err(watch_poisoned)?;
+            let broadcasts = before.broadcasts;
+            let lower = before.observed.host_lower;
+            let new = match self.read_outer(name, !host) {
+                Ok(Some(info)) => info,
+                Ok(None) => return Ok(HostLinkChange::Rebind),
+                Err(e) if self.host_capture.is_some() && e.kind() == io::ErrorKind::Unsupported => {
+                    return Ok(HostLinkChange::Rebind);
+                }
+                Err(e) => return Err(e),
+            };
+            let after = self.state.get_mut().map_err(watch_poisoned)?;
+            if host && lower != after.observed.host_lower {
+                return Ok(HostLinkChange::Rebind);
+            }
+            return Ok(HostLinkChange::compare(
+                old,
+                new,
+                host,
+                after.broadcasts != broadcasts,
+            ));
         }
-        Ok(false)
+        Ok(HostLinkChange::Unchanged)
     }
 
     fn drain(
@@ -374,6 +691,53 @@ impl Snapshot {
             return Err(malformed("duplicate l3_lan interface name"));
         }
         Ok(Some(link))
+    }
+
+    fn check_host_overlap(&self, host: u32, captures: &[InterfaceName]) -> io::Result<()> {
+        if captures.is_empty() {
+            return Ok(());
+        }
+        let lower_kinds = [
+            interface_name(b"vlan")?,
+            interface_name(b"macvlan")?,
+            interface_name(b"macvtap")?,
+            interface_name(b"ipvlan")?,
+        ];
+        let mut lowers = std::collections::HashMap::<u32, Vec<u32>>::new();
+        let mut roots = Vec::new();
+        for link in &self.links {
+            if link.name.is_some_and(|name| captures.contains(&name)) {
+                roots.push(link.index);
+            }
+            if link.master != 0 {
+                lowers.entry(link.master).or_default().push(link.index);
+            }
+            if link.kind.is_some_and(|k| lower_kinds.contains(&k))
+                && !link.foreign_parent
+                && link.parent != link.index
+            {
+                lowers.entry(link.index).or_default().push(link.parent);
+            }
+        }
+        // A master captures its members; a VLAN traverses its parent. Sibling members
+        // of an unrelated master and cross-namespace veth peers need not overlap.
+        let descendants = |mut pending: Vec<u32>| {
+            let mut seen = HashSet::new();
+            while let Some(index) = pending.pop() {
+                if seen.insert(index)
+                    && let Some(children) = lowers.get(&index)
+                {
+                    pending.extend_from_slice(children);
+                }
+            }
+            seen
+        };
+        if !descendants(roots).is_disjoint(&descendants(vec![host])) {
+            return Err(unsupported(
+                "Host egress overlaps physical or auxiliary capture through a master or VLAN",
+            ));
+        }
+        Ok(())
     }
 
     fn check_aux_defaults(&self, index: u32) -> io::Result<()> {
@@ -488,6 +852,95 @@ impl LegacyIngress {
                 target.parent == self.parent
             }
     }
+}
+
+fn private_host_qdisc(body: &[u8], slots: u32, initial: bool) -> io::Result<()> {
+    let target = TcTarget::read(body)?;
+    if target.parent != u32::MAX || initial && u32_at(body, 8)? != 0x10000 {
+        return Err(unsupported("private Host TUN requires one root queue"));
+    }
+    let mut kind = None;
+    let mut options = None;
+    attributes(&body[20..], |field, value| {
+        match field {
+            TCA_KIND if kind.replace(value).is_some() => {
+                return Err(malformed("duplicate Host qdisc kind"));
+            }
+            2 if options.replace(value).is_some() => {
+                return Err(malformed("duplicate Host qdisc options"));
+            }
+            13 | 14 if exact_u32(value)? != 0 => {
+                return Err(unsupported("private Host qdisc has a shared block"));
+            }
+            _ => (),
+        }
+        Ok(())
+    })?;
+    let options = options.ok_or_else(|| malformed("private Host qdisc options missing"))?;
+    let limit = match kind {
+        Some(b"pfifo\0") => exact_u32(options)?,
+        Some(b"netem\0") if !initial && options.len() >= 24 => {
+            // The operator's delay-only test queue may hold the same number of the
+            // original skbs. Duplication, corruption (including GSO segmentation),
+            // child queues and packet/flow transforms cannot inherit that charge.
+            if options[8..24].iter().any(|&b| b != 0) {
+                return Err(unsupported("private Host netem must be delay-only"));
+            }
+            attributes(&options[24..], |field, data| {
+                match field {
+                    10 | 14 if data.len() == 8 => Ok(()), // latency64 and PRNG seed
+                    9 if data.is_empty() => Ok(()),       // alignment pad
+                    1 | 3 | 4 | 6 | 11 if data.iter().all(|&b| b == 0) => Ok(()),
+                    _ => Err(unsupported("private Host netem has unverified options")),
+                }
+            })?;
+            u32_at(options, 4)?
+        }
+        _ => {
+            return Err(unsupported(
+                "private Host TUN requires bounded pfifo or a delay-only netem root",
+            ));
+        }
+    };
+    if limit == 0 || limit > slots || initial && limit != slots {
+        return Err(unsupported(
+            "private Host qdisc exceeds its admitted slot count",
+        ));
+    }
+    Ok(())
+}
+
+fn private_host_qdiscs(
+    fd: BorrowedFd<'_>,
+    index: u32,
+    slots: u32,
+    initial: bool,
+    deadline: Instant,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    let mut found = false;
+    dump_request(
+        fd,
+        6,
+        libc::RTM_GETQDISC,
+        &[0; 20],
+        deadline,
+        buffer,
+        |_, body| {
+            if TcTarget::read(body)?.ifindex == index {
+                if found {
+                    return Err(unsupported("additional private Host TUN qdisc"));
+                }
+                private_host_qdisc(body, slots, initial)?;
+                found = true;
+            }
+            Ok(())
+        },
+    )?;
+    if !found {
+        return Err(unsupported("private Host TUN root queue is absent"));
+    }
+    Ok(())
 }
 
 fn legacy_ingress(
@@ -623,11 +1076,22 @@ impl Changes {
                 libc::RTM_NEWLINK | libc::RTM_DELLINK => {
                     parsed.push(libc::RTM_NEWLINK, body)?;
                     let link = &parsed.links[0];
+                    // Another member joining a master or a new VLAN can make an otherwise
+                    // unchanged Host device overlap a capture root.
+                    self.recheck |= observed.host;
                     self.invalidated |= match previous {
                         Some(info) if link.index == info.ifindex => {
                             kind == libc::RTM_DELLINK
                                 || link.name != Some(name)
-                                || AuxLinkInfo::from_link(link).ok() != Some(info)
+                                || if observed.host {
+                                    !AuxLinkInfo::from_host_link(link)
+                                        .is_ok_and(|new| info.same_geometry(new))
+                                        || observed
+                                            .host_lower
+                                            .is_some_and(|old| old != HostLower::from(link))
+                                } else {
+                                    AuxLinkInfo::from_link(link).ok() != Some(info)
+                                }
                         }
                         _ => match kind {
                             libc::RTM_NEWLINK => link.name == Some(name),
@@ -636,7 +1100,11 @@ impl Changes {
                     };
                     if let Some((inner_name, index, mtu)) = inner {
                         self.invalidated |= link.index == index
-                            && (kind == libc::RTM_DELLINK || !link.is_owned_tun(inner_name, mtu));
+                            && (kind == libc::RTM_DELLINK
+                                || !link.is_owned_tun(inner_name, mtu)
+                                || observed.host_fifo.is_some_and(|(i, slots)| {
+                                    i == index && link.tx_queue_len != Some(slots)
+                                }));
                     }
                 }
                 libc::RTM_NEWROUTE | libc::RTM_DELROUTE => {
@@ -645,7 +1113,7 @@ impl Changes {
                     self.broadcasts_dirty |= outer_index.is_some()
                         && (broadcasts.is_some() || observed.broadcasts_refused)
                         && route.may_change_ipv4_broadcasts(broadcasts);
-                    if route.is_ip_default() {
+                    if !observed.host && route.is_ip_default() {
                         self.invalidated |= waiting_for_default
                             || outer_index.is_some_and(|index| route.uses_output(index));
                         self.recheck |= route.nexthop.is_some();
@@ -681,15 +1149,29 @@ impl Changes {
                 | libc::RTM_DELTFILTER => {
                     let target = TcTarget::read(body)?;
                     attributes(&body[20..], |_, _| Ok(()))?;
-                    self.invalidated |= outer_index.is_some_and(|index| {
-                        if matches!(kind, libc::RTM_NEWQDISC | libc::RTM_DELQDISC) {
-                            target.ifindex == index && target.parent == TC_H_INGRESS
-                        } else {
-                            observed.ingress.is_some_and(|ingress| {
-                                ingress.index == index && ingress.contains(target)
-                            })
-                        }
-                    });
+                    if observed.host && inner.is_some_and(|(_, index, _)| index == target.ifindex) {
+                        self.invalidated |= match kind {
+                            libc::RTM_NEWQDISC => observed.host_fifo.is_none_or(|(_, slots)| {
+                                private_host_qdisc(body, slots, false).is_err()
+                            }),
+                            libc::RTM_DELQDISC => {
+                                self.recheck = true;
+                                false
+                            }
+                            libc::RTM_NEWTFILTER | libc::RTM_DELTFILTER => true,
+                            _ => false,
+                        };
+                    }
+                    self.invalidated |= !observed.host
+                        && outer_index.is_some_and(|index| {
+                            if matches!(kind, libc::RTM_NEWQDISC | libc::RTM_DELQDISC) {
+                                target.ifindex == index && target.parent == TC_H_INGRESS
+                            } else {
+                                observed.ingress.is_some_and(|ingress| {
+                                    ingress.index == index && ingress.contains(target)
+                                })
+                            }
+                        });
                 }
                 libc::RTM_NEWTCLASS
                 | libc::RTM_DELTCLASS

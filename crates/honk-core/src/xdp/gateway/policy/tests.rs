@@ -248,6 +248,51 @@ fn tcp(ipv6: bool, sport: u16, dport: u16) -> (GatewayKey, Vec<u8>) {
     (key, frame)
 }
 
+fn host_dns_is_independent_and_shares_policy_maps() -> anyhow::Result<()> {
+    use aya_obj::generated::{
+        BPF_ALU64, BPF_DW, BPF_EXIT, BPF_IMM, BPF_JMP, BPF_K, BPF_LD, BPF_MOV,
+    };
+    use honk_ebpf_common::xdp_gateway::GATEWAY_ROUTE_NEED_DNS;
+    use std::collections::BTreeSet;
+
+    let config = honk_config::parser::parse_dae_config(
+        "routing {
+            dip(198.51.100.0/24) && sip(192.0.2.0/24) && mac(02:00:00:00:00:01) && !pname(curl) -> block
+            domain(full:lab.test) -> direct(must)
+            fallback: direct
+        }",
+    )?;
+    let router = Router::from_config(&config.routing)?;
+    let plan = ControlPlane::compile_routing_plan(&config, &router)?;
+    let load_map = BPF_LD | BPF_DW | BPF_IMM;
+    let return_value = BPF_ALU64 | BPF_MOV | BPF_K;
+    for (lan_dns, host_dns) in [(false, true), (true, false)] {
+        let policy = GatewayPolicy::prepare(&plan, lan_dns, Some(host_dns))?;
+        let fds: BTreeSet<_> = policy.fact_fds().map(|fd| fd.as_raw_fd()).collect();
+        assert_eq!(fds.len(), 5);
+        for (bytecode, dns) in [
+            (&policy.bytecode, lan_dns),
+            (policy.host_bytecode.as_ref().unwrap(), host_dns),
+        ] {
+            let referenced: BTreeSet<_> = bytecode
+                .insns
+                .iter()
+                .filter(|insn| u32::from(insn.code) == load_map && insn.src_reg() == 1)
+                .map(|insn| insn.imm)
+                .collect();
+            assert_eq!(referenced, fds);
+            let requests_dns = bytecode.insns.windows(2).any(|pair| {
+                u32::from(pair[0].code) == return_value
+                    && pair[0].dst_reg() == 0
+                    && pair[0].imm == GATEWAY_ROUTE_NEED_DNS
+                    && u32::from(pair[1].code) == (BPF_JMP | BPF_EXIT)
+            });
+            assert_eq!(requests_dns, dns);
+        }
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires root in the disposable kernel VM gate and a private network namespace"]
 fn kernel_gateway_full_program_adaptive_endpoint_verifies_and_preserves_packets()
@@ -271,6 +316,7 @@ fn kernel_gateway_full_program_adaptive_endpoint_verifies_and_preserves_packets(
     std::thread::spawn(move || -> anyhow::Result<()> {
         nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET)?;
         assert_ne!(current, std::fs::metadata("/proc/thread-self/ns/net")?.ino());
+        host_dns_is_independent_and_shares_policy_maps()?;
         let mut netlink = NlSock::new()?;
         netlink.add_veth_pair("gwfull0", "gwfull1")?;
         // /sys/class/net reflects the netns sysfs was mounted in, not this unshared thread's.
@@ -301,7 +347,8 @@ fn kernel_gateway_full_program_adaptive_endpoint_verifies_and_preserves_packets(
         assert_eq!(plan.rules.len(), 2);
         assert!(plan.rules.iter().all(|rule| rule.action.outbound == 2));
         assert_eq!(plan.fallback.outbound, 0);
-        let policy = GatewayPolicy::prepare(&plan, false)?;
+        let policy = GatewayPolicy::prepare(&plan, false, None)?;
+        assert!(policy.host_bytecode.is_none());
         let conntrack = ConntrackKfuncs::read()?;
         let maps = GatewayMaps::new(
             &[(
@@ -335,7 +382,7 @@ fn kernel_gateway_full_program_adaptive_endpoint_verifies_and_preserves_packets(
             GatewayLoad {
                 routing: &policy.bytecode.insns,
                 maps: &maps,
-                conntrack: &conntrack,
+                conntrack: Some(&conntrack),
                 dns: None,
                 arbitration: None,
             },
@@ -355,7 +402,7 @@ fn kernel_gateway_full_program_adaptive_endpoint_verifies_and_preserves_packets(
             GatewayLoad {
                 routing: &policy.bytecode.insns,
                 maps: &maps,
-                conntrack: &conntrack,
+                conntrack: Some(&conntrack),
                 dns: None,
                 arbitration: None,
             },

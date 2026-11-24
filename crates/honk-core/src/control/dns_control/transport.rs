@@ -20,8 +20,12 @@ pub(in crate::control) enum DnsUdpReply<'a> {
 pub(in crate::control) struct PacketDnsScopeRetired;
 
 impl DnsController {
+    fn dns_delivery_is_current(&self, scope: QueryScope) -> bool {
+        scope.is_host_listener() || self.routing_projection.query_scope_is_current(scope)
+    }
+
     fn retired_dns_delivery(&self, scope: QueryScope) -> bool {
-        if self.routing_projection.query_scope_is_current(scope) {
+        if self.dns_delivery_is_current(scope) {
             return false;
         }
         crate::observe::flows::dns::delivery("cancelled", Some("intentional_retirement"));
@@ -179,11 +183,11 @@ impl DnsController {
         let mut query = Vec::new();
         let mut served = false;
         loop {
-            if !self.routing_projection.query_scope_is_current(scope) {
+            if !self.dns_delivery_is_current(scope) {
                 return Err(PacketDnsScopeRetired.into());
             }
             if !read_tcp_dns_query(stream, &mut query, Some(TCP_DNS_IO_TIMEOUT)).await {
-                if !self.routing_projection.query_scope_is_current(scope) {
+                if !self.dns_delivery_is_current(scope) {
                     return Err(PacketDnsScopeRetired.into());
                 }
                 return Ok(served || original_dst.is_some());
@@ -191,7 +195,8 @@ impl DnsController {
             if !served {
                 debug!(%client_addr, "DNS controller (TCP): forwarding query");
             }
-            self.process_tcp_query(stream, &query, client_addr, metadata, scope)
+            let query_scope = self.routing_projection.refresh_listener_query_scope(scope);
+            self.process_tcp_query(stream, &query, client_addr, metadata, query_scope)
                 .await?;
             served = true;
         }

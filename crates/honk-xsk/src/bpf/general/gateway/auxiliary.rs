@@ -84,10 +84,14 @@ impl Ingress {
     }
 
     pub(super) fn redirect(b: &mut GatewayBuilder) {
+        Self::request_redirect(b);
+        b.emit(EXIT, 0, 0, 0, 0);
+    }
+
+    pub(super) fn request_redirect(b: &mut GatewayBuilder) {
         b.load(LDX_W, 1, 10, TARGET_IFINDEX);
         b.imm(2, 0);
         b.helper(bpf_func_id::BPF_FUNC_redirect as i32);
-        b.emit(EXIT, 0, 0, 0, 0);
     }
 }
 

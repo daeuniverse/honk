@@ -201,18 +201,62 @@ pub(crate) struct RoutingProjection {
     publication_released: tokio::sync::Notify,
 }
 
-/// The binding admitted for a DNS query, retained through asynchronous publication.
+/// The fact destination and its originating authority, retained through publication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct QueryScope {
-    scope: ScopeId,
-    binding: u64,
+    fact_scope: ScopeId,
+    origin: QueryOrigin,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryOrigin {
+    Permanent,
+    Packet {
+        execution: ScopeId,
+        stamp: u64,
+    },
+    #[cfg(target_os = "linux")]
+    HostListener {
+        stamp: u64,
+    },
 }
 
 impl QueryScope {
-    pub(crate) const HOST: Self = Self {
-        scope: ScopeId::HOST,
-        binding: 0,
-    };
+    pub(crate) const HOST: Self = Self::permanent(ScopeId::HOST);
+
+    const fn permanent(fact_scope: ScopeId) -> Self {
+        Self {
+            fact_scope,
+            origin: QueryOrigin::Permanent,
+        }
+    }
+
+    fn packet(fact_scope: ScopeId, execution: ScopeId, stamp: u64) -> Self {
+        Self {
+            fact_scope,
+            origin: QueryOrigin::Packet { execution, stamp },
+        }
+    }
+
+    pub(crate) fn is_host_listener(self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            matches!(self.origin, QueryOrigin::HostListener { .. })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_shared_host(self) -> bool {
+        match self.origin {
+            QueryOrigin::Permanent => false,
+            QueryOrigin::Packet { execution, .. } => execution != self.fact_scope,
+            QueryOrigin::HostListener { .. } => true,
+        }
+    }
 }
 
 /// One scope's withdrawal identity and original applicable expiry in tokio time.
@@ -376,7 +420,7 @@ impl RoutingProjection {
             self.packet_query_scope(scope)
                 .expect("test DNS scope is offline")
         } else {
-            QueryScope { scope, binding: 0 }
+            QueryScope::permanent(scope)
         };
         assert!(
             self.try_submit(query, &snapshot, observation),
@@ -417,6 +461,34 @@ impl RoutingProjection {
         self.state.lock().register_aux_scopes(scopes, budget)
     }
 
+    /// Reserve the fact-only scopes before registering the endpoint's packet scopes.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn register_host_scopes(
+        &self,
+        shared: ScopeId,
+        standalone: ScopeId,
+        ports: &[crate::control::netstack::PacketScope],
+        budget: &Arc<honk_netstack::MemoryBudget>,
+    ) -> std::io::Result<()> {
+        self.state
+            .lock()
+            .register_host_scopes(shared, standalone, ports, budget)
+    }
+
+    /// Publish or withdraw one port's actual driver stamp under the projection lock.
+    #[cfg(all(target_os = "linux", any(feature = "ebpf", test)))]
+    pub(crate) fn set_host_binding(
+        &self,
+        scope: ScopeId,
+        stamp: u64,
+        active: bool,
+    ) -> std::io::Result<()> {
+        self.state.lock().set_host_binding(scope, stamp, active)?;
+        self.publication_released.notify_waiters();
+        self.notify_worker();
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn set_aux_binding(&self, scope: ScopeId, active: bool) -> std::io::Result<()> {
         self.state.lock().set_aux_binding(scope, active)?;
@@ -430,7 +502,31 @@ impl RoutingProjection {
     }
 
     pub(crate) fn query_scope_is_current(&self, query: QueryScope) -> bool {
-        query.binding == 0 || self.packet_query_scope(query.scope) == Some(query)
+        query.origin == QueryOrigin::Permanent || self.state.lock().query_scope_is_current(query)
+    }
+
+    pub(crate) fn listener_query_scopes(
+        &self,
+        standalone: ScopeId,
+    ) -> (Option<QueryScope>, Option<QueryScope>) {
+        if standalone == ScopeId::HOST {
+            return (Some(QueryScope::HOST), None);
+        }
+        let state = self.state.lock();
+        #[cfg(target_os = "linux")]
+        let loopback = state.host_listener_query_scope(standalone);
+        #[cfg(not(target_os = "linux"))]
+        let loopback = None;
+        (state.packet_query_scope(standalone), loopback)
+    }
+
+    // Each bound TCP frame has its own activity stamp even on a persistent socket.
+    pub(crate) fn refresh_listener_query_scope(&self, query: QueryScope) -> QueryScope {
+        #[cfg(target_os = "linux")]
+        if query.is_host_listener() {
+            return self.state.lock().host_listener_scope(query.fact_scope);
+        }
+        query
     }
 
     pub(crate) fn owns_packet_scope(&self, scope: ScopeId) -> bool {
@@ -453,15 +549,23 @@ impl RoutingProjection {
         generation: u64,
     ) -> anyhow::Result<PacketDomainBitmap> {
         let mut state = self.state.lock();
-        if !state.owns_packet_scope(scope) {
+        let query = state.packet_query_scope(scope);
+        if query.is_none() && !state.owns_packet_scope(scope) {
             return Ok(PacketDomainBitmap::default());
         }
         check_packet_authority(&state, router, generation)?;
-        let bitmap = state.try_bitmap(scope, ip)?;
+        let scope = query
+            .map(|query| query.fact_scope)
+            .or_else(|| state.packet_fact_destination(scope));
+        let bitmap = if let Some(scope) = scope {
+            state.try_bitmap(scope, ip)?
+        } else {
+            None
+        };
         Ok(PacketDomainBitmap {
             bitmap,
             #[cfg(target_os = "linux")]
-            fill: state.gateway_packet_fill(scope, ip, bitmap),
+            fill: query.and_then(|query| state.gateway_packet_fill(query, ip, bitmap)),
         })
     }
 
@@ -498,7 +602,7 @@ impl RoutingProjection {
     ) -> bool {
         #[cfg(target_os = "linux")]
         let mut export = None;
-        let scope = query.scope;
+        let scope = query.fact_scope;
         let submitted = self.try_mutate(query, snapshot.generation(), |state| {
             if !state.update_snapshot(snapshot) {
                 crate::stats::record_dns_event(
@@ -527,7 +631,7 @@ impl RoutingProjection {
             };
             #[cfg(target_os = "linux")]
             if let ProjectionObservation::Positive { domain, family, .. } = observation {
-                export = state.gateway_answer_fills(scope, domain, family, now);
+                export = state.gateway_answer_fills(query, domain, family, now);
             }
             evictions
         });
@@ -549,7 +653,7 @@ impl RoutingProjection {
         snapshot: &Arc<RoutingProjectionSnapshot>,
         observation: ProjectionObservation<'_>,
     ) -> bool {
-        let scope = query.scope;
+        let scope = query.fact_scope;
         if scope != ScopeId::HOST {
             return self.submit_observation(query, snapshot, observation, true);
         }
@@ -659,9 +763,9 @@ impl RoutingProjection {
         generation: u64,
         operation: impl FnOnce(&mut DesiredState) -> u64,
     ) -> bool {
-        if query.scope != ScopeId::HOST {
+        if query.fact_scope != ScopeId::HOST {
             let mut state = self.state.lock();
-            if query.binding != 0 && state.packet_query_scope(query.scope) != Some(query) {
+            if !state.query_scope_is_current(query) {
                 return true;
             }
             if generation > state.snapshot.generation() {

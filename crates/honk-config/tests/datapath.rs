@@ -57,7 +57,7 @@ fn dns_projection_is_strict_and_compares_effective_restart_identity() {
             true,
         ),
         (
-            "backend: xdp\ndirect: endpoint\ninterface {\nlan0: lan\nwan0: wan\n}\nhost {\nxsk_mode: copy\ninterface { host0 }\n}",
+            "backend: xdp\ndirect: endpoint\ninterface {\nlan0: lan\nwan0: wan\n}\nhost {\ninterface { host0 }\n}",
             true,
         ),
         ("backend: tc", false),
@@ -75,8 +75,8 @@ fn dns_projection_is_strict_and_compares_effective_restart_identity() {
             true,
         ),
         (
-            "backend: xdp\ndirect: endpoint\nhost {\nxsk_mode: copy\ninterface { host0 }\n}",
-            false,
+            "backend: xdp\ndirect: endpoint\nhost {\ninterface { host0 }\n}",
+            true,
         ),
     ] {
         let source = |claim: &str| format!("datapath {{\n{settings}\n{claim}\n}}");

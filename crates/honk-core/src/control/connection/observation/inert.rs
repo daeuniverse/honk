@@ -64,8 +64,9 @@ impl ConnectionObservation {
     #[inline]
     pub(in crate::control) fn packet_facts(
         &mut self,
-        _facts: &honk_ebpf_common::host::HostSourceFacts,
+        _process: crate::control::netstack::ProcessMeta,
         _dscp: u8,
+        _mark: Option<u32>,
     ) {
     }
 

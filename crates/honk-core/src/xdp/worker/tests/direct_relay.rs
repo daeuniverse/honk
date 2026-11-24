@@ -328,7 +328,7 @@ struct Flow {
     socket: std::net::TcpStream,
 }
 
-fn socket_open(socket: &Path) -> bool {
+fn socket_open(socket: &std::path::Path) -> bool {
     std::fs::read_dir("/proc/self/fd").unwrap().any(|entry| {
         match std::fs::read_link(entry.unwrap().path()) {
             Ok(target) => target == socket,

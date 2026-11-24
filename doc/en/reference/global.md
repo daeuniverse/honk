@@ -258,7 +258,7 @@ Use `name: lan` or `name: wan` for physical capture. XDP Endpoint also accepts
 `name: l3_lan` for an [auxiliary IP interface](#auxiliary-l3-lan). Interface
 declarations with a nested body, even an empty one, are rejected.
 
-`datapath.xsk_mode` accepts `copy`, `zerocopy`, or `auto` for physical capture. Omission remains forced ZeroCopy; Auto selects per member from its capabilities and required segments. Every bind is read back; a failed selected bind does not retry another mode. Omitted and explicit `zerocopy` are equivalent for reload; changing mode requires restart. TC and TUN reject an explicit mode. The private Host queue requires Copy independently.
+`datapath.xsk_mode` accepts `copy`, `zerocopy`, or `auto` for physical capture. Omission remains forced ZeroCopy; Auto selects per member from its capabilities and required segments. Every bind is read back; a failed selected bind does not retry another mode. Omitted and explicit `zerocopy` are equivalent for reload; changing mode requires restart. TC and TUN reject an explicit mode. Host uses no AF_XDP queue.
 
 `datapath.workers` is an XDP-only integer, either `1` (default) or `2`; changing it
 requires restart. Two workers require at least two actual physical queue owners
@@ -296,7 +296,7 @@ Configure up to eight distinct auxiliary names. They do not count as physical
 workers or RX queues. The interface must actually carry bare IP (`ARPHRD_NONE`),
 have an MTU of at least 1280, and not be used by a default route. An Ethernet,
 PPP or GRE device is not admitted merely because of its name. The role is not
-available with TC, TUN, Core Direct, or the legacy XDP Host block. A physical
+available with TC, TUN or Core Direct. Host egress interfaces must be distinct. A physical
 interface that fails XDP admission never falls back to TCX.
 
 An absent auxiliary interface can start in `waiting_link`. A present but
@@ -312,10 +312,10 @@ rule for that listener; the local-service exemption does not include port 53.
 ### XDP Endpoint DNS projection
 
 `datapath.dns_projection` is an optional boolean for `backend: xdp` with
-`direct: endpoint` and at least one `lan` or `l3_lan` interface. Omission
+`direct: endpoint` and at least one `lan`, `l3_lan` or Host interface. Omission
 and `true` both enable DNS projection. Set `false` to turn it off. A
 change to the effective value requires a restart. TC, TUN, XDP Core and XDP
-Endpoint without either LAN role require omission. Either explicit boolean is
+Endpoint without an eligible interface require omission. Either explicit boolean is
 rejected in those configurations. Duplicate declarations across merged sections
 or includes and explicit null in structured input are also rejected.
 
@@ -331,43 +331,22 @@ If honk observes `notrack`, it closes DNS permission for the rest of this captur
 
 ### XDP Host Endpoint
 
-Host-originated TCP/UDP capture requires an explicit `host` block and a build with
-`ebpf`. Select `backend: xdp` and `direct: endpoint`:
+Use an `ebpf` build to classify locally originated TCP/UDP on explicit egress interfaces:
 
 ```dae
+global { nfqueue_enable: false }
 datapath {
     backend: xdp
     direct: endpoint
-    host {
-        xsk_mode: copy
-        interface {
-            eth0
-        }
-    }
+    host { interface { eth0 } }
 }
 ```
 
-`host.interface` requires 1–16 unique explicit Ethernet names, as bare entries
-without roles or bodies. `host.xsk_mode: copy` is mandatory; it controls the owned
-private Host queue independently of the physical `datapath.xsk_mode` default.
-Unknown or duplicate Host fields/blocks are rejected. Physical `interface` capture
-may be omitted or added beside `host`; both use the same global Endpoint Direct
-profile. The complete Host configuration is restart-required. Keep NFQUEUE off,
-TC interface lists empty and the required bypass-mark routing in place.
+Configure 1–4 distinct names. `lo`, `auto`, overlap with physical capture (including bond members and VLANs) or with an auxiliary LAN, and the former `host.xsk_mode` are rejected. See the [migration note](../../migration/en/gateway-host.md). A Host-only configuration needs no physical queue; `workers: 2` still requires two physical queue owners. Changing the interface list requires a restart.
 
-Admission currently requires x86-64 little endian, matching running-kernel BTF,
-active BPF LSM, exclusive effective root-cgroup hooks and plain source-namespace
-custody. Ordinary operator veths, stacked/mastered/tunnel links and foreign
-reinjection paths are refused; only the daemon's owned private veth pair is excepted.
-Consumers and actual Copy binding must be ready before the one-shot capture gate
-opens. Stale custody receipts refuse restart without adoption. See
-[Host source custody](../design/datapath.md#host-source-custody) for the full limits
-and retained-stop behavior.
+A supported Ethernet, VLAN, bridge or raw-IP egress (for example WireGuard) needs MTU 1280 or larger. PPP and GRE are not supported. A missing device waits for a link; an incompatible device cannot acquire a hook. Each active egress owns one unnumbered, nonpersistent `honk-host-<n>` TUN. Do not add addresses, routes or packet-rewriting programs to these private devices. honk does not change main routes or require the host firewall to be empty.
 
-Authenticated Host facts may supply process routing. With `direct: endpoint`,
-Direct terminates and creates a new marked outbound; generated replies use ordinary
-Linux demultiplexing, not original socket-operation continuation. TUN's separate
-opt-in HostFacts support is described below.
+Packets already proved Direct continue on the original socket. Endpoint traffic stays on its original binding; replies enter Linux on that egress. Process names are socket observations, not evidence of the caller of every `sendmsg`. In Host mode honk requires its effective bypass mark on originated sockets and management/DNS listeners. See [capture and ownership](../design/datapath.md#host-source-custody) for capacity and delayed packets. `backend: tun` has its own independent `host_facts` contract.
 
 ### Linux TUN Endpoint
 

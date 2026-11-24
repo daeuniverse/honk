@@ -458,8 +458,38 @@ fn embed_ebpf_object() {
         ("honk-tun.o", "HONK_TUN_EBPF_OBJECT"),
     ]) {
         let dest = out_dir.join(name);
-        std::fs::copy(object, &dest)
-            .unwrap_or_else(|e| panic!("copy {} -> {}: {}", object.display(), dest.display(), e));
+        if name == "honk-host.o" && object.metadata().unwrap().len() >= 32 * 1024 {
+            // llvm-tools is already a component of the pinned eBPF toolchain. Strip
+            // DWARF only in the embedded copy; .BTF, .BTF.ext and relocations survive.
+            let sysroot = Command::new("rustc")
+                .arg(format!("+{channel}"))
+                .args(["--print", "sysroot"])
+                .output()
+                .expect("locate eBPF llvm-tools");
+            assert!(sysroot.status.success(), "locate eBPF llvm-tools");
+            let objcopy = Path::new(std::str::from_utf8(&sysroot.stdout).unwrap().trim())
+                .join("lib/rustlib")
+                .join(std::env::var("HOST").unwrap())
+                .join("bin/llvm-objcopy");
+            let status = Command::new(objcopy)
+                .arg("--strip-debug")
+                .arg(object)
+                .arg(&dest)
+                .status()
+                .expect("strip Host identity ELF DWARF");
+            assert!(
+                status.success() && object_has_btf(&dest),
+                "Host identity ELF strip lost BTF"
+            );
+            assert!(
+                dest.metadata().unwrap().len() < 32 * 1024,
+                "embedded Host identity ELF exceeds size contract"
+            );
+        } else {
+            std::fs::copy(object, &dest).unwrap_or_else(|e| {
+                panic!("copy {} -> {}: {}", object.display(), dest.display(), e)
+            });
+        }
         println!("cargo:rerun-if-changed={}", object.display());
         println!(
             "cargo:rerun-if-changed={}",
@@ -468,7 +498,7 @@ fn embed_ebpf_object() {
         println!("cargo:rustc-env={env_key}={}", dest.display());
         println!(
             "cargo:warning={name} embedded ({} bytes)",
-            object.metadata().map(|m| m.len()).unwrap_or(0)
+            dest.metadata().unwrap().len()
         );
     }
 }

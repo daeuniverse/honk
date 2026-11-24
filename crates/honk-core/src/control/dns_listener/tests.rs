@@ -891,6 +891,141 @@ async fn packet_scoped_bound_dns_keeps_udp_and_each_tcp_frame_current() {
     .expect("bound DNS must use its registered scope and current per-frame admission");
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn host_bound_dns_serves_offline_and_learns_live_loopback_queries() {
+    use crate::control::netstack::auxiliary_scope;
+    use crate::dns::runtime::{
+        DnsRuntime, DnsRuntimeParts, DnsServiceProvider, RoutingProjectionSnapshot,
+        RuntimeGeneration,
+    };
+
+    let router = Arc::new(
+        Router::from_config(
+            &honk_config::parser::parse_dae_config(
+                "routing { domain(suffix: example.com) -> block\n fallback: direct }",
+            )
+            .unwrap()
+            .routing,
+        )
+        .unwrap(),
+    );
+    let expected = [192, 0, 2, 53];
+    let (forwarder, _) = forwarder(expected);
+    let controller = Arc::new(DnsController::new_with_runtime(
+        Arc::new(DnsServiceProvider::new(DnsRuntime::new(DnsRuntimeParts {
+            generation: RuntimeGeneration::new(1),
+            forwarder,
+            routing_projection: Arc::new(RoutingProjectionSnapshot::new(1, Arc::clone(&router))),
+            outbound_runtime: None,
+            transport: Arc::new(TestRuntimeTransport),
+        }))),
+        Arc::new(tokio::sync::RwLock::new(Box::new(
+            crate::ebpf::mock::MockEbpfBackend::new(),
+        ))),
+        16,
+    ));
+    let budget = honk_netstack::MemoryBudget::new(8 << 20);
+    let (port, owner) = auxiliary_scope(1500, &budget).unwrap();
+    let shared = ScopeId::allocate().unwrap();
+    let standalone = ScopeId::allocate().unwrap();
+    let ports = std::slice::from_ref(&port);
+    let projection = controller.routing_projection();
+    projection
+        .register_host_scopes(shared, standalone, ports, &budget)
+        .unwrap();
+    controller.register_packet_scopes(ports).unwrap();
+
+    let scopes = controller.listener_query_scopes(standalone);
+    for peer in ["127.0.0.2:1234", "[::1]:1234", "[::ffff:127.0.0.1]:1234"] {
+        assert_eq!(peer_query_scope(peer.parse().unwrap(), scopes), scopes.1);
+    }
+    for peer in [
+        "192.0.2.1:1234",
+        "[::ffff:192.0.2.1]:1234",
+        "[::127.0.0.1]:1234",
+    ] {
+        assert_eq!(peer_query_scope(peer.parse().unwrap(), scopes), scopes.0);
+    }
+
+    let bound = BoundDnsListener::bind(
+        &DnsBindEndpoint::parse("tcp+udp://127.0.0.1:0").unwrap(),
+        None,
+    )
+    .unwrap();
+    let address = bound.local_addr();
+    let drain = Arc::new(DrainTracker::new().with_drain_timeout(Duration::from_millis(20)));
+    let mut listener = bound
+        .spawn(
+            Arc::clone(&controller),
+            Arc::new(Semaphore::new(16)),
+            Arc::new(StatsManager::new()),
+            Arc::clone(&drain),
+            None,
+            Default::default(),
+            standalone,
+        )
+        .unwrap();
+    let learned = |scope| {
+        controller
+            .packet_domain_bitmap(scope, expected.into(), &router, 1)
+            .unwrap()
+            .bitmap
+            .is_some()
+    };
+    let mut tcp = TcpStream::connect(address).await.unwrap();
+    let exchange_tcp = async |stream: &mut TcpStream, id| {
+        crate::dns::transport::write_length_prefixed(stream, &query("tcp.example.com", id))
+            .await
+            .unwrap();
+        read_tcp_frame(stream).await
+    };
+    assert!(exchange_tcp(&mut tcp, 1).await.ends_with(&expected));
+    assert!(
+        udp_exchange(address, &query("udp.example.com", 2))
+            .await
+            .ends_with(&expected)
+    );
+    assert!(!learned(standalone));
+
+    let mut driver = owner.hand_off();
+    driver.resume_auxiliary(1500, || true).unwrap();
+    projection
+        .set_host_binding(port.scope(), port.binding(), true)
+        .unwrap();
+    assert!(!learned(shared));
+    assert!(
+        udp_exchange(address, &query("udp.example.com", 3))
+            .await
+            .ends_with(&expected)
+    );
+    assert!(learned(port.scope()));
+    projection
+        .set_host_binding(port.scope(), port.binding(), false)
+        .unwrap();
+    assert!(exchange_tcp(&mut tcp, 4).await.ends_with(&expected));
+
+    driver.begin_auxiliary_pause().unwrap();
+    driver.drain_auxiliary().await.unwrap();
+    driver.resume_auxiliary(1500, || true).unwrap();
+    projection
+        .set_host_binding(port.scope(), port.binding(), true)
+        .unwrap();
+    assert!(!learned(shared));
+    assert!(exchange_tcp(&mut tcp, 5).await.ends_with(&expected));
+    assert!(learned(shared));
+    assert!(!learned(standalone));
+
+    drop(tcp);
+    stop_listener(&mut listener, &drain).await;
+    projection
+        .set_host_binding(port.scope(), port.binding(), false)
+        .unwrap();
+    drop(driver);
+    owner.shutdown().await;
+    controller.shutdown(Duration::from_secs(1)).await;
+}
+
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 #[test]
 #[ignore = "requires the disposable kernel VM gate and SO_MARK privileges"]

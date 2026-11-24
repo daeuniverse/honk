@@ -790,7 +790,6 @@ async fn restart_b(rig: &mut Rig, config: Config, label: &str) -> anyhow::Result
         config,
         PollBudgetBinding::Participant(rig.budget.clone()),
         rig.b_namespace.clone(),
-        rig.pins.join("b"),
         rig.artifacts.clone(),
         rig.deadline,
     )

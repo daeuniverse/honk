@@ -90,7 +90,7 @@ fn generated_dns_shadow_policy_verifies_and_jits() -> anyhow::Result<()> {
         vlan_metadata: true,
     };
     for (enabled, mode) in [(false, "static"), (true, "shadow")] {
-        let policy = GatewayPolicy::prepare(&plan, enabled)?;
+        let policy = GatewayPolicy::prepare(&plan, enabled, None)?;
         let programs = Programs::load_general_gateway(
             &capture,
             2,
@@ -98,7 +98,7 @@ fn generated_dns_shadow_policy_verifies_and_jits() -> anyhow::Result<()> {
             GatewayLoad {
                 routing: &policy.bytecode.insns,
                 maps: &maps,
-                conntrack: &conntrack,
+                conntrack: Some(&conntrack),
                 dns: enabled.then_some(&dns),
                 arbitration: enabled.then_some(&arbitration),
             },

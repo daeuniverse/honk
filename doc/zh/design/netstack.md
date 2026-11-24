@@ -200,7 +200,7 @@ XDP 在启动时为每个物理 Port 选择容量。`physical_mtu + 22` 不溢�
 
 单物理成员、两个 owner 且基础 bulk 帧数为 256 时，启动先为每个 owner 预留 128 个 bulk 和 16 个 control 帧。在开放准入之前，仅当共享预算能同时承担两侧新增帧、两个新 ledger 和数组替换峰值时，才将两侧分别升至 256 个 bulk 和 32 个 control 帧。否则两侧都保持原窗口。两种情况下 Stack 内存和流数上限均不增加。
 
-较大 RX 档仅用于 `direct: endpoint` 网关：一个物理成员、一个逻辑 realm、强制 ZeroCopy（不能是 Auto）、无 `datapath.host`，且有 1–8 个队列。从 384 MiB 捕获预算中为协议栈留出一半后，每队列还须有至少 8 MiB 余量。这是启动筛选条件，不是实际分配 8 MiB UMEM：每个 Port 的 UMEM、元数据和 ring 各按实际额度预留。打开设备前重新选择档位，运行中不调整。UMEM 保留至进程退出。网卡硬件 ring 和每轮每 realm 每类别 32 个输出的限制不变。单帧 scope 的 256 个 bulk owner 会留下 224 个 Port bulk 帧，其他 realm 和 Core 输出也可使用，不承诺吞吐或公平性。
+较大 RX 档仅用于 `direct: endpoint` 网关：一个物理成员、一个逻辑 realm、强制 ZeroCopy（不能是 Auto），且有 1–8 个队列。Host 的预留先从预算扣除。从 384 MiB 捕获预算中为协议栈留出一半后，每队列还须有至少 8 MiB 余量。这是启动筛选条件，不是实际分配 8 MiB UMEM：每个 Port 的 UMEM、元数据和 ring 各按实际额度预留。打开设备前重新选择档位，运行中不调整。UMEM 保留至进程退出。网卡硬件 ring 和每轮每 realm 每类别 32 个输出的限制不变。单帧 scope 的 256 个 bulk owner 会留下 224 个 Port bulk 帧，其他 realm 和 Core 输出也可使用，不承诺吞吐或公平性。
 
 优化后的 Port 与 scope 预留更大，因此在 384 MiB 预算下，大量所选 queue/realm 的启动余量会降低。成功映射的 UMEM 会持续计费直到进程退出，即使后续启动步骤失败也不归还，并继续占用原有进程级 512 MiB retained-UMEM 上限。在同一进程中重启 capture 不会回收它。
 
@@ -212,24 +212,7 @@ TUN 选择 bulk 128 和配置的逻辑 MTU（默认 1500）；false 使用一个
 
 每个 scope/class 最多保留 32 个 pending lease。一次 `writev` 提交不可变 record；EAGAIN/EINTR 保留原 lease，短/零写为终止错误，不重放。就绪和 joined close 期间服务所有 driver。独立 DNS 在 plain scope 学习，透明 DNS 使用各 packet 的 scope，均不借用 HOST 事实。Socket HostFacts 保留原始来源有效期与所有权；plain 不提供进程权威。Direct 新建 dial，不保留原 socket operation 或 pre-NAT/TTL 行为。
 
-显式 XDP [Host 捕获](./datapath.md#host-来源托管) 在 Endpoint 启动前准备单独的
-认证 scope，导入前检查有效 source receipt。source lineage 包含 namespace、
-attachment、socket cookie、operation incarnation 及原 return identity；不可变
-fact snapshot 还会在 mark/process fact 改变时分隔执行。既有精确 TCP FlowId、
-UDP initializer/source owner、重组及排队/导出的 `OutputLease` 保留该 context；
-tuple 复用或更新 snapshot 都不能把旧工作重新指向新来源。路由使用实际进程是否存在
-的事实，不伪造身份。普通 Direct/proxy 新建带 mark 的 outbound，生成回复由普通
-Linux demultiplexing 交付，不保留原 socket operation 或 pre-NAT/TTL 行为。
-
-Host source-context cell/index 在 scope 冷准备时计费并分配，准入与 generation
-exhaustion 有界；活动 protocol、fragment、work 和 output owner 阻止回收。冷启动
-namespace setup 保留绑定该 namespace 的 custody socket，后续查询不再切换 namespace。
-Host 为 fixed map/loader storage 预留 96 MiB，验证实际 kernel allocation 不超过
-64 MiB，并为 running-BTF 准备峰值及有界 source/child custody snapshot 单独计费。
-这些与私有 Copy Port、UMEM、scope 和 output storage 共用 384 MiB capture
-预算；这是预留契约，不是整个进程的 RSS 测量。BTF 准备存储在 setup 后释放，retained
-fixed kernel 与 UMEM 计费持续到进程退出，包括资源移除后或创建 pin 后 setup 失败时。
-此 XDP 路径本身不授予 TUN 能力，也不代表完整 V7、E6、physical 或 13-size 验收。
+每个 [Host 出口](./datapath.md#host-来源托管) 使用与辅助 LAN 相同的 4 MiB 私有 TUN/Stack 份额，不创建 Copy Port。元数据、设备对象、程序以及重载时两代并存的开销计入同一 384 MiB 根预算。两张 socket storage 的动态元素由内核按活动 socket 分配；它们及未来外部创建的 cgroup 的增量不属于 honk 的内存硬上限。流的 PID 和规范化进程名来自其精确 Endpoint 归属记录，不是最近一个发送者或 TUN HostFacts 收据。
 
 `PacketScope::receive_with_source` 在既有输出互斥锁内调用 source callback；callback
 不得重入该 scope 或阻塞 I/O。设备可先安装当前包的 reverse L2 关联，再让输出

@@ -300,6 +300,13 @@ impl DnsController {
         }
     }
 
+    pub(super) fn listener_query_scopes(
+        &self,
+        standalone: ScopeId,
+    ) -> (Option<QueryScope>, Option<QueryScope>) {
+        self.routing_projection.listener_query_scopes(standalone)
+    }
+
     /// Acquire a generation-pinned query admission. The runtime lease and
     /// permits remain owned by the caller through response I/O.
     pub(crate) fn try_admit_query(&self, udp: bool) -> Result<AdmittedDnsQuery, DnsAdmissionError> {
@@ -364,8 +371,11 @@ impl DnsController {
         udp: bool,
         scope: Option<QueryScope>,
     ) -> Result<AdmittedDnsQuery, DnsAdmissionError> {
+        // Losing the Host activity stamp withdraws listener facts while its socket stays live.
         let scope = scope
-            .filter(|scope| self.routing_projection.query_scope_is_current(*scope))
+            .filter(|scope| {
+                scope.is_host_listener() || self.routing_projection.query_scope_is_current(*scope)
+            })
             .ok_or_else(DnsAdmissionError::closed)?;
         self.admit_query_in(udp, scope)
     }

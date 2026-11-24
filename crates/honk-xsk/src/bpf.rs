@@ -2,8 +2,7 @@ use std::io;
 use std::mem::size_of;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,25 +11,17 @@ use aya_obj::btf::{Btf, BtfKind};
 use crate::{Capture, Protocol};
 mod attachment;
 mod ct;
-pub use attachment::{Attachment, OwnedXdpLink, PersistentAttachment};
+pub use attachment::{Attachment, OwnedXdpLink};
 pub mod gateway;
 mod general;
+pub use ct::{ConntrackKfuncs, HostConntrack, SkbConntrackKfuncs};
 use gateway::{GatewayLoad, GatewayMaps};
-#[cfg(feature = "host")]
-mod host;
-pub use ct::{ConntrackKfuncs, SkbConntrackKfuncs};
-pub use general::AuxGatewayProgram;
-#[cfg(feature = "host")]
-mod source;
+pub use general::{AuxGatewayProgram, HostGatewayLoad};
 mod tcx_aux;
-pub use tcx_aux::{AuxDevicePair, AuxReturnLink, AuxTcxLink, AuxTunGuard};
+pub use tcx_aux::{AuxDevicePair, AuxReturnLink, AuxTcxLink, AuxTunGuard, HostFifo};
 #[cfg(feature = "host")]
 mod tun;
 
-#[cfg(feature = "host")]
-pub use host::{HostPrograms, HostTcxAttachment};
-#[cfg(feature = "host")]
-pub use source::{HostSourceConfig, HostSourcePrograms};
 #[cfg(feature = "host")]
 pub use tun::{TunKernelOffsets, TunMaps, TunProgramConfig, TunPrograms, TunTraceTarget};
 fn fdinfo_memlock(info: &str) -> io::Result<usize> {
@@ -65,7 +56,6 @@ const BPF_MAP_LOOKUP_ELEM: u32 = 1;
 const BPF_MAP_UPDATE_ELEM: u32 = 2;
 const BPF_MAP_DELETE_ELEM: u32 = 3;
 const BPF_PROG_LOAD: u32 = 5;
-const BPF_OBJ_PIN: u32 = 6;
 const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
 const BPF_LINK_CREATE: u32 = 28;
 const BPF_LINK_UPDATE: u32 = 29;
@@ -73,8 +63,9 @@ const BPF_PROG_TYPE_XDP: u32 = 6;
 const BPF_XDP: u32 = 37;
 const BPF_LINK_TYPE_XDP: u32 = 6;
 const BPF_F_REPLACE: u32 = 4;
-const BPF_F_PATH_FD: u32 = 1 << 14;
+#[cfg(test)]
 const XDP_FLAGS_UPDATE_IF_NOEXIST: u32 = 1;
+#[cfg(test)]
 const XDP_FLAGS_REPLACE: u32 = 1 << 4;
 const XDP_FLAGS_DRV_MODE: u32 = 4;
 const XDP_DROP: i32 = 1;
@@ -320,8 +311,7 @@ impl Programs {
             )?;
             program.kfunc_btf = gateway
                 .conntrack
-                .btf
-                .as_ref()
+                .and_then(|ct| ct.btf.as_ref())
                 .map(OwnedFd::try_clone)
                 .transpose()?;
             program.dns_shadow = gateway.dns.is_some();
@@ -725,6 +715,7 @@ pub fn xdp_state(ifindex: u32) -> io::Result<XdpState> {
     exchange_netlink(&request, |bytes| parse_link_messages(bytes, 1, ifindex))
 }
 
+#[cfg(test)]
 fn xdp_update_request(ifindex: u32, program: RawFd, expected: Option<RawFd>) -> ([u8; 60], usize) {
     let mut request = [0u8; 60];
     let length = if expected.is_some() { 60 } else { 52 };
@@ -754,47 +745,13 @@ fn xdp_update_request(ifindex: u32, program: RawFd, expected: Option<RawFd>) -> 
     (request, length)
 }
 
-#[derive(Debug)]
-pub(crate) enum XdpUpdateError {
-    Rejected(io::Error),
-    Uncertain(io::Error),
-}
-
-impl From<XdpUpdateError> for io::Error {
-    fn from(error: XdpUpdateError) -> Self {
-        match error {
-            XdpUpdateError::Rejected(error) => error,
-            XdpUpdateError::Uncertain(error) => io::Error::new(
-                error.kind(),
-                format!("XDP update outcome unknown; retain pins and owners: {error}"),
-            ),
-        }
-    }
-}
-
-pub(crate) fn set_xdp(
-    ifindex: u32,
-    program: RawFd,
-    expected: Option<RawFd>,
-) -> Result<(), XdpUpdateError> {
+#[cfg(test)]
+fn set_xdp(ifindex: u32, program: RawFd, expected: Option<RawFd>) -> io::Result<()> {
     let (request, length) = xdp_update_request(ifindex, program, expected);
-    let mut rejected = false;
-    exchange_netlink(&request[..length], |bytes| {
-        let result = parse_setlink_ack(bytes, 1);
-        rejected = result
-            .as_ref()
-            .is_err_and(|error| error.raw_os_error().is_some());
-        result
-    })
-    .map_err(|error| {
-        if rejected {
-            XdpUpdateError::Rejected(error)
-        } else {
-            XdpUpdateError::Uncertain(error)
-        }
-    })
+    exchange_netlink(&request[..length], |bytes| parse_setlink_ack(bytes, 1))
 }
 
+#[cfg(test)]
 fn parse_setlink_ack(mut bytes: &[u8], sequence: u32) -> io::Result<Option<()>> {
     let mut outcome = None;
     while !bytes.is_empty() {
@@ -1469,7 +1426,7 @@ fn build_program(
 
 #[cfg(test)]
 mod tests {
-    use super::attachment::{LinkCreateAttr, LinkInfo, LinkUpdateAttr, private_bpffs};
+    use super::attachment::{LinkCreateAttr, LinkInfo, LinkUpdateAttr};
     use super::*;
 
     #[test]
@@ -1502,44 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_pin_preflight_rejects_ordinary_filesystem_without_writes() {
-        let error = private_bpffs(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(error.to_string(), "XDP pin root must be bpffs");
-    }
-
-    #[test]
-    fn persistent_updates_encode_native_exclusion_and_kernel_comparison() {
-        for (program, expected) in [(12, None), (12, Some(11)), (-1, Some(11)), (-1, Some(-2))] {
-            let (request, length) = xdp_update_request(7, program, expected);
-            assert_eq!(
-                u32::from_ne_bytes(request[..4].try_into().unwrap()) as usize,
-                length,
-            );
-            assert_eq!(u16::from_ne_bytes(request[4..6].try_into().unwrap()), 19);
-            assert_eq!(u16::from_ne_bytes(request[6..8].try_into().unwrap()), 5);
-            assert_eq!(i32::from_ne_bytes(request[20..24].try_into().unwrap()), 7);
-            let mut outer = 0;
-            attributes(&request[32..length], |kind, value| {
-                outer += 1;
-                assert_eq!(kind, 43);
-                let mut fields = Vec::new();
-                attributes(value, |kind, value| {
-                    fields.push((kind, i32::from_ne_bytes(value.try_into().unwrap())));
-                    Ok(())
-                })?;
-                assert_eq!(fields[0], (1, program));
-                assert_eq!(fields[1], (3, if expected.is_some() { 20 } else { 5 }));
-                if let Some(expected) = expected {
-                    assert_eq!(fields, [(1, program), (3, 20), (8, expected)]);
-                } else {
-                    assert_eq!(fields, [(1, program), (3, 5)]);
-                }
-                Ok(())
-            })
-            .unwrap();
-            assert_eq!(outer, 1);
-        }
+    fn native_attachment_requires_consistent_driver_identity() {
         let native = XdpState {
             attached: 1,
             prog_id: 12,
@@ -1646,34 +1566,6 @@ mod tests {
                 .kind(),
             io::ErrorKind::TimedOut
         );
-    }
-
-    #[test]
-    fn persistent_updates_require_successful_matching_kernel_ack() {
-        let (request, _) = xdp_update_request(7, -1, Some(11));
-        let mut ack = [0u8; 36];
-        ack[..4].copy_from_slice(&36u32.to_ne_bytes());
-        ack[20..36].copy_from_slice(&request[..16]);
-        ack[4..6].copy_from_slice(&2u16.to_ne_bytes());
-        ack[8..12].copy_from_slice(&1u32.to_ne_bytes());
-        assert_eq!(parse_setlink_ack(&ack, 1).unwrap(), Some(()));
-        assert_eq!(parse_setlink_ack(&ack, 2).unwrap(), None);
-        for end in 1..ack.len() {
-            assert!(parse_setlink_ack(&ack[..end], 1).is_err());
-        }
-        let mut incomplete = ack;
-        incomplete[..4].copy_from_slice(&20u32.to_ne_bytes());
-        assert!(parse_setlink_ack(&incomplete[..20], 1).is_err());
-        let mut wrong_request = ack;
-        wrong_request[28..32].copy_from_slice(&2u32.to_ne_bytes());
-        assert!(parse_setlink_ack(&wrong_request, 1).is_err());
-        for errno in [libc::EEXIST, libc::EBUSY, libc::EINVAL, libc::EOPNOTSUPP] {
-            ack[16..20].copy_from_slice(&(-errno).to_ne_bytes());
-            assert_eq!(
-                parse_setlink_ack(&ack, 1).unwrap_err().raw_os_error(),
-                Some(errno),
-            );
-        }
     }
 
     fn attribute(bytes: &mut Vec<u8>, kind: u16, value: &[u8]) {

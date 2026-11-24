@@ -1816,13 +1816,11 @@ async fn finish_coordinator(
 
 pub(super) async fn run_coordinator(
     plane: ControlPlane,
-    pin_root: &Path,
     admission: Arc<AtomicBool>,
     pname_support: crate::ebpf::PnameSupportCell,
 ) -> (Option<ControlPlane>, anyhow::Result<()>) {
     let shared_runtime = tokio::runtime::Handle::current();
     let shutdown = plane.shutdown_intent();
-    let pin_root = pin_root.to_owned();
     let (send, receive) = tokio::sync::oneshot::channel();
     let runtime_handle = shared_runtime.clone();
     let thread_admission = Arc::clone(&admission);
@@ -1850,7 +1848,6 @@ pub(super) async fn run_coordinator(
             let outcome = runtime.block_on(
                 std::panic::AssertUnwindSafe(super::run_capture(
                     plane,
-                    &pin_root,
                     thread_admission,
                     pname_support,
                     runtime_handle,

@@ -140,15 +140,16 @@ impl ControlPlaneHandle {
         }
         let client_addr = lease.client_addr();
         let original_dst = lease.original_dst();
-        let packet_facts = lease
+        let packet_input = lease
             .packet_source()
-            .and_then(|source| source.optional_facts());
-        if let Some(facts) = &packet_facts {
+            .and_then(|source| source.packet_input());
+        if let Some((process, mark)) = packet_input {
             observation.packet_facts(
-                facts,
+                process,
                 lease
                     .packet_dscp
                     .ok_or_else(|| anyhow::anyhow!("packet UDP has no admitted DSCP"))?,
+                mark,
             );
         }
         let data = lease.first_payload();
@@ -168,6 +169,7 @@ impl ControlPlaneHandle {
                             .packet_dscp
                             .ok_or_else(|| anyhow::anyhow!("packet UDP has no admitted DSCP"))?,
                         lease.packet_source(),
+                        None,
                         #[cfg(feature = "native-api")]
                         observation.is_recording(),
                     )
@@ -360,9 +362,6 @@ impl ControlPlaneHandle {
             let mut input =
                 build_connection_info(quic_domain.clone(), original_dst, client_addr, "udp", None);
             input.dscp = lease.packet_dscp;
-            input.process_name = packet_facts
-                .as_ref()
-                .and_then(super::routing::packet_process_name);
             self.route_packet_with_sniffed(
                 snapshot,
                 dial_mode,
@@ -986,8 +985,8 @@ impl ControlPlaneHandle {
                         start_time: std::time::Instant::now(),
                         domain: quic_domain.clone(),
                         network: "udp".to_string(),
-                        process: match &packet_facts {
-                            Some(facts) => super::routing::packet_process_name(facts),
+                        process: match packet_input {
+                            Some((process, _)) => process.name(),
                             None => handoff.as_ref().and_then(|ho| ho.process_name()),
                         },
                         process_path: None,

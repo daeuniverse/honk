@@ -48,6 +48,7 @@ pub(in crate::control) use auxiliary::AuxiliaryWork;
 pub(crate) use auxiliary::auxiliary_scope;
 mod source;
 pub use source::HostIngress;
+pub(in crate::control) use source::ProcessMeta;
 pub(in crate::control) use source::SourceWork;
 use source::Sources;
 
@@ -68,7 +69,7 @@ const CAPTURE_CONTROL_FRAMES: usize = 32;
 #[cfg(target_os = "linux")]
 pub(crate) const CAPTURE_WIDE_BULK_FRAMES: usize = 256;
 
-#[cfg(all(target_os = "linux", any(test, feature = "ebpf")))]
+#[cfg(all(target_os = "linux", test))]
 pub(crate) fn capture_scope(
     mtu: u32,
     realms: usize,
@@ -256,6 +257,7 @@ struct FlowSlot {
     accepted: bool,
     rx_admitted: bool,
     routing: Option<super::packet_endpoint::EndpointAdmission>,
+    process: Option<ProcessMeta>,
     source: Option<SourceContext>,
 }
 
@@ -293,6 +295,8 @@ struct Inner {
     #[cfg(target_os = "linux")]
     output_peer_holds: Box<[Option<crate::xdp::worker::PeerHold>]>,
     source_work: Sources,
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    host_process: Option<auxiliary::HostProcessBinding>,
     queue: Box<[Option<Queued>]>,
     head: usize,
     queued: usize,
@@ -596,6 +600,8 @@ impl PacketScope {
                 #[cfg(target_os = "linux")]
                 output_peer_holds: frames.output_peer_holds,
                 source_work: frames.source_work,
+                #[cfg(all(target_os = "linux", feature = "ebpf"))]
+                host_process: None,
                 queue: frames.queue,
                 head: 0,
                 queued: 0,
@@ -769,6 +775,12 @@ impl PacketScope {
             if inner.source_work.is_host() {
                 return Rx::Dropped(DropReason::NotForUs);
             }
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            if inner.host_process.is_some() {
+                return self
+                    .receive_process(inner, packet, RxMeta::VERIFY, now, |_| true)
+                    .0;
+            }
             if inner.resources.is_some() {
                 return inner
                     .receive_checked(packet, RxMeta::VERIFY, now, now, |_| true)
@@ -809,6 +821,12 @@ impl PacketScope {
                 return (Rx::Dropped(DropReason::NotForUs), Default::default());
             }
             let pending = check_output && inner.pending_source_output(packet);
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            if inner.host_process.is_some() {
+                return self.receive_process(inner, packet, meta, now, |source| {
+                    on_source(source, pending)
+                });
+            }
             let (rx, report) =
                 inner.receive_checked(packet, meta, now, now, |source| on_source(source, pending));
             (rx, inner.receive_result(report))
@@ -873,40 +891,30 @@ impl PacketScope {
                 inner.receive_checked(packet, RxMeta::VERIFY, now, service_at, |source| {
                     on_source(source, pending)
                 });
-            if let honk_netstack::ReceiveOutcome::TcpNew(id) = report.outcome {
-                if let Some(vacant) = inner.slots.iter().position(Option::is_none) {
-                    let source = report
-                        .source
-                        .expect("new TCP admission has a validated tuple");
-                    inner.slots[vacant] = Some(FlowSlot {
-                        id,
-                        client: source.src,
-                        destination: source.dst,
-                        app_open: true,
-                        close_pending: false,
-                        retiring: false,
-                        outputs: 0,
-                        rx: None,
-                        tx: None,
-                        callback: None,
-                        accepted: false,
-                        rx_admitted: false,
-                        routing: admission.take(),
-                        source: None,
-                    });
-                    inner.pending_routing += 1;
-                } else {
-                    inner
-                        .stack
-                        .as_mut()
-                        .expect("live scope stack")
-                        .tcp_refuse(id, honk_netstack::Refuse::Drop);
-                }
-            }
+            inner.register_tcp_new(&report, admission, None);
             if inner.resources.is_some() {
                 inner.advance(service_at);
             }
             (rx, inner.receive_result(report))
+        })
+    }
+
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    fn receive_process(
+        &self,
+        inner: &mut Inner,
+        packet: &[u8],
+        meta: RxMeta,
+        now: Instant,
+        on_source: impl FnMut(honk_netstack::ValidatedSource) -> bool,
+    ) -> (Rx, super::packet_endpoint::PacketReceive) {
+        let (rx, report) = inner.receive_checked(packet, meta, now, now, on_source);
+        inner.bind_host_process(rx, report, |inner, source| {
+            inner
+                .host_process
+                .as_ref()
+                .expect("gateway Host binding")
+                .process(self.binding(), source.src, source.dst, source.protocol)
         })
     }
 
@@ -927,7 +935,18 @@ impl PacketScope {
             }
             let stack = inner.stack.as_mut()?;
             let syn = stack.poll_accept()?;
-            if vacant.is_none() && !inner.slots.iter().flatten().any(|slot| slot.id == syn.id) {
+            let pending = inner
+                .slots
+                .iter_mut()
+                .flatten()
+                .find(|slot| slot.id == syn.id);
+            if vacant.is_none() && pending.is_none() {
+                stack.tcp_refuse(syn.id, honk_netstack::Refuse::Drop);
+                return None;
+            }
+            let process = pending.as_ref().and_then(|slot| slot.process);
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            if inner.host_process.is_some() && process.is_none() {
                 stack.tcp_refuse(syn.id, honk_netstack::Refuse::Drop);
                 return None;
             }
@@ -935,12 +954,8 @@ impl PacketScope {
                 stack.tcp_abort(syn.id);
                 return None;
             }
-            let routing = if let Some(slot) = inner
-                .slots
-                .iter_mut()
-                .flatten()
-                .find(|slot| slot.id == syn.id)
-            {
+            let source = pending.as_ref().and_then(|slot| slot.source);
+            let routing = if let Some(slot) = pending {
                 slot.accepted = true;
                 inner.pending_routing -= 1;
                 slot.routing.take()
@@ -963,19 +978,14 @@ impl PacketScope {
                     accepted: true,
                     rx_admitted: false,
                     routing: None,
+                    process: None,
                     source: None,
                 });
                 None
             };
-            let mut flow = FlowIo::new(self.clone(), syn);
+            let mut flow = FlowIo::new(self.clone(), syn, process);
             flow.set_routing(routing);
-            if let Some(context) = inner
-                .slots
-                .iter()
-                .flatten()
-                .find(|slot| slot.id == syn.id)
-                .and_then(|slot| slot.source)
-            {
+            if let Some(context) = source {
                 let work = SourceWork::retained(self, &mut inner.source_work, context)
                     .expect("admitted TCP source owner");
                 flow.set_packet_source(work);
@@ -1487,6 +1497,13 @@ impl Inner {
         )
         .expect("stack output has IP addresses")
         .1;
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        if tx.flow.is_none()
+            && let Some(binding) = &mut self.host_process
+        {
+            let bytes = &self.frames[index].as_ref().expect("reserved Host output")[..tx.len];
+            binding.outputs[index] = auxiliary::HostOutput::from_packet(bytes, fragment);
+        }
         let queued = self
             .install(lease, index, tx, class, destination, fragment)
             .expect("reserved complete output frame");
@@ -1496,6 +1513,10 @@ impl Inner {
     fn release(&mut self, queued: Queued) {
         let index = self.index(queued.lease);
         self.output_peers[index] = None;
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        if let Some(binding) = &mut self.host_process {
+            binding.outputs[index] = None;
+        }
         #[cfg(target_os = "linux")]
         if let Some(peer) = self.output_peer_holds.get_mut(index) {
             peer.take();
@@ -2052,6 +2073,13 @@ impl PacketDriver {
         let queued = reservation
             .inner
             .install(lease, index, tx, class, destination, fragment)?;
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        if tx.flow.is_none()
+            && let Some(binding) = &mut reservation.inner.host_process
+        {
+            binding.outputs[index] =
+                auxiliary::HostOutput::from_packet(&packet[..tx.len], fragment);
+        }
         reservation.lease = None;
         #[cfg(target_os = "linux")]
         let path = reservation
@@ -2127,7 +2155,7 @@ impl OutputLease {
     pub(crate) fn transmit(&self) -> Transmit {
         self.0.queued.expect("live output lease").tx
     }
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(test)]
     pub(crate) fn host_return(&self) -> Option<honk_ebpf_common::host::HostSourceFacts> {
         self.0.host_return()
     }
@@ -2180,7 +2208,7 @@ impl OutputOwner {
             .and_then(Clone::clone)
     }
 
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(test)]
     pub(crate) fn host_return(&self) -> Option<honk_ebpf_common::host::HostSourceFacts> {
         let context = self.queued.as_ref()?.tx.source?;
         Some(

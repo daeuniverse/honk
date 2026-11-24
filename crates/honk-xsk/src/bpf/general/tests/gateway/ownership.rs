@@ -87,7 +87,7 @@ fn kernel_gateway_tcp_dns_ownership() {
         .reload_general_gateway(GatewayLoad {
             routing: &direct,
             maps: &fixture.maps,
-            conntrack: &fixture.ct,
+            conntrack: Some(&fixture.ct),
             dns: None,
             arbitration: Some(&arb),
         })
@@ -621,7 +621,7 @@ fn kernel_gateway_udp_dns_ownership() {
         .reload_general_gateway(GatewayLoad {
             routing: &direct,
             maps: &fixture.maps,
-            conntrack: &fixture.ct,
+            conntrack: Some(&fixture.ct),
             dns: Some(&dns),
             arbitration: Some(&arb),
         })

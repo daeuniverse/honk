@@ -1140,7 +1140,10 @@ async fn tun_dns_bind_requires_preparation_before_startup() {
     })
     .await
     .expect_err("TUN cannot resolve a bind endpoint after routing setup");
-    assert!(format!("{error:#}").contains("addresses prepared before routing setup"));
+    assert_eq!(
+        error.downcast_ref::<io::Error>().map(io::Error::kind),
+        Some(io::ErrorKind::InvalidInput)
+    );
 }
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]

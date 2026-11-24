@@ -901,13 +901,13 @@ fn send_segments(sender: &UdpSocket) -> io::Result<()> {
     message.msg_iov = &mut vector;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = unsafe { libc::CMSG_SPACE(size_of::<u16>() as u32) } as usize;
+    message.msg_controllen = unsafe { libc::CMSG_SPACE(size_of::<u16>() as u32) } as _;
     // SAFETY: aligned control has enough initialized storage for one u16 control message.
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&message);
         (*cmsg).cmsg_level = libc::IPPROTO_UDP;
         (*cmsg).cmsg_type = 103; // UDP_SEGMENT.
-        (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<u16>() as u32) as usize;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<u16>() as u32) as _;
         std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<u16>(), 64);
     }
     // SAFETY: all msghdr/iovec/control extents above remain alive and are immutable input.
@@ -933,7 +933,7 @@ fn send_packet(ifindex: u32, frame: &[u8], bypass: bool) -> io::Result<()> {
     // SAFETY: raw is a newly owned descriptor.
     let socket = unsafe { OwnedFd::from_raw_fd(raw) };
     let timeout = libc::timeval {
-        tv_sec: DEADLINE.as_secs() as libc::time_t,
+        tv_sec: DEADLINE.as_secs() as _,
         tv_usec: 0,
     };
     // SAFETY: timeout and option have the documented integer/timeval extents.

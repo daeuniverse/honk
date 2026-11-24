@@ -430,9 +430,9 @@ pub enum PnameSupport {
     Full,
     /// Kernel argv capture is unavailable; rules see the thread name.
     ThreadName,
-    /// Argv-derived names are available only on authenticated Host sources.
+    /// Argv-derived names are available only for Host sockets with captured identity.
     HostFull,
-    /// Thread names are available only on authenticated Host sources.
+    /// Thread names are available only for Host sockets with captured identity.
     HostThreadName,
     /// The cgroup hooks are not attached; `pname()` never matches and
     /// `!pname()` always does.
@@ -458,12 +458,12 @@ pub(crate) fn record_pname_routing(
         }),
         PnameSupport::HostFull => Some(Issue {
             code: "pname_routing_host_only",
-            message: "Process names are available only on authenticated Host sources; plain sources and Host sources without a process name retain Missing semantics.",
+            message: "Process names are available only for Host sockets with captured identity. Other traffic retains Missing semantics.",
             reason: "host_only",
         }),
         PnameSupport::HostThreadName => Some(Issue {
             code: "pname_routing_host_only",
-            message: "Kernel argv capture is unavailable; process-name rules match thread names only on authenticated Host sources. Plain sources and Host sources without a process name retain Missing semantics.",
+            message: "Kernel argv capture is unavailable; only Host sockets with captured identity can match thread names. Other traffic retains Missing semantics.",
             reason: "host_only_comm_fallback",
         }),
         PnameSupport::Unavailable => Some(Issue {

@@ -1,11 +1,11 @@
 //! Process-scoped standalone DNS listener for `dns.bind`.
 //!
-//! These sockets stay in the host netns. TUN replies carry the required bypass
-//! mark; other backends keep ordinary unmarked listener semantics.
+//! Required bypass marks follow the packet backend's listener setup.
 
 use super::ConnectionGuard;
 use crate::control::dns_control::DnsController;
 use crate::control::drain::DrainTracker;
+use crate::dns::projection::QueryScope;
 use crate::dns::query::{DnsRequestMeta, validate_exact_dns_query};
 use crate::stats::StatsManager;
 use honk_config::dns::DnsBindEndpoint;
@@ -55,6 +55,17 @@ fn udp_response_source(meta: &super::sockets::UdpRecvMeta) -> Option<(IpAddr, u3
         .filter(|ip| !ip.is_unspecified())
         .map(|ip| (ip, meta.packet_ifindex.unwrap_or(0)))
         .or_else(|| (!meta.local_addr.ip().is_unspecified()).then_some((meta.local_addr.ip(), 0)))
+}
+
+fn peer_query_scope(
+    peer: SocketAddr,
+    (standalone, host): (Option<QueryScope>, Option<QueryScope>),
+) -> Option<QueryScope> {
+    if host.is_some() && peer.ip().to_canonical().is_loopback() {
+        host
+    } else {
+        standalone
+    }
 }
 
 async fn send_bound_udp_response(
@@ -460,8 +471,8 @@ async fn run_udp_supervisor(
                     continue;
                 }
                 let received = batch.len();
-                // Pin all datagrams in this receive before an earlier reply can yield.
-                let batch_scope = controller.query_scope(fact_scope);
+                // Pin the receive's Host activity before any reply in it can yield.
+                let batch_scopes = controller.listener_query_scopes(fact_scope);
                 for index in 0..received {
                     let (query, client_addr, meta) = match batch.packet(index) {
                         Ok(packet) => packet,
@@ -507,7 +518,8 @@ async fn run_udp_supervisor(
                         continue;
                     }
 
-                    let admission = match controller.try_admit_bound_query(true, batch_scope) {
+                    let query_scope = peer_query_scope(client_addr, batch_scopes);
+                    let admission = match controller.try_admit_bound_query(true, query_scope) {
                         Ok(admission) => {
                             stats.record_udp_slow_permit_accepted();
                             admission
@@ -737,7 +749,8 @@ async fn run_tcp_supervisor(
                 if *phase.borrow() != ListenerPhase::Running || drain.should_reject() {
                     continue;
                 }
-                let Some(connection_scope) = controller.query_scope(fact_scope) else { continue };
+                let scopes = controller.listener_query_scopes(fact_scope);
+                let Some(connection_scope) = peer_query_scope(client_addr, scopes) else { continue };
                 let standalone_permit = match Arc::clone(&standalone_tcp_limit).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {

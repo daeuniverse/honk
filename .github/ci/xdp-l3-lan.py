@@ -178,12 +178,12 @@ def wg_stats():
     return dict(rx=int(transfers[1]), tx=int(transfers[2]), handshake=int(handshake[1]))
 
 
-def tcx(ns, device, *, with_revision=False):
+def tcx(ns, device, *, with_revision=False, attach_type=TCX_INGRESS):
     c = dns.C
     with dns.namespace(ns):
         programs, link_ids = (c.c_uint32 * 4)(), (c.c_uint32 * 4)()
-        # BPF_PROG_QUERY, BPF_TCX_INGRESS, including link IDs in chain order.
-        wire = struct.pack('=4IQII4Q', socket.if_nametoindex(device), TCX_INGRESS, 0, 0, c.addressof(programs),
+        # BPF_PROG_QUERY includes link IDs in chain order.
+        wire = struct.pack('=4IQII4Q', socket.if_nametoindex(device), attach_type, 0, 0, c.addressof(programs),
                            len(programs), 0, 0, c.addressof(link_ids), 0, 0)
         query = c.create_string_buffer(wire, len(wire))
         dns.probe.bpf(16, query)
@@ -858,8 +858,9 @@ def classifier_control(daemon, config, pins, artifacts, state):
         assert json.loads(tc('-j', 'qdisc', 'show', 'dev', OUTER)) == bare
 
 
-def late_reply(server, peer, target):
-    payload = os.urandom(29)
+def late_reply(server, peer, target, *, payload=None):
+    if payload is None:
+        payload = os.urandom(29)
     with dns.namespace('dut'):
         capture = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
     with capture:
@@ -974,10 +975,18 @@ def matrix(daemon, core, xsk, workers, artifacts, pins):
             wg_outer(keys, peer_keys)
             classifier_control(daemon, config, pins, artifacts, state)
             exact_kernel_case(core, ROLLBACK, artifacts / 'rollback', pins)
+            dns_case = 'control::dns_control::tests::packet::kernel_gateway_host_dns_fences_queued_fills'
+            exact_kernel_case(core, dns_case, artifacts / dns_case.rsplit('::', 1)[1], pins)
             for test in ('gateway::tests::kernel_aux_registry_and_retirement_preserve_other_realms',
                          'gateway::tests::kernel_aux_tun_guard_requires_its_fd_and_outlives_return_link',
                          'gateway::tests::kernel_aux_hash_batch_survives_deleted_successor',
-                         'tcx_aux::tests::kernel_aux_outer_anchor_cannot_activate_on_reused_ifindex'):
+                         'tcx_aux::tests::kernel_aux_outer_anchor_cannot_activate_on_reused_ifindex',
+                         'tcx_aux::tests::kernel_host_return_header_uses_verified_mac_and_preserves_protocol',
+                         'tcx_aux::tests::kernel_host_broadcast_swap_keeps_incumbent_through_invalid_snapshot',
+                         'tcx_aux::tests::kernel_host_delay_filter_checks_full_timestamp_and_counts_before_the_ring',
+                         'gateway::host::tests::kernel_host_flow_capacity_charge',
+                         'gateway::host::tests::kernel_host_batch_reclaims_short_endpoint_flows',
+                         'gateway::host::tests::kernel_host_flow_owner_and_drain'):
                 exact_kernel_case(xsk, 'bpf::' + test, artifacts / test.rsplit('::', 1)[1], pins)
             no_live_links()
             ip('dut', 'link', 'del', OUTER)

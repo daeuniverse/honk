@@ -203,7 +203,7 @@ XDP sizes each physical Port at startup. A device qualifies for single-frame TX 
 
 For a single-member, two-owner realm with a base of 256 bulk frames, startup first funds 128 bulk and 16 control frames per owner. Before admission opens, both windows may grow to 256 bulk and 32 control frames each if the shared budget can fund the extra frames, both ledgers and the peak array storage. Otherwise both keep the smaller windows. Neither path increases the Stack memory or flow limit.
 
-The larger RX tier requires a `direct: endpoint` gateway with one physical member, one logical realm, forced ZeroCopy (not Auto), no `datapath.host`, and 1–8 queues. After setting aside half the 384 MiB capture budget for the stack, at least 8 MiB per queue must remain. This is a startup screen, not an 8 MiB UMEM allocation: each Port reserves its actual UMEM, metadata and rings separately. Sizing is re-evaluated before opening the device, not while it is running. UMEM is retained until process exit. NIC rings and the 32-output class/realm turn limit are unchanged. A sole single-frame scope's 256 bulk owners leave 224 Port bulk frames; other realms and Core output can use that headroom. No throughput or fairness guarantee follows.
+The larger RX tier requires a `direct: endpoint` gateway with one physical member, one logical realm, forced ZeroCopy (not Auto), and 1–8 queues. Host reservations are deducted first. After setting aside half the 384 MiB capture budget for the stack, at least 8 MiB per queue must remain. This is a startup screen, not an 8 MiB UMEM allocation: each Port reserves its actual UMEM, metadata and rings separately. Sizing is re-evaluated before opening the device, not while it is running. UMEM is retained until process exit. NIC rings and the 32-output class/realm turn limit are unchanged. A sole single-frame scope's 256 bulk owners leave 224 Port bulk frames; other realms and Core output can use that headroom. No throughput or fairness guarantee follows.
 
 The larger optimized Port and scope reservations reduce startup headroom for many selected queues/realms under the 384 MiB budget. Successfully mapped UMEM remains charged until process exit, including after a later startup failure, and also counts against the unchanged 512 MiB process-wide retained-UMEM ceiling. Restarting capture in the same process does not reclaim it.
 
@@ -215,29 +215,7 @@ The [TUN owner](./datapath.md#fd-packet-pipeline) retains CPU-backed `OutputLeas
 
 Each scope/class retains at most 32 pending leases. One `writev` submits each immutable record; EAGAIN/EINTR retains its exact lease and short/zero writes are terminal without replay. All drivers continue through readiness and joined close. Standalone DNS learns in the plain scope; transparent DNS learns in the packet's own scope. Neither borrows HOST facts. Socket HostFacts retain original source expiry and ownership; plain input grants no process authority. Direct creates a new dial and does not preserve the original socket operation or pre-NAT/TTL behavior.
 
-Explicit XDP [Host capture](./datapath.md#host-source-custody) prepares a separate
-authenticated scope before Endpoint starts. A valid source receipt is checked
-before import; source lineage includes namespace, attachment, socket cookie,
-operation incarnation and original return identity. Immutable fact snapshots also
-partition execution when marks/process facts change. The existing exact TCP
-FlowId, UDP initializer/source owners, reassembly and queued/exported `OutputLease`
-retain that context; a reused tuple or newer snapshot cannot retarget earlier work.
-Routing consumes actual process presence, never a fabricated identity. Ordinary
-Direct/proxy execution creates new marked outbounds and generated replies use normal
-Linux demultiplexing, without preserving the original socket operation or pre-NAT/TTL behavior.
-
-Host source-context cells and indexes are funded and allocated during cold scope
-preparation, with bounded admission and generation exhaustion; live protocol,
-fragment, work and output owners prevent reclamation. Cold namespace setup retains
-namespace-bound custody sockets rather than switching namespace for later queries.
-Host reserves 96 MiB for fixed maps/loader storage, verifies observed kernel
-allocations within 64 MiB, and separately charges running-BTF preparation peaks
-and bounded source/child custody snapshots. These share the 384 MiB
-capture budget with the private Copy Port, UMEM, scope and output storage; this is
-a reservation contract, not a whole-process RSS measurement. BTF preparation
-storage drops after setup; retained fixed kernel and UMEM charges last until
-process exit, including after resource removal or failed setup after pin creation.
-This XDP path does not grant TUN capability or constitute full V7, E6, physical or 13-size acceptance.
+Each [Host egress](./datapath.md#host-source-custody) uses the same 4 MiB private TUN/Stack partition as an auxiliary LAN, not a Copy Port. Metadata, device objects, programs and overlapping reload generations are charged to the same 384 MiB root. The kernel allocates the two socket-storage elements against live sockets; these dynamic charges and future externally created cgroups are not a process-wide memory bound. A flow's PID and normalized name come from its exact Endpoint ownership record, not from the most recent sender or a TUN HostFacts receipt.
 
 `PacketScope::receive_with_source` invokes the source callback under the existing
 output mutex; it must not re-enter the scope or block on I/O. A device can install

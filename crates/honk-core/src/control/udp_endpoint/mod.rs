@@ -343,10 +343,12 @@ impl UdpEndpoint {
     }
 
     pub(in crate::control) fn packet_source(&self) -> Option<&SourceWork> {
-        match &self.transport {
-            EndpointTransport::Flow(_) => self.packet_source.as_ref(),
-            EndpointTransport::Source(source) => source.packet_source(),
-        }
+        self.packet_source
+            .as_ref()
+            .or_else(|| match &self.transport {
+                EndpointTransport::Source(source) => source.packet_source(),
+                EndpointTransport::Flow(_) => None,
+            })
     }
 
     pub(in crate::control) fn bind_packet_source(
@@ -362,9 +364,14 @@ impl UdpEndpoint {
                     "UDP source context mismatch",
                 ));
             }
-        } else {
-            self.packet_source = source;
+            if source
+                .as_ref()
+                .is_none_or(|source| !source.has_gateway_process())
+            {
+                return Ok(());
+            }
         }
+        self.packet_source = source;
         Ok(())
     }
 
@@ -1010,6 +1017,20 @@ impl UdpEndpointPool {
     ) -> bool {
         self.endpoints
             .contains_key(&EndpointKey::new(scope, client, dst, packet_lineage))
+    }
+
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub(in crate::control) fn retains_host_udp(
+        &self,
+        scope: ScopeId,
+        client: SocketAddr,
+        destination: SocketAddr,
+    ) -> bool {
+        self.contains(scope, client, destination, None)
+            || self
+                .sources
+                .iter()
+                .any(|owner| owner.delivering_foreign_reply(scope, client, destination))
     }
 
     pub(in crate::control) fn retains_source(

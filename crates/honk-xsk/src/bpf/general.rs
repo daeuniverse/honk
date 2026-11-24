@@ -394,7 +394,7 @@ pub(super) fn build(
 }
 
 mod aux_program;
-pub use aux_program::AuxGatewayProgram;
+pub use aux_program::{AuxGatewayProgram, HostGatewayLoad};
 mod gateway;
 pub(super) use gateway::build as build_gateway;
 
