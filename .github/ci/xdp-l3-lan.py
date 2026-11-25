@@ -1068,6 +1068,7 @@ def matrix(daemon, core, xsk, workers, artifacts, pins):
             ip('dut', 'link', 'set', OUTER, 'up')
             current = binding(process, log, offset, 1420, previous=current)
             assert epoch(maps, current['realm']) > old_epoch
+            wg_reset_peer(keys)
             trial('wg-old-fact-cleared-on-down-up', 'wgpeer', TARGETS[0][0], socket.SOCK_STREAM, 'endpoint')
             current = delete_reload_reuse(artifacts, state, process, log, config, workers, keys, peer_keys, current, hold, progress)
 
