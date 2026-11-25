@@ -116,10 +116,14 @@ impl TcpSniffNegCache {
         cache.remove(key);
     }
 
-    /// Prune all expired entries from the cache.
+    /// Prune all expired entries from the cache and shrink oversized backing storage.
     pub fn prune_expired(&self, now: Instant) {
         let mut cache = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = cache.capacity();
         cache.retain(|_, entry| now < entry.expires_at);
+        if cap > 64 && cache.len() <= cap / 4 {
+            cache.shrink_to_fit();
+        }
     }
 
     /// Return the number of entries in the cache.
@@ -254,5 +258,44 @@ mod tests {
 
         cache.clear_all();
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_prune_expired_shrinks_oversized_capacity_with_hysteresis() {
+        let key = |host, port| (SocketAddr::from(([198, 51, 100, host], port)), 2);
+        let cap = |c: &TcpSniffNegCache| c.inner.lock().unwrap().capacity();
+        let now = Instant::now();
+        let past = now - NEGATIVE_CACHE_TTL - Duration::from_secs(1);
+
+        let cache = TcpSniffNegCache::new();
+        for port in 1000..1200u16 {
+            cache.note_sniff_failure(key(1, port), past);
+        }
+        for port in 2000..2010u16 {
+            for _ in 0..SNIFF_FAILURE_THRESHOLD {
+                cache.note_sniff_failure(key(2, port), now);
+            }
+        }
+        assert!(cap(&cache) > 64);
+        cache.prune_expired(now);
+        assert_eq!(cache.len(), 10);
+        assert!(cap(&cache) <= 64);
+        assert!(cache.should_skip_sniff(&key(2, 2000), now));
+
+        for port in 3000..3200u16 {
+            cache.note_sniff_failure(key(3, port), now);
+        }
+        assert!(cap(&cache) > 64);
+        cache.prune_expired(now + NEGATIVE_CACHE_TTL + Duration::from_secs(1));
+        assert!(cache.is_empty() && cap(&cache) == 0);
+
+        let small = TcpSniffNegCache::new();
+        for port in 4000..4008u16 {
+            small.note_sniff_failure(key(4, port), past);
+        }
+        let small_cap = cap(&small);
+        assert!(small_cap > 0 && small_cap <= 64);
+        small.prune_expired(now);
+        assert!(small.is_empty() && cap(&small) == small_cap);
     }
 }

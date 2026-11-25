@@ -980,3 +980,25 @@ async fn urltest_group_failures_do_not_advance_real_dial_streaks() {
         assert!(alive_set.is_failure_demoted(member.id, ProbeDomain::Tcp, IpVersion::V4));
     }
 }
+
+#[test]
+fn https_connector_tracks_tls_mode_and_reuses_shared_context() {
+    if crate::bootstrap::run_global_test_in_child(
+        "urltest::tests::https_connector_tracks_tls_mode_and_reuses_shared_context",
+    ) {
+        return;
+    }
+    let build = |mode| {
+        crate::tls::set_tls_mode(mode);
+        let a = https_connector().unwrap();
+        let b = https_connector().unwrap();
+        assert_eq!(a.context_ptr(), b.context_ptr());
+        a
+    };
+    let tls = build("tls");
+    let utls = build("utls");
+    assert!(!tls.is_chrome() && utls.is_chrome());
+    assert_ne!(utls.context_ptr(), tls.context_ptr());
+    let tls_again = build("tls");
+    assert!(!tls_again.is_chrome() && tls_again.context_ptr() == tls.context_ptr());
+}

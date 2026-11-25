@@ -122,6 +122,8 @@ native-api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:subtle", "dep:hmac
 native-ui = ["native-api", "dep:brotli", "dep:flate2"]
 # Route the shipped binary's allocations through jemalloc (see main.rs)
 jemalloc = ["dep:tikv-jemallocator"]
+# Enable jemalloc runtime statistics (e.g. `_RJEM_MALLOC_CONF=stats_print:true`)
+jemalloc-stats = ["jemalloc", "tikv-jemallocator/stats"]
 # VLESS / VMess proxy handlers (xtls-rprx-vision flow support)
 rprx = ["honk-outbound/rprx"]
 # Compile optional client DNS syslog auditing.

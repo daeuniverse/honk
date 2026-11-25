@@ -595,17 +595,9 @@ pub async fn measure_pinned_http_probe(
     .await
 }
 
-/// BoringSSL connector with webpki root verification for HTTP probes.
-/// Built once and reused across measurements (it never changes at runtime).
-/// Offers `h2,http/1.1`; the exchange dispatches on the negotiated ALPN.
+/// Shared BoringSSL probe connector (`h2,http/1.1`, webpki roots) tracking active TLS mode.
 fn https_connector() -> anyhow::Result<crate::tls::TlsConnector> {
-    static CONNECTOR: std::sync::OnceLock<anyhow::Result<crate::tls::TlsConnector>> =
-        std::sync::OnceLock::new();
-    let connector = CONNECTOR.get_or_init(|| crate::tls::build_http_probe_connector(false));
-    match connector {
-        Ok(c) => Ok(c.clone()),
-        Err(e) => Err(anyhow!("failed to build urltest TLS connector: {e:#}")),
-    }
+    crate::tls::build_http_probe_connector(false).context("failed to build urltest TLS connector")
 }
 
 /// Measure every member of a group concurrently (at most
