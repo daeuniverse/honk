@@ -40,7 +40,7 @@ group {
 | `exit` | `null` | Experimental. Append one [supported proxy hop](./nodes.md#proxy-chains) to the selected path. VLESS TCP multiplexing and hostname-based ECH discovery are unavailable on that hop. See [UDP path requirements](#udp-through-an-exit). An explicit `block` remains terminal. |
 | `check_url` | `null` | Per-group TCP health-check target for non-Selector policies; see [`check_url`](#check_url). |
 | `tolerance` | `50` | URLTest switch threshold in milliseconds; see [`tolerance`](#tolerance). |
-| `idle_timeout` | `null` | Seconds without a selection after which a URLTest group pauses member probes; see [`idle_timeout`](#idle_timeout). |
+| `idle_timeout` | `null` | Seconds without a selection after which a group pauses member probes; see [`idle_timeout`](#idle_timeout). |
 | `interrupt_connections` | `false` | Closes affected live transports when the selection changes; see [`interrupt_connections`](#interrupt_connections). |
 | `icon` | `null` | Group icon served by native group reads; see [`icon`](#icon). |
 | — (`check_interval`, not in dae) | `null` | Per-group interval field in seconds. The current runtime does not consult it and uses the global interval. |
@@ -107,13 +107,13 @@ group {
 
 ### idle_timeout
 
-Seconds without a selection after which a URLTest group pauses member probes. The behavior corresponds to Clash's `lazy`.
+Seconds without a selection after which a group pauses member probes. The behavior corresponds to Clash's `lazy`.
 
-The value is a plain integer: write `idle_timeout: 1800`, not `30m`. `idle_timeout: 0` makes the group idle between selections; it does not time out connections.
+The value is a plain integer: write `idle_timeout: 1800`, not `30m`. `idle_timeout: 0` keeps the group idle between selections without triggering per-selection wake-up probes; it does not time out connections.
 
 The default is `null`, and honk then uses 1800 seconds.
 
-A URLTest group is idle until its first selection and again after `idle_timeout` seconds without one. Periodic probes of its members pause while it is idle and resume on the next selection. A node keeps being probed while any non-URLTest group or any active URLTest group reaches it.
+An automatic group is idle until its first selection and again after `idle_timeout` seconds without one. Periodic probes of its direct members pause while it is idle and resume on the next unpinned selection (traversed automatic subgroups wake on use). An active `Selector` or a manually pinned automatic group (on its pinned network) never wakes unselected direct members or unselected subgroups; only a Selector's current TCP and UDP picks, a manually pinned automatic-group member (including its custom `check_url`), and a non-builtin `final` node keep periodic probes while their groups are idle, and changing a selection or pin onto a suspended node probes it immediately. A node pauses periodic probes whenever every automatic group owning it is idle and no group holds it fixed; between full cycles, suspended nodes are recovered only when an owning idle automatic group has no alive member left on TCP, data UDP, or its custom `check_url`.
 
 ```dae
 group {

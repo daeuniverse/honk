@@ -217,6 +217,34 @@ impl GroupManager {
         self.groups.get(name).map(|entry| &entry.group)
     }
 
+    pub(super) fn pick_in_group_entry<'a>(
+        &'a self,
+        entry: &'a ManagedGroup,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        visited: &mut Vec<&'a str>,
+        depth: usize,
+        effects: SelectionEffects,
+    ) -> Option<&'a Node> {
+        self.pick_candidate_for_entry(
+            &entry.group,
+            Some(&entry.idle_activity),
+            &ScoreSelectionContext::aggregate(
+                SelectionNetwork::from_probe_domain(domain),
+                domain,
+                ipver,
+            ),
+            visited,
+            depth,
+            effects,
+            score::selection::ScoreSelectionRules {
+                routes: entry.routes,
+                ..Default::default()
+            },
+        )
+        .map(|candidate| candidate.node)
+    }
+
     /// Resolve a group to the single leaf node its policy selects.
     /// `visited`/`depth` thread the cycle/depth guards through nesting;
     /// `routes` is the root's, as in `ScoreSelectionRules::routes`.
@@ -900,7 +928,7 @@ mod native_probe_tests {
             ..Default::default()
         };
         let alive = Arc::new(AliveDialerSet::new());
-        alive.register_urltest_group(&group.name, &group.nodes, Some(Duration::from_secs(60)));
+        alive.register_idle_group(&group.name, &group.nodes, Some(Duration::from_secs(60)));
         let manager = GroupManager::with_alive_set(&[group], &nodes, Some(alive.clone()));
         let member = GroupMember::Group(manager.group("urltest").unwrap());
         assert!(
@@ -925,7 +953,7 @@ mod native_probe_tests {
                 .probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V4)
                 .is_none()
         );
-        assert!(alive.is_urltest_group_idle("urltest"));
+        assert!(alive.is_group_idle("urltest"));
         assert_eq!(
             manager.get_urltest_selection_for_network("urltest", SelectionNetwork::Udp),
             None

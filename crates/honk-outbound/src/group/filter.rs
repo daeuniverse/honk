@@ -51,14 +51,7 @@ impl GroupManager {
     /// Whether the node carries UDP itself or through its bound chain exit.
     #[inline]
     pub fn node_carries_udp(&self, node: &Node) -> bool {
-        use crate::descriptor::{UdpPath, builtin_tunneled_udp_available, carries_udp};
-
-        if node.protocol() == honk_config::types::NodeProtocol::Chain {
-            return node
-                .resolved_chain_hops()
-                .is_some_and(|hops| builtin_tunneled_udp_available(hops, |id| self.nodes.get(id)));
-        }
-        carries_udp(UdpPath::Own(node))
+        crate::descriptor::node_carries_udp(node, |id| self.nodes.get(id))
     }
 
     /// Keep only capable, alive leaves; absent health tracking skips only health.

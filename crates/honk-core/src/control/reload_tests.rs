@@ -523,7 +523,7 @@ fn nested_final_only_leaf_is_health_registered_and_keeps_probe_ownership() {
     let mut config = nested_final_config();
     let primary = config.nodes[0].id;
     let backup = config.nodes[1].id;
-    let alive = AliveDialerSet::new();
+    let alive = Arc::new(AliveDialerSet::new());
     sync_health_check_nodes(&alive, &config);
     assert_eq!(
         alive
@@ -537,12 +537,16 @@ fn nested_final_only_leaf_is_health_registered_and_keeps_probe_ownership() {
     for group in &mut config.groups {
         group.policy = GroupPolicy::URLTest;
     }
-    alive.sync_urltest_groups(&urltest_group_registrations(&config));
+    alive.sync_idle_groups(&idle_group_registrations(&config));
     assert!(alive.is_probe_suspended(backup));
 
     config.groups[0].policy = GroupPolicy::Selector;
     config.groups[2].groups.push("root".into());
-    alive.sync_urltest_groups(&urltest_group_registrations(&config));
+    alive.sync_idle_groups(&idle_group_registrations(&config));
+    assert!(alive.is_probe_suspended(backup));
+    // A node `final` keeps probing while its groups are idle.
+    GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)))
+        .publish_selected_probe_nodes();
     assert!(!alive.is_probe_suspended(backup));
 
     config.groups[2].final_outbound = None;
@@ -3843,7 +3847,7 @@ fn udp_warm_candidates_do_not_mutate_group_selection_state() {
         ..Default::default()
     };
     let alive = Arc::new(crate::outbound::AliveDialerSet::new());
-    alive.register_urltest_group(
+    alive.register_idle_group(
         "cold-urltest",
         std::slice::from_ref(&cold.id),
         Some(Duration::from_secs(60)),
@@ -3875,7 +3879,7 @@ fn udp_warm_candidates_do_not_mutate_group_selection_state() {
             alive.report_unavailable_forced(fallback_a.id, domain, ipver);
         }
     }
-    assert!(alive.is_urltest_group_idle("cold-urltest"));
+    assert!(alive.is_group_idle("cold-urltest"));
     let runtime = honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap();
 
     assert_eq!(
@@ -3883,7 +3887,7 @@ fn udp_warm_candidates_do_not_mutate_group_selection_state() {
         vec![lb_a.id, lb_b.id, lb_c.id, cold.id, fallback_b.id],
         "per-group top-three plus cold URLTest and the live fallback leaf,              UUID-deduplicated across V4/V6"
     );
-    assert!(alive.is_urltest_group_idle("cold-urltest"));
+    assert!(alive.is_group_idle("cold-urltest"));
     assert_eq!(
         manager
             .get_fallback_selection_for_network("fallback", crate::group::SelectionNetwork::Udp,),
@@ -5471,8 +5475,9 @@ fn reference_leaf_ids(
     path.pop();
 }
 
-/// Assert the outbound id map, health registrations and URLTest table
-/// against [`reference_leaf_ids`].
+/// Assert the outbound id map and health registrations against [`reference_leaf_ids`],
+/// and verify each idle-group entry's direct members, policy kind, and non-builtin
+/// TCP/UDP recovery leaves.
 fn assert_connectivity_matches_reference(config: &Config) {
     let leaves: Vec<std::collections::BTreeSet<uuid::Uuid>> = config
         .groups
@@ -5518,40 +5523,75 @@ fn assert_connectivity_matches_reference(config: &Config) {
         "{config:?}"
     );
 
-    let always: std::collections::BTreeSet<uuid::Uuid> = config
+    let node_by_id: std::collections::HashMap<uuid::Uuid, &honk_config::node::Node> =
+        config.nodes.iter().map(|node| (node.id, node)).collect();
+    let idle: Vec<honk_outbound::alive::IdleGroupRegistration> = config
         .groups
         .iter()
-        .zip(&leaves)
-        .filter(|(group, _)| group.policy != GroupPolicy::URLTest)
-        .flat_map(|(_, set)| set.iter().copied())
-        .collect();
-    let urltest: Vec<(String, Vec<uuid::Uuid>)> = config
-        .groups
-        .iter()
-        .zip(&leaves)
-        .filter(|(group, _)| group.policy == GroupPolicy::URLTest)
-        .map(|(group, set)| {
-            (
-                group.name.clone(),
-                set.iter()
-                    .copied()
-                    .filter(|id| !always.contains(id))
-                    .collect(),
-            )
+        .enumerate()
+        .map(|(index, group)| {
+            let mut members: std::collections::BTreeSet<uuid::Uuid> =
+                group.nodes.iter().copied().collect();
+            match group.final_outbound.as_deref() {
+                None => {}
+                Some(Config::BUILTIN_DIRECT_NODE) => {
+                    members.insert(honk_config::config::DIRECT_NODE_ID);
+                }
+                Some(Config::BUILTIN_BLOCK_NODE) => {
+                    members.insert(honk_config::config::BLOCK_NODE_ID);
+                }
+                Some(name) => {
+                    if let Some(node) = config.nodes.iter().find(|node| node.name == name) {
+                        members.insert(node.id);
+                    }
+                }
+            }
+            let (kind, tcp_recovery_members, udp_recovery_members) =
+                if group.policy == GroupPolicy::Selector {
+                    (
+                        honk_outbound::alive::IdleGroupKind::Selector,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                } else {
+                    let tcp: Vec<uuid::Uuid> = leaves[index]
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            *id != honk_config::config::DIRECT_NODE_ID
+                                && *id != honk_config::config::BLOCK_NODE_ID
+                        })
+                        .collect();
+                    let udp: Vec<uuid::Uuid> = tcp
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            node_by_id.get(id).is_some_and(|node| {
+                                honk_outbound::descriptor::node_carries_udp(node, |hop| {
+                                    node_by_id.get(hop).copied()
+                                })
+                            })
+                        })
+                        .collect();
+                    (honk_outbound::alive::IdleGroupKind::Automatic, tcp, udp)
+                };
+            honk_outbound::alive::IdleGroupRegistration {
+                name: group.name.clone(),
+                members: members.into_iter().collect(),
+                idle_timeout: group.idle_timeout.map(std::time::Duration::from_secs),
+                kind,
+                tcp_recovery_members,
+                udp_recovery_members,
+            }
         })
         .collect();
-    assert_eq!(
-        urltest_group_registrations(config)
-            .into_iter()
-            .map(|(name, members, _)| (name, members))
-            .collect::<Vec<_>>(),
-        urltest,
-        "{config:?}"
-    );
+    assert_eq!(idle_group_registrations(config), idle, "{config:?}");
 }
 
 /// GroupManager cuts subgroup cycles, but the eBPF outbound ids, health
-/// registrations and URLTest table come from the uncut configuration: with
+/// registrations, and automatic-group recovery leaves come from the uncut
+/// configuration (while each group's idle membership records direct members
+/// and direct-node finals only): with
 /// `b` declared before `a` and `a <-> b` as subgroups, `a`'s leaf keeps
 /// `b`'s slot, which a cut `b -> a` edge would move to `a`'s.
 #[test]

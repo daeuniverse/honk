@@ -289,9 +289,9 @@ SIGHUP 为每次尝试单独收集诊断。不管加载和配置校验成功与�
    完整的 256 位谓词值，把生成函数挂到每个相关 target，最后切换
    `ROUTING_POLICY_ROOT`。调用成功后，原生显式激活会用自己的 backend 重置 mode；
    用户态接着在同一串行边界内发布替代的 outbound registry、DNS runtime pointer、
-   Router、配置、组和 projection snapshot。节点的健康检查登记与运行时注册表一起发布。
+   Router、配置、组和 projection snapshot。节点的健康检查登记、组的空闲探测注册表和自定义检查 URL 在发布 guard 内与运行时注册表一起发布。
    root 已提交后，mode reset 失败会把新 generation 标为 degraded 并保持 admission fence。
-   发布完成后，退役旧 generation，替换 UDP 与 Selector warm coordinator，并同步 URLTest 组和自定义检查 URL。
+   释放发布锁后，先唤醒新固定的探测目标，再退役旧 generation 并替换 UDP 与 Selector warm coordinator。
    已提交的 degraded generation 也会走完这些步骤，只是 admission 继续 fence。停止 warm coordinator 会取消可能依
    赖另一个 coordinator 的 retention-reconciliation 等待；coordinator 退出之前，
    仍会 abort 并 join 自己派发的子任务。QUIC warm 释放和终止关闭在 client 槽位上

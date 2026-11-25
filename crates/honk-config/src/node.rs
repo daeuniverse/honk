@@ -519,7 +519,8 @@ pub struct Group {
     /// Serialized only when `own.tolerance` is set.
     #[serde(skip_serializing)]
     pub tolerance: u64,
-    /// URLTest inactivity threshold in seconds; `None` uses 1800 seconds.
+    /// Inactivity threshold in seconds before member probes pause; `None`
+    /// uses 1800 seconds.
     /// Zero makes the group immediately idle between selections.
     pub idle_timeout: Option<u64>,
     /// Close owned connections when the selected member changes.

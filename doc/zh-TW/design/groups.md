@@ -185,13 +185,13 @@ Clash 將 Score 群組表示為 `type: "url_test"`，在 `now` 中報告目前�
 
 權威 URLTest 建立失敗保留既有的單輪前三名候選重賽。重賽的新 deadline 不會建立另一份原始 Score 業務，即使首輪在自己的 deadline 之後才結束。Score 所屬建立失敗則至多依序嘗試一個不同葉節點，在排名前排除失敗 `NodeId`，不要求普通評分先改選。Score 兩次嘗試共享一個絕對建立 deadline 和實體撥號預算；規範解析保留 Selector 選擇，只允許首選真正經過的 final 群組邊，顯示名稱不授權備援。型別化本機拒絕、未通過 admission 時容量耗盡、取消和 generation 關閉均為終態；應用負載寫入後不重試。
 
-群組的 `check_url` 會建立獨立的 TCP-only 存活性和延遲狀態，key 為 `(member tag, check_url)`。失敗只會從使用該目標的群組中排除該成員。Selector 群組忽略 `check_url` 並印出 warning。URLTest 在超過 `idle_timeout` 後暫停探測；未設定時使用健康層預設的 30 分鐘，下一次真實選擇會立即喚醒探測。
+群組的 `check_url` 會建立獨立的 TCP-only 存活性和延遲狀態，key 為 `(member tag, check_url)`。失敗只會從使用該目標的群組中排除該成員。Selector 群組忽略 `check_url` 並印出 warning。任何策略的群組在超過 `idle_timeout` 後都會暫停週期探測；未設定時使用健康層預設的 30 分鐘，`idle_timeout: 0` 讓群組在兩次選擇之間保持閒置且不會觸發逐次選路喚醒探測。經由未固定自動群組的真實選擇會立即喚醒其直接成員及實際遍歷到的自動子群組，而活躍的 `Selector`（或對應網路已手動固定的自動群組）絕不喚醒未選中的直接成員或未選中的子群組。Selector 目前選中的節點（TCP 與 UDP 選擇）、自動群組中手動固定的節點（含該群組的自訂 `check_url`）以及非內建 `final` 節點在所屬群組閒置時仍持續探測。在兩次完整週期之間，閒置恢復僅在所屬閒置自動群組於 IPv4 TCP 或可承載 UDP 的資料 UDP 上已無任何存活的非內建可達葉節點時才探測被暫停節點（略過 `DnsUdp` 與未選中的 `Selector` 成員），並在自訂 `check_url` 群組全員失效或固定成員失效時執行恢復。
 
 ## 巢狀代理群組與成員身分
 
 `Group.groups` 指定子群組。每個子群組只貢獻一個候選：該子群組策略針對目前網路和位址族選出的葉節點。父群組將其作為一個成員排名或固定，不把所有後代合併進父策略。
 
-解析受 `MAX_GROUP_DEPTH = 8` 和每次遍歷的 visited set 限制。建構階段還會對群組邊執行 DFS，切斷每條形成環的邊並印出 warning，防止異常群組圖阻塞選擇或內省。分配 eBPF outbound ID、登記健康檢查和建構 URLTest 閒置表時，都遍歷設定自身的群組圖（`honk_config::group_graph`），深度上限相同，也依路徑防環，但不切邊，所以被切掉的邊不會把葉節點挪到另一個 outbound 槽位。
+解析受 `MAX_GROUP_DEPTH = 8` 和每次遍歷的 visited set 限制。建構階段還會對群組邊執行 DFS，切斷每條形成環的邊並印出 warning，防止異常群組圖阻塞選擇或內省。分配 eBPF outbound ID 和登記健康檢查時，都遍歷設定自身的群組圖（`honk_config::group_graph`），深度上限相同，也依路徑防環，但不切邊，所以被切掉的邊不會把葉節點挪到另一個 outbound 槽位；群組的閒置探測表則只記錄各群組的直接節點成員與直接節點 `final` 邊，讓巢狀子群組僅在實際遍歷到時才被啟用。
 
 成員邊與顯式 `final` 邊使用同一個有界遞迴解析器。子群組策略沒有合格選擇時，
 只沿自己的設定 final 繼續；父群組仍把該子群組視為已選成員。Final 鏈保留選擇鏈和

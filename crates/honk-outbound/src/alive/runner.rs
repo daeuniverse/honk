@@ -346,7 +346,7 @@ impl AliveDialerSet {
 
     /// Revisit failed routes and dead protocol families between full cycles.
     /// The delay between configured health sweeps need not delay recovery.
-    pub(super) async fn run_recovery_check_cycle_concurrent(
+    pub(crate) async fn run_recovery_check_cycle_concurrent(
         self: &Arc<Self>,
         timeout: Duration,
         concurrency: usize,
@@ -363,22 +363,35 @@ impl AliveDialerSet {
             .collect();
         let cancel = permit.cancellation();
 
+        // Suspended nodes only recover when an owning idle automatic group has
+        // no alive recovery leaf left on `(Tcp, V4)` or `(DataUdp, V4)` (TC
+        // ignores DnsUdp and allows V6→V4 fallback, never V4→V6).
         let due = nodes.into_iter().filter_map(|(id, registration)| {
-            if self.is_probe_suspended(id) {
-                return None;
-            }
-            let tcp_due = [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
-                !self.is_alive_for(id, ProbeDomain::Tcp, ipver)
-                    && self.should_probe(id, ProbeDomain::Tcp, ipver)
-            });
-            let udp_due = [ProbeDomain::DataUdp, ProbeDomain::DnsUdp]
-                .into_iter()
-                .any(|domain| {
-                    [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
-                        !self.is_alive_for(id, domain, ipver)
-                            && self.should_probe(id, domain, ipver)
+            let suspended = self.is_probe_suspended(id);
+            let tcp_due = if suspended {
+                self.needs_idle_recovery(id, ProbeDomain::Tcp)
+                    && !self.is_alive_for(id, ProbeDomain::Tcp, IpVersion::V4)
+                    && self.should_probe(id, ProbeDomain::Tcp, IpVersion::V4)
+            } else {
+                [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
+                    !self.is_alive_for(id, ProbeDomain::Tcp, ipver)
+                        && self.should_probe(id, ProbeDomain::Tcp, ipver)
+                })
+            };
+            let udp_due = if suspended {
+                self.needs_idle_recovery(id, ProbeDomain::DataUdp)
+                    && !self.is_alive_for(id, ProbeDomain::DataUdp, IpVersion::V4)
+                    && self.should_probe(id, ProbeDomain::DataUdp, IpVersion::V4)
+            } else {
+                [ProbeDomain::DataUdp, ProbeDomain::DnsUdp]
+                    .into_iter()
+                    .any(|domain| {
+                        [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
+                            !self.is_alive_for(id, domain, ipver)
+                                && self.should_probe(id, domain, ipver)
+                        })
                     })
-                });
+            };
             if !tcp_due && !udp_due {
                 return None;
             }
@@ -395,6 +408,209 @@ impl AliveDialerSet {
         });
         self.run_probe_batch(due, timeout, concurrency, &cancel)
             .await;
+        if !cancel.is_cancelled() {
+            self.run_custom_url_recovery_cycle(timeout, concurrency, &cancel)
+                .await;
+        }
+    }
+
+    async fn run_custom_url_recovery_cycle(
+        self: &Arc<Self>,
+        timeout: Duration,
+        concurrency: usize,
+        cancel: &ProbeCancellation,
+    ) {
+        let group_urls = self.group_check_urls();
+        if group_urls.is_empty() || cancel.is_cancelled() {
+            return;
+        }
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+        let mut join_set = tokio::task::JoinSet::new();
+        let native_epoch = self.health_epoch();
+        for (group, url) in group_urls {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let members = self.url_members_for(&group);
+            if members.is_empty()
+                || members
+                    .iter()
+                    .all(|member| self.is_alive_for_url(&member.tag, &url))
+            {
+                continue;
+            }
+            let idle = self.is_group_idle(&group);
+            let all_dead = !members
+                .iter()
+                .any(|member| self.is_alive_for_url(&member.tag, &url));
+            let pinned = (idle && !all_dead).then(|| self.pinned_url_members_for(&group));
+            if pinned.as_ref().is_some_and(HashSet::is_empty) {
+                continue;
+            }
+            for member in members {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                if self.is_alive_for_url(&member.tag, &url)
+                    || !self.should_probe_url(&member.tag, &url)
+                {
+                    continue;
+                }
+                if pinned
+                    .as_ref()
+                    .is_some_and(|pins| !pins.contains(&member.tag))
+                {
+                    continue;
+                }
+                let this = Arc::clone(self);
+                let url = url.clone();
+                let permit = Arc::clone(&semaphore);
+                join_set.spawn(async move {
+                    let _p = permit.acquire().await;
+                    this.probe_node_with_url(
+                        &member.tag,
+                        member.leaf,
+                        &url,
+                        timeout,
+                        member.native.zip(native_epoch),
+                    )
+                    .await;
+                });
+            }
+        }
+        while let Some(result) = join_set.join_next().await {
+            if result.is_err() {
+                self.health_worker_failed();
+            }
+        }
+    }
+
+    async fn probe_triggered_custom_urls(
+        &self,
+        node_id: Uuid,
+        timeout: Duration,
+        cancel: &ProbeCancellation,
+    ) {
+        let group_urls = self.group_check_urls();
+        if group_urls.is_empty() || cancel.is_cancelled() {
+            return;
+        }
+        let native_epoch = self.health_epoch();
+        let now = Instant::now();
+        for (group, url) in group_urls {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let members = self.url_members_for(&group);
+            if !members.iter().any(|member| member.leaf == node_id) {
+                continue;
+            }
+            let idle = self.is_group_idle(&group);
+            let all_dead = !members
+                .iter()
+                .any(|member| self.is_alive_for_url(&member.tag, &url));
+            let pinned = (idle && !all_dead).then(|| self.pinned_url_members_for(&group));
+            if pinned.as_ref().is_some_and(HashSet::is_empty) {
+                continue;
+            }
+            for member in members {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                if member.leaf != node_id {
+                    continue;
+                }
+                if pinned
+                    .as_ref()
+                    .is_some_and(|pins| !pins.contains(&member.tag))
+                {
+                    continue;
+                }
+                if let Some(state) = self
+                    .url_states
+                    .write()
+                    .get_mut(&(member.tag.clone(), url.clone()))
+                {
+                    state.cooldown_until = now;
+                }
+                self.probe_node_with_url(
+                    &member.tag,
+                    member.leaf,
+                    &url,
+                    timeout,
+                    member.native.zip(native_epoch),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn probe_woken_custom_url_group(
+        self: &Arc<Self>,
+        group: &str,
+        timeout: Duration,
+        concurrency: usize,
+    ) {
+        let Ok(permit) = self.acquire_health_probe() else {
+            return;
+        };
+        let cancel = permit.cancellation();
+        let Some(url) = self.group_check_urls.read().get(group).cloned() else {
+            return;
+        };
+        let members = self.url_members_for(group);
+        if members.is_empty() || cancel.is_cancelled() {
+            return;
+        }
+        let idle = self.is_group_idle(group);
+        let all_dead = !members
+            .iter()
+            .any(|member| self.is_alive_for_url(&member.tag, &url));
+        let pinned = (idle && !all_dead).then(|| self.pinned_url_members_for(group));
+        if pinned.as_ref().is_some_and(HashSet::is_empty) {
+            return;
+        }
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+        let mut join_set = tokio::task::JoinSet::new();
+        let native_epoch = self.health_epoch();
+        let now = Instant::now();
+        for member in members {
+            if cancel.is_cancelled() {
+                break;
+            }
+            if pinned
+                .as_ref()
+                .is_some_and(|pins| !pins.contains(&member.tag))
+            {
+                continue;
+            }
+            if let Some(state) = self
+                .url_states
+                .write()
+                .get_mut(&(member.tag.clone(), url.clone()))
+            {
+                state.cooldown_until = now;
+            }
+            let this = Arc::clone(self);
+            let url = url.clone();
+            let permit = Arc::clone(&semaphore);
+            join_set.spawn(async move {
+                let _p = permit.acquire().await;
+                this.probe_node_with_url(
+                    &member.tag,
+                    member.leaf,
+                    &url,
+                    timeout,
+                    member.native.zip(native_epoch),
+                )
+                .await;
+            });
+        }
+        while let Some(result) = join_set.join_next().await {
+            if result.is_err() {
+                self.health_worker_failed();
+            }
+        }
     }
 
     /// Run health check cycle with concurrent probing.
@@ -425,10 +641,8 @@ impl AliveDialerSet {
         let has_registered_nodes = !nodes.is_empty();
 
         let due = nodes.into_iter().filter_map(|(id, registration)| {
-            // URLTest idle suspension: skip nodes whose groups are all idle
-            // (lazy start: never-active groups start suspended).
             if self.is_probe_suspended(id) {
-                tracing::trace!("Skipping health check for '{}' (URLTest groups idle)", id);
+                tracing::trace!("Skipping health check for '{}' (groups idle)", id);
                 return None;
             }
             // Stopped nodes are probed too — on their slow max_cooldown
@@ -466,7 +680,9 @@ impl AliveDialerSet {
         // so nested groups rank correctly even as sub-picks change.
         let native_epoch = self.health_epoch();
         for (group, url) in self.group_check_urls() {
-            if self.is_urltest_group_idle(&group) {
+            let idle = self.is_group_idle(&group);
+            let pinned = idle.then(|| self.pinned_url_members_for(&group));
+            if pinned.as_ref().is_some_and(HashSet::is_empty) {
                 tracing::trace!(
                     "Skipping custom-URL health checks for idle group '{}'",
                     group
@@ -474,6 +690,12 @@ impl AliveDialerSet {
                 continue;
             }
             for member in self.url_members_for(&group) {
+                if pinned
+                    .as_ref()
+                    .is_some_and(|pins| !pins.contains(&member.tag))
+                {
+                    continue;
+                }
                 if !self.should_probe_url(&member.tag, &url) {
                     continue;
                 }
@@ -557,6 +779,16 @@ impl AliveDialerSet {
                     drop(owner);
                     return;
                 }
+                while emergency_workers.len() < concurrency {
+                    let Some(group) = this.take_pending_url_group_wake() else {
+                        break;
+                    };
+                    let this = Arc::clone(&this);
+                    emergency_workers.spawn(async move {
+                        this.probe_woken_custom_url_group(&group, timeout, concurrency)
+                            .await;
+                    });
+                }
                 tokio::select! {
                     biased;
                     _ = mode.changed() => {}
@@ -565,6 +797,7 @@ impl AliveDialerSet {
                             this.health_worker_failed();
                         }
                     }
+                    _ = this.url_group_wake_notify.notified(), if emergency_workers.len() < concurrency => {}
                     node = trigger_rx.recv(), if emergency_workers.len() < concurrency => {
                         if let Some(id) = node {
                             {
@@ -580,7 +813,14 @@ impl AliveDialerSet {
                             }
                             let this = Arc::clone(&this);
                             emergency_workers.spawn(async move {
-                                this.probe_node(id, timeout).await;
+                                if let Ok(permit) = this.acquire_health_probe() {
+                                    let cancel = permit.cancellation();
+                                    this.probe_node(id, timeout).await;
+                                    if this.take_trigger_custom_urls(id) {
+                                        this.probe_triggered_custom_urls(id, timeout, &cancel)
+                                            .await;
+                                    }
+                                }
                                 this.finish_trigger_probe(id);
                             });
                         }

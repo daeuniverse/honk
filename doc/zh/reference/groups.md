@@ -40,7 +40,7 @@ group {
 | `exit` | `null` | 实验性。在选中的路径末尾追加一个[支持隧道拨号的代理节点](./nodes.md#链式节点)。该跳不支持 VLESS 的 TCP 多路复用或按域名发现 ECH 配置。见[多跳 UDP 路径要求](#经出口的-udp)。显式 `block` 仍是终止动作。 |
 | `check_url` | `null` | 给非 Selector 策略用的按组 TCP 健康检查目标，见 [`check_url`](#check_url)。 |
 | `tolerance` | `50` | URLTest 切换阈值，单位为毫秒，见 [`tolerance`](#tolerance)。 |
-| `idle_timeout` | `null` | URLTest 组连续多少秒没有被选用后暂停成员探测，见 [`idle_timeout`](#idle_timeout)。 |
+| `idle_timeout` | `null` | 组连续多少秒没有被选用后暂停成员探测，见 [`idle_timeout`](#idle_timeout)。 |
 | `interrupt_connections` | `false` | 选择变化时关闭受影响的用户态传输，见 [`interrupt_connections`](#interrupt_connections)。 |
 | `icon` | `null` | 原生组读取返回的组图标，见 [`icon`](#icon)。 |
 | —（`check_interval`，dae 中不可配置） | `null` | 按组间隔字段，单位为秒。当前运行时不读取该字段，而使用全局间隔。 |
@@ -107,13 +107,13 @@ group {
 
 ### idle_timeout
 
-URLTest 组连续多少秒没有被选用后暂停成员探测；作用类似 Clash 的 `lazy`。
+组连续多少秒没有被选用后暂停成员探测；作用类似 Clash 的 `lazy`。
 
-该值写成纯整数：`idle_timeout: 1800`，不能写 `30m`。`idle_timeout: 0` 表示两次选择之间就进入空闲，它不是连接超时。
+该值写成纯整数：`idle_timeout: 1800`，不能写 `30m`。`idle_timeout: 0` 让组在两次选择之间保持空闲且不会触发逐次选路唤醒探测，它不是连接超时。
 
 默认 `null`，此时使用 1800 秒。
 
-URLTest 组在第一次被选中之前保持空闲，之后只要连续 `idle_timeout` 秒没有流量选中它，就再次转入空闲。空闲期间暂停成员的周期探测，下一次选中时恢复。只要还有非 URLTest 组，或者有活跃的 URLTest 组能到达某个节点，该节点就继续接受探测。
+自动策略组在第一次被选中之前保持空闲，之后只要连续 `idle_timeout` 秒没有流量选中它，就再次转入空闲。空闲期间暂停直接成员的周期探测，下一次未固定选择时恢复（实际遍历到的自动子组按需唤醒）。活跃的 `Selector` 或对应网络已手动固定的自动组绝不唤醒未选中的直接成员或未选中的子组；仅 Selector 当前选中的节点（TCP 和 UDP 选择）、自动组中手动固定的成员（含该组的自定义 `check_url`）以及非内置 `final` 节点在所属组空闲时保持周期探测，选择或固定切换到被暂停的节点时会立即探测该节点。当节点所属的全部自动组均空闲且没有任何组固定持有该节点时，其周期探测暂停；在完整周期之间，仅当所属空闲自动组在 TCP、数据 UDP 或自定义 `check_url` 上已无任何存活成员时，才对被暂停节点执行恢复探测。
 
 ```dae
 group {

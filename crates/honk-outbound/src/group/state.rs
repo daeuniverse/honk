@@ -156,6 +156,32 @@ pub type SelectorChangeCallback = Arc<dyn Fn() + Send + Sync>;
 /// Invoked for the changed network of a group opting into interruption.
 pub type InterruptCallback = Arc<dyn Fn(&str, SelectionNetwork) + Send + Sync>;
 
+/// Newly added fixed probe targets awaiting wakeup outside publication guards.
+#[must_use = "wake newly selected idle nodes after releasing publication guards"]
+pub struct SelectedProbeWake {
+    alive: Option<Arc<AliveDialerSet>>,
+    nodes: Vec<uuid::Uuid>,
+    url_pins: Vec<(String, String)>,
+}
+
+impl SelectedProbeWake {
+    fn empty() -> Self {
+        Self {
+            alive: None,
+            nodes: Vec::new(),
+            url_pins: Vec::new(),
+        }
+    }
+
+    pub fn wake(self) {
+        let Some(alive) = self.alive else {
+            return;
+        };
+        alive.wake_idle_nodes(&self.nodes);
+        alive.wake_pinned_url_members(&self.url_pins);
+    }
+}
+
 /// Committed selection and callbacks deferred until the caller drops its guards.
 #[must_use = "run callbacks after releasing the publication guards"]
 pub struct SelectorUpdate {
@@ -167,9 +193,17 @@ pub struct SelectorUpdate {
     persist: Option<PersistCallback>,
     changed: Option<SelectorChangeCallback>,
     interrupt: Option<InterruptCallback>,
+    probe_wake: SelectedProbeWake,
 }
 
 impl SelectorUpdate {
+    /// Suppress immediate probe wakeups (used during startup state restore so
+    /// initial probing follows the health loop's stagger).
+    pub fn without_probe_wake(mut self) -> Self {
+        self.probe_wake = SelectedProbeWake::empty();
+        self
+    }
+
     /// The control owner already captured the exact pre-transition close set.
     pub fn run_callbacks_without_interrupt(mut self) {
         self.interrupt = None;
@@ -198,6 +232,7 @@ impl SelectorUpdate {
                 callback(&self.group, network);
             }
         }
+        self.probe_wake.wake();
     }
 }
 
@@ -284,6 +319,11 @@ impl GroupManager {
             state.revision = revision;
         }
         let revision = state.revision;
+        let probe_wake = if !changed_networks.is_empty() {
+            self.publish_fixed_probe_targets_in(&state)
+        } else {
+            SelectedProbeWake::empty()
+        };
         drop(state);
         Ok(SelectorUpdate {
             revision,
@@ -297,6 +337,7 @@ impl GroupManager {
                 .interrupt_connections
                 .then(|| self.interrupt_callback.read().clone())
                 .flatten(),
+            probe_wake,
         })
     }
 
@@ -380,6 +421,11 @@ impl GroupManager {
             state.revision = revision;
         }
         let revision = state.revision;
+        let probe_wake = if !changed_networks.is_empty() {
+            self.publish_fixed_probe_targets_in(&state)
+        } else {
+            SelectedProbeWake::empty()
+        };
         drop(state);
         Ok(SelectorUpdate {
             revision,
@@ -393,6 +439,7 @@ impl GroupManager {
                 .interrupt_connections
                 .then(|| self.interrupt_callback.read().clone())
                 .flatten(),
+            probe_wake,
         })
     }
 
@@ -464,11 +511,109 @@ impl GroupManager {
             .any(|entry| entry.group.interrupt_connections)
     }
 
-    /// Wake URLTest health checks when a group serves traffic.
-    pub(super) fn mark_used(&self, group_name: &str) {
-        if let Some(alive) = &self.alive_set {
-            alive.mark_group_active(group_name);
+    /// Wake idle-suspended health checks when a group serves traffic.
+    #[inline]
+    pub(super) fn mark_used(
+        &self,
+        group_name: &str,
+        cached: Option<&std::sync::OnceLock<Arc<crate::alive::IdleActivitySlot>>>,
+    ) {
+        let Some(alive) = &self.alive_set else {
+            return;
+        };
+        let cell = cached.or_else(|| {
+            self.groups
+                .get(group_name)
+                .map(|entry| &entry.idle_activity)
+        });
+        if let Some(cell) = cell
+            && let Some(slot) = cell.get()
+            && alive.try_touch_activity_slot(slot)
+        {
+            return;
         }
+        self.mark_used_slow(alive, group_name, cell);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn mark_used_slow(
+        &self,
+        alive: &AliveDialerSet,
+        group_name: &str,
+        cell: Option<&std::sync::OnceLock<Arc<crate::alive::IdleActivitySlot>>>,
+    ) {
+        if let Some(slot) = alive.mark_group_active_slot(group_name)
+            && let Some(cell) = cell
+        {
+            let _ = cell.set(slot);
+        }
+    }
+
+    fn collect_fixed_probe_targets(
+        &self,
+        state: &SelectorState,
+    ) -> (HashSet<uuid::Uuid>, HashMap<String, HashSet<String>>) {
+        let mut nodes = HashSet::new();
+        let mut pinned_urls: HashMap<String, HashSet<String>> = HashMap::new();
+        for group in self.groups.values().map(|managed| &managed.group) {
+            for network in [SelectionNetwork::Tcp, SelectionNetwork::Udp] {
+                if let Some(member) = self.selector_member_in(group, network, state) {
+                    if let GroupMember::Node(node) = member
+                        && node.id != honk_config::config::BLOCK_NODE_ID
+                    {
+                        nodes.insert(node.id);
+                    }
+                    if network == SelectionNetwork::Tcp
+                        && group.policy != GroupPolicy::Selector
+                        && group.check_url.is_some()
+                    {
+                        pinned_urls
+                            .entry(group.name.clone())
+                            .or_default()
+                            .insert(member.tag().to_owned());
+                    }
+                }
+            }
+            if let Some(GroupMember::Node(node)) = self.final_member(group)
+                && !matches!(
+                    node.protocol(),
+                    honk_config::types::NodeProtocol::Direct
+                        | honk_config::types::NodeProtocol::Block
+                )
+            {
+                nodes.insert(node.id);
+            }
+        }
+        (nodes, pinned_urls)
+    }
+
+    fn publish_fixed_probe_targets_in(&self, state: &SelectorState) -> SelectedProbeWake {
+        let Some(alive) = &self.alive_set else {
+            return SelectedProbeWake::empty();
+        };
+        let (nodes, pinned_urls) = self.collect_fixed_probe_targets(state);
+        let added_nodes = alive.replace_selected_nodes(nodes);
+        let added_pins = alive.replace_pinned_url_members(pinned_urls);
+        SelectedProbeWake {
+            alive: Some(Arc::clone(alive)),
+            nodes: added_nodes,
+            url_pins: added_pins,
+        }
+    }
+
+    /// Publish the nodes groups hold fixed to the alive set: every Selector's
+    /// current TCP and UDP member, an automatic group's pin (including
+    /// custom-`check_url` pins), and any non-builtin node `final`.
+    pub fn publish_selected_probe_nodes(&self) {
+        let _ = self.stage_selected_probe_wake();
+    }
+
+    /// Publish fixed probe targets atomically under `selector_choice` and
+    /// defer immediate wakeups until the caller releases publication guards.
+    pub fn stage_selected_probe_wake(&self) -> SelectedProbeWake {
+        let state = self.selector_choice.read();
+        self.publish_fixed_probe_targets_in(&state)
     }
 
     /// Fire the interrupt callback when the group opted into connection

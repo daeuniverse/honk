@@ -48,8 +48,8 @@ pub use score::{
 #[cfg(test)]
 pub use state::SelectorChoices;
 pub use state::{
-    InterruptCallback, PersistCallback, SelectorChangeCallback, SelectorError, SelectorMember,
-    SelectorNetworks, SelectorUpdate,
+    InterruptCallback, PersistCallback, SelectedProbeWake, SelectorChangeCallback, SelectorError,
+    SelectorMember, SelectorNetworks, SelectorUpdate,
 };
 
 /// Maximum nesting depth for group → sub-group resolution, shared with
@@ -295,13 +295,15 @@ fn removed_unique_candidates(
     Some(before)
 }
 
-/// A group as this manager selects through it: its cycle-cut copy and
-/// whether selection from it can produce a route (`Exits::build`).
+/// A group as this manager selects through it: its cycle-cut copy,
+/// whether selection from it can produce a route (`Exits::build`), and its
+/// lazily cached lock-free idle-activity slot.
 struct ManagedGroup {
     group: Group,
     routes: bool,
     udp_chain: bool,
     udp_root: Option<Arc<str>>,
+    idle_activity: std::sync::OnceLock<Arc<crate::alive::IdleActivitySlot>>,
 }
 
 impl std::borrow::Borrow<Group> for ManagedGroup {
@@ -393,6 +395,7 @@ impl GroupManager {
                     routes: false,
                     udp_chain: false,
                     udp_root: None,
+                    idle_activity: std::sync::OnceLock::new(),
                 };
                 (group.name.clone(), entry)
             })
@@ -492,7 +495,6 @@ impl GroupManager {
     ) -> Option<&Node> {
         let entry = self.groups.get(group_name)?;
         let group = &entry.group;
-        self.mark_used(group_name);
         // The overwhelmingly common selector has only direct members. Avoid
         // constructing its transient candidate/visited vectors; nested
         // groups still take the guarded recursive path below.
@@ -506,9 +508,8 @@ impl GroupManager {
             });
         }
         let mut visited = Vec::with_capacity(MAX_GROUP_DEPTH);
-        self.pick_in_group(
-            group,
-            entry.routes,
+        self.pick_in_group_entry(
+            entry,
             domain,
             ipver,
             &mut visited,
@@ -585,22 +586,20 @@ impl GroupManager {
                 nodes: vec![],
             };
         };
-        self.selection_plan_for_group(&entry.group, entry.routes, domain, ipver, effects)
+        self.selection_plan_for_group(entry, domain, ipver, effects)
     }
 
     // An out-of-line call added about 25 instructions to a direct Selector plan.
     #[inline(always)]
     fn selection_plan_for_group<'a>(
         &'a self,
-        group: &'a Group,
-        routes: bool,
+        entry: &'a ManagedGroup,
         domain: ProbeDomain,
         ipver: IpVersion,
         effects: SelectionEffects,
     ) -> SelectionPlan<'a> {
-        if effects.applies() {
-            self.mark_used(&group.name);
-        }
+        let group = &entry.group;
+        let routes = entry.routes;
         let network = SelectionNetwork::from_probe_domain(domain);
         if !routes
             && group.policy == GroupPolicy::Selector
@@ -617,8 +616,9 @@ impl GroupManager {
             };
         }
         let context = ScoreSelectionContext::aggregate(network, domain, ipver);
-        let (mode, candidates) = self.selection_candidates_for_target(
+        let (mode, candidates) = self.selection_candidates_for_entry(
             group,
+            Some(&entry.idle_activity),
             &context,
             &mut Vec::new(),
             0,

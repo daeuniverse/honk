@@ -584,6 +584,8 @@ impl ControlPlane {
         };
         let mut new_outbound_id_map = build_outbound_id_map(&new_config);
         let health_targets = health_registrations(&new_config, &new_outbound_id_map);
+        let idle_groups = idle_group_registrations(&new_config);
+        let check_urls = group_check_url_registrations(&new_config);
         extend_route_health_dependencies(&new_config, &new_group_manager, &mut new_outbound_id_map);
         let bootstrap = new_config.global.bootstrap_resolver.clone();
         let direct_target = super::direct_check_addr(&bootstrap);
@@ -804,7 +806,14 @@ impl ControlPlane {
                     std::mem::replace(&mut *runtime_guard, Arc::clone(&new_runtime_registry));
                 new_runtime_registry.activate_background_dial_admission();
                 // A node can retain its runtime while leaving all health-checked groups.
-                // Publish its registration under the same fence as the runtime swap.
+                // Publish its idle/probe state and registration under the same fence as
+                // the runtime swap so newly registered idle nodes are suspended at once.
+                let probe_wake = publish_group_probe_state(
+                    &self.alive_set,
+                    &new_group_manager,
+                    &idle_groups,
+                    &check_urls,
+                );
                 self.alive_set.sync_registrations_retaining_routes(
                     health_targets,
                     |id| reused_runtime_ids.contains(id),
@@ -919,17 +928,18 @@ impl ControlPlane {
                     projection_snapshot,
                     routing_publication_needed.then_some(new_projection),
                 );
-                Ok(old_registry)
+                Ok((old_registry, probe_wake))
             }
         };
-        let old_registry = match old_registry_result {
-            Ok(old_registry) => old_registry,
+        let (old_registry, probe_wake) = match old_registry_result {
+            Ok(committed) => committed,
             Err(()) => {
                 self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
                     .await;
                 return Ok(ReloadOutcome::Rejected);
             }
         };
+        probe_wake.wake();
         if !old_plan.semantically_eq(&new_plan) && (old_has_direct_marks || new_has_direct_marks) {
             // Direct sockets retain their policy mark for life, including raw DNS.
             self.udp_pool
@@ -950,13 +960,6 @@ impl ControlPlane {
             .await;
         self.start_selector_warm_coordinator(new_runtime_registry)
             .await;
-        {
-            let config = self.config.read().await;
-            self.alive_set
-                .sync_urltest_groups(&urltest_group_registrations(&config));
-            self.alive_set
-                .sync_group_check_urls(&group_check_url_registrations(&config));
-        }
         #[cfg(feature = "native-api")]
         if mode_reset_failed {
             self.datapath_healthy

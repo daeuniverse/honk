@@ -185,13 +185,13 @@ Clash 将 Score 组表示为 `type: "url_test"`，在 `now` 中报告当前聚�
 
 权威 URLTest 建立失败保留既有的一轮前三候选重赛。重赛的新 deadline 不会创建另一份原始 Score 业务，即使首轮在自己的 deadline 之后才结束。Score 所属建立失败则至多顺序尝试一个不同叶节点，在排名前排除失败 `NodeId`，不要求普通评分先改选。Score 两次尝试共享一个绝对建立 deadline 和物理拨号预算；规范解析保留 Selector 选择，只允许首选真正经过的 final 组边，显示名称不授权兜底。类型化本地拒绝、未通过 admission 时容量耗尽、取消和 generation 关闭均为终态；应用负载写入后不重试。
 
-组的 `check_url` 会建立独立的 TCP-only 存活性和延迟状态，key 为 `(member tag, check_url)`。失败只会从使用该目标的组中排除该成员。Selector 组忽略 `check_url` 并打印 warning。URLTest 在超过 `idle_timeout` 后暂停探测；未设置时使用健康层默认的 30 分钟，下一次真实选择会立即唤醒探测。
+组的 `check_url` 会建立独立的 TCP-only 存活性和延迟状态，key 为 `(member tag, check_url)`。失败只会从使用该目标的组中排除该成员。Selector 组忽略 `check_url` 并打印 warning。任何策略的组在超过 `idle_timeout` 后都会暂停周期探测；未设置时使用健康层默认的 30 分钟，`idle_timeout: 0` 让组在两次选择之间保持空闲且不会触发逐次选路唤醒探测。经由未固定自动组的真实选择会立即唤醒其直接成员及实际遍历到的自动子组，而活跃的 `Selector`（或对应网络已手动固定的自动组）绝不唤醒未选中的直接成员或未选中的子组。Selector 当前选中的节点（TCP 和 UDP 选择）、自动组中手动固定的节点（含该组的自定义 `check_url`）以及非内置 `final` 节点在所属组空闲时仍持续探测。在两次完整周期之间，空闲恢复仅在所属空闲自动组在 IPv4 TCP 或可承载 UDP 的数据 UDP 上已没有任何存活的非内置可达叶节点时才探测被暂停节点（跳过 `DnsUdp` 与未选中的 `Selector` 成员），并在自定义 `check_url` 组全员失效或固定成员失效时执行恢复。
 
 ## 嵌套代理组与成员身份
 
 `Group.groups` 指定子组。每个子组只贡献一个候选：该子组策略针对当前网络和地址族选出的叶节点。父组将其作为一个成员排名或固定，不把所有后代合并进父策略。
 
-解析受 `MAX_GROUP_DEPTH = 8` 和每次遍历的 visited set 限制。构造阶段还会对组边执行 DFS，切断每条形成环的边并打印 warning，防止异常组图阻塞选择或内省。分配 eBPF outbound ID、登记健康检查和构建 URLTest 空闲表时，都遍历配置自身的组图（`honk_config::group_graph`），深度上限相同，也按路径防环，但不切边，所以被切掉的边不会把叶节点挪到另一个 outbound 槽位。
+解析受 `MAX_GROUP_DEPTH = 8` 和每次遍历的 visited set 限制。构造阶段还会对组边执行 DFS，切断每条形成环的边并打印 warning，防止异常组图阻塞选择或内省。分配 eBPF outbound ID 和登记健康检查时，都遍历配置自身的组图（`honk_config::group_graph`），深度上限相同，也按路径防环，但不切边，所以被切掉的边不会把叶节点挪到另一个 outbound 槽位；组的空闲探测表则只记录各组的直接节点成员与直接节点 `final` 边，使嵌套子组仅在实际遍历到时才被激活。
 
 成员边与显式 `final` 边使用同一个有界递归解析器。子组策略没有合格选择时，
 只沿自己的配置 final 继续；父组仍把该子组视为已选成员。Final 链保留选择链和

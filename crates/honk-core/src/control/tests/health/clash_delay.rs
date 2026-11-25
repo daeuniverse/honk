@@ -247,7 +247,7 @@ async fn reload(control: &ControlPlane, config: Config) {
 }
 
 /// The caller owns the warm coordinator mutex, so publication is observable
-/// before warm work and URLTest idle/target resynchronization finish.
+/// before warm work finishes.
 async fn publish_while_warm_blocked(
     control: &Arc<ControlPlane>,
     config: Config,
@@ -855,7 +855,7 @@ async fn clash_group_delay_cannot_credit_or_reselect_after_manager_only_rebuild(
         control.group_manager.read().get_urltest_selection("pool"),
         None
     );
-    assert!(control.alive_set.is_urltest_group_idle("pool"));
+    assert!(control.alive_set.is_group_idle("pool"));
     resume_tx.send(()).unwrap();
     rebuild.await.unwrap();
 
@@ -872,7 +872,7 @@ async fn clash_group_delay_cannot_credit_or_reselect_after_manager_only_rebuild(
             .as_deref(),
         Some("new")
     );
-    assert!(!control.alive_set.is_urltest_group_idle("pool"));
+    assert!(!control.alive_set.is_group_idle("pool"));
     server.abort();
 }
 
@@ -968,7 +968,7 @@ async fn delay_cannot_select_a_successor(
     let mut delay = ClashDelay::new(api, Some(old), path, old_key);
     let successor = urltest_config(vec![peer_node("new", &new), Config::builtin_block_node()]);
     let choice = || control.group_manager.read().get_urltest_selection("pool");
-    let idle = || control.alive_set.is_urltest_group_idle("pool");
+    let idle = || control.alive_set.is_group_idle("pool");
 
     let warm = control.udp_warm_task.lock().await;
     let (response, reload) = delay

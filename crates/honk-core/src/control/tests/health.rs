@@ -145,6 +145,9 @@ async fn c28_health_reload_retains_old_period_after_rejection() {
             "HEAD".into(),
         )
         .await;
+    // Measure the period alone: without idle suspension, and without the
+    // wake-up probes that marking the group active would queue.
+    alive.sync_idle_groups(&[]);
     let task = alive.spawn_health_check_loop(Duration::from_secs(30), Duration::from_secs(1));
     let first = observations.recv().await.unwrap();
     // Both registered leaves are probed in each cycle.
@@ -230,6 +233,7 @@ async fn reject_http_change(change: fn(&mut Config)) {
         !cp.reload_runtime_config(candidate, Default::default())
             .await
     );
+    cp.alive_set().mark_group_active("score");
     cp.alive_set()
         .run_health_check_cycle(Duration::from_secs(1))
         .await;
@@ -1032,4 +1036,419 @@ async fn fifty_ambiguous_udp_closures_preserve_sibling_route_and_bare_exit() {
             .is_alive_for(land.id, ProbeDomain::Tcp, IpVersion::V4)
     );
     retirement.join(&handle).await.unwrap();
+}
+
+#[tokio::test]
+async fn control_plane_idle_probe_lifecycle_startup_restore_reload_and_timeout_hot_reload() {
+    use crate::state::StateDb;
+    use crate::state::cache::Maintenance;
+    use honk_config::group::{Group, GroupPolicy};
+
+    let build_config = |sel_nodes: &[&Node], auto_nodes: &[&Node], idle_timeout: Option<u64>| {
+        let mut config = Config::default();
+        config.global.nfqueue_enable = false;
+        config.ensure_builtin_nodes();
+        for node in sel_nodes.iter().chain(auto_nodes.iter()) {
+            if !config.nodes.iter().any(|existing| existing.id == node.id) {
+                config.nodes.push((*node).clone());
+            }
+        }
+        config.groups = vec![
+            Group {
+                name: "proxy".into(),
+                policy: GroupPolicy::Selector,
+                nodes: sel_nodes.iter().map(|n| n.id).collect(),
+                default: sel_nodes.first().map(|n| n.name.clone()),
+                ..Default::default()
+            },
+            Group {
+                name: "auto".into(),
+                policy: GroupPolicy::Score,
+                nodes: auto_nodes.iter().map(|n| n.id).collect(),
+                idle_timeout,
+                ..Default::default()
+            },
+        ];
+        config
+    };
+
+    let n_sel1 = canonical_socks5("sel1", "127.0.0.1", 2001, None);
+    let n_sel2 = canonical_socks5("sel2", "127.0.0.1", 2002, None);
+    let n_auto1 = canonical_socks5("auto1", "127.0.0.1", 2003, None);
+    let n_new = canonical_socks5("new_idle", "127.0.0.1", 2004, None);
+
+    // Persist a Selector choice (`sel2`) to verify quiet startup cache restore.
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(StateDb::open(dir.path()).unwrap());
+    {
+        let mut seeded = control_plane(build_config(&[&n_sel1, &n_sel2], &[&n_auto1], Some(1800)));
+        seeded.init_cache_db(Some(Arc::clone(&state)), None).await;
+        seeded
+            .group_manager()
+            .read()
+            .set_selector_choice(
+                "proxy",
+                "sel2",
+                honk_outbound::group::SelectorNetworks::Both,
+            )
+            .unwrap();
+        seeded
+            .cache_db()
+            .unwrap()
+            .maintain(Maintenance::default())
+            .unwrap();
+    }
+
+    // Startup + cache restore: default/restored pick is unsuspended without
+    // pre-filling trigger_tx, while unselected Selector and idle Score nodes pause.
+    let mut plane = control_plane(build_config(&[&n_sel1, &n_sel2], &[&n_auto1], Some(1800)));
+    let mut trigger_rx = plane
+        .alive_set()
+        .take_trigger_rx()
+        .expect("trigger receiver");
+    assert!(!plane.alive_set().is_probe_suspended(n_sel1.id));
+    assert!(plane.alive_set().is_probe_suspended(n_sel2.id));
+    assert!(plane.alive_set().is_probe_suspended(n_auto1.id));
+    assert!(trigger_rx.try_recv().is_err());
+
+    plane.init_cache_db(Some(state), None).await;
+    assert!(plane.alive_set().is_probe_suspended(n_sel1.id));
+    assert!(!plane.alive_set().is_probe_suspended(n_sel2.id));
+    assert!(
+        trigger_rx.try_recv().is_err(),
+        "startup cache restore must not pre-fill trigger_tx before health loop stagger"
+    );
+
+    // Reload atomicity + idle_timeout hot reload: hold udp_warm_task so reload
+    // pauses right after publication locks drop, before warm coordinators run.
+    let plane = Arc::new(plane);
+    let next = build_config(&[&n_sel1], &[&n_auto1, &n_new], Some(0));
+    let warm_guard = plane.udp_warm_task.lock().await;
+    let generation = plane.runtime_registry.read().generation();
+    let reload_plane = Arc::clone(&plane);
+    let reload = tokio::spawn(async move {
+        reload_plane
+            .reload_runtime_config(next, Default::default())
+            .await
+    });
+    while plane.runtime_registry.read().generation() == generation {
+        assert!(!reload.is_finished(), "reload exited before publication");
+        tokio::task::yield_now().await;
+    }
+    // Already published before warm coordinators run: new idle node is suspended,
+    // and newly active Selector fallback `sel1` is unsuspended and woken.
+    assert!(plane.alive_set().is_probe_suspended(n_new.id));
+    assert!(!plane.alive_set().is_probe_suspended(n_sel1.id));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), trigger_rx.recv())
+            .await
+            .expect("reload must wake newly active Selector pick before warm coordinators"),
+        Some(n_sel1.id)
+    );
+    drop(warm_guard);
+    assert!(reload.await.unwrap());
+
+    // Hot-reloaded `idle_timeout: 0` takes effect immediately without storming.
+    plane.alive_set().mark_group_active("auto");
+    assert!(plane.alive_set().is_group_idle("auto"));
+    assert!(trigger_rx.try_recv().is_err());
+
+    // Manager-only rebuild switches Selector membership and wakes the new selection.
+    let rebuilt = build_config(&[&n_sel2], &[&n_auto1], Some(1800));
+    *plane.config_handle().write().await = Arc::new(rebuilt);
+    plane.reload_group_manager().await.unwrap();
+    assert!(!plane.alive_set().is_probe_suspended(n_sel2.id));
+    assert_eq!(trigger_rx.try_recv(), Ok(n_sel2.id));
+}
+
+#[tokio::test]
+async fn control_plane_selector_isolates_unselected_members_and_registers_recovery_leaves() {
+    use honk_config::group::{Group, GroupPolicy};
+    use honk_config::node::{Node, OutboundConfig};
+    use honk_outbound::alive::IdleGroupKind;
+
+    let sel_a = canonical_socks5("sel_a", "127.0.0.1", 2101, None);
+    let sel_b = canonical_socks5("sel_b", "127.0.0.1", 2102, None);
+    let mut hk_tcp_only = Node {
+        outbound: OutboundConfig::Vmess(honk_config::node::VmessConfig {
+            uuid: Some("11111111-1111-1111-1111-111111111111".into()),
+            ..Default::default()
+        }),
+        ..canonical_socks5("hk_tcp_only", "127.0.0.1", 2103, None)
+    };
+    hk_tcp_only.id = hk_tcp_only.derive_id();
+    let hk_udp = canonical_socks5("hk_udp", "127.0.0.1", 2104, None);
+    let jp1 = canonical_socks5("jp1", "127.0.0.1", 2105, None);
+    let p_direct = canonical_socks5("p_direct", "127.0.0.1", 2106, None);
+
+    let mut config = Config::default();
+    config.global.nfqueue_enable = false;
+    config.ensure_builtin_nodes();
+    config.nodes.extend([
+        sel_a.clone(),
+        sel_b.clone(),
+        hk_tcp_only.clone(),
+        hk_udp.clone(),
+        jp1.clone(),
+        p_direct.clone(),
+    ]);
+    config.groups = vec![
+        Group {
+            name: "proxy".into(),
+            policy: GroupPolicy::Selector,
+            nodes: vec![sel_a.id, sel_b.id],
+            groups: vec!["auto_hk".into(), "auto_jp".into()],
+            default: Some("sel_a".into()),
+            ..Default::default()
+        },
+        Group {
+            name: "auto_hk".into(),
+            policy: GroupPolicy::Score,
+            nodes: vec![hk_tcp_only.id, hk_udp.id],
+            final_outbound: Some("direct".into()),
+            idle_timeout: Some(0),
+            ..Default::default()
+        },
+        Group {
+            name: "auto_jp".into(),
+            policy: GroupPolicy::Fallback,
+            nodes: vec![jp1.id],
+            ..Default::default()
+        },
+        Group {
+            name: "parent_auto".into(),
+            policy: GroupPolicy::URLTest,
+            nodes: vec![p_direct.id],
+            groups: vec!["auto_jp".into()],
+            ..Default::default()
+        },
+    ];
+
+    // Verify idle_group_registrations directly: direct-only members + Selector kind +
+    // datapath-parity TCP/UDP recovery sets (builtins & TCP-only excluded appropriately).
+    let regs = super::super::reload::idle_group_registrations(&config);
+    let by_name = |name: &str| regs.iter().find(|r| r.name == name).unwrap();
+
+    let reg_proxy = by_name("proxy");
+    assert_eq!(reg_proxy.kind, IdleGroupKind::Selector);
+    assert_eq!(
+        reg_proxy
+            .members
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([sel_a.id, sel_b.id])
+    );
+    assert!(reg_proxy.tcp_recovery_members.is_empty());
+    assert!(reg_proxy.udp_recovery_members.is_empty());
+
+    let reg_hk = by_name("auto_hk");
+    assert_eq!(reg_hk.kind, IdleGroupKind::Automatic);
+    assert_eq!(
+        reg_hk
+            .tcp_recovery_members
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([hk_tcp_only.id, hk_udp.id])
+    );
+    assert_eq!(reg_hk.udp_recovery_members, vec![hk_udp.id]);
+
+    let reg_parent = by_name("parent_auto");
+    assert_eq!(reg_parent.members, vec![p_direct.id]);
+    assert_eq!(
+        reg_parent
+            .tcp_recovery_members
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([p_direct.id, jp1.id])
+    );
+    assert_eq!(
+        reg_parent
+            .udp_recovery_members
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([p_direct.id, jp1.id])
+    );
+
+    // Real ControlPlane: selecting through active Selector keeps unselected direct
+    // members and unselected automatic subgroups suspended.
+    let plane = control_plane(config);
+    assert_eq!(
+        plane
+            .group_manager()
+            .read()
+            .select_node("proxy")
+            .map(|n| n.id),
+        Some(sel_a.id)
+    );
+    assert!(!plane.alive_set().is_probe_suspended(sel_a.id));
+    for suspended in [sel_b.id, hk_tcp_only.id, hk_udp.id, jp1.id, p_direct.id] {
+        assert!(plane.alive_set().is_probe_suspended(suspended));
+    }
+    assert!(plane.alive_set().is_group_idle("auto_hk"));
+    assert!(plane.alive_set().is_group_idle("auto_jp"));
+
+    // Switching Selector to `auto_jp` wakes only `auto_jp` on traffic.
+    plane
+        .group_manager()
+        .read()
+        .set_selector_choice(
+            "proxy",
+            "auto_jp",
+            honk_outbound::group::SelectorNetworks::Both,
+        )
+        .unwrap();
+    assert_eq!(
+        plane
+            .group_manager()
+            .read()
+            .select_node("proxy")
+            .map(|n| n.id),
+        Some(jp1.id)
+    );
+    assert!(!plane.alive_set().is_group_idle("auto_jp"));
+    assert!(!plane.alive_set().is_probe_suspended(jp1.id));
+    for suspended in [sel_a.id, sel_b.id, hk_tcp_only.id, hk_udp.id, p_direct.id] {
+        assert!(plane.alive_set().is_probe_suspended(suspended));
+    }
+}
+
+#[tokio::test]
+async fn control_plane_custom_url_selection_under_group_manager_read_does_not_deadlock_on_writer() {
+    use honk_config::group::{Group, GroupPolicy};
+
+    let n1 = canonical_socks5("n1", "127.0.0.1", 2201, None);
+    let n2 = canonical_socks5("n2", "127.0.0.1", 2202, None);
+    let mut config = Config::default();
+    config.global.nfqueue_enable = false;
+    config.ensure_builtin_nodes();
+    config.nodes.extend([n1.clone(), n2.clone()]);
+    config.groups = vec![
+        Group {
+            name: "custom_auto".into(),
+            policy: GroupPolicy::URLTest,
+            nodes: vec![n1.id],
+            groups: vec!["sub".into()],
+            check_url: Some("http://127.0.0.1/custom".into()),
+            ..Default::default()
+        },
+        Group {
+            name: "sub".into(),
+            policy: GroupPolicy::Fallback,
+            nodes: vec![n2.id],
+            ..Default::default()
+        },
+    ];
+
+    let plane = control_plane(config);
+    let gm_cell = plane.group_manager().clone();
+
+    // Hold a read guard while a writer parks on the write-preferring RwLock.
+    // Reentering `group_manager.read()` from `mark_group_active` would self-deadlock here.
+    let (writer_ready_tx, writer_ready_rx) = std::sync::mpsc::channel();
+    let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
+    let gm_read = gm_cell.read();
+    let writer_cell = Arc::clone(&gm_cell);
+    let writer = std::thread::spawn(move || {
+        writer_ready_tx.send(()).unwrap();
+        let _guard = writer_cell.write();
+        let _ = writer_done_tx.send(());
+    });
+    writer_ready_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+
+    assert!(gm_read.select_node("custom_auto").is_some());
+    drop(gm_read);
+
+    writer_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer must acquire group_manager lock without deadlock");
+    writer.join().unwrap();
+    assert!(!plane.alive_set().is_group_idle("custom_auto"));
+}
+
+#[tokio::test]
+async fn control_plane_noop_reload_clears_override_and_runs_callbacks_after_config_unlock() {
+    use honk_config::group::{Group, GroupPolicy};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let a1 = canonical_socks5("a1", "127.0.0.1", 2301, None);
+    let a2 = canonical_socks5("a2", "127.0.0.1", 2302, None);
+    let mut config = Config::default();
+    config.global.nfqueue_enable = false;
+    config.ensure_builtin_nodes();
+    config.nodes.extend([a1.clone(), a2.clone()]);
+    config.groups = vec![Group {
+        name: "auto".into(),
+        policy: GroupPolicy::Score,
+        nodes: vec![a1.id, a2.id],
+        ..Default::default()
+    }];
+
+    let plane = control_plane(config.clone());
+    // Establish a reload-compiled DNS forwarder policy_id so the next identical
+    // reload enters the NOOP fast path.
+    assert!(
+        plane
+            .reload_runtime_config(config.clone(), Default::default())
+            .await
+    );
+    assert!(plane.alive_set().is_probe_suspended(a1.id));
+
+    plane
+        .group_manager()
+        .read()
+        .publish_override(
+            "auto",
+            &honk_outbound::group::SelectorMember::Node(a1.id),
+            honk_outbound::group::SelectorNetworks::Both,
+        )
+        .unwrap()
+        .run_callbacks();
+    assert!(!plane.alive_set().is_probe_suspended(a1.id));
+    assert!(
+        plane
+            .group_manager()
+            .read()
+            .has_override("auto", honk_outbound::group::SelectionNetwork::Tcp)
+    );
+
+    let callback_fired = Arc::new(AtomicBool::new(false));
+    let config_unlocked = Arc::new(AtomicBool::new(false));
+    let fired_cb = Arc::clone(&callback_fired);
+    let unlocked_cb = Arc::clone(&config_unlocked);
+    let config_handle = plane.config_handle().clone();
+    plane
+        .group_manager()
+        .read()
+        .set_selector_change_callback(Some(Arc::new(move || {
+            fired_cb.store(true, Ordering::Release);
+            unlocked_cb.store(config_handle.try_read().is_ok(), Ordering::Release);
+        })));
+
+    let gen_before = plane.runtime_registry.read().generation();
+    let reloaded = plane
+        .reload_runtime_config(config, Default::default())
+        .await;
+    assert!(reloaded, "NOOP reload must succeed");
+    assert_eq!(
+        plane.runtime_registry.read().generation(),
+        gen_before,
+        "identical config must take the NOOP reload path without advancing generation"
+    );
+    assert!(
+        !plane
+            .group_manager()
+            .read()
+            .has_override("auto", honk_outbound::group::SelectionNetwork::Tcp)
+    );
+    assert!(plane.alive_set().is_probe_suspended(a1.id));
+    assert!(callback_fired.load(Ordering::Acquire));
+    assert!(
+        config_unlocked.load(Ordering::Acquire),
+        "NOOP reload must release config write guard before running clear_override callbacks"
+    );
 }

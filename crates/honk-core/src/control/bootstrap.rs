@@ -104,11 +104,8 @@ impl ControlPlane {
             config.nodes.len(),
             config.nodes.len().saturating_sub(added),
         );
-        // Register URLTest groups for idle-aware probe suspension (lazy
-        // start: probing pauses after `idle_timeout` without group usage
-        // and resumes on the next dial). Members shared with Selector
-        // groups are excluded — those are probed unconditionally.
-        alive_set.sync_urltest_groups(&urltest_group_registrations(&config));
+        // Fixed probe nodes are published below once GroupManager exists.
+        alive_set.sync_idle_groups(&idle_group_registrations(&config));
         alive_set.sync_group_check_urls(&group_check_url_registrations(&config));
         let group_manager =
             GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive_set.clone()));
@@ -120,6 +117,7 @@ impl ControlPlane {
                 map.read().get(&node_id).copied()
             })));
         }
+        group_manager.publish_selected_probe_nodes();
         // Custom-URL member resolution: a group's members are probed via
         // their current picks (delay_test_members = tag → representative
         // leaf), so sub-group members are measured through whatever leaf
