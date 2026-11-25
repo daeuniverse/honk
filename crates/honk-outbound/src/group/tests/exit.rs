@@ -1113,24 +1113,37 @@ fn unrelated_exits_do_not_add_allocations_to_plain_dial_plans() {
             .cloned()
             .chain([exit_group("exit", vec![nid("a")], "land")])
             .collect();
-        let plain = GroupManager::new(&groups, &nodes(&["a", "b", "c"]));
-        let mixed = GroupManager::new(&mixed, &nodes(&["a", "b", "c", "land"]));
+        let plain_nodes = nodes(&["a", "b", "c"]);
+        let mixed_nodes = nodes(&["a", "b", "c", "land"]);
         for context in [tcp_context(), udp_context()] {
             for group in &groups {
-                let measure = |manager: &GroupManager| {
-                    let region = stats_alloc::Region::new(crate::test_support::ALLOCATOR);
-                    let (plan, _) = manager.dial_plan_for_target(&group.name, &context, None);
-                    let stats = region.change();
-                    assert!(!plan.entries.is_empty());
-                    assert!(plan.entries.iter().all(|entry| entry.route.is_none()));
-                    (plan.entries.len(), stats.allocations, stats.reallocations)
+                // The counters are process-wide, and libtest's main thread can
+                // allocate inside a region; that only ever adds to a count. The
+                // fewest over several samples, each on a fresh manager, is the
+                // plan's own count.
+                let measure = |groups: &[Group], nodes: &[Node]| {
+                    let mut fewest = (0, usize::MAX, usize::MAX);
+                    for _ in 0..5 {
+                        let manager = GroupManager::new(groups, nodes);
+                        let region = stats_alloc::Region::new(crate::test_support::ALLOCATOR);
+                        let (plan, _) = manager.dial_plan_for_target(&group.name, &context, None);
+                        let stats = region.change();
+                        assert!(!plan.entries.is_empty());
+                        assert!(plan.entries.iter().all(|entry| entry.route.is_none()));
+                        fewest = (
+                            plan.entries.len(),
+                            fewest.1.min(stats.allocations),
+                            fewest.2.min(stats.reallocations),
+                        );
+                    }
+                    fewest
                 };
-                let expected = measure(&plain);
+                let expected = measure(&groups, &plain_nodes);
                 assert_ne!(
                     expected.1, 0,
                     "counting allocator must record plan allocations"
                 );
-                assert_eq!(measure(&mixed), expected, "{}", group.name);
+                assert_eq!(measure(&mixed, &mixed_nodes), expected, "{}", group.name);
             }
         }
         return;
