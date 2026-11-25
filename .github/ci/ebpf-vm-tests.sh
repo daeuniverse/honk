@@ -32,9 +32,11 @@ mkdir -p "$log_dir"
   echo t > /proc/sysrq-trigger
   dmesg > "$log_dir/hang-dmesg.txt"
   ps -eo pid,ppid,stat,wchan:32,etime,args > "$log_dir/hang-ps.txt"
-) &
+) </dev/null >/dev/null 2>&1 &
 watchdog=$!
-trap 'kill "$watchdog" 2>/dev/null || true' EXIT
+# vng waits for the console to close, so the watchdog and its sleep must not
+# hold it or outlive the gate.
+trap 'pkill -P "$watchdog" 2>/dev/null; kill "$watchdog" 2>/dev/null || true' EXIT
 
 "$HONK_CORE_TEST_BIN" ebpf::real::tests --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-core-real.log"
