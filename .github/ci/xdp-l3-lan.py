@@ -1058,11 +1058,12 @@ def matrix(daemon, core, xsk, workers, artifacts, pins):
             old_epoch, physical_epoch = epoch(maps, current['realm']), epoch(maps, physical_realm)
             assert old_epoch and physical_epoch
             progress('physical-before-wg-down')
+            dns.live_dns_fact(dict(maps=maps, realm=physical_realm, epoch=physical_epoch), TARGETS[1][1], True)
             ip('dut', 'link', 'set', OUTER, 'down')
             require_offline(current, check_existing=True)
             assert epoch(maps, current['realm']) == 0 and epoch(maps, physical_realm) == physical_epoch
             progress('physical-while-wg-down')
-            trial('physical-fact-survives-aux-down', 'client', TARGETS[1][0], socket.SOCK_STREAM, 'dns')
+            trial('physical-fact-survives-aux-down', 'client', TARGETS[1][1], socket.SOCK_STREAM, 'dns')
             offset = len(log.read_text())
             ip('dut', 'link', 'set', OUTER, 'up')
             current = binding(process, log, offset, 1420, previous=current)
