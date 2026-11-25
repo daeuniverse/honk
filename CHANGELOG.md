@@ -30,6 +30,7 @@ Entries live in [changes/](changes/) until release.
 - Cron schedules skip nonexistent local times and use the first occurrence of a repeated time. Startup and API changes reject a schedule with no future occurrence in the local time zone; a later time-zone change is reported without dropping pending failure retries. (#484)
 - `docker-compose.yml` mounts the host's `/etc/localtime` read-only, so the container uses the host's time zone for log timestamps and the geodata schedule instead of UTC. (#484)
 - Full builds embed doona 0.1.0-rc.7 with both editions. (#536)
+- Health checks pause for every idle group policy after `idle_timeout` (default 1800 seconds) without traffic. Automatic groups resume probing their direct members on the next selection while keeping unselected Selector branches suspended; a Selector's current TCP and UDP picks, manually pinned automatic-group members (including custom `check_url`), and non-builtin `final` nodes keep being probed and wake immediately on change, and idle automatic groups still recover when all members fail TCP, data UDP, or a custom `check_url`. (#527)
 
 ### Fixed
 
