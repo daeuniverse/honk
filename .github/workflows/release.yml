@@ -50,8 +50,8 @@ jobs:
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y cmake libclang-dev
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y cmake libclang-dev
 
       # routing::tests::test_geosite_* need geo assets (locally found at
       # /etc/dae/geosite.dat; the runner has none).
@@ -72,11 +72,11 @@ jobs:
           geo_dir="$RUNNER_TEMP/geo-assets"
           mkdir -p "$geo_dir"
           if ! test -f "$geo_dir/geosite.dat"; then
-            curl -fsSL --retry 3 -o "$geo_dir/geosite.dat" \
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$geo_dir/geosite.dat" \
               "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat"
           fi
           if ! test -f "$geo_dir/geoip.dat"; then
-            curl -fsSL --retry 3 -o "$geo_dir/geoip.dat" \
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$geo_dir/geoip.dat" \
               "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat"
           fi
           echo "$GEOSITE_SHA256  $geo_dir/geosite.dat" | sha256sum -c -
@@ -161,14 +161,14 @@ jobs:
       - name: Install system dependencies
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev pkg-config cmake libclang-dev zstd
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y clang llvm libbpf-dev pkg-config cmake libclang-dev zstd
 
       - name: Install pinned bpf-linker
         run: |
           set -euo pipefail
           source .github/ci/pins.env
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
             "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
           echo "$BPF_LINKER_SHA256  $RUNNER_TEMP/bpf-linker.tar.zst" | sha256sum -c -
           zstd -dc "$RUNNER_TEMP/bpf-linker.tar.zst" | tar -xf - -C "$CARGO_HOME/bin"
@@ -339,7 +339,7 @@ jobs:
         run: |
           set -euo pipefail
           source .github/ci/pins.env
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/nfpm.tar.gz" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$RUNNER_TEMP/nfpm.tar.gz" \
             "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
           echo "$NFPM_SHA256  $RUNNER_TEMP/nfpm.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/nfpm.tar.gz" -C "$RUNNER_TEMP" nfpm

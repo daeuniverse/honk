@@ -52,8 +52,8 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.stable }}
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake libclang-dev
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y cmake libclang-dev
       - name: Read geo cache key
         id: geo-pins
         run: |
@@ -69,11 +69,11 @@ jobs:
           geo_dir="$RUNNER_TEMP/geo-assets"
           mkdir -p "$geo_dir"
           if ! test -f "$geo_dir/geosite.dat"; then
-            curl -fsSL --retry 3 -o "$geo_dir/geosite.dat" \
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$geo_dir/geosite.dat" \
               "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat"
           fi
           if ! test -f "$geo_dir/geoip.dat"; then
-            curl -fsSL --retry 3 -o "$geo_dir/geoip.dat" \
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$geo_dir/geoip.dat" \
               "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat"
           fi
           echo "$GEOSITE_SHA256  $geo_dir/geosite.dat" | sha256sum -c -
