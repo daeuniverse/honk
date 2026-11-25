@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 
 use honk_ebpf_common::host::HostSourceFacts;
+use honk_ebpf_common::{ROUTING_PROCESS_MAX_LEN, normalize_process_name};
 use honk_netstack::SourceContext;
 
 use super::*;
@@ -425,7 +426,8 @@ impl PacketScope {
     /// Bind and fund authenticated Host intake before handing this scope to Endpoint.
     pub fn prepare_host(&self) -> io::Result<()> {
         self.0.with(|inner| {
-            if inner.endpoint_prepared
+            if self.is_auxiliary()
+                || inner.endpoint_prepared
                 || inner.closing
                 || inner.finished
                 || !inner.stack.as_ref().is_some_and(Stack::is_quiescent)
@@ -486,6 +488,7 @@ impl PacketScope {
         }
         Ok(DatagramSender {
             scope: self.clone(),
+            binding: self.binding(),
             source,
             packet_source: Some(source_work),
             realm: None,
@@ -493,30 +496,209 @@ impl PacketScope {
     }
 }
 
+/// Immutable routing input. Only the TUN source path separately carries a SourceContext.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::control) struct ProcessMeta {
+    pub(in crate::control) pid: u32,
+    pname: [u8; ROUTING_PROCESS_MAX_LEN],
+    pname_len: u8,
+}
+
+impl Default for ProcessMeta {
+    fn default() -> Self {
+        Self {
+            pid: 0,
+            pname: [0; ROUTING_PROCESS_MAX_LEN],
+            pname_len: 0,
+        }
+    }
+}
+
+impl ProcessMeta {
+    pub(in crate::control) fn from_facts(facts: &HostSourceFacts) -> Self {
+        if facts.flags & honk_ebpf_common::host::HOST_PROCESS_PRESENT == 0 {
+            return Self::default();
+        }
+        let mut pname = [0; ROUTING_PROCESS_MAX_LEN];
+        let pname_len = normalize_process_name(&facts.pname, &mut pname) as u8;
+        Self {
+            pid: facts.pid,
+            pname,
+            pname_len,
+        }
+    }
+
+    #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+    pub(super) fn from_gateway(
+        meta: honk_ebpf_common::xdp_gateway::HostFlowMeta,
+    ) -> io::Result<Self> {
+        let bytes = meta
+            .pname
+            .get(..usize::from(meta.pname_len))
+            .ok_or_else(|| invalid("invalid Host process name length"))?;
+        let name =
+            std::str::from_utf8(bytes).map_err(|_| invalid("invalid Host process name UTF-8"))?;
+        if name.contains('\0') || name.trim() != name {
+            return Err(invalid("unnormalized Host process name"));
+        }
+        Ok(Self {
+            pid: meta.pid,
+            pname: meta.pname,
+            pname_len: meta.pname_len,
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::control) fn test_gateway(pid: u32, name: &str) -> Self {
+        let mut meta = honk_ebpf_common::xdp_gateway::HostFlowMeta {
+            pid,
+            pname: [b'X'; ROUTING_PROCESS_MAX_LEN],
+            pname_len: u8::try_from(name.len()).unwrap(),
+            ..Default::default()
+        };
+        meta.pname[..name.len()].copy_from_slice(name.as_bytes());
+        Self::from_gateway(meta).unwrap()
+    }
+
+    pub(in crate::control) fn name(&self) -> Option<String> {
+        let bytes = &self.pname[..usize::from(self.pname_len)];
+        (!bytes.is_empty()).then(|| {
+            std::str::from_utf8(bytes)
+                .expect("normalized process name")
+                .to_owned()
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+enum SourceOrigin {
+    Plain,
+    #[cfg(target_os = "linux")]
+    Physical(crate::xdp::worker::PeerHold),
+    #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+    Gateway {
+        process: ProcessMeta,
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        slot: Option<u16>,
+    },
+}
+
 #[derive(Debug)]
 pub(in crate::control) struct SourceWork {
     scope: PacketScope,
     index: usize,
+    origin: SourceOrigin,
     context: Option<SourceContext>,
-    #[cfg(target_os = "linux")]
-    peer: Option<crate::xdp::worker::PeerHold>,
 }
 
 impl SourceWork {
+    #[cfg(test)]
+    pub(in crate::control) fn with_process_input(mut self, process: ProcessMeta) -> Self {
+        assert!(matches!(self.origin, SourceOrigin::Plain) && self.context.is_none());
+        self.origin = SourceOrigin::Gateway {
+            process,
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            slot: None,
+        };
+        self
+    }
+
+    pub(in crate::control) fn has_gateway_process(&self) -> bool {
+        self.gateway_process().is_some()
+    }
+
+    fn gateway_process(&self) -> Option<&ProcessMeta> {
+        #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+        if let SourceOrigin::Gateway { process, .. } = &self.origin {
+            return Some(process);
+        }
+        None
+    }
+
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    fn host_udp_slot(&self) -> Option<u16> {
+        match &self.origin {
+            SourceOrigin::Gateway { slot, .. } => *slot,
+            _ => None,
+        }
+    }
+
+    /// Shared reply delivery owns the binding and address. Only views own a Host flow's process.
+    pub(in crate::control) fn into_shared_reply_source(mut self) -> Self {
+        if !self.has_gateway_process() {
+            return self;
+        }
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        if let Some(index) = self.host_udp_slot() {
+            self.scope
+                .0
+                .inner
+                .lock()
+                .host_process
+                .as_mut()
+                .expect("owned Host binding")
+                .udp
+                .release(index);
+        }
+        self.origin = SourceOrigin::Plain;
+        self
+    }
+
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub(in crate::control) fn admit_udp_process(
+        &mut self,
+        client: SocketAddr,
+        destination: SocketAddr,
+    ) -> io::Result<()> {
+        if !self.scope.is_auxiliary() {
+            return Ok(());
+        }
+        let mut inner = self.scope.0.inner.lock();
+        let closed_binding = inner.aborted || inner.closing;
+        let Some(binding) = &mut inner.host_process else {
+            return Ok(());
+        };
+        if closed_binding {
+            return Err(closed());
+        }
+        if let Some(index) = self.host_udp_slot() {
+            return if binding.udp.owns(index, client, destination) {
+                Ok(())
+            } else {
+                Err(invalid("gateway Host UDP input belongs to another tuple"))
+            };
+        }
+        if !matches!(self.origin, SourceOrigin::Plain) || self.context.is_some() {
+            return Err(invalid(
+                "gateway Host cannot replace an admitted packet source",
+            ));
+        }
+        let (index, process) = binding.udp_input(
+            self.scope.binding(),
+            client,
+            destination,
+            &self.scope.0.budget,
+        )?;
+        self.origin = SourceOrigin::Gateway {
+            process,
+            slot: Some(index),
+        };
+        Ok(())
+    }
+
     pub(super) fn plain(
         scope: &PacketScope,
         inner: &mut Inner,
         address: IpAddr,
     ) -> io::Result<Self> {
-        if inner.closing || inner.finished {
+        if inner.closing || inner.aborted || inner.finished {
             return Err(closed());
         }
         Ok(Self {
             index: inner.source_work.hold_address(address)?,
+            origin: SourceOrigin::Plain,
             scope: scope.clone(),
             context: None,
-            #[cfg(target_os = "linux")]
-            peer: None,
         })
     }
 
@@ -529,9 +711,8 @@ impl SourceWork {
         Ok(Self {
             scope: scope.clone(),
             index: sources.index(context).expect("retained source"),
+            origin: SourceOrigin::Plain,
             context: Some(context),
-            #[cfg(target_os = "linux")]
-            peer: None,
         })
     }
 
@@ -547,7 +728,7 @@ impl SourceWork {
     pub(in crate::control) fn source_mac(&self) -> Option<[u8; 6]> {
         #[cfg(target_os = "linux")]
         {
-            self.peer.as_ref().map(|peer| peer.original_path().mac)
+            self.peer().map(|peer| peer.original_path().mac)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -559,7 +740,7 @@ impl SourceWork {
             return None;
         }
         #[cfg(target_os = "linux")]
-        if let Some(peer) = &self.peer {
+        if let Some(peer) = self.peer() {
             return Some(peer.address());
         }
         let inner = self.scope.0.inner.lock();
@@ -568,6 +749,15 @@ impl SourceWork {
             SourceStorage::Host { .. } => None,
         }
     }
+    pub(in crate::control) fn packet_input(&self) -> Option<(ProcessMeta, Option<u32>)> {
+        self.gateway_process()
+            .map(|process| (*process, None))
+            .or_else(|| {
+                self.optional_facts()
+                    .map(|facts| (ProcessMeta::from_facts(&facts), Some(facts.skb_mark)))
+            })
+    }
+
     pub(in crate::control) fn optional_facts(&self) -> Option<HostSourceFacts> {
         self.context.map(|_| self.facts())
     }
@@ -580,12 +770,18 @@ impl SourceWork {
     }
     #[cfg(target_os = "linux")]
     pub(in crate::control) fn with_peer(mut self, peer: crate::xdp::worker::PeerHold) -> Self {
-        self.peer = Some(peer);
+        // A peer observation never supersedes previously admitted process or return authority.
+        if self.context.is_none() && matches!(self.origin, SourceOrigin::Plain) {
+            self.origin = SourceOrigin::Physical(peer);
+        }
         self
     }
     #[cfg(target_os = "linux")]
     pub(super) fn peer(&self) -> Option<&crate::xdp::worker::PeerHold> {
-        self.peer.as_ref()
+        match &self.origin {
+            SourceOrigin::Physical(peer) => Some(peer),
+            _ => None,
+        }
     }
     pub(in crate::control) fn context(&self) -> SourceContext {
         self.context.expect("Host source context")
@@ -605,6 +801,15 @@ impl SourceWork {
 impl Clone for SourceWork {
     fn clone(&self) -> Self {
         let mut inner = self.scope.0.inner.lock();
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        if let Some(index) = self.host_udp_slot() {
+            inner
+                .host_process
+                .as_mut()
+                .expect("owned Host binding")
+                .udp
+                .retain(index);
+        }
         if let Some(context) = self.context {
             inner
                 .source_work
@@ -617,8 +822,7 @@ impl Clone for SourceWork {
             scope: self.scope.clone(),
             index: self.index,
             context: self.context,
-            #[cfg(target_os = "linux")]
-            peer: self.peer.clone(),
+            origin: self.origin.clone(),
         }
     }
 }
@@ -627,6 +831,15 @@ impl Drop for SourceWork {
     fn drop(&mut self) {
         let device = {
             let mut inner = self.scope.0.inner.lock();
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            if let Some(index) = self.host_udp_slot() {
+                inner
+                    .host_process
+                    .as_mut()
+                    .expect("owned Host binding")
+                    .udp
+                    .release(index);
+            }
             let last = if let Some(context) = self.context {
                 let source = inner
                     .source_work
@@ -738,34 +951,7 @@ impl PacketScope {
                             pending,
                         )
                 });
-            if let honk_netstack::ReceiveOutcome::TcpNew(id) = report.outcome {
-                if let Some(index) = inner.slots.iter().position(Option::is_none) {
-                    let source = report.source.expect("new TCP has verified source");
-                    inner.slots[index] = Some(FlowSlot {
-                        id,
-                        client: source.src,
-                        destination: source.dst,
-                        app_open: true,
-                        close_pending: false,
-                        retiring: false,
-                        outputs: 0,
-                        rx: None,
-                        tx: None,
-                        callback: None,
-                        accepted: false,
-                        rx_admitted: false,
-                        routing: admission.take(),
-                        source: report.source_context,
-                    });
-                    inner.pending_routing += 1;
-                } else {
-                    inner
-                        .stack
-                        .as_mut()
-                        .expect("live scope")
-                        .tcp_refuse(id, honk_netstack::Refuse::Drop);
-                }
-            }
+            inner.register_tcp_new(&report, admission, None);
             let retained = if matches!(&rx, Rx::TransparentOwned { .. }) {
                 Some(SourceWork::retained(
                     self,
@@ -787,12 +973,24 @@ impl PacketScope {
         destination: SocketAddr,
         lineage: Option<NonZeroU64>,
     ) -> bool {
-        let inner = self.0.inner.lock();
-        inner
-            .stack
+        self.0
+            .inner
+            .lock()
+            .retains_tcp_with_lineage(source, destination, lineage)
+    }
+}
+
+impl Inner {
+    pub(super) fn retains_tcp_with_lineage(
+        &self,
+        source: SocketAddr,
+        destination: SocketAddr,
+        lineage: Option<NonZeroU64>,
+    ) -> bool {
+        self.stack
             .as_ref()
             .is_some_and(|stack| stack.retains_tcp_with_lineage(source, destination, lineage))
-            || inner.slots.iter().flatten().any(|slot| {
+            || self.slots.iter().flatten().any(|slot| {
                 slot.client == source
                     && slot.destination == destination
                     && slot.source.map(|source| source.lineage) == lineage

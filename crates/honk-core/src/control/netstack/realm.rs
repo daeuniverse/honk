@@ -169,6 +169,7 @@ impl PacketRealm {
     pub(crate) fn datagram_sender(&self, source: SocketAddr) -> DatagramSender {
         DatagramSender {
             scope: self.0.owners[0].clone(),
+            binding: self.0.owners[0].binding(),
             source,
             packet_source: None,
             realm: Some(self.clone()),
@@ -397,6 +398,7 @@ pub(super) fn capture_partition(
             workers,
             resources.clone(),
             physical,
+            None,
         )?;
         scopes.push(owner_scope);
         owners.push(owner);

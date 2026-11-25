@@ -22,6 +22,7 @@ pub(in crate::control) struct RoutingDecision {
 pub(in crate::control) struct PacketRoutingSnapshot {
     pub(in crate::control) source: Option<honk_netstack::SourceContext>,
     pub(in crate::control) source_mac: Option<String>,
+    pub(in crate::control) process: Option<crate::control::netstack::ProcessMeta>,
     pub(in crate::control) mode: super::handoff::ModeDecision,
     pub(in crate::control) mode_state: Option<crate::mode::ModeState>,
     pub(in crate::control) admission_final: bool,
@@ -139,22 +140,6 @@ pub(super) fn build_connection_info(
         mac: handoff.and_then(|ho| ho.mac_address()),
         dscp: handoff.map(|ho| ho.dscp),
     }
-}
-
-pub(super) fn packet_process_name(
-    facts: &honk_ebpf_common::host::HostSourceFacts,
-) -> Option<String> {
-    if facts.flags & honk_ebpf_common::host::HOST_PROCESS_PRESENT == 0 {
-        return None;
-    }
-    let end = facts
-        .pname
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(facts.pname.len());
-    let name = String::from_utf8_lossy(&facts.pname[..end]);
-    let name = name.trim();
-    (!name.is_empty()).then(|| name.to_owned())
 }
 
 impl ControlPlaneHandle {
@@ -299,14 +284,18 @@ impl ControlPlaneHandle {
         protocol: &'static str,
         dscp: u8,
         packet_source: Option<&crate::control::netstack::SourceWork>,
+        gateway_process: Option<crate::control::netstack::ProcessMeta>,
         #[cfg(feature = "native-api")] record_route: bool,
     ) -> anyhow::Result<PacketRoutingSnapshot> {
         let config = Arc::clone(&*self.config.read().await);
         let mut input = build_connection_info(None, destination, client, protocol, None);
         input.dscp = Some(dscp);
-        input.process_name = packet_source
-            .and_then(|source| source.optional_facts())
-            .and_then(|facts| packet_process_name(&facts));
+        let process = gateway_process.or_else(|| {
+            packet_source
+                .and_then(|source| source.packet_input())
+                .map(|(process, _)| process)
+        });
+        input.process_name = process.and_then(|process| process.name());
         #[cfg(target_os = "linux")]
         {
             input.mac = packet_source
@@ -364,6 +353,7 @@ impl ControlPlaneHandle {
         Ok(PacketRoutingSnapshot {
             source: packet_source.and_then(crate::control::netstack::SourceWork::optional_context),
             source_mac: input.mac,
+            process,
             mode,
             mode_state,
             admission_final: false,
@@ -396,6 +386,7 @@ impl ControlPlaneHandle {
         }
         let mut conn_info = conn_info.clone();
         conn_info.mac.clone_from(&snapshot.source_mac);
+        conn_info.process_name = snapshot.process.and_then(|process| process.name());
         snapshot.decision = self
             .prepare_routing(
                 dial_mode,
@@ -673,6 +664,7 @@ mod packet_mac_tests {
                     protocol,
                     0,
                     Some(&work),
+                    None,
                     #[cfg(feature = "native-api")]
                     false,
                 )

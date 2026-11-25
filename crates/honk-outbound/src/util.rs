@@ -39,6 +39,9 @@ pub fn bypass_mark() -> u32 {
 /// Set `SO_MARK`, tolerating permission denial only when the process mark is optional.
 #[cfg(target_os = "linux")]
 pub fn set_mark_best_effort(socket: &socket2::Socket, mark: u32) -> io::Result<()> {
+    if BYPASS_MARK.get().is_some_and(|&(_, required)| required) {
+        return set_mark_verified(socket, mark);
+    }
     set_mark_result_best_effort(socket.set_mark(mark))
 }
 

@@ -1,9 +1,6 @@
 //! Admit the running vmlinux/module BTF before emitting any TUN program.
-use crate::ebpf::real::btf::{self, Btf};
-use crate::xdp::host::{
-    kernel::{Leaf, field},
-    sys,
-};
+use super::sys;
+use crate::ebpf::real::btf::{self, Btf, Leaf, field};
 use anyhow::{Context as _, ensure};
 use honk_netstack::{MemoryBudget, MemoryReservation};
 use honk_xsk::{TunKernelOffsets, TunTraceTarget};
@@ -14,6 +11,14 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::sync::Arc;
 
 const BTF_LIMIT: usize = 256 << 20;
+
+pub(super) fn zero_monotonic_namespace() -> anyhow::Result<()> {
+    ensure!(
+        crate::xdp::timens::monotonic_namespace_offset()? == Some(0),
+        "Host requires zero current monotonic offset"
+    );
+    Ok(())
+}
 
 struct RawBtf {
     data: Vec<u8>,
@@ -440,6 +445,7 @@ fn prototype(btf: &Btf<'_>, function: usize, args: &[Argument], result: u32) -> 
     }
     Ok(())
 }
+
 fn void_pointer(btf: &Btf<'_>, root: &str, name: &str, void: bool) -> anyhow::Result<u32> {
     let owner = btf.find_type(4, root).context("TUN pointer owner")?;
     let info = btf.u32_at(owner + 4).context("TUN pointer owner fields")?;

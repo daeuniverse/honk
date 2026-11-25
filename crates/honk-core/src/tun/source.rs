@@ -2,23 +2,23 @@
 mod kernel;
 mod object;
 mod reader;
+mod receipt;
+mod sys;
 
 use crate::control::netstack::HostIngress;
 use crate::ebpf::PnameSupport;
-use crate::xdp::host::{
-    receipt::Receipt,
-    sys::{Cgroups, Grace},
-};
 use anyhow::{Context as _, ensure};
 use honk_config::Config;
 use honk_netstack::{MemoryBudget, MemoryReservation};
 use object::Object;
 use reader::Reader;
 pub(super) use reader::is_expired;
+use receipt::Receipt;
 use std::os::fd::{AsRawFd as _, RawFd};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use sys::{Cgroups, Grace};
 
 const SOURCE_BYTES: usize = 32 << 20;
 const LOADER_BYTES: usize = 32 << 20;
@@ -62,7 +62,7 @@ impl Source {
         budget: &Arc<MemoryBudget>,
         pin_root: &Path,
     ) -> anyhow::Result<Self> {
-        crate::xdp::host::kernel::zero_monotonic_namespace()?;
+        kernel::zero_monotonic_namespace()?;
         let memory = budget
             .reserve(SOURCE_BYTES)
             .context("TUN source persistent memory budget exhausted")?;

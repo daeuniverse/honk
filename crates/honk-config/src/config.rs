@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_path_to_error::{Deserializer as PathDeserializer, Segment, Track};
 
 use crate::ConfigDiagnostic;
+use crate::datapath::{Backend, REMOVED_HOST_XSK_MODE_CODE};
 use crate::dns::DnsConfig;
 use crate::experimental::ExperimentalConfig;
 use crate::group::Group;
@@ -442,6 +443,17 @@ impl Config {
     /// The built-in `block` node name.
     pub const BUILTIN_BLOCK_NODE: &'static str = "block";
 
+    /// Socket mark that must be set and read back for validated TUN or XDP Host.
+    pub fn required_socket_mark(&self) -> Option<u32> {
+        self.datapath
+            .as_ref()
+            .is_some_and(|datapath| {
+                datapath.backend == Backend::Tun
+                    || (datapath.backend == Backend::Xdp && datapath.host.is_some())
+            })
+            .then(|| self.global.effective_so_mark())
+    }
+
     /// Inject the built-in `direct`/`block` nodes unless the config already
     /// defines nodes with those names. Idempotent.
     ///
@@ -636,6 +648,9 @@ impl Config {
                     return Ok(config);
                 }
                 Err(error) => {
+                    if error.diagnostic.code == REMOVED_HOST_XSK_MODE_CODE {
+                        return Err(error);
+                    }
                     if index + 1 == formats.len() {
                         if error.diagnostic.entry_index.is_none()
                             && let Some(cause_index) =
@@ -837,12 +852,25 @@ impl Config {
         }
         let reserved = crate::routing::DATAPATH_RESERVED_MARK_MASK;
         // Transparent listeners carry the global mark; daens routes the TPROXY bit to local delivery.
-        if self.global.so_mark_from_dae & (reserved | DEFAULT_TPROXY_MARK) != 0 {
+        let host = self
+            .datapath
+            .as_ref()
+            .is_some_and(|datapath| datapath.host.is_some());
+        let mark = if host {
+            self.global.effective_so_mark()
+        } else {
+            self.global.so_mark_from_dae
+        };
+        if (host && mark == 0) || mark & (reserved | DEFAULT_TPROXY_MARK) != 0 {
             return Err(config_validation_error(
                 source,
                 SettingPath::new("global").field("so_mark_from_dae"),
                 "invalid-config-value",
-                "so_mark_from_dae overlaps datapath-reserved or TPROXY mark bits",
+                if host {
+                    "effective bypass mark must be nonzero and clear of datapath-reserved and TPROXY mark bits"
+                } else {
+                    "so_mark_from_dae overlaps datapath-reserved or TPROXY mark bits"
+                },
             ));
         }
         for (index, rule) in self.routing.rules.iter().enumerate() {
@@ -1236,7 +1264,11 @@ fn parse_structured(
                 diagnostic.line = location.line;
                 diagnostic.byte_column = location.byte_column;
                 return Err(DetailedConfigError {
-                    category: ErrorCategory::Validation,
+                    category: if diagnostic.code == REMOVED_HOST_XSK_MODE_CODE {
+                        ErrorCategory::Parse
+                    } else {
+                        ErrorCategory::Validation
+                    },
                     diagnostic: Box::new(diagnostic),
                 });
             }

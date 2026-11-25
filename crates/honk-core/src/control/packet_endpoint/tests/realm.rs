@@ -221,3 +221,77 @@ async fn exact_udp_source_refuses_another_worker_and_another_client() {
         owner.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn auxiliary_rebind_forgets_positive_and_negative_quic_decisions() {
+    use crate::control::packet_sniffer::{PacketSnifferKey, QuicSniffOutcome};
+    use crate::control::quic::test_utils::rfc9001_client_initial;
+
+    let budget = MemoryBudget::new(32 << 20);
+    let (scope, owner) = crate::control::netstack::auxiliary_scope(1500, &budget).unwrap();
+    let (plane, _health) = local_plane().await;
+    let pool = Arc::clone(&plane.sniffer_pool);
+    let (endpoints, mut supervisor, mut drivers) =
+        PacketEndpoints::start_driven(plane, vec![(scope.clone(), owner)], 2, None, ScopeId::HOST)
+            .await
+            .unwrap();
+    let driver = drivers.first_mut().unwrap();
+    std::future::poll_fn(|cx| {
+        driver.service(cx, Instant::now());
+        supervisor.poll_ready(cx)
+    })
+    .await
+    .unwrap();
+    endpoints.resume_auxiliary(driver, 1500).unwrap();
+    let work = scope.auxiliary_work().unwrap().unwrap();
+    let positive = PacketSnifferKey::new(
+        scope.scope(),
+        "192.0.2.1:40000".parse().unwrap(),
+        "192.0.2.9:443".parse().unwrap(),
+        None,
+    );
+    let negative = PacketSnifferKey {
+        src_port: 40001,
+        ..positive
+    };
+    let sibling = PacketSnifferKey {
+        scope: ScopeId::HOST,
+        ..positive
+    };
+    let sibling_failure = PacketSnifferKey {
+        scope: ScopeId::HOST,
+        ..negative
+    };
+    let hello = rfc9001_client_initial();
+    let example = QuicSniffOutcome::Domain("example.com".into());
+    {
+        let mut pause = std::pin::pin!(endpoints.pause_auxiliary(driver));
+        assert!(futures::poll!(&mut pause).is_pending());
+        // An initializer already inside sniffing may finish after the pause request.
+        for key in [positive, sibling] {
+            assert_eq!(pool.feed_quic_initial(key, &hello), example);
+        }
+        for key in [negative, sibling_failure] {
+            pool.mark_dcid_failed_decrypt(key);
+        }
+        drop(work);
+        pause.await.unwrap();
+    }
+    endpoints.resume_auxiliary(driver, 1280).unwrap();
+    assert_eq!(
+        pool.feed_quic_initial(positive, b"new data"),
+        QuicSniffOutcome::NotQuic
+    );
+    assert_eq!(pool.feed_quic_initial(negative, &hello), example);
+    assert_eq!(pool.feed_quic_initial(sibling, b"unchanged"), example);
+    assert!(pool.is_dcid_failed(&sibling_failure));
+
+    endpoints.close();
+    let (_, result) = std::future::poll_fn(|cx| {
+        driver.service(cx, Instant::now());
+        supervisor.poll_join_plane(cx)
+    })
+    .await
+    .unwrap();
+    result.unwrap();
+}

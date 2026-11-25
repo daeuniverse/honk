@@ -149,6 +149,15 @@ impl UdpTx {
         self.queue.iter().any(|pending| pending.dst == address)
     }
 
+    pub(crate) fn retains_tuple(&self, source: SocketAddr, destination: SocketAddr) -> bool {
+        self.queue.iter().any(|pending| {
+            pending.src == source.ip()
+                && pending.dst == destination.ip()
+                && pending.datagram[..2] == source.port().to_be_bytes()
+                && pending.datagram[2..4] == destination.port().to_be_bytes()
+        })
+    }
+
     pub(crate) fn retains_source_output_with_lineage(&self, lineage: std::num::NonZeroU64) -> bool {
         self.queue.iter().any(|pending| {
             pending

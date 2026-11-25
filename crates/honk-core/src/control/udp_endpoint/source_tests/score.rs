@@ -125,7 +125,7 @@ impl ScoreSourceFixture {
         (
             endpoint,
             owner,
-            super::super::run_endpoint_driver(context, initial, ack_tx),
+            super::super::run_endpoint_driver(context, initial, |result| drop(ack_tx.send(result))),
             ack_rx,
         )
     }

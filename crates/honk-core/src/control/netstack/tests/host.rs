@@ -20,6 +20,56 @@ fn facts(cookie: u64) -> HostSourceFacts {
 }
 
 #[tokio::test]
+async fn raw_tun_and_canonical_gateway_preserve_full_process_names() {
+    use honk_ebpf_common::host::HOST_PROCESS_PRESENT;
+    use honk_ebpf_common::{ROUTING_PROCESS_MAX_LEN, TASK_COMM_LEN};
+
+    let (scope, owner, _) = runtime(Instant::now());
+    scope.prepare_host().unwrap();
+    let replacements = "\u{fffd}".repeat(TASK_COMM_LEN);
+    assert_eq!(replacements.len(), ROUTING_PROCESS_MAX_LEN);
+    for (raw, expected) in [
+        ([0xff; TASK_COMM_LEN], replacements.as_str()),
+        (*b"abcdefghijkl\xff\xe7\x8c\xab", "abcdefghijkl�猫"),
+    ] {
+        let mut facts = facts(29);
+        facts.flags |= HOST_PROCESS_PRESENT;
+        facts.pid = 417;
+        facts.pname = raw;
+        let work = scope.hold_host_source(&facts).unwrap();
+        let (tun, mark) = work.packet_input().unwrap();
+        let shared = work.clone().into_shared_reply_source();
+        assert_eq!(shared.optional_facts(), Some(facts));
+        assert_eq!(shared.packet_input(), Some((tun, mark)));
+        assert_eq!(work.facts().pname, raw);
+        assert_eq!(mark, Some(facts.skb_mark));
+        let gateway = ProcessMeta::test_gateway(417, expected);
+        for metadata in [tun, gateway] {
+            assert_eq!(metadata.name().as_deref(), Some(expected));
+            assert_eq!(metadata.pid, 417);
+        }
+    }
+    owner.shutdown().await;
+}
+
+#[test]
+fn malformed_gateway_name_refuses_the_flow() {
+    use honk_ebpf_common::xdp_gateway::HostFlowMeta;
+
+    let mut meta = HostFlowMeta::default();
+    meta.pname[..3].copy_from_slice("猫".as_bytes());
+    for length in [1, 2, u8::MAX] {
+        meta.pname_len = length;
+        assert!(ProcessMeta::from_gateway(meta).is_err());
+    }
+    meta.pname_len = 3;
+    assert_eq!(
+        ProcessMeta::from_gateway(meta).unwrap().name().as_deref(),
+        Some("猫")
+    );
+}
+
+#[tokio::test]
 async fn host_retirement_keeps_exact_socket_work_without_a_transport_or_output() {
     let (scope, owner, _) = runtime(Instant::now());
     scope.prepare_host().unwrap();
@@ -66,6 +116,33 @@ fn udp_fragments(now: Instant) -> Vec<Vec<u8>> {
         packets.push(packet[..n].to_vec());
     }
     packets
+}
+
+#[test]
+fn host_retirement_keeps_only_matching_reassembly_and_unpulled_udp_replies() {
+    let now = Instant::now();
+    let client: SocketAddr = "192.0.2.1:40000".parse().unwrap();
+    let target: SocketAddr = "198.51.100.1:443".parse().unwrap();
+    let other = SocketAddr::new(client.ip(), client.port() + 1);
+    let mut stack = Stack::new(config(), now);
+    let fragments = udp_fragments(now);
+    stack.receive(now, &fragments[0]);
+    assert!(stack.retains_packet_obligation(client, target, wire::PROTO_UDP));
+    assert!(!stack.retains_packet_obligation(client, target, wire::PROTO_TCP));
+    assert!(!stack.retains_packet_obligation(target, client, wire::PROTO_UDP));
+    for fragment in &fragments[1..] {
+        stack.receive(now, fragment);
+    }
+    assert!(!stack.retains_packet_obligation(client, target, wire::PROTO_UDP));
+
+    let mut out = [0; 1280];
+    stack
+        .udp_send_from(target, client, &[42; 3000], &mut out)
+        .unwrap();
+    assert!(stack.retains_packet_obligation(client, target, wire::PROTO_UDP));
+    assert!(!stack.retains_packet_obligation(other, target, wire::PROTO_UDP));
+    while stack.poll_transmit(now, &mut out).is_some() {}
+    assert!(!stack.retains_packet_obligation(client, target, wire::PROTO_UDP));
 }
 
 #[test]

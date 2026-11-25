@@ -79,10 +79,7 @@ impl ControlPlane {
         );
         honk_outbound::util::init_dae_socket_mark(
             config.global.effective_so_mark(),
-            config
-                .datapath
-                .as_ref()
-                .is_some_and(|datapath| datapath.backend == honk_config::datapath::Backend::Tun),
+            config.required_socket_mark().is_some(),
         )?;
         let (tx, rx) = mpsc::channel(256);
         let effective_log_file = crate::resolved_log_file_path(&config, None);

@@ -39,6 +39,8 @@ pub use poll_budget::{PollBudgetBinding, PollBudgetPublisher, ProcessPollBudget}
 mod runtime;
 mod shutdown;
 mod task_registry;
+#[cfg(target_os = "linux")]
+pub(crate) use task_registry::TASK_BOOKKEEPING;
 #[cfg(test)]
 pub(crate) mod tests;
 #[cfg(test)]
@@ -109,6 +111,8 @@ pub(crate) use reload::restart_required_fields;
 use reload::*;
 pub(crate) use reload::{LogFiles, StartupDowngrades};
 pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
+#[cfg(target_os = "linux")]
+pub(crate) use sockets::probe_socket_marks;
 use sockets::*;
 #[cfg(all(test, feature = "native-api"))]
 pub(crate) use tests::reload_harness::ReloadBehavior;

@@ -1,6 +1,8 @@
-use honk_xsk::GatewayMaps;
+use honk_ebpf_common::xdp_gateway::GatewayKey;
+use honk_netstack::MemoryBudget;
+use honk_xsk::{GatewayArbitration, GatewayMaps};
 use std::io;
-use std::net::{IpAddr, Ipv6Addr};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) const HOLD_IDLE: Duration = Duration::from_secs(30);
@@ -20,13 +22,17 @@ impl HoldCollector {
         &mut self,
         maps: &GatewayMaps,
         now_ns: u64,
-        retains: &mut dyn FnMut(u32, IpAddr) -> bool,
+        lan_arbitration: Option<&GatewayArbitration>,
+        host_arbitration: Option<&GatewayArbitration>,
+        budget: &Arc<MemoryBudget>,
+        retains: &mut dyn FnMut(&GatewayKey) -> bool,
     ) -> io::Result<usize> {
-        maps.retire_if_unretained(now_ns, HOLD_IDLE, |key| {
-            retains(
-                key.realm_id,
-                IpAddr::V6(Ipv6Addr::from(key.src)).to_canonical(),
-            )
-        })
+        let mut removed =
+            maps.retire_if_unretained(now_ns, HOLD_IDLE, lan_arbitration, &mut *retains)?;
+        if let Some(arbitration) = host_arbitration {
+            removed += maps.retire_host_flows(now_ns, arbitration, budget, retains)?;
+            maps.request_host_drain(arbitration, now_ns)?;
+        }
+        Ok(removed)
     }
 }

@@ -569,6 +569,7 @@ pub(super) struct Shared {
     wake: [Arc<Notify>; 2],
     admission: Arc<AtomicBool>,
     relays: OnceLock<RelayOwners>,
+    pub(super) auxiliary: OnceLock<super::aux_tasks::AuxTasks>,
     closing: AtomicBool,
     peers: Arc<PeerAuthority>,
     pub(super) workers: u8,
@@ -600,6 +601,7 @@ impl Shared {
                 peers: PeerAuthority::new(Arc::clone(&admission)),
                 admission,
                 relays: OnceLock::new(),
+                auxiliary: OnceLock::new(),
                 closing: AtomicBool::new(false),
                 workers,
                 placements: OnceLock::new(),
@@ -797,7 +799,9 @@ impl Shared {
         shutdown.open_capture(&self.admission)?;
         state.activated = true;
         drop(state);
-        if let Err(error) = endpoints.capture_ready() {
+        if self.auxiliary.get().is_none()
+            && let Err(error) = endpoints.capture_ready()
+        {
             self.begin_close();
             return Err(error.into());
         }
@@ -1793,6 +1797,17 @@ async fn finish_coordinator(
                 });
             }
         }
+        if let Some(auxiliary) = workers.auxiliary.get() {
+            auxiliary.stop();
+            if let Err(aux) = auxiliary.join().await {
+                result.1 = Err(match result.1 {
+                    Ok(()) => aux,
+                    Err(error) => {
+                        error.context(format!("auxiliary TUN teardown also failed: {aux:#}"))
+                    }
+                });
+            }
+        }
         // The shared TCP parent holds its lease until it collects the actual owner task.
         workers.close_and_join_relays().await;
     }
@@ -1801,13 +1816,11 @@ async fn finish_coordinator(
 
 pub(super) async fn run_coordinator(
     plane: ControlPlane,
-    pin_root: &Path,
     admission: Arc<AtomicBool>,
     pname_support: crate::ebpf::PnameSupportCell,
 ) -> (Option<ControlPlane>, anyhow::Result<()>) {
     let shared_runtime = tokio::runtime::Handle::current();
     let shutdown = plane.shutdown_intent();
-    let pin_root = pin_root.to_owned();
     let (send, receive) = tokio::sync::oneshot::channel();
     let runtime_handle = shared_runtime.clone();
     let thread_admission = Arc::clone(&admission);
@@ -1835,7 +1848,6 @@ pub(super) async fn run_coordinator(
             let outcome = runtime.block_on(
                 std::panic::AssertUnwindSafe(super::run_capture(
                     plane,
-                    &pin_root,
                     thread_admission,
                     pname_support,
                     runtime_handle,

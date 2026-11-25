@@ -12,17 +12,17 @@ mod port;
 pub mod topology;
 
 pub use bpf::gateway::{
-    GatewayDnsMaps, GatewayLoad, GatewayMaps, HoldValue, gateway_dns_load_failure,
+    AuxReaderGrace, GatewayArbitration, GatewayDnsMaps, GatewayLoad, GatewayMaps, HoldValue,
+    gateway_dns_load_failure,
 };
 pub use bpf::{
-    Attachment, CaptureCounters, ConntrackKfuncs, OwnedXdpLink, PersistentAttachment,
-    ProgramQueueMaps, Programs, XdpState, kernel_memory_bytes, xdp_absent, xdp_state,
+    Attachment, AuxDevicePair, AuxGatewayProgram, AuxReturnLink, AuxTcxLink, AuxTunGuard,
+    CaptureCounters, ConntrackKfuncs, OwnedXdpLink, ProgramQueueMaps, Programs, SkbConntrackKfuncs,
+    XdpState, kernel_memory_bytes, xdp_absent, xdp_state,
 };
+pub use bpf::{HostConntrack, HostFifo, HostGatewayLoad};
 #[cfg(feature = "host")]
-pub use bpf::{
-    HostPrograms, HostSourceConfig, HostSourcePrograms, HostTcxAttachment, TunKernelOffsets,
-    TunMaps, TunProgramConfig, TunPrograms, TunTraceTarget,
-};
+pub use bpf::{TunKernelOffsets, TunMaps, TunProgramConfig, TunPrograms, TunTraceTarget};
 pub use capture::{Capture, DecodeError, DecodedPacket, GeneralCapture, Protocol, Reject};
 pub use port::{
     BindMode, FRAME_SIZE, MAX_SEGMENTS, Port, PortConfig, PortCounters, RetainedRxHandle,

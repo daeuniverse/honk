@@ -360,8 +360,7 @@ impl AdaptivePoll {
         self.config.revision
     }
 
-    #[cfg(test)]
-    pub(crate) fn notification(&self) -> OwnedNotified {
+    pub(in crate::xdp) fn notification(&self) -> OwnedNotified {
         self.publication.notification()
     }
 

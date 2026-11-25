@@ -343,6 +343,10 @@ pub(super) struct ReadyEndpoint {
     pub(super) memory: Option<Arc<super::budget::EntryMemory>>,
 }
 
+// Retiring is inline in every UDP table entry, not just entries with Host metadata.
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64"))]
+const _: () = assert!(size_of::<EndpointEntry>() <= 208);
+
 pub(super) enum EndpointEntry {
     Initializing(Arc<InitializingEndpoint>),
     Ready(Arc<ReadyEndpoint>),
@@ -487,6 +491,9 @@ impl UdpInitLease {
                 .native_terminal
                 .get_or_init(|| observation::NativeUdpTerminal::new(Arc::clone(&flow), false)),
         );
+        if !packet_binding_active(self.packet_source()) {
+            terminal.outcome(UdpTerminal::IntentionalRetirement);
+        }
         if let Some(mut entry) = self.pool.endpoints.get_mut(&self.key) {
             if let EndpointEntry::Retiring {
                 generation,
@@ -675,6 +682,14 @@ impl UdpInitLease {
         };
         let _epoch_gate = self.pool.initialization_epoch.lock();
         if self.pool.terminal.load(Ordering::Acquire) || self.initializer.epoch != *_epoch_gate {
+            return false;
+        }
+        if !packet_binding_active(self.packet_source()) {
+            // The peer's scope can close before its pool retirement reaches this entry.
+            #[cfg(feature = "native-api")]
+            if let Some(terminal) = self.initializer.native_terminal.get() {
+                terminal.outcome(UdpTerminal::IntentionalRetirement);
+            }
             return false;
         }
         let initializing = match occupied.get() {
@@ -1012,11 +1027,29 @@ impl UdpEndpointPool {
                 return EndpointReservation::QueueFull;
             }
         };
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        let packet_source = {
+            let mut packet_source = packet_source;
+            if let Some(source) = &mut packet_source {
+                let key = vacant.key();
+                if let Err(error) = source.admit_udp_process(
+                    SocketAddr::new(key.client_ip(), key.client_port),
+                    SocketAddr::new(key.dst_ip(), key.dst_port),
+                ) {
+                    tracing::debug!(%error, "gateway Host UDP admission refused");
+                    return EndpointReservation::IdentityMismatch;
+                }
+            }
+            packet_source
+        };
         let raw_dns_route = raw_dns_route.map(RawDnsRoute::into_owned);
         let (queue_tx, queue_rx) = mpsc::channel(FLOW_QUEUE_CAPACITY);
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let epoch_gate = self.initialization_epoch.lock();
-        if self.terminal.load(Ordering::Acquire) || reservation_epoch != *epoch_gate {
+        if self.terminal.load(Ordering::Acquire)
+            || reservation_epoch != *epoch_gate
+            || !packet_binding_active(packet_source.as_ref())
+        {
             stats.record_udp_queue_closed();
             return EndpointReservation::QueueClosed;
         }
@@ -1160,6 +1193,10 @@ impl UdpEndpointPool {
             }
             match self.endpoints.entry(key) {
                 dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                    if !packet_binding_active(packet_source.as_ref()) {
+                        stats.record_udp_queue_closed();
+                        return EndpointReservation::QueueClosed;
+                    }
                     let (stale_token, stale_generation) = match occupied.get() {
                         EndpointEntry::Initializing(initializing) => {
                             if initializing.owner != owner
@@ -1519,6 +1556,7 @@ impl UdpEndpointPool {
             stats,
             packet_lineage,
             None,
+            None,
         )
         .map(|(reservation, _)| reservation)
     }
@@ -1535,6 +1573,7 @@ impl UdpEndpointPool {
         stats: &StatsManager,
         packet_lineage: Option<NonZeroU64>,
         initializing_epoch: Option<u64>,
+        auxiliary: Option<&AuxiliaryWork>,
     ) -> Option<(EndpointReservation, bool)> {
         if self.terminal.load(Ordering::Acquire) {
             stats.record_udp_queue_closed();
@@ -1542,6 +1581,10 @@ impl UdpEndpointPool {
         }
         let key = EndpointKey::new(scope, client, dst, packet_lineage);
         let entry = self.endpoints.get(&key)?;
+        if auxiliary.is_some_and(|work| !work.is_active()) {
+            stats.record_udp_queue_closed();
+            return Some((EndpointReservation::QueueClosed, false));
+        }
         let ready = matches!(entry.value(), EndpointEntry::Ready(_));
         let (result, identity) = match entry.value() {
             EndpointEntry::Initializing(initializing) => {

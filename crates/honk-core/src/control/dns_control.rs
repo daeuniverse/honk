@@ -7,6 +7,7 @@
 
 #[cfg(test)]
 use crate::dns::forwarder::DnsForwarder;
+use crate::dns::projection::QueryScope;
 use crate::ebpf::PolicyBackend;
 #[cfg(test)]
 use crate::routing::Router;
@@ -20,7 +21,7 @@ use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError};
 use tracing::warn;
 
 mod transport;
-pub(in crate::control) use transport::DnsUdpReply;
+pub(in crate::control) use transport::{DnsUdpReply, PacketDnsScopeRetired};
 
 #[cfg(test)]
 mod tests;
@@ -77,7 +78,7 @@ pub(crate) struct AdmittedDnsQuery {
     runtime: crate::dns::runtime::RuntimeLease,
     _query_permit: OwnedSemaphorePermit,
     _udp_permit: Option<OwnedSemaphorePermit>,
-    projection_scope: ScopeId,
+    projection_scope: QueryScope,
 }
 
 pub(crate) struct DnsAdmissionError {
@@ -92,6 +93,13 @@ impl std::fmt::Debug for DnsAdmissionError {
 }
 
 impl DnsAdmissionError {
+    fn closed() -> Self {
+        Self {
+            error: TryAcquireError::Closed,
+            udp_reply: None,
+        }
+    }
+
     pub(crate) async fn run_reply<T>(
         &self,
         operation: impl Future<Output = T>,
@@ -269,6 +277,7 @@ impl DnsController {
         let _ = facts;
     }
 
+    #[cfg(test)]
     fn owns_packet_scope(&self, scope: ScopeId) -> bool {
         self.routing_projection.owns_packet_scope(scope)
     }
@@ -283,9 +292,32 @@ impl DnsController {
         self.dns_service.cache()
     }
 
+    pub(in crate::control) fn query_scope(&self, scope: ScopeId) -> Option<QueryScope> {
+        if scope == ScopeId::HOST {
+            Some(QueryScope::HOST)
+        } else {
+            self.routing_projection.packet_query_scope(scope)
+        }
+    }
+
+    pub(super) fn listener_query_scopes(
+        &self,
+        standalone: ScopeId,
+    ) -> (Option<QueryScope>, Option<QueryScope>) {
+        self.routing_projection.listener_query_scopes(standalone)
+    }
+
     /// Acquire a generation-pinned query admission. The runtime lease and
     /// permits remain owned by the caller through response I/O.
     pub(crate) fn try_admit_query(&self, udp: bool) -> Result<AdmittedDnsQuery, DnsAdmissionError> {
+        self.admit_query_in(udp, QueryScope::HOST)
+    }
+
+    fn admit_query_in(
+        &self,
+        udp: bool,
+        projection_scope: QueryScope,
+    ) -> Result<AdmittedDnsQuery, DnsAdmissionError> {
         let runtime = self
             .dns_service
             .try_acquire_runtime()
@@ -318,7 +350,7 @@ impl DnsController {
             runtime,
             _query_permit: query_permit,
             _udp_permit: udp_permit,
-            projection_scope: ScopeId::HOST,
+            projection_scope,
         })
     }
 
@@ -327,16 +359,25 @@ impl DnsController {
         udp: bool,
         scope: ScopeId,
     ) -> Result<AdmittedDnsQuery, DnsAdmissionError> {
-        if !self.owns_packet_scope(scope) {
-            return Err(DnsAdmissionError {
-                error: TryAcquireError::Closed,
-                udp_reply: None,
-            });
-        }
-        self.try_admit_query(udp).map(|mut query| {
-            query.projection_scope = scope;
-            query
-        })
+        let scope = self
+            .routing_projection
+            .packet_query_scope(scope)
+            .ok_or_else(DnsAdmissionError::closed)?;
+        self.admit_query_in(udp, scope)
+    }
+
+    pub(in crate::control) fn try_admit_bound_query(
+        &self,
+        udp: bool,
+        scope: Option<QueryScope>,
+    ) -> Result<AdmittedDnsQuery, DnsAdmissionError> {
+        // Losing the Host activity stamp withdraws listener facts while its socket stays live.
+        let scope = scope
+            .filter(|scope| {
+                scope.is_host_listener() || self.routing_projection.query_scope_is_current(*scope)
+            })
+            .ok_or_else(DnsAdmissionError::closed)?;
+        self.admit_query_in(udp, scope)
     }
 
     /// Resolve and project one generation-pinned DNS query.
@@ -419,7 +460,7 @@ impl DnsController {
     async fn project_answer(
         &self,
         lease: &crate::dns::runtime::RuntimeLease,
-        scope: ScopeId,
+        scope: QueryScope,
         outcome: crate::dns::outcome::DnsOutcome,
     ) -> Result<DnsClientAnswer, crate::dns::runtime::RuntimeCancelled> {
         let observed_at = tokio::time::Instant::now();
@@ -459,7 +500,7 @@ impl DnsController {
     fn try_submit_projection(
         &self,
         runtime: &crate::dns::runtime::DnsRuntime,
-        scope: ScopeId,
+        scope: QueryScope,
         outcome: &crate::dns::outcome::DnsOutcome,
         observed_at: tokio::time::Instant,
     ) -> bool {

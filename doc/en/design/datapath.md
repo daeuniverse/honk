@@ -218,23 +218,29 @@ L2 group addresses cannot grant unicast IP a native socket exemption. Existing
 native ARP/ND and IP special-address handling remains; directed broadcasts come
 from at most 64 exact local-table `RTN_BROADCAST` routes, never suffix guesses.
 
-Physical capture defaults to forced ZeroCopy; `xsk_mode: copy` requests Copy and `xsk_mode: auto` selects per member using advertised capabilities and required segments. Auto does not retry Copy after a selected ZeroCopy bind fails. Every bind is read back; mode changes require restart. The private Host queue remains Copy.
+Physical capture defaults to forced ZeroCopy; `xsk_mode: copy` requests Copy and `xsk_mode: auto` selects per member using advertised capabilities and required segments. Auto does not retry Copy after a selected ZeroCopy bind fails. Every bind is read back; mode changes require restart. Host has no AF_XDP queue.
 
-Read-only startup admission collects up to 256 issues, reporting omitted counts and `NOT_CHECKED` for checks whose prerequisites failed. It checks capture layout, queues, device capabilities, foreign XDP, topology, memory, and, for Endpoint, zone-0 CT and uplink prerequisites. Only after admission does it prepare VLAN features, load programs, create FD-owned links and bind queues; supervisor readiness and topology validation precede activation. Failure unwinds previously created links, including failure on a later queue. Physical Endpoint/Core links and programs are not pinned; foreign XDP is refused. Process exit or SIGKILL closes link FDs and restores kernel forwarding, although existing proxy sessions may need to reconnect. Host retains its separate persistent custody.
+Read-only startup admission collects up to 256 issues, reporting omitted counts and `NOT_CHECKED` for checks whose prerequisites failed. It checks capture layout, queues, device capabilities, foreign XDP, topology, memory, and, for Endpoint, zone-0 CT and uplink prerequisites. Only after admission does it prepare VLAN features, load programs, create FD-owned links and bind queues; supervisor readiness and topology validation precede activation. Failure unwinds previously created links, including failure on a later queue. Physical Endpoint/Core links and programs are not pinned; foreign XDP is refused. Process exit or SIGKILL closes link FDs and restores kernel forwarding, although existing proxy sessions may need to reconnect. Host egress has its own FD-owned TCX binding.
 
 The physical coordinator drains RTNL notifications on readiness. A Core turn that can send cached traffic from RX queue zero still performs the full check before consuming that input. On a quiet link the coordinator schedules an identity read of each owned link FD after one second, independently of Core policy readers. This check detects a lost or replaced attachment; it does not query other XDP modes or take a fresh topology snapshot. Each live RTNL watcher charges its own 64 KiB receive buffer, including the overlap during final startup admission.
+
+When Linux marks a topology dump with `NLM_F_DUMP_INTR`, honk discards the partial snapshot and restarts the full read on a fresh dump socket in the same network namespace. XDP and TUN topology reads allow up to eight attempts within one two-second deadline. If all attempts are interrupted, admission fails closed. Invalid topology and lost watch notifications retain their existing failure handling.
 
 On stop, honk freezes physical workers and withdraws the XSK map entries. From entry to capture close, policy withdrawal, physical TX completion and the second worker's acknowledgement share one 100 ms wait budget. Only TX with outstanding descriptors may request a wakeup. Timeout or device error still triggers a detach attempt and fails shutdown; neither is a completion. After detach, physical queues only reap real CQ entries. The budget does not bound an in-flight syscall or wall-clock time from SIGTERM to kernel forwarding.
 
 With no VLAN upper, honk disables the two RX VLAN stripping features it changes and restores them on normal stop or startup failure. SIGKILL leaves them off; the kernel handles VLAN in software. An identity-loss failure abandons restoration because the device may have been replaced. Veth still requires VLAN metadata.
 
-Endpoint classification follows local non-53, Endpoint hold, zone-0 conntrack, fragment verdict, D1 and XSK. Hold precedes CT; CT lookup contract errors drop the packet and cause fatal shutdown. TCP reaches D1 only on a pure SYN; a non-SYN miss goes to the kernel. UDP evaluates D1 per hold/CT miss. Non-TCP/UDP normally passes; ICMP errors inspect the quoted flow. Unclassifiable transport headers drop. First-fragment verdicts last 30 seconds; a later fragment arriving before the first has no verdict and is dropped.
+Local non-53 traffic goes to the kernel before the hold lookup; local port 53 still follows policy. Endpoint hold takes precedence over zone-0 conntrack. For a DNS-native pending hold, confirmed CT takes over; without CT, a repeated SYN or complete UDP datagram must qualify again. The pending hold alone cannot authorize delivery. Without a hold or CT match, TCP reaches D1 only on a pure SYN; a non-SYN miss goes to the kernel. A true UDP first fragment cannot acquire or renew DNS-native ownership. Non-TCP/UDP normally passes; ICMP errors inspect the quoted flow. Unclassifiable transport headers drop. A later fragment follows a cached first-fragment verdict for up to 30 seconds; if no verdict is available it drops. See [gateway DNS routing](../reference/global.md#xdp-endpoint-dns-projection).
 
-Only zone 0 is supported: startup refuses nonzero or unprovable nft and legacy zones. Runtime watches nft changes and fails on unsafe zone state; legacy zone changes are not monitored, so stop honk before changing them and restart afterward.
+Only zone 0 is supported. Startup refuses nonzero or unprovable nft and legacy zones. Unsafe runtime nft zone state or a CT lookup contract error remains fatal. A periodic legacy raw-table scan can disable DNS-derived forwarding but does not establish full runtime legacy zone admission. Stop honk before changing legacy zones and restart afterward.
 
 An admitted 802.3ad bond is one logical realm, with XDP on its physical Ethernet or veth members; other bond modes and unsupported hash policies are refused. A peer can move between members of that realm; already exported output keeps its original member. Multi-member realms use CPU output rather than generated output, a performance cost; a single-member bond may use generated output. Realm workers are limited by the smallest member queue count. Captured identity changes, a new bond member, ENOBUFS or `Desynchronized` are fatal; carrier, LACP state, statistics and unrelated device changes are ignored. Address updates refresh the local set; the published map remains until successful resynchronization, and failure is fatal. Interrupted FIB dumps are retried within three synchronization rounds.
 
 Kernel map/program memory is charged alongside UMEM to the shared 384 MiB capture budget; reload temporarily charges old and new generations. See [reload limitations](./control-plane.md#reload-and-runtime-generations).
+
+A configured [auxiliary L3 LAN](../reference/global.md#auxiliary-l3-lan) enters this policy at TCX ingress without a MAC fact. Native decisions continue the kernel chain; Endpoint redirects go to the binding's exclusive, unnumbered TUN. The TCX program uses its own per-CPU scratch and skb conntrack lookup. It bounds header reads by both the declared IP extent and the linear skb extent, pulling only missing header bytes. ICMP errors with a known Endpoint owner reach the Stack for quote validation; an unresolved transport quote does not create an owner.
+
+The shared-runtime TUN task owns the reads, writes and packet driver; it does not service a physical AF_XDP queue. Both directions check the binding's device pair, so a reused numeric ifindex is not permission to redirect. A device-owned terminal drop on the private TUN remains effective if its FD-owned return program disappears first. Replacement unregisters the old TUN and retires that binding's packet work and DNS permissions before admitting a new one. A successful `writev` is not evidence that the old kernel backlog was empty. Reload replaces physical and active auxiliary links in order, with reverse-order rollback; Linux does not change all links at a single packet boundary.
 
 SG/multi-buffer capability advertisement and successful binding are not runtime
 proof of jumbo traffic. The manual veth smoke exercises MTU 1500 and 9000 in Copy
@@ -312,74 +318,17 @@ DMA-release result. Existing Copy and virtio Event profiles remain separate.
 
 ### Host source custody
 
-The explicit [Host block](../reference/global.md#xdp-host-endpoint) adds ordinary
-Host TCP/UDP Endpoint capture, alone or beside physical Transit capture. Both use
-global `direct: endpoint`; Host cannot be combined with Core Direct. Host requires
-the `ebpf` build feature, active `bpf` in the kernel LSM list and the mandatory
-`sk_free_security` link, running-kernel BTF with admitted socket/skb layout and
-visible `sock_wfree`, and x86-64 little endian. Current, worker and children time
-namespaces must agree with zero MONOTONIC offset. Root cgroup2 create/connect/
-sendmsg and egress-selector hooks must remain the exact effective hooks throughout
-the inspected descendant tree; foreign competing hooks refuse startup. An identity
-canary must observe actual socket creation and final retirement.
+Host TCX egress applies after normal route selection and POSTROUTING. Forwarded packets and honk's exact bypass mark pass untouched. A service reply exemption requires tracked **reply** information from this skb and the same zone-zero conntrack object: finding a reverse tuple, or an existing ORIGINAL entry, cannot grant the exemption. Unsupported link frames, non-transport traffic, DHCP, special destinations and local non-53 traffic keep their kernel paths.
 
-Host Endpoint carries a fixed 96 MiB charge within the shared 384 MiB capture budget.
+New local flows use the ordered gateway policy. Five FD-owned cgroup hooks record the first available process identity in non-cloned socket storage (argv0, or thread name when unavailable). Only TCP uses a second socket-storage value for its connection decision; disconnect/reconnect is a new decision. UDP ownership is per tuple, never socket-wide. Endpoints keep their original egress, binding incarnation and flow ownership through retirement. New-flow process metadata is checked against the hold; it is not a per-packet source receipt and cannot resume a past syscall. `backend: tun` HostFacts remain separate. A shared UDP receiver keeps the binding and address, not the first target’s process. This does not erase a physical reply path or authenticated TUN source facts.
 
-`HostCapture` prepares its owned private namespace/veth pair, source TCX capture,
-private XDP/AF_XDP queue and return TCX path with capture closed. The private queue
-always uses verified Copy, independently of physical binding mode. Admission checks
-the actual owned XSK/namespace, ready Endpoint consumer, complete source/child
-custody and reader grace before opening the one-shot gate. The journal at
-`data_dir/state/host-<source-netns-cookie>.json` records mutation intent before
-ACK/readback, with pins under `<bpf-pin-root>/host-<cookie>/`. An existing receipt
-refuses restart; resources are never automatically adopted.
+Proved Direct stays native. Only if the hold table is actually full may a new UDP packet **already proved Direct** pass unrecorded; its next packet is evaluated again. Same-key contention, an unknown decision, and missing Endpoint capacity do not authorize Direct. The 8,192-entry process metadata table is not a quota on Direct. The LAN's 8,192 native-pending credits are separate. A separate 8,192-row table records native TCP ownership, including control packets without a full socket. Exhausting the 65,536-row Host UDP/Endpoint table does not exhaust TCP Direct or physical/L3 LAN holds. Exhausting the TCP Direct table can refuse a new native SYN; it cannot send an unrecorded SYN.
 
-Custody covers the whole source namespace, not just listed Host interfaces. Only
-plain Ethernet and loopback plus the exact owned private pair are admitted.
-Ordinary operator veths are currently refused, as are mastered/stacked/lower/tunnel
-links, route encapsulation, foreign XDP/TCX or legacy TC filters/actions, XFRM state
-or policy and nftables tables. Even dormant nftables tables refuse admission.
-Missing, malformed, lost or over-limit inventory evidence fails closed.
+Host Endpoint records use a private single-queue TUN for each egress. A new packet after an idle connection is not a late packet. The driver rejects a redirected packet delayed **more than 30 seconds** before entering the private FIFO; the internal timestamp is not IP payload. Idle collection waits for a sampled kernel-reader grace period and the sole reader's drain of earlier records, and checks protocol, application and outstanding output before reusing a row. A TUN write or a timer alone is not a drain receipt. No packet is replayed on a different egress.
 
-The sole nonempty netfilter exception is the kernel-origin built-in
-`apparmor_ip_postroute` record for IPv4/IPv6 POSTROUTING, with active AppArmor,
-exact family/hook and priority -225, and at most one record per applicable family.
-Native NFNL metadata derives the symbol from the registered callback pointer;
-device, module and NFT/BPF chain descriptors, duplicate/missing/unknown/flagged
-attributes and malformed records are refused. All other hooks, NAT/transforms,
-QUEUE and reinjection compositions remain refused. This relies on trusted stock
-kernel symbolization: `%ps` omits offsets and supplies no code attestation.
+An external link is FD-owned. A return enters the original live interface at ingress, with the checked local MAC on Ethernet. Closing a binding revokes both redirects and its outstanding work before replacement; an unplugged device or reused ifindex cannot acquire an old return. The terminal device guard lives only on the exclusive private TUN until that device disappears. There is no Host XSK, pinned external program, persistent Host receipt or fallback to TC/NFQUEUE. Native firewall, routing, NAT and strict reverse-path checks still decide what injected packets can reach; their presence alone proves neither success nor failure.
 
-Ordinary AppArmor POSTROUTING processing remains before source TCX capture;
-denials retain their encoded error and never become successful captures.
-Generated replies remain new packets entering ordinary Linux ingress and security
-processing, without reconstructing the original socket label/secmark or promising
-an identical AppArmor permission decision.
-
-Cold namespace entry prepares snapshots and namespace-bound netlink sockets;
-later custody queries use those retained sockets. Both namespace inventories
-retain actual hook counts and complete native records; full inventory comparisons
-reject additions, removals and identity/priority drift. Detected topology, hook or
-offload invalidation closes capture. Fast checks without RTNL activity may skip
-netfilter queries. The owner contract excludes concurrent privileged topology/hook
-or code replacement; notification delivery is not an atomic mutation fence.
-
-Authenticated source receipts bind namespace, attachment, socket and operation
-incarnation, process presence and original output/return identity before Stack
-import. No tuple guess grants Host identity. Ordinary Direct creates a new marked
-outbound; generated replies enter normal Linux demultiplexing through the admitted
-interface, without selecting a recipient FD or resuming the original socket
-operation.
-
-Close fences new capture with the gate, source/private guards and reader grace,
-then joins Endpoint output/CQ work. Confirmed stop with selected external socket
-owners records `guarded-retained` and keeps custody, hooks, pins and receipt: this
-is a completed guarded stop, not full resource removal. With no such owners,
-confirmed teardown removes the owned pair, pins/hooks and receipt. Crash or
-ambiguous/failed cleanup retains custody without claiming completed cleanup.
-Neither FD close nor resource removal refunds retained kernel/UMEM charges before
-process exit. XDP Host itself grants no TUN capability and does not establish
-physical or 13-size acceptance.
+Closed Host bindings retire in FIFO order. The head removes its gate and device map entries without holding either the capture registry or binding lock. An error keeps the original device pair and its budget; that realm cannot rebind until its rows have been swept.
 
 ### Physical capture and smoke
 

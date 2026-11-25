@@ -10,7 +10,6 @@ use aya_ebpf_bindings::helpers::{
     bpf_get_netns_cookie, bpf_get_socket_cookie, bpf_spin_lock, bpf_spin_unlock,
 };
 use core::{
-    mem::MaybeUninit,
     ptr,
     sync::atomic::{Ordering, compiler_fence},
 };
@@ -192,25 +191,6 @@ fn register_birth(cookie: u64, address: u64) {
             gate.write_volatile(0);
         }
     }
-}
-
-#[inline(always)]
-pub(crate) fn lookup(cookie: u64, address: u64) -> Option<HostSocketEntry> {
-    if cookie == 0 || address == 0 {
-        return None;
-    }
-    let (bucket, lock, _) = bucket(cookie)?;
-    let mut snapshot = MaybeUninit::<HostSocketEntry>::uninit();
-    let found = unsafe {
-        bpf_spin_lock(&raw mut (*lock).lock);
-        let (entry, _) = positions(bucket, cookie, address);
-        if !entry.is_null() {
-            copy_entry(snapshot.as_mut_ptr(), entry);
-        }
-        bpf_spin_unlock(&raw mut (*lock).lock);
-        !entry.is_null()
-    };
-    found.then(|| unsafe { snapshot.assume_init() })
 }
 
 #[inline(always)]

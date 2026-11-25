@@ -1,23 +1,21 @@
 //! One Linux capture owner for every selected RX queue and one routing domain.
 //! Physical links are owned by FDs: exit detaches them and the kernel resumes forwarding; UMEM stays until exit.
 
+mod aux_tasks;
 pub(crate) mod gateway;
 #[cfg(feature = "ebpf")]
-pub(crate) mod host;
-#[cfg(feature = "ebpf")]
-mod host_runtime;
+mod host_identity;
 pub(crate) mod polling;
 pub(crate) mod routing_input;
+mod tcx_aux;
 pub(crate) mod timens;
 mod topology;
 pub(crate) mod worker;
 use crate::control::poll_budget::BusyInterval;
-#[cfg(feature = "ebpf")]
-use host_runtime::{HostRuntime, PreparedHost};
 use polling::runtime::polling_segment_stop;
 use polling::{AdaptivePoll, ContextDigest};
 
-#[cfg(all(target_os = "linux", any(test, feature = "ebpf")))]
+#[cfg(test)]
 use crate::control::netstack::capture_scope;
 use crate::control::{
     ControlPlane,
@@ -63,7 +61,6 @@ use std::{
     io,
     net::IpAddr,
     os::fd::{AsFd, AsRawFd},
-    path::Path,
     pin::Pin,
     sync::{
         Arc,
@@ -364,41 +361,30 @@ struct PressureCounters {
     capture_rejected: u64,
 }
 
-fn diagnostics(
-    devices: &[Device],
-    budget: &Arc<MemoryBudget>,
-    host: Option<QueueObservation>,
-) -> io::Result<Arc<Diagnostics>> {
+fn diagnostics(devices: &[Device], budget: &Arc<MemoryBudget>) -> io::Result<Arc<Diagnostics>> {
     Diagnostics::new(
         budget,
-        devices
-            .iter()
-            .map(|device| device.queues.len())
-            .sum::<usize>()
-            + usize::from(host.is_some()),
-        devices
-            .iter()
-            .flat_map(|device| {
-                device.queues.iter().map(|queue| QueueObservation {
-                    namespace: device.capture.authority.namespace_cookie,
-                    attachment: device.capture.authority.attachment_generation,
-                    ifindex: device.info.ifindex,
-                    queue: queue.id,
-                    zero_copy: queue.io.get_ref().zerocopy(),
-                    ring_capacity: device.port_config.ring_size,
-                    rx_frames: device.port_config.rx_frames,
-                    control_frames: device.port_config.control_frames,
-                    bulk_frames: device.port_config.bulk_frames,
-                    sequence: 0,
-                    attempted_at: None,
-                    succeeded_at: None,
-                    socket: None,
-                    errno: None,
-                    read_errors: 0,
-                    rings: None,
-                })
+        devices.iter().map(|device| device.queues.len()).sum(),
+        devices.iter().flat_map(|device| {
+            device.queues.iter().map(|queue| QueueObservation {
+                namespace: device.capture.authority.namespace_cookie,
+                attachment: device.capture.authority.attachment_generation,
+                ifindex: device.info.ifindex,
+                queue: queue.id,
+                zero_copy: queue.io.get_ref().zerocopy(),
+                ring_capacity: device.port_config.ring_size,
+                rx_frames: device.port_config.rx_frames,
+                control_frames: device.port_config.control_frames,
+                bulk_frames: device.port_config.bulk_frames,
+                sequence: 0,
+                attempted_at: None,
+                succeeded_at: None,
+                socket: None,
+                errno: None,
+                read_errors: 0,
+                rings: None,
             })
-            .chain(host),
+        }),
     )
 }
 
@@ -844,8 +830,6 @@ struct Runtime {
     _kernel_memory: Vec<MemoryReservation>,
     hold_collector: HoldCollector,
     realm_scopes: std::collections::HashMap<u32, ScopeId>,
-    #[cfg(feature = "ebpf")]
-    host: Option<HostRuntime>,
     admission: Arc<AtomicBool>,
     pname_support: crate::ebpf::PnameSupportCell,
     realms: Vec<Realm>,
@@ -957,15 +941,27 @@ impl Runtime {
         Ok(())
     }
 
+    fn revalidate_gateway_zones(&mut self) -> io::Result<()> {
+        let Some(zones) = &mut self.zones else {
+            return Ok(());
+        };
+        let result = zones.revalidate(&self.polling_budget);
+        // A notification can supply evidence before a hard inventory failure.
+        if zones.notrack_seen()
+            && let Some(publisher) = &self.gateway
+        {
+            publisher.latch_notrack();
+        }
+        result
+    }
+
     fn maintain_gateway(&mut self, now: Instant) -> anyhow::Result<()> {
         if self.gateway_maps.is_none()
             || now.duration_since(self.core_maintenance_checked) < Duration::from_secs(1)
         {
             return Ok(());
         }
-        if let Some(zones) = &mut self.zones {
-            zones.revalidate(&self.polling_budget)?;
-        }
+        self.revalidate_gateway_zones()?;
         self.refresh_local_addresses()?;
         let mut clock = std::mem::MaybeUninit::<libc::timespec>::uninit();
         // SAFETY: clock_gettime initializes one timespec on success.
@@ -983,17 +979,34 @@ impl Runtime {
                 maps.lookup_errors()? == 0,
                 "conntrack lookup contract failure"
             );
-            let scopes = &self.realm_scopes;
-            let endpoints = &self.endpoints;
-            self.hold_collector
-                .sweep(maps, now_ns, &mut |realm, source| {
-                    scopes
-                        .get(&realm)
-                        .is_none_or(|scope| endpoints.retains_source(*scope, source))
-                })?;
         }
         if let Some(publisher) = &self.gateway {
-            publisher.sample_dns();
+            let scopes = &self.realm_scopes;
+            let endpoints = &self.endpoints;
+            publisher.maintain_holds(&mut self.hold_collector, now_ns, &mut |key| {
+                let Some(&scope) = scopes.get(&key.realm_id) else {
+                    return true;
+                };
+                let source = IpAddr::V6(key.src.into()).to_canonical();
+                #[cfg(feature = "ebpf")]
+                if self
+                    .gateway_maps
+                    .as_ref()
+                    .is_some_and(|m| m.host_realms().contains(&key.realm_id))
+                {
+                    return endpoints.retains_host_flow(
+                        scope,
+                        (source, u16::from_be(key.sport)).into(),
+                        (
+                            IpAddr::V6(key.dst.into()).to_canonical(),
+                            u16::from_be(key.dport),
+                        )
+                            .into(),
+                        key.proto,
+                    );
+                }
+                endpoints.retains_source(scope, source)
+            })?;
         }
         self.core_maintenance_checked = now;
         Ok(())
@@ -1001,17 +1014,6 @@ impl Runtime {
 
     fn sample_queues(&self) {
         sample_queues(&self.devices, &self.diagnostics);
-        #[cfg(feature = "ebpf")]
-        if let Some(host) = &self.host {
-            let port = host.queue.io.get_ref();
-            let index = self
-                .devices
-                .iter()
-                .map(|device| device.info.queues.len())
-                .sum();
-            self.diagnostics
-                .sample(index, SystemTime::now(), port.stats(), port.rings());
-        }
     }
 
     fn ports_ready_for_backend_teardown(&mut self) -> bool {
@@ -1043,22 +1045,13 @@ impl Runtime {
         Ok(outstanding)
     }
 
-    fn complete_transmit(&mut self) -> io::Result<bool> {
-        let outstanding = self.complete_physical_tx(None)?;
-        #[cfg(feature = "ebpf")]
-        if let Some(host) = &mut self.host {
-            let port = host.queue.io.get_mut();
-            port.complete(release_completed)?;
-            port.kick_outstanding_tx()?;
-            return Ok(outstanding || port.counters().submitted != port.counters().completed);
-        }
-        Ok(outstanding)
-    }
-
     async fn close_capture(
         &mut self,
         backend: &tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>,
     ) -> anyhow::Result<()> {
+        if let Some(tasks) = self.workers.auxiliary.get() {
+            tasks.stop();
+        }
         let deadline = Instant::now() + DETACH_BUDGET;
         self.workers.begin_close();
         if let Some(publisher) = &self.gateway {
@@ -1151,11 +1144,6 @@ impl Runtime {
             }
             device.active = false;
         }
-        #[cfg(feature = "ebpf")]
-        if let Some(host) = &mut self.host {
-            fold_capture_result(&mut failure, host.capture.close_capture());
-            host.pending = [None, None];
-        }
         self.endpoints.close();
         self.waiting.clear();
         self.pending.clear();
@@ -1197,6 +1185,13 @@ impl Runtime {
         let mut queue_zero_batch = BATCH;
         if !self.closing {
             if !self.admission.load(Ordering::Acquire) {
+                if let Some(error) = self
+                    .gateway
+                    .as_deref()
+                    .and_then(GatewayPublisher::capture_error)
+                {
+                    return Poll::Ready(Err(error.into()));
+                }
                 return Poll::Ready(Err(anyhow::anyhow!("XDP publication admission closed")));
             }
             let readable =
@@ -1462,19 +1457,6 @@ impl Runtime {
             self.rx_device = (device_index + 1) % (before.len() + 1 + after.len());
             self.rx_queue = 0;
         }
-        #[cfg(feature = "ebpf")]
-        if let Some(host) = &mut self.host {
-            progress += host.poll_io(
-                cx,
-                now,
-                self.closing,
-                &self.endpoints,
-                &mut self.staging,
-                &mut self.pressure.counters,
-                &mut self.qualified_rx,
-                &mut self.qualification_unavailable,
-            )?;
-        }
         for realm in &mut self.realms {
             if !self.closing && realm.generated.is_none() && realm.driver.service(cx, now) {
                 progress += 1;
@@ -1627,10 +1609,6 @@ impl Runtime {
         for realm in &mut self.realms {
             more |= realm.driver.service(cx, now);
         }
-        #[cfg(feature = "ebpf")]
-        if let Some(host) = &mut self.host {
-            more |= host.driver.service(cx, now);
-        }
         more
     }
 
@@ -1648,17 +1626,10 @@ impl Runtime {
     }
 
     fn scope_deadline(&self) -> Option<Instant> {
-        let deadline = self
-            .realms
+        self.realms
             .iter()
             .filter_map(|realm| realm.driver.deadline())
-            .min();
-        #[cfg(feature = "ebpf")]
-        let deadline = deadline
-            .into_iter()
-            .chain(self.host.as_ref().and_then(|host| host.driver.deadline()))
-            .min();
-        deadline
+            .min()
     }
 
     /// `core` false while a publication-reader acquisition is already pending: its
@@ -1689,23 +1660,6 @@ impl Runtime {
         }
         if !self.closing && self.gateway_maps.is_some() {
             include(self.core_maintenance_checked + Duration::from_secs(1));
-        }
-        #[cfg(feature = "ebpf")]
-        if let Some(host) = &self.host {
-            let port = host.queue.io.get_ref();
-            if if self.closing {
-                port.counters().submitted != port.counters().completed
-            } else {
-                port.needs_service_retry()
-            } {
-                include(now + Duration::from_millis(1));
-            }
-            if !self.closing {
-                include(host.metadata_checked + Duration::from_secs(1));
-            }
-            if let Some(due) = host.driver.deadline() {
-                include(due);
-            }
         }
         for realm in &self.realms {
             if let Some(due) = realm.driver.deadline() {
@@ -2061,6 +2015,9 @@ impl Drop for Runtime {
         if self.finished {
             return;
         }
+        if let Some(tasks) = self.workers.auxiliary.get() {
+            tasks.stop();
+        }
         self.admission.store(false, Ordering::Release);
         self.workers.close();
         *self.pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
@@ -2071,12 +2028,6 @@ impl Drop for Runtime {
         for device in &mut self.devices {
             device.vlan_offload.abandon();
             device.attachment.take();
-        }
-        #[cfg(feature = "ebpf")]
-        if let Some(host) = &mut self.host
-            && let Err(error) = host.capture.close_capture()
-        {
-            tracing::error!(%error, "Host capture fence failed; retaining fail-closed source custody");
         }
         self.endpoints.close();
         if std::thread::panicking() {
@@ -2090,8 +2041,6 @@ impl Drop for Runtime {
                 self.endpoints.clone(),
                 Arc::clone(&self.workers),
             ));
-            #[cfg(feature = "ebpf")]
-            std::mem::forget(self.host.take());
         }
     }
 }
@@ -2783,16 +2732,14 @@ fn poll_deadline(
 
 pub(crate) async fn run(
     plane: ControlPlane,
-    pin_root: &Path,
     admission: Arc<AtomicBool>,
     pname_support: crate::ebpf::PnameSupportCell,
 ) -> (Option<ControlPlane>, anyhow::Result<()>) {
-    worker::run_coordinator(plane, pin_root, admission, pname_support).await
+    worker::run_coordinator(plane, admission, pname_support).await
 }
 
 async fn run_capture(
     plane: ControlPlane,
-    pin_root: &Path,
     admission: Arc<AtomicBool>,
     pname_support: crate::ebpf::PnameSupportCell,
     shared_runtime: tokio::runtime::Handle,
@@ -2809,12 +2756,10 @@ async fn run_capture(
         .expect("validated XDP polling consumer");
     let notification = polling_publication.notification();
     tokio::pin!(notification);
-    let prepared = match prepare(&plane, &config, pin_root, Arc::clone(&admission)).await {
+    let prepared = match prepare(&plane, &config, Arc::clone(&admission)).await {
         Ok(prepared) => prepared,
         Err(error) => return (Some(plane), Err(error)),
     };
-    #[cfg(feature = "ebpf")]
-    let host = prepared.host;
     let PreparedRuntime {
         devices,
         topology,
@@ -2827,6 +2772,10 @@ async fn run_capture(
         local_memory,
         kernel_memory,
         realm_scopes,
+        auxiliary,
+        dns_bind,
+        standalone_dns_scope,
+        source_support,
         realms,
         scope_pairs,
         workers,
@@ -2847,8 +2796,8 @@ async fn run_capture(
             plane,
             scope_pairs,
             64,
-            None,
-            ScopeId::HOST,
+            dns_bind,
+            standalone_dns_scope,
         ))
         .await
     {
@@ -2860,17 +2809,6 @@ async fn run_capture(
                 Ok(Ok(_)) => unreachable!(),
             };
             diagnostics.lifecycle(Lifecycle::FailedRetained);
-            #[cfg(feature = "ebpf")]
-            if let Some(host) = host
-                && let Err(close) = host.finish()
-            {
-                return (
-                    None,
-                    Err(error
-                        .context(close)
-                        .context("Host unpublished teardown also failed")),
-                );
-            }
             return (None, Err(error));
         }
     };
@@ -2918,12 +2856,6 @@ async fn run_capture(
         }
     }
     let realms = local_realms;
-    #[cfg(feature = "ebpf")]
-    let host = host.map(|host| host.start(&mut drivers));
-    assert!(
-        drivers.is_empty(),
-        "every prepared scope has its exact service owner"
-    );
     let [inbox, remote_inbox] = inboxes;
     let mut runtime = Runtime {
         devices: std::mem::take(&mut devices.0),
@@ -2940,8 +2872,6 @@ async fn run_capture(
         _kernel_memory: kernel_memory,
         realm_scopes,
         hold_collector: HoldCollector,
-        #[cfg(feature = "ebpf")]
-        host,
         admission,
         pname_support,
         realms,
@@ -2980,6 +2910,11 @@ async fn run_capture(
         .as_ref()
         .and_then(|datapath| datapath.direct);
     let relay_candidate = runtime.relay_candidates(direct).next().is_some();
+    let aux_startup = runtime.start_auxiliary(auxiliary, &mut drivers, &shared_runtime);
+    assert!(
+        drivers.is_empty(),
+        "every prepared scope has its exact service owner"
+    );
     let mut relay_setup =
         (relay_candidate && workers.workers == 2).then(|| workers.defer_secondary_ready());
     if workers.workers == 2 {
@@ -3012,12 +2947,11 @@ async fn run_capture(
     .await
     .err();
     let activate = if startup_failure.is_some() {
+        drop(aux_startup);
         Ok(())
     } else {
         async {
-            if let Some(zones) = &mut runtime.zones {
-                zones.revalidate(&runtime.polling_budget)?;
-            }
+            runtime.revalidate_gateway_zones()?;
             let topology = runtime.admit_final_topology()?;
             ensure!(
                 topology.ipv4_broadcasts() == runtime.topology.get_ref().ipv4_broadcasts(),
@@ -3051,13 +2985,7 @@ async fn run_capture(
                 &mut runtime.topology_lost,
             )?;
             runtime.rebuild_polling_context();
-            #[cfg(feature = "ebpf")]
-            if let Some(host) = &mut runtime.host {
-                if let Some(publisher) = &runtime.gateway {
-                    host.capture.set_gateway(Arc::clone(publisher))?;
-                }
-                host.admit(&runtime.pname_support)?;
-            }
+            *runtime.pname_support.write() = source_support;
             if relay_candidate {
                 workers.prepare_relays(&runtime.polling_budget)?;
             }
@@ -3086,11 +3014,11 @@ async fn run_capture(
                     publisher,
                     active_routing_plan.read().fingerprint,
                     diagnostics_generation.read().generation,
-                );
-                Ok(())
+                )?;
             } else {
-                runtime.activate_capture(&shutdown, direct)
+                runtime.activate_capture(&shutdown, direct)?;
             }
+            runtime.activate_auxiliary(aux_startup, &shutdown).await
         }
         .await
     };
@@ -3170,9 +3098,16 @@ async fn run_capture(
             }
         },
     };
+    if let Some(tasks) = workers.auxiliary.get() {
+        fold_capture_result(&mut failure, tasks.join().await);
+    }
     // An endpoint join cannot release Core TX leases; drain those same descriptor owners too.
-    if let Err(error) =
-        drain_transmit(|| runtime.complete_transmit(), close_started, &mut warned).await
+    if let Err(error) = drain_transmit(
+        || runtime.complete_physical_tx(None),
+        close_started,
+        &mut warned,
+    )
+    .await
     {
         tracing::error!(%error, "XDP terminal drain failed; retaining owners and UMEM until process exit");
         fold_capture_result(&mut failure, Err(error.into()));
@@ -3212,12 +3147,6 @@ async fn run_capture(
             failure.get_or_insert(error.into());
         }
     }
-    #[cfg(feature = "ebpf")]
-    if let Some(host) = runtime.host.take()
-        && let Err(error) = host.finish()
-    {
-        failure.get_or_insert(error);
-    }
     runtime.diagnostics.lifecycle(Lifecycle::Closed);
     if let Err(error) = backend.write().await.cleanup().await {
         failure.get_or_insert(error);
@@ -3242,8 +3171,10 @@ struct PreparedRuntime {
     local_memory: Option<MemoryReservation>,
     kernel_memory: Vec<MemoryReservation>,
     realm_scopes: std::collections::HashMap<u32, ScopeId>,
-    #[cfg(feature = "ebpf")]
-    host: Option<PreparedHost>,
+    auxiliary: Vec<tcx_aux::PreparedAux>,
+    dns_bind: Option<crate::control::dns_listener::PreparedDnsBind>,
+    standalone_dns_scope: ScopeId,
+    source_support: crate::ebpf::PnameSupport,
     realms: Vec<RealmPlan>,
     workers: Arc<worker::Shared>,
     inboxes: [tokio::sync::mpsc::Receiver<worker::Envelope>; 2],
@@ -3366,11 +3297,8 @@ fn direct_relay_eligible(
 async fn prepare(
     plane: &ControlPlane,
     config: &Config,
-    pin_root: &Path,
     admission: Arc<AtomicBool>,
 ) -> anyhow::Result<PreparedRuntime> {
-    #[cfg(not(feature = "ebpf"))]
-    let _ = pin_root;
     let datapath = config
         .datapath
         .as_ref()
@@ -3402,8 +3330,21 @@ async fn prepare(
             None
         }
     };
-    let gateway_enabled =
-        datapath.direct == Some(DirectProfile::Endpoint) && !datapath.interfaces.is_empty();
+    let auxiliary_interfaces = || {
+        datapath
+            .interfaces
+            .iter()
+            .filter(|port| port.role == honk_config::datapath::InterfaceRole::L3Lan)
+    };
+    let lan_count = auxiliary_interfaces().count();
+    let host_ports = datapath
+        .host
+        .as_ref()
+        .map_or(&[][..], |host| host.interfaces.as_slice());
+    let has_host = !host_ports.is_empty();
+    let aux_count = lan_count + host_ports.len();
+    let gateway_enabled = datapath.direct == Some(DirectProfile::Endpoint)
+        && (has_host || !datapath.interfaces.is_empty());
     if gateway_enabled
         && let Some((reason, details)) =
             gateway_time_namespace_issue(timens::monotonic_namespace_offset())
@@ -3411,8 +3352,9 @@ async fn prepare(
         record(reason, "namespace", details);
     }
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let dns_projection = datapath.effective_dns_projection();
     let mut zones = if gateway_enabled {
-        match ZoneAdmission::read(&budget) {
+        match ZoneAdmission::read(&budget, dns_projection) {
             Ok(zones) => Some(zones),
             Err(error) => {
                 record("conntrack_zones", "namespace", error.to_string());
@@ -3422,7 +3364,7 @@ async fn prepare(
     } else {
         None
     };
-    let conntrack = if gateway_enabled {
+    let conntrack = if gateway_enabled && plan.as_ref().is_some_and(|p| !p.members().is_empty()) {
         match honk_xsk::ConntrackKfuncs::read() {
             Ok(conntrack) => Some(Arc::new(conntrack)),
             Err(error) => {
@@ -3446,7 +3388,6 @@ async fn prepare(
         [device]
             if gateway_enabled
                 && requested_mode == Some(BindMode::ZeroCopy)
-                && datapath.host.is_none()
                 && plan.as_ref().is_some_and(|plan| plan.realms().len() == 1) =>
         {
             device.queues.len()
@@ -3462,7 +3403,10 @@ async fn prepare(
         .0
     };
     let topology = if let Some(plan) = &plan {
-        if gateway_enabled && let Err(error) = plan.check_gateway_defaults() {
+        if gateway_enabled
+            && !plan.members().is_empty()
+            && let Err(error) = plan.check_gateway_defaults()
+        {
             record("gateway_uplink", "namespace", error.to_string());
         }
         if let Err(error) = worker::admit(datapath.effective_workers(), &infos) {
@@ -3499,9 +3443,8 @@ async fn prepare(
     } else {
         None
     };
-    let realm_count =
-        plan.as_ref().map_or(0, |plan| plan.realms().len()) + usize::from(datapath.host.is_some());
-    if plan.is_some() && !(1..=64).contains(&realm_count) {
+    let realm_count = plan.as_ref().map_or(0, |plan| plan.realms().len());
+    if plan.is_some() && !(1..=64).contains(&(realm_count + aux_count)) {
         record(
             "realm_capacity",
             "capture",
@@ -3550,8 +3493,12 @@ async fn prepare(
         None
     };
     let fib = (|| -> anyhow::Result<_> {
-        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
-        let namespace = socket_namespace(socket.as_fd())?;
+        let namespace = if has_host {
+            crate::control::probe_socket_marks(config.global.effective_so_mark())?
+        } else {
+            let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+            socket_namespace(socket.as_fd())?
+        };
         let mut links = Fib::new(&budget, namespace)?;
         links.synchronize()?;
         Ok((namespace, links))
@@ -3560,16 +3507,14 @@ async fn prepare(
         record("local_addresses", "namespace", format!("{error:#}"));
     }
     let max_mtu = infos.iter().map(|info| info.mtu).max().unwrap_or(65535) as usize;
-    #[cfg(feature = "ebpf")]
-    let host_memory = usize::from(datapath.host.is_some()) * size_of::<PreparedHost>();
-    #[cfg(not(feature = "ebpf"))]
-    let host_memory = 0;
     let memory = if plan.is_some() {
         let bytes = max_mtu
             + 65536
             + size_of::<Runtime>()
             + size_of::<CaptureTopology>()
-            + host_memory
+            + aux_count
+                * (size_of::<tcx_aux::PreparedAux>()
+                    + size_of::<(PacketRealm, Vec<crate::control::netstack::PacketOwner>)>())
             + PENDING * (size_of::<Waiting>() + size_of::<Pending>())
             + realm_count
                 * usize::from(datapath.effective_workers())
@@ -3625,7 +3570,46 @@ async fn prepare(
     );
     let routing_scope = ScopeId::allocate().context("XDP routing domain exhausted")?;
     let mut realms = Vec::with_capacity(realm_count);
-    let mut scope_pairs = Vec::with_capacity(realm_count);
+    let mut scope_pairs = Vec::with_capacity(realm_count + aux_count);
+    let mut auxiliary = Vec::with_capacity(aux_count);
+    if aux_count != 0 {
+        ensure!(
+            realm_keys.len() + aux_count
+                <= honk_ebpf_common::xdp_gateway::GATEWAY_REALM_CAPACITY as usize,
+            "physical and auxiliary capture keys exceed the gateway realm table"
+        );
+        let private_names = (0..lan_count)
+            .map(tcx_aux::PreparedAux::device_name)
+            .chain((0..host_ports.len()).map(tcx_aux::PreparedAux::host_device_name));
+        for name in private_names {
+            ensure!(
+                datapath.interfaces.iter().all(|port| port.name != name)
+                    && !host_ports.contains(&name),
+                "configured interface {name} collides with a private TUN"
+            );
+        }
+        let tasks = aux_tasks::AuxTasks::reserve(aux_count, &budget, plane.shutdown_intent())?;
+        assert!(workers.auxiliary.set(tasks).is_ok());
+        for (index, port) in auxiliary_interfaces().enumerate() {
+            let id = u32::try_from(plan.realms().len() + index + 1)?;
+            let (aux, scope, owner) = tcx_aux::PreparedAux::new(&port.name, id, index, &budget)?;
+            let realm = PacketRealm::singleton(scope)?;
+            scope_pairs.push((realm, vec![owner]));
+            auxiliary.push(aux);
+        }
+        for (index, name) in host_ports.iter().enumerate() {
+            let id = u32::try_from(realm_count + lan_count + index + 1)?;
+            let (aux, scope, owner) = tcx_aux::PreparedAux::new_host(
+                name,
+                id,
+                index,
+                datapath.interfaces.iter().map(|p| p.name.as_str()),
+                &budget,
+            )?;
+            scope_pairs.push((PacketRealm::singleton(scope)?, vec![owner]));
+            auxiliary.push(aux);
+        }
+    }
     let config_generation = plane.diagnostics_handle().read().generation;
     let authority = if datapath.direct == Some(DirectProfile::Core) {
         Some(plane.core_forward_policy(Execution::MixedEndpoints).await?)
@@ -3633,7 +3617,11 @@ async fn prepare(
         None
     };
     let policy = if gateway_enabled {
-        let policy = GatewayPolicy::prepare(&plane.active_routing_plan_handle().read(), false)?;
+        let policy = GatewayPolicy::prepare(
+            &plane.active_routing_plan_handle().read(),
+            false,
+            has_host.then_some(false),
+        )?;
         let charge = gateway::reserve_objects(&budget, policy.fact_fds())?;
         Some((policy, charge))
     } else {
@@ -3643,36 +3631,33 @@ async fn prepare(
     local_addresses.sort_unstable_by_key(|key| (key.family, key.address));
     local_addresses.dedup();
     let gateway_maps = if policy.is_some() {
-        Some(Arc::new(honk_xsk::GatewayMaps::new(
-            &realm_keys,
-            &local_addresses,
-        )?))
+        let maps = if auxiliary.is_empty() {
+            honk_xsk::GatewayMaps::new(&realm_keys, &local_addresses)?
+        } else {
+            let mut lans = [0; honk_config::datapath::MAX_L3_LANS];
+            let mut hosts = [0; 4];
+            for (id, aux) in lans.iter_mut().zip(&auxiliary[..lan_count]) {
+                *id = aux.realm();
+            }
+            for (id, aux) in hosts.iter_mut().zip(&auxiliary[lan_count..]) {
+                *id = aux.realm();
+            }
+            honk_xsk::GatewayMaps::new_with_host(
+                &realm_keys,
+                &local_addresses,
+                &lans[..lan_count],
+                &hosts[..host_ports.len()],
+            )?
+        };
+        Some(Arc::new(maps.account(&budget)?))
     } else {
         None
     };
     let mut kernel_memory = Vec::new();
     let mut local_memory = None;
     if let Some(maps) = &gateway_maps {
-        kernel_memory.push(
-            budget
-                .reserve(maps.memory_bytes())
-                .context("gateway counter scratch memory capacity")?,
-        );
         let backend = plane.policy_backend_handle();
         maps.set_mode_flags(backend.write().await.userspace_mut()?.mode_flags())?;
-        let bytes =
-            maps.object_fds()
-                .into_iter()
-                .try_fold(0usize, |total, fd| -> io::Result<usize> {
-                    total
-                        .checked_add(honk_xsk::kernel_memory_bytes(fd)?)
-                        .ok_or_else(|| io::Error::other("gateway memory overflow"))
-                })?;
-        kernel_memory.push(
-            budget
-                .reserve(bytes)
-                .context("gateway map memory capacity")?,
-        );
         local_memory = Some(
             budget
                 .reserve(honk_xsk::kernel_memory_bytes(maps.local_map_fd()?.as_fd())?)
@@ -3682,6 +3667,34 @@ async fn prepare(
     if let Some(zones) = &mut zones {
         zones.revalidate(&budget)?;
     }
+    let dns_bind = if has_host {
+        PacketEndpoints::prepare_dns_bind(config)?
+    } else {
+        None
+    };
+    let host_scope = has_host
+        .then(|| ScopeId::allocate().context("Host DNS scope exhausted"))
+        .transpose()?;
+    let standalone_dns_scope = if has_host {
+        ScopeId::allocate().context("standalone DNS scope exhausted")?
+    } else {
+        ScopeId::HOST
+    };
+    #[cfg(feature = "ebpf")]
+    let (host_resources, source_support) = if has_host {
+        let needs_pname = plane.active_routing_plan_handle().read().features
+            & honk_ebpf_common::ROUTING_FEATURE_PROCESS
+            != 0;
+        let identity = host_identity::HostIdentity::load(&budget, needs_pname)?;
+        let support = identity.pname_support();
+        let resources =
+            gateway::HostResources::prepare(identity, config.global.effective_so_mark(), &budget)?;
+        (Some(resources), support)
+    } else {
+        (None, crate::ebpf::PnameSupport::Unavailable)
+    };
+    #[cfg(not(feature = "ebpf"))]
+    let source_support = crate::ebpf::PnameSupport::Unavailable;
     let mut devices = StartupDevices(Vec::with_capacity(infos.len()));
     for (device_index, info) in infos.into_iter().enumerate() {
         let port_config = physical_config(info.mtu);
@@ -3722,8 +3735,9 @@ async fn prepare(
                 honk_xsk::GatewayLoad {
                     routing: &policy.bytecode.insns,
                     maps,
-                    conntrack: ct,
+                    conntrack: Some(ct),
                     dns: None,
+                    arbitration: None,
                 },
             )?
         } else {
@@ -3787,46 +3801,6 @@ async fn prepare(
                 .role,
         });
     }
-    #[cfg(feature = "ebpf")]
-    let host = if let Some(host) = &datapath.host {
-        let source_xdp_capacity = devices.len() * 2;
-        let _source_xdp_memory = budget
-            .reserve(source_xdp_capacity * size_of::<(u32, u32)>())
-            .context("Host source XDP identity memory capacity")?;
-        let mut source_xdp = Vec::with_capacity(source_xdp_capacity);
-        for device in devices.iter() {
-            let programs = device.unpublished_programs()?;
-            source_xdp.push((device.info.ifindex, programs.discover_prog_id()));
-            source_xdp.push((device.info.ifindex, programs.data_prog_id()));
-        }
-        let attachment = ScopeId::allocate()
-            .context("Host attachment identity exhausted")?
-            .as_u64();
-        let (host, scope) = PreparedHost::prepare(
-            &host.interfaces,
-            &source_xdp,
-            CaptureAuthority {
-                namespace_cookie: namespace,
-                attachment_generation: attachment,
-                scope: routing_scope.as_u64(),
-                config_generation,
-                ifindex: 0,
-                reserved: 0,
-            },
-            config.global.effective_so_mark(),
-            pin_root,
-            honk_config::paths::data_dir(),
-            realm_count,
-            &budget,
-        )?;
-        tracing::debug!(
-            used = budget.used(),
-            "XDP prepare: after PreparedHost::prepare"
-        );
-        Some((host, scope))
-    } else {
-        None
-    };
     let mut realm_scopes = std::collections::HashMap::new();
     for logical in plan.realms() {
         let members: Vec<_> = devices
@@ -3892,21 +3866,14 @@ async fn prepare(
         }
         scope_pairs.push((realm, owners));
     }
+    // Reserve auxiliary memory first, but keep physical owners first in the ingress lookup.
+    scope_pairs.rotate_left(auxiliary.len());
+    for aux in &auxiliary {
+        realm_scopes.insert(aux.realm(), aux.scope());
+    }
     // Worker 1 takes its immutable reference before registering its queues.
     assert!(workers.placements.set(Arc::new(placements)).is_ok());
-    #[cfg(feature = "ebpf")]
-    let host = match host {
-        Some((host, (scope, owner))) => {
-            scope_pairs.push((PacketRealm::singleton(scope)?, vec![owner]));
-            Some(host)
-        }
-        None => None,
-    };
-    #[cfg(feature = "ebpf")]
-    let host_observation = host.as_ref().map(PreparedHost::observation);
-    #[cfg(not(feature = "ebpf"))]
-    let host_observation = None;
-    let diagnostics = diagnostics(&devices, &budget, host_observation)?;
+    let diagnostics = diagnostics(&devices, &budget)?;
     workers
         .diagnostics
         .set(Arc::clone(&diagnostics))
@@ -3941,33 +3908,66 @@ async fn prepare(
     } else {
         None
     };
-    let gateway = match (policy, gateway_maps.as_ref(), conntrack) {
-        (Some(policy), Some(maps), Some(ct)) => {
-            let enabled = datapath.effective_dns_projection();
-            let lan = plan
-                .realms()
-                .iter()
-                .filter(|realm| enabled && realm.role == honk_config::datapath::InterfaceRole::Lan)
-                .map(|realm| (realm_scopes[&realm.realm_id], realm.realm_id));
+    let gateway = match (policy, gateway_maps.as_ref()) {
+        (Some(policy), Some(maps)) => {
+            let lan =
+                plan.realms()
+                    .iter()
+                    .filter(|realm| {
+                        dns_projection && realm.role == honk_config::datapath::InterfaceRole::Lan
+                    })
+                    .map(|realm| (realm_scopes[&realm.realm_id], realm.realm_id))
+                    .chain(
+                        auxiliary
+                            .iter()
+                            .filter(|aux| dns_projection && !aux.is_host())
+                            .map(|aux| (aux.scope(), aux.realm())),
+                    )
+                    .chain(host_scope.filter(|_| dns_projection).map(|scope| {
+                        (scope, honk_ebpf_common::xdp_gateway::GATEWAY_REALM_CAPACITY)
+                    }));
             let shadow = gateway::GatewayShadow::new(
                 lan,
-                &plane.packet_routing_projection(),
+                plane,
                 Arc::clone(&diagnostics),
                 Arc::clone(&admission),
-                plane.datapath_health_handle(),
-                plane.shutdown_intent(),
                 &budget,
+                zones.as_ref().is_some_and(ZoneAdmission::notrack_seen),
             );
-            Some(Arc::new(GatewayPublisher::new(
+            let mut publisher = GatewayPublisher::new(
                 policy,
                 Arc::clone(maps),
-                ct,
+                conntrack,
                 Arc::clone(&budget),
                 shadow,
-            )))
+                plane.active_routing_plan_handle(),
+            );
+            if lan_count != 0 {
+                publisher.prepare_auxiliary(lan_count)?;
+            }
+            #[cfg(feature = "ebpf")]
+            if let Some(resources) = host_resources {
+                publisher.prepare_host(resources)?;
+            }
+            Some(Arc::new(publisher))
         }
         _ => None,
     };
+    let projection = plane.packet_routing_projection();
+    if lan_count != 0 {
+        let mut scopes = [ScopeId::HOST; honk_config::datapath::MAX_L3_LANS];
+        for (scope, aux) in scopes.iter_mut().zip(&auxiliary[..lan_count]) {
+            *scope = aux.scope();
+        }
+        projection.register_aux_scopes(&scopes[..lan_count], &budget)?;
+    }
+    if let Some(shared) = host_scope {
+        let mut ports = Vec::with_capacity(host_ports.len());
+        for (realm, _) in &scope_pairs[realm_count + lan_count..] {
+            ports.push(realm.owners()[0].clone());
+        }
+        projection.register_host_scopes(shared, standalone_dns_scope, &ports, &budget)?;
+    }
     Ok(PreparedRuntime {
         devices: std::mem::take(&mut devices.0),
         topology,
@@ -3980,8 +3980,10 @@ async fn prepare(
         local_memory,
         kernel_memory,
         realm_scopes,
-        #[cfg(feature = "ebpf")]
-        host,
+        auxiliary,
+        dns_bind,
+        standalone_dns_scope,
+        source_support,
         realms,
         scope_pairs,
         workers,

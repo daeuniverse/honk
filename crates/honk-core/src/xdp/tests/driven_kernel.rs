@@ -1,6 +1,11 @@
 use super::*;
 use crate::control::core_forward::PolicyRead;
-use std::{net::SocketAddr, os::unix::fs::MetadataExt, path::PathBuf, process::Stdio};
+use std::{
+    net::SocketAddr,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
     process::{Child, ChildStdin, ChildStdout, Command},
@@ -304,7 +309,6 @@ fn guarded_pin_root() -> PathBuf {
 async fn start_runtime(
     plane: ControlPlane,
     config: &Config,
-    pins: &Path,
     artifacts: &Path,
     admission: Arc<AtomicBool>,
     pname_support: crate::ebpf::PnameSupportCell,
@@ -316,9 +320,7 @@ async fn start_runtime(
     let backend = plane.policy_backend_handle();
     let active_plan = plane.active_routing_plan_handle();
     let diagnostics_generation = plane.diagnostics_handle();
-    let prepared = prepare(&plane, config, pins, Arc::clone(&admission)).await?;
-    #[cfg(feature = "ebpf")]
-    let host = prepared.host;
+    let prepared = prepare(&plane, config, Arc::clone(&admission)).await?;
     let PreparedRuntime {
         devices,
         topology,
@@ -330,6 +332,10 @@ async fn start_runtime(
         local_memory,
         kernel_memory,
         realm_scopes,
+        auxiliary,
+        dns_bind,
+        standalone_dns_scope,
+        source_support,
         plan_memory,
         realms: plans,
         scope_pairs: scopes,
@@ -344,9 +350,13 @@ async fn start_runtime(
         diagnostics,
         ..
     } = prepared;
+    ensure!(
+        !defer_gateway || auxiliary.is_empty(),
+        "deferred physical-only fixture cannot activate auxiliary TUNs"
+    );
     plane.stats_handle().install_xdp(Arc::clone(&diagnostics));
     let (endpoints, mut owner, mut drivers) =
-        PacketEndpoints::start_driven(plane, scopes, 64, None, ScopeId::HOST).await?;
+        PacketEndpoints::start_driven(plane, scopes, 64, dns_bind, standalone_dns_scope).await?;
     let mut realms = Vec::with_capacity(plans.len());
     let mut remote_realms = Vec::with_capacity(plans.len());
     for (ingress, device, link, scope) in plans {
@@ -387,9 +397,6 @@ async fn start_runtime(
             }
         }
     }
-    #[cfg(feature = "ebpf")]
-    let host = host.map(|host| host.start(&mut drivers));
-    assert!(drivers.is_empty());
     let [inbox, remote_inbox] = inboxes;
     let mut runtime = Runtime {
         devices,
@@ -406,8 +413,6 @@ async fn start_runtime(
         _kernel_memory: kernel_memory,
         realm_scopes,
         hold_collector: HoldCollector,
-        #[cfg(feature = "ebpf")]
-        host,
         admission,
         pname_support,
         realms,
@@ -441,6 +446,9 @@ async fn start_runtime(
         context_revision: 0,
         _memory: Some(memory),
     };
+    let aux_startup =
+        runtime.start_auxiliary(auxiliary, &mut drivers, &tokio::runtime::Handle::current());
+    assert!(drivers.is_empty());
     if runtime.workers.workers == 2 {
         runtime.worker = Some(worker::Worker::start(
             Arc::clone(&runtime.workers),
@@ -524,13 +532,7 @@ async fn start_runtime(
     runtime.capture_plan.take();
     runtime.capture_plan_memory.take();
     runtime.rebuild_polling_context();
-    #[cfg(feature = "ebpf")]
-    if let Some(host) = &mut runtime.host {
-        if let Some(publisher) = &runtime.gateway {
-            host.capture.set_gateway(Arc::clone(publisher))?;
-        }
-        host.admit(&runtime.pname_support)?;
-    }
+    *runtime.pname_support.write() = source_support;
     if defer_gateway {
         return Ok((runtime, owner));
     }
@@ -545,7 +547,7 @@ async fn start_runtime(
             publisher,
             active_plan.read().fingerprint,
             diagnostics_generation.read().generation,
-        );
+        )?;
         publisher.validate_programs(|programs| {
             for &(ifindex, id) in programs {
                 if let Some(device) = runtime
@@ -564,6 +566,7 @@ async fn start_runtime(
     } else {
         runtime.activate_capture(&shutdown, direct)?;
     }
+    runtime.activate_auxiliary(aux_startup, &shutdown).await?;
     runtime.diagnostics.lifecycle(Lifecycle::Active);
     Ok((runtime, owner))
 }
@@ -686,7 +689,7 @@ async fn two_worker_publication_keeps_real_endpoint_app_timer_and_close_owned() 
 }
 
 async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
-    let pins = guarded_pin_root();
+    let _ = guarded_pin_root();
     let artifacts = PathBuf::from(std::env::var_os("HONK_XDP_ARTIFACT_ROOT").unwrap());
     let mut peer = Peer::spawn(workers == 2)?;
     let result = tokio::time::timeout(Duration::from_secs(45), async {
@@ -732,7 +735,7 @@ async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
         let backend = plane.policy_backend_handle();
         let shutdown = plane.shutdown_intent();
         let (mut runtime, mut owner) =
-            start_runtime(plane, &config, &pins, &artifacts, admission, pname_support, false).await?;
+            start_runtime(plane, &config, &artifacts, admission, pname_support, false).await?;
         let authority = runtime.core.as_ref().unwrap().authority();
         let acquire = || authority.read_policy();
         let reader = None;
@@ -851,7 +854,7 @@ async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
         ).await??;
         result?;
         drain_transmit(
-            || runtime.complete_transmit(),
+            || runtime.complete_physical_tx(None),
             Instant::now(),
             &mut warned,
         ).await?;
@@ -866,10 +869,6 @@ async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
                 port.close_socket();
             }
             device.vlan_offload.restore()?;
-        }
-        #[cfg(feature = "ebpf")]
-        if let Some(host) = runtime.host.take() {
-            host.finish()?;
         }
         backend.write().await.cleanup().await?;
         runtime.finished = true;

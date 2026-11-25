@@ -2503,6 +2503,124 @@ async fn reload_timeout_keeps_runtime_and_restores_admission() {
     assert!(pool.is_empty());
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn canceled_auxiliary_reload_recovers_the_canonical_config_before_and_after_commit() {
+    use crate::ebpf::userspace::UserspaceBackend;
+    use honk_config::datapath::{InterfaceRole, XdpInterface};
+    let mut config = polling_config();
+    config
+        .datapath
+        .as_mut()
+        .unwrap()
+        .interfaces
+        .push(XdpInterface {
+            name: "wg0".into(),
+            role: InterfaceRole::L3Lan,
+        });
+    let resolver = DnsResolver::new(&config.dns).unwrap();
+    let forwarder = resolver.forwarder();
+    let mut cp = ControlPlane::new(
+        config.clone(),
+        Box::new(UserspaceBackend::new(
+            Default::default(),
+            Arc::new(parking_lot::RwLock::new(
+                crate::ebpf::PnameSupport::Unavailable,
+            )),
+        )),
+        Router::from_config(&config.routing).unwrap(),
+        Arc::new(ProxyRegistry::default_resolver().unwrap()),
+        resolver,
+        forwarder,
+    )
+    .unwrap();
+    cp.set_mode_state(Arc::new(parking_lot::RwLock::new(
+        crate::mode::ModeState::new("Rule", "Proxy"),
+    )));
+    cp.start_datapath_flags_coordinator().unwrap();
+    cp.initialize_datapath_flags(false, false).await.unwrap();
+    let drain = DrainTracker::new();
+    for after_commit in [false, true] {
+        let baseline = cp.diagnostics.read().generation;
+        let mut next = cp.config.read().await.as_ref().clone();
+        next.global.check_tolerance_ms += 1;
+        let router = cp.router.read().await;
+        let mut reload = Box::pin(cp.apply_runtime_config(next, Default::default(), &drain));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while cp.router.try_read().is_ok() {
+                tokio::select! { result = &mut reload => panic!("reload ended before commit: {result:?}"), () = tokio::task::yield_now() => {} }
+            }
+            if after_commit {
+                let before = cp.ebpf.read().await;
+                drop(router);
+                while cp.ebpf.try_read().is_ok() {
+                    tokio::select! { result = &mut reload => panic!("reload ended before backend commit: {result:?}"), () = tokio::task::yield_now() => {} }
+                }
+                let mut after = Box::pin(cp.ebpf.read());
+                assert!(futures::poll!(&mut after).is_pending());
+                drop(before);
+                let _hold_final_flags = tokio::select! {
+                    result = &mut reload => panic!("reload escaped queued reader: {result:?}"), reader = after => reader,
+                };
+                assert_eq!(cp.diagnostics.read().generation, baseline + 1);
+                assert!(futures::poll!(&mut reload).is_pending());
+            }
+            drop(reload);
+        }).await.unwrap();
+        let committed = cp.config.read().await.as_ref().clone();
+        let generation = cp.diagnostics.read().generation;
+        assert_eq!(generation, baseline + u64::from(after_commit));
+        assert!(!cp.is_datapath_healthy());
+        assert!(drain.should_reject() && cp.drain_tracker.should_reject());
+        assert_eq!(
+            cp.apply_runtime_config(committed.clone(), Default::default(), &drain)
+                .await,
+            ReloadOutcome::Committed {
+                generation: generation + 1
+            }
+        );
+        assert!(cp.is_datapath_healthy());
+        assert!(!drain.should_reject() && !cp.drain_tracker.should_reject());
+        assert_eq!(
+            cp.apply_runtime_config(committed, Default::default(), &drain)
+                .await,
+            ReloadOutcome::Noop {
+                generation: generation + 1
+            }
+        );
+    }
+    #[cfg(feature = "native-api")]
+    {
+        let current = cp.config.read().await.as_ref().clone();
+        let flags = cp.datapath_flags.as_ref().unwrap();
+        *cp.mode_state.as_ref().unwrap().write() = crate::mode::ModeState::native();
+        flags
+            .set_clash_mode("Direct", &current, &Default::default())
+            .await
+            .unwrap();
+        let before = flags.snapshot();
+        let mut ebpf = cp.ebpf.write().await;
+        let gateway = ebpf.userspace_mut().unwrap();
+        let before_flags = gateway.mode_flags();
+        gateway.pause_gateway_auxiliary();
+        drop(ebpf);
+        assert_eq!(
+            cp.apply_runtime_config(current, Default::default(), &drain)
+                .await,
+            ReloadOutcome::Rejected
+        );
+        assert_eq!(
+            flags.snapshot(),
+            before,
+            "rejected source activation changed the native override or revision"
+        );
+        assert_eq!(
+            cp.ebpf.write().await.userspace_mut().unwrap().mode_flags(),
+            before_flags
+        );
+    }
+}
+
 /// A non-routing reload publishes a fresh DNS generation without rewriting
 /// the static routing bank or retaining its generation-owned upstream pool.
 #[tokio::test]

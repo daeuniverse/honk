@@ -14,8 +14,20 @@ use honk_netstack::{MemoryBudget, MemoryReservation};
 
 use crate::bpf::{attributes, wait_netlink};
 
+mod auxiliary;
+pub use auxiliary::{AuxLinkInfo, AuxLinkWatch, HostLinkChange};
+
+const IFLA_GSO_IPV4_MAX_SIZE: u16 = 63;
+const IFLA_GRO_IPV4_MAX_SIZE: u16 = 64;
+const LEGACY_OFFLOAD_MAX_SIZE: u32 = 65_536;
+
 const MAX_OBJECTS: usize = 65_536;
 const RTNL_BUFFER_BYTES: usize = 65_536;
+const DUMP_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_DUMP_ATTEMPTS: usize = 8;
+const NLM_F_DUMP_INTR: u16 = 0x10;
+const DUMP_INTERRUPTED: &str = "topology changed or dump was interrupted during admission";
+const RTM_GETNEXTHOP: u16 = 106;
 pub(crate) const MAX_BROADCASTS: usize = 64;
 
 const IFA_F_NODAD: u32 = 0x02;
@@ -266,36 +278,52 @@ pub fn capture_layout(names: &[String]) -> io::Result<Vec<CaptureRealm>> {
     if names.is_empty() {
         return Ok(Vec::new());
     }
-    let fd = route_socket(false)?;
-    let mut snapshot = snapshot(fd.as_fd(), None)?;
-    dump(
-        fd.as_fd(),
-        5,
-        106,
-        8,
-        &mut snapshot,
-        Instant::now() + Duration::from_secs(2),
-    )?;
-    snapshot.links.sort_unstable_by_key(|link| link.index);
-    capture_layout_snapshot(&snapshot, names)
+    with_topology_dump(
+        None,
+        Instant::now() + DUMP_TIMEOUT,
+        &mut [0; RTNL_BUFFER_BYTES],
+        |dump| {
+            let mut snapshot = dump.snapshot()?;
+            dump.append(5, RTM_GETNEXTHOP, 8, &mut snapshot)?;
+            snapshot.links.sort_unstable_by_key(|link| link.index);
+            capture_layout_snapshot(&snapshot, names)
+        },
+    )
 }
 
 pub fn check_gateway_defaults(captured: &[u32]) -> io::Result<()> {
-    let fd = route_socket(false)?;
-    let mut observed = snapshot(fd.as_fd(), None)?;
-    dump(
-        fd.as_fd(),
-        5,
-        106,
-        8,
-        &mut observed,
-        Instant::now() + Duration::from_secs(2),
-    )?;
-    check_gateway_defaults_snapshot(&observed, captured)
+    with_topology_dump(
+        None,
+        Instant::now() + DUMP_TIMEOUT,
+        &mut [0; RTNL_BUFFER_BYTES],
+        |dump| {
+            let mut observed = dump.snapshot()?;
+            dump.append(5, RTM_GETNEXTHOP, 8, &mut observed)?;
+            check_gateway_defaults_snapshot(&observed, captured)
+        },
+    )
 }
 
 fn check_gateway_defaults_snapshot(snapshot: &Snapshot, captured: &[u32]) -> io::Result<()> {
     snapshot.gateway_defaults(captured)
+}
+
+pub(crate) fn auxiliary_up(ifindex: u32) -> io::Result<bool> {
+    with_topology_dump(
+        None,
+        Instant::now() + DUMP_TIMEOUT,
+        &mut [0; RTNL_BUFFER_BYTES],
+        |dump| {
+            let mut observed = Snapshot::default();
+            dump.append(1, libc::RTM_GETLINK, 16, &mut observed)?;
+            observed
+                .links
+                .iter()
+                .find(|link| link.index == ifindex)
+                .map(|link| link.flags & libc::IFF_UP as u32 != 0)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))
+        },
+    )
 }
 
 fn capture_layout_snapshot(snapshot: &Snapshot, names: &[String]) -> io::Result<Vec<CaptureRealm>> {
@@ -476,9 +504,14 @@ pub struct CaptureWatch {
 impl CaptureWatch {
     pub fn new(indices: &[u32], budget: &Arc<MemoryBudget>) -> io::Result<Self> {
         let mut buffer = CaptureBuffer::new(budget)?;
+        let deadline = Instant::now() + DUMP_TIMEOUT;
         let fd = route_socket(true)?;
-        let dump_fd = route_socket(false)?;
-        let current = snapshot_with_buffer(dump_fd.as_fd(), None, &mut buffer.bytes)?;
+        let current = with_topology_dump(
+            Some(netns_cookie(fd.as_fd())?),
+            deadline,
+            &mut buffer.bytes,
+            |dump| dump.snapshot(),
+        )?;
         let mut links = Vec::new();
         for index in indices {
             if links.iter().any(|link: &Link| link.index == *index) {
@@ -542,42 +575,23 @@ impl CaptureWatch {
     fn receive(&mut self) -> io::Result<CaptureWatchEvent> {
         let mut dirty = false;
         for _ in 0..64 {
-            // SAFETY: recvfrom writes only the provided buffer and sockaddr extent.
-            let mut source: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-            let mut length = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-            let n = unsafe {
-                libc::recvfrom(
-                    self.fd.as_raw_fd(),
-                    self.buffer.bytes.as_mut_ptr().cast(),
-                    self.buffer.bytes.len(),
-                    libc::MSG_DONTWAIT | libc::MSG_TRUNC,
-                    (&mut source as *mut libc::sockaddr_nl).cast(),
-                    &mut length,
-                )
-            };
-            if n < 0 {
-                let error = io::Error::last_os_error();
-                match error.kind() {
-                    io::ErrorKind::WouldBlock => {
-                        return Ok(if dirty {
-                            CaptureWatchEvent::AddressDirty
-                        } else {
-                            CaptureWatchEvent::Quiet
-                        });
-                    }
-                    io::ErrorKind::Interrupted => continue,
-                    _ => return Err(error),
+            let length = match receive_netlink(
+                self.fd.as_fd(),
+                &mut self.buffer.bytes,
+                "invalid capture notification sender or extent",
+            ) {
+                Ok(length) => length,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(if dirty {
+                        CaptureWatchEvent::AddressDirty
+                    } else {
+                        CaptureWatchEvent::Quiet
+                    });
                 }
-            }
-            if n == 0
-                || n as usize > self.buffer.bytes.len()
-                || length as usize != size_of::<libc::sockaddr_nl>()
-                || source.nl_family != libc::AF_NETLINK as libc::sa_family_t
-                || source.nl_pid != 0
-            {
-                return Err(malformed("invalid capture notification sender or extent"));
-            }
-            dirty |= self.datagram(&self.buffer.bytes[..n as usize], crate::bpf::xdp_state)?;
+                Err(error) => return Err(error),
+            };
+            dirty |= self.datagram(&self.buffer.bytes[..length], crate::bpf::xdp_state)?;
         }
         Err(malformed("capture notification drain bound exceeded"))
     }
@@ -597,7 +611,7 @@ impl CaptureWatch {
             if length < 16 || length > bytes.len() || ((length + 3) & !3) > bytes.len() {
                 return Err(malformed("truncated capture notification"));
             }
-            if u16::from_ne_bytes([bytes[6], bytes[7]]) & 0x10 != 0 {
+            if u16::from_ne_bytes([bytes[6], bytes[7]]) & NLM_F_DUMP_INTR != 0 {
                 return Err(malformed("interrupted capture notification"));
             }
             let kind = u16::from_ne_bytes([bytes[4], bytes[5]]);
@@ -680,6 +694,7 @@ impl AsRawFd for CaptureWatch {
 
 pub struct Topology {
     fd: OwnedFd,
+    netns_cookie: u64,
     watch: WatchState,
 }
 
@@ -731,22 +746,19 @@ impl Topology {
     /// divert traffic. Foreign topology and malformed observations stay terminal.
     pub fn wait_tun_device(spec: &TunSpec<'_>, ifindex: u32) -> io::Result<()> {
         let name = spec.validate()?;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let fd = route_socket(false)?;
+        let deadline = Instant::now() + DUMP_TIMEOUT;
+        let mut watch = route_socket(true)?;
+        let cookie = netns_cookie(watch.as_fd())?;
+        let mut buffer = [0; RTNL_BUFFER_BYTES];
         loop {
-            let watch = route_socket(true)?;
-            let ready =
-                snapshot(fd.as_fd(), Some(deadline))?.tun_ready(spec, name, Some(ifindex), None)?;
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "owned TUN device readiness deadline expired",
-                ));
-            }
+            let ready = with_topology_dump(Some(cookie), deadline, &mut buffer, |dump| {
+                dump.snapshot()?.tun_ready(spec, name, Some(ifindex), None)
+            })?;
             if ready {
                 return Ok(());
             }
             wait_netlink(watch.as_fd(), libc::POLLIN, deadline)?;
+            watch = route_socket(true)?;
         }
     }
 
@@ -759,10 +771,16 @@ impl Topology {
 
     fn watch_tun(spec: &TunSpec<'_>, owned: Option<(u32, TunStage)>) -> io::Result<Self> {
         let name = spec.validate()?;
+        let deadline = Instant::now() + DUMP_TIMEOUT;
         let fd = route_socket(true)?;
-        snapshot(fd.as_fd(), None)?.admit_tun(spec, name, owned)?;
+        let netns_cookie = netns_cookie(fd.as_fd())?;
+        let mut buffer = [0; RTNL_BUFFER_BYTES];
+        with_topology_dump(Some(netns_cookie), deadline, &mut buffer, |dump| {
+            dump.snapshot()?.admit_tun(spec, name, owned)
+        })?;
         let mut topology = Self {
             fd,
+            netns_cookie,
             watch: match owned {
                 Some(owned) => WatchState::Tun {
                     spec: TunWatch {
@@ -781,7 +799,12 @@ impl Topology {
                 None => WatchState::Strict { invalidated: false },
             },
         };
-        if topology.check_changed()? {
+        let changed = if owned.is_some() {
+            topology.check_tun_changed_until(deadline, &mut buffer)?
+        } else {
+            topology.check_changed()?
+        };
+        if changed {
             return Err(unsupported("routing topology changed during admission"));
         }
         Ok(topology)
@@ -829,6 +852,14 @@ impl Topology {
 
     /// Classifies notifications and rechecks the admitted TUN dependencies.
     pub fn check_tun_changed(&mut self) -> io::Result<bool> {
+        self.check_tun_changed_until(Instant::now() + DUMP_TIMEOUT, &mut [0; RTNL_BUFFER_BYTES])
+    }
+
+    fn check_tun_changed_until(
+        &mut self,
+        deadline: Instant,
+        buffer: &mut [u8],
+    ) -> io::Result<bool> {
         let WatchState::Tun {
             spec,
             owned,
@@ -842,38 +873,19 @@ impl Topology {
         }
         let result = (|| {
             let mut changed = false;
-            let mut buffer = [0u8; 65536];
+            let spec = spec.spec();
             for turn in 0..64 {
-                // SAFETY: source and buffer are writable for their specified lengths.
-                let mut source: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-                let mut source_len = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-                let n = unsafe {
-                    libc::recvfrom(
-                        self.fd.as_raw_fd(),
-                        buffer.as_mut_ptr().cast(),
-                        buffer.len(),
-                        libc::MSG_DONTWAIT | libc::MSG_TRUNC,
-                        (&mut source as *mut libc::sockaddr_nl).cast(),
-                        &mut source_len,
-                    )
+                let n = match receive_netlink(
+                    self.fd.as_fd(),
+                    buffer,
+                    "invalid topology notification sender or extent",
+                ) {
+                    Ok(n) => n,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
                 };
-                if n < 0 {
-                    let error = io::Error::last_os_error();
-                    match error.kind() {
-                        io::ErrorKind::WouldBlock => break,
-                        io::ErrorKind::Interrupted => continue,
-                        _ => return Err(error),
-                    }
-                }
-                if n == 0
-                    || n as usize > buffer.len()
-                    || source_len as usize != size_of::<libc::sockaddr_nl>()
-                    || source.nl_family != libc::AF_NETLINK as libc::sa_family_t
-                    || source.nl_pid != 0
-                {
-                    return Err(malformed("invalid topology notification sender or extent"));
-                }
-                if tun_notifications(&buffer[..n as usize], spec, owned.0)? {
+                if tun_notifications(&buffer[..n], &spec, owned.0)? {
                     return Ok(true);
                 }
                 changed = true;
@@ -882,9 +894,10 @@ impl Topology {
                 }
             }
             if changed {
-                let fd = route_socket(false)?;
-                let current = snapshot(fd.as_fd(), None)?;
-                current.admit_tun(&spec.spec(), spec.spec().validate()?, Some(*owned))?;
+                let name = spec.validate()?;
+                with_topology_dump(Some(self.netns_cookie), deadline, buffer, |dump| {
+                    dump.snapshot()?.admit_tun(&spec, name, Some(*owned))
+                })?;
             }
             Ok(false)
         })();
@@ -895,7 +908,7 @@ impl Topology {
     }
 }
 
-fn tun_notifications(mut bytes: &[u8], spec: &TunWatch, ifindex: u32) -> io::Result<bool> {
+fn tun_notifications(mut bytes: &[u8], spec: &TunSpec<'_>, ifindex: u32) -> io::Result<bool> {
     let mut owned_changed = false;
     while !bytes.is_empty() {
         if bytes.len() < 16 {
@@ -907,7 +920,7 @@ fn tun_notifications(mut bytes: &[u8], spec: &TunWatch, ifindex: u32) -> io::Res
         }
         let kind = u16::from_ne_bytes([bytes[4], bytes[5]]);
         let flags = u16::from_ne_bytes([bytes[6], bytes[7]]);
-        if flags & 0x10 != 0 {
+        if flags & NLM_F_DUMP_INTR != 0 {
             return Err(malformed("interrupted topology notification"));
         }
         let body = &bytes[16..length];
@@ -984,32 +997,12 @@ fn unicast_source(family: u8, bytes: &[u8]) -> io::Result<bool> {
 /// Unrepresentable occupants retain their slot and have no deletable key.
 pub fn tun_readback(spec: &TunSpec<'_>, ifindex: u32) -> io::Result<TunReadback> {
     spec.validate()?;
-    let fd = route_socket(false)?;
-    snapshot(fd.as_fd(), None)?.tun_readback(spec, ifindex)
-}
-
-fn snapshot(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> io::Result<Snapshot> {
-    snapshot_with_buffer(fd, deadline, &mut [0; RTNL_BUFFER_BYTES])
-}
-
-fn snapshot_with_buffer(
-    fd: BorrowedFd<'_>,
-    deadline: Option<Instant>,
-    buffer: &mut [u8],
-) -> io::Result<Snapshot> {
-    let mut snapshot = Snapshot::default();
-    for (sequence, kind, body_len) in [(1, 18, 16), (2, 22, 8), (3, 34, 12), (4, 26, 12)] {
-        dump_with_buffer(
-            fd,
-            sequence,
-            kind,
-            body_len,
-            &mut snapshot,
-            deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(2)),
-            buffer,
-        )?;
-    }
-    Ok(snapshot)
+    with_topology_dump(
+        None,
+        Instant::now() + DUMP_TIMEOUT,
+        &mut [0; RTNL_BUFFER_BYTES],
+        |dump| dump.snapshot()?.tun_readback(spec, ifindex),
+    )
 }
 
 fn interface_name(bytes: &[u8]) -> io::Result<[u8; 16]> {
@@ -1111,68 +1104,235 @@ fn route_socket(watch: bool) -> io::Result<OwnedFd> {
     {
         return Err(io::Error::last_os_error());
     }
-    let ipv6_rules: libc::c_int = 19;
-    // SAFETY: the supplied option is a live integer, for RTNLGRP_IPV6_RULE.
-    if watch
-        && unsafe {
-            libc::setsockopt(
-                raw,
-                270,
-                1,
-                (&ipv6_rules as *const libc::c_int).cast(),
-                size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        } < 0
-    {
-        return Err(io::Error::last_os_error());
+    if watch {
+        join_route_group(fd.as_fd(), libc::RTNLGRP_IPV6_RULE)?;
     }
     Ok(fd)
 }
 
-fn dump(
+fn join_route_group(fd: BorrowedFd<'_>, group: libc::c_uint) -> io::Result<()> {
+    // SAFETY: the supplied option points to a live group number.
+    if unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_NETLINK,
+            libc::NETLINK_ADD_MEMBERSHIP,
+            (&group as *const libc::c_uint).cast(),
+            size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn netns_cookie(fd: BorrowedFd<'_>) -> io::Result<u64> {
+    let mut value = 0u64;
+    let mut length = size_of::<u64>() as libc::socklen_t;
+    // SAFETY: value is writable and length names its exact extent.
+    if unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NETNS_COOKIE,
+            (&mut value as *mut u64).cast(),
+            &mut length,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if length as usize != size_of::<u64>() || value == 0 {
+        return Err(malformed("invalid topology RTNL namespace cookie"));
+    }
+    Ok(value)
+}
+
+fn receive_netlink(
     fd: BorrowedFd<'_>,
-    sequence: u32,
-    kind: u16,
-    body_len: usize,
-    snapshot: &mut Snapshot,
+    buffer: &mut [u8],
+    invalid_sender: &'static str,
+) -> io::Result<usize> {
+    // SAFETY: recvfrom writes only the provided buffer and sockaddr extent.
+    let mut source: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    let mut length = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+    let n = unsafe {
+        libc::recvfrom(
+            fd.as_raw_fd(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+            (&mut source as *mut libc::sockaddr_nl).cast(),
+            &mut length,
+        )
+    };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if n == 0
+        || n as usize > buffer.len()
+        || length as usize != size_of::<libc::sockaddr_nl>()
+        || source.nl_family != libc::AF_NETLINK as libc::sa_family_t
+        || source.nl_pid != 0
+    {
+        return Err(malformed(invalid_sender));
+    }
+    Ok(n as usize)
+}
+
+struct TopologyDump<'a> {
+    fd: BorrowedFd<'a>,
     deadline: Instant,
-) -> io::Result<()> {
-    dump_with_buffer(
-        fd,
-        sequence,
-        kind,
-        body_len,
-        snapshot,
+    buffer: &'a mut [u8],
+}
+
+impl TopologyDump<'_> {
+    fn snapshot(&mut self) -> io::Result<Snapshot> {
+        let mut snapshot = Snapshot::default();
+        for (sequence, kind, body_len) in [(1, 18, 16), (2, 22, 8), (3, 34, 12), (4, 26, 12)] {
+            self.append(sequence, kind, body_len, &mut snapshot)?;
+        }
+        Ok(snapshot)
+    }
+
+    fn append(
+        &mut self,
+        sequence: u32,
+        kind: u16,
+        body_len: usize,
+        snapshot: &mut Snapshot,
+    ) -> io::Result<()> {
+        self.request(sequence, kind, &[0; 16][..body_len], |message, body| {
+            snapshot.push(message, body)
+        })
+    }
+
+    fn request(
+        &mut self,
+        sequence: u32,
+        kind: u16,
+        body: &[u8],
+        receive: impl FnMut(u16, &[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        dump_request(
+            self.fd,
+            sequence,
+            kind,
+            body,
+            self.deadline,
+            self.buffer,
+            receive,
+        )
+    }
+}
+
+fn with_topology_dump<T>(
+    expected_cookie: Option<u64>,
+    deadline: Instant,
+    buffer: &mut [u8],
+    run: impl FnMut(&mut TopologyDump<'_>) -> io::Result<T>,
+) -> io::Result<T> {
+    with_topology_dump_socket(
+        expected_cookie,
         deadline,
-        &mut [0; RTNL_BUFFER_BYTES],
+        buffer,
+        || {
+            let fd = route_socket(false)?;
+            let cookie = netns_cookie(fd.as_fd())?;
+            Ok((fd, cookie))
+        },
+        run,
     )
 }
 
-fn dump_with_buffer(
+#[derive(Debug)]
+struct InterruptedDump;
+
+impl std::fmt::Display for InterruptedDump {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(DUMP_INTERRUPTED)
+    }
+}
+
+impl std::error::Error for InterruptedDump {}
+
+fn with_topology_dump_socket<T>(
+    mut expected_cookie: Option<u64>,
+    deadline: Instant,
+    buffer: &mut [u8],
+    mut open: impl FnMut() -> io::Result<(OwnedFd, u64)>,
+    mut run: impl FnMut(&mut TopologyDump<'_>) -> io::Result<T>,
+) -> io::Result<T> {
+    check_dump_deadline(deadline)?;
+    for attempt in 0..MAX_DUMP_ATTEMPTS {
+        if attempt != 0 && Instant::now() >= deadline {
+            break;
+        }
+        let (fd, cookie) = open()?;
+        if *expected_cookie.get_or_insert(cookie) != cookie {
+            return Err(malformed("topology dump crossed network namespaces"));
+        }
+        let result = run(&mut TopologyDump {
+            fd: fd.as_fd(),
+            deadline,
+            buffer,
+        });
+        // The kernel can still be dumping into an interrupted socket.
+        drop(fd);
+        match result.and_then(|value| check_dump_deadline(deadline).map(|()| value)) {
+            Err(error)
+                if error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<InterruptedDump>()) =>
+            {
+                continue;
+            }
+            Err(error)
+                if attempt != 0
+                    && error.kind() == io::ErrorKind::TimedOut
+                    && error.raw_os_error().is_none()
+                    && Instant::now() >= deadline =>
+            {
+                break;
+            }
+            other => return other,
+        }
+    }
+    Err(unsupported(DUMP_INTERRUPTED))
+}
+
+fn check_dump_deadline(deadline: Instant) -> io::Result<()> {
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "topology dump deadline expired",
+        ));
+    }
+    Ok(())
+}
+
+fn dump_request(
     fd: BorrowedFd<'_>,
     sequence: u32,
     kind: u16,
-    body_len: usize,
-    snapshot: &mut Snapshot,
+    request_body: &[u8],
     deadline: Instant,
     buffer: &mut [u8],
+    mut receive: impl FnMut(u16, &[u8]) -> io::Result<()>,
 ) -> io::Result<()> {
-    let mut request = [0u8; 32];
-    let length = 16 + body_len;
+    let mut request = [0u8; 36];
+    let length = 16 + request_body.len();
     request[..4].copy_from_slice(&(length as u32).to_ne_bytes());
     request[4..6].copy_from_slice(&kind.to_ne_bytes());
     request[6..8].copy_from_slice(&0x301u16.to_ne_bytes());
     request[8..12].copy_from_slice(&sequence.to_ne_bytes());
+    request[16..length].copy_from_slice(request_body);
     // SAFETY: zero is valid initialization for sockaddr_nl.
     let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
     loop {
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "topology dump deadline expired",
-            ));
-        }
+        check_dump_deadline(deadline)?;
         // SAFETY: request and kernel match their supplied lengths.
         let n = unsafe {
             libc::sendto(
@@ -1200,95 +1360,87 @@ fn dump_with_buffer(
         wait_netlink(fd, libc::POLLOUT, deadline)?;
     }
     loop {
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "topology dump deadline expired",
-            ));
-        }
+        check_dump_deadline(deadline)?;
         wait_netlink(fd, libc::POLLIN, deadline)?;
-        let mut source = kernel;
-        let mut source_len = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-        // SAFETY: receive buffers are writable and correctly sized.
-        let n = unsafe {
-            libc::recvfrom(
-                fd.as_raw_fd(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                libc::MSG_DONTWAIT | libc::MSG_TRUNC,
-                (&mut source as *mut libc::sockaddr_nl).cast(),
-                &mut source_len,
-            )
-        };
-        if n < 0 {
-            let error = io::Error::last_os_error();
-            if matches!(
-                error.kind(),
-                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-            ) {
+        check_dump_deadline(deadline)?;
+        let length = match receive_netlink(fd, buffer, "invalid topology dump sender or extent") {
+            Ok(length) => length,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) =>
+            {
                 continue;
             }
-            return Err(error);
-        }
-        if n == 0
-            || n as usize > buffer.len()
-            || source_len as usize != size_of::<libc::sockaddr_nl>()
-            || source.nl_family != libc::AF_NETLINK as libc::sa_family_t
-            || source.nl_pid != 0
-        {
-            return Err(malformed("invalid topology dump sender or extent"));
-        }
-        let mut bytes = &buffer[..n as usize];
-        let mut done = false;
-        while !bytes.is_empty() {
-            if bytes.len() < 16 {
-                return Err(malformed("short topology message"));
-            }
-            let length = u32_at(bytes, 0)? as usize;
-            if length < 16 || length > bytes.len() {
-                return Err(malformed("invalid topology message length"));
-            }
-            let message = u16::from_ne_bytes([bytes[4], bytes[5]]);
-            let flags = u16::from_ne_bytes([bytes[6], bytes[7]]);
-            if u32_at(bytes, 8)? != sequence || flags & 0x10 != 0 {
-                return Err(unsupported(
-                    "topology changed or dump was interrupted during admission",
-                ));
-            }
-            let body = &bytes[16..length];
-            match message {
-                2 => {
-                    let errno = u32_at(body, 0)? as i32;
-                    if errno != 0 {
-                        return Err(io::Error::from_raw_os_error(
-                            errno
-                                .checked_neg()
-                                .ok_or_else(|| malformed("invalid topology errno"))?,
-                        ));
-                    }
-                }
-                3 => {
-                    if body.len() >= 4 && u32_at(body, 0)? != 0 {
-                        return Err(malformed("failed topology dump completion"));
-                    }
-                    done = true;
-                }
-                4 => return Err(malformed("topology netlink overrun")),
-                16 | 20 | 24 | 32 | 104 if !done && message == kind - 2 && flags & 2 != 0 => {
-                    snapshot.push(message, body)?
-                }
-                _ => return Err(malformed("unexpected topology dump message")),
-            }
-            let advance = (length + 3) & !3;
-            if advance > bytes.len() && length != bytes.len() {
-                return Err(malformed("short topology alignment"));
-            }
-            bytes = &bytes[advance.min(bytes.len())..];
-        }
-        if done {
+            Err(error) => return Err(error),
+        };
+        if dump_datagram(&buffer[..length], sequence, kind, &mut receive)? {
             return Ok(());
         }
     }
+}
+
+fn dump_datagram(
+    mut bytes: &[u8],
+    sequence: u32,
+    kind: u16,
+    mut receive: impl FnMut(u16, &[u8]) -> io::Result<()>,
+) -> io::Result<bool> {
+    let mut done = false;
+    while !bytes.is_empty() {
+        if bytes.len() < 16 {
+            return Err(malformed("short topology message"));
+        }
+        let length = u32_at(bytes, 0)? as usize;
+        if length < 16 || length > bytes.len() {
+            return Err(malformed("invalid topology message length"));
+        }
+        let advance = (length + 3) & !3;
+        if advance > bytes.len() && length != bytes.len() {
+            return Err(malformed("short topology alignment"));
+        }
+        let message = u16::from_ne_bytes([bytes[4], bytes[5]]);
+        let flags = u16::from_ne_bytes([bytes[6], bytes[7]]);
+        if u32_at(bytes, 8)? != sequence {
+            return Err(unsupported(DUMP_INTERRUPTED));
+        }
+        let interrupted = flags & NLM_F_DUMP_INTR != 0;
+        let body = &bytes[16..length];
+        match message {
+            2 => {
+                let errno = u32_at(body, 0)? as i32;
+                if errno != 0 {
+                    return Err(io::Error::from_raw_os_error(
+                        errno
+                            .checked_neg()
+                            .ok_or_else(|| malformed("invalid topology errno"))?,
+                    ));
+                }
+            }
+            3 => {
+                if !body.is_empty() {
+                    let status = u32_at(body, 0)? as i32;
+                    if status != 0 && !(interrupted && status == -libc::EINTR) {
+                        return Err(malformed("failed topology dump completion"));
+                    }
+                }
+                done = true;
+            }
+            4 => return Err(malformed("topology netlink overrun")),
+            _ if !done && message == kind - 2 && flags & 2 != 0 => {
+                if !interrupted {
+                    receive(message, body)?;
+                }
+            }
+            _ => return Err(malformed("unexpected topology dump message")),
+        }
+        if interrupted {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, InterruptedDump));
+        }
+        bytes = &bytes[advance.min(bytes.len())..];
+    }
+    Ok(done)
 }
 
 #[derive(Default)]
@@ -1306,17 +1458,35 @@ struct Link {
     loopback: bool,
     name: Option<[u8; 16]>,
     mtu: Option<u32>,
+    tx_queue_len: Option<u32>,
     kind: Option<[u8; 16]>,
     flags: u32,
     master: u32,
     arphrd: u16,
     parent: u32,
+    foreign_parent: bool,
     mac: [u8; 6],
     rx_queues: u32,
     tx_queues: u32,
     vlan: Option<(u16, u16)>,
     bond: Option<(u8, u8)>,
+    big_tcp: bool,
+    has_hardware_address: bool,
 }
+
+impl Link {
+    fn is_owned_tun(&self, name: [u8; 16], mtu: u32) -> bool {
+        // tun_net_initialize sets POINTOPOINT|NOARP|MULTICAST. An attached,
+        // administratively up queue also reports RUNNING|LOWER_UP.
+        self.name == Some(name)
+            && self.mtu == Some(mtu)
+            && self.kind == interface_name(b"tun").ok()
+            && self.arphrd == libc::ARPHRD_NONE
+            && self.flags == 0x110d1
+            && self.master == 0
+    }
+}
+
 #[derive(Clone)]
 struct Address {
     family: u8,
@@ -1341,6 +1511,7 @@ struct Rule {
     mask: u32,
     action: u8,
     iif: Option<[u8; 16]>,
+    oif: Option<[u8; 16]>,
     flags: u32,
     unsupported: bool,
 }
@@ -1349,6 +1520,7 @@ struct Route {
     family: u8,
     table: u32,
     output: u32,
+    input: u32,
     default: bool,
     kind: u8,
     simple: bool,
@@ -1544,23 +1716,30 @@ impl Snapshot {
                     loopback: flags & 8 != 0,
                     name: None,
                     mtu: None,
+                    tx_queue_len: None,
                     kind: None,
                     flags,
                     master: 0,
                     arphrd,
                     parent: index,
+                    foreign_parent: false,
                     mac: [0; 6],
                     rx_queues: 0,
                     tx_queues: 0,
                     vlan: None,
                     bond: None,
+                    big_tcp: false,
+                    has_hardware_address: false,
                 };
                 let mut parent = index;
                 let mut seen = 0;
+                let mut seen_offload = 0;
                 let mut info_data = None;
                 attributes(&body[16..], |kind, value| {
                     match kind {
-                        1 | 3 | 4 | 5 | 10 | 18 | 31 | 32 => unique_attribute(&mut seen, kind)?,
+                        1 | 3 | 4 | 5 | 10 | libc::IFLA_TXQLEN | 18 | 31 | 32 => {
+                            unique_attribute(&mut seen, kind)?
+                        }
                         _ => {}
                     }
                     match kind {
@@ -1570,11 +1749,28 @@ impl Snapshot {
                             }
                             link.mac.copy_from_slice(value);
                         }
+                        1 if arphrd == libc::ARPHRD_NONE => {
+                            link.has_hardware_address = !value.is_empty();
+                        }
                         31 => link.tx_queues = exact_u32(value)?,
                         32 => link.rx_queues = exact_u32(value)?,
                         3 => link.name = Some(netlink_name(value)?),
                         4 => link.mtu = Some(exact_u32(value)?),
                         5 => parent = exact_u32(value)?,
+                        libc::IFLA_TXQLEN => link.tx_queue_len = Some(exact_u32(value)?),
+                        libc::IFLA_LINK_NETNSID => {
+                            exact_u32(value)?;
+                            link.foreign_parent = true;
+                        }
+                        libc::IFLA_GSO_MAX_SIZE
+                        | libc::IFLA_GRO_MAX_SIZE
+                        | IFLA_GSO_IPV4_MAX_SIZE
+                        | IFLA_GRO_IPV4_MAX_SIZE
+                            if matches!(arphrd, libc::ARPHRD_NONE | libc::ARPHRD_ETHER) =>
+                        {
+                            unique_attribute(&mut seen_offload, kind - libc::IFLA_GSO_MAX_SIZE)?;
+                            link.big_tcp |= exact_u32(value)? > LEGACY_OFFLOAD_MAX_SIZE;
+                        }
                         10 => {
                             link.master = exact_u32(value)?;
                         }
@@ -1713,6 +1909,7 @@ impl Snapshot {
                     mask: 0,
                     action: body[7],
                     iif: None,
+                    oif: None,
                     flags,
                     unsupported: body[1..4] != [0, 0, 0] || body[5..7] != [0, 0],
                 };
@@ -1727,6 +1924,10 @@ impl Snapshot {
                         10 => rule.mark = Some(exact_u32(value)?),
                         15 => rule.table = exact_u32(value)?,
                         16 => rule.mask = exact_u32(value)?,
+                        17 => {
+                            rule.oif = Some(netlink_name(value)?);
+                            rule.unsupported = true;
+                        }
                         14 if exact_u32(value)? == u32::MAX => {}
                         18 if value.is_empty() => {}
                         21 if value.len() == 1 => {}
@@ -1746,6 +1947,7 @@ impl Snapshot {
                     family: body[0],
                     table: u32::from(body[4]),
                     output: 0,
+                    input: 0,
                     default: body[1] == 0,
                     kind: body[7],
                     simple: body[2] == 0 && body[3] == 0,
@@ -1785,6 +1987,12 @@ impl Snapshot {
                                         .map_err(|_| malformed("invalid IPv4 route destination"))?,
                                 ));
                             }
+                        }
+                        3 => {
+                            route.input = exact_u32(value)?;
+                            route.simple = false;
+                            route.unsupported = true;
+                            route.gateway_unsupported = true;
                         }
                         4 => route.output = exact_u32(value)?,
                         9 => {
@@ -2069,17 +2277,12 @@ impl Snapshot {
     }
 
     fn tun_link(&self, spec: &TunSpec<'_>, index: u32) -> bool {
-        // tun_net_initialize sets POINTOPOINT|NOARP|MULTICAST; an attached,
-        // administratively up queue also reports RUNNING|LOWER_UP.
-        self.links.iter().any(|link| {
-            link.index == index
-                && interface_name(spec.name.as_bytes()).ok() == link.name
-                && link.mtu == Some(spec.mtu)
-                && link.kind == interface_name(b"tun").ok()
-                && link.arphrd == 0xfffe
-                && link.flags == 0x110d1
-                && link.master == 0
-        })
+        let Ok(name) = interface_name(spec.name.as_bytes()) else {
+            return false;
+        };
+        self.links
+            .iter()
+            .any(|link| link.index == index && link.is_owned_tun(name, spec.mtu))
     }
 
     fn system_tun_rule(rule: &Rule) -> bool {
@@ -2287,7 +2490,226 @@ mod tests {
 
     mod tun;
 
-    fn capture_notification(kind: u16, body: &[u8]) -> Vec<u8> {
+    pub(super) fn dump_message(sequence: u32, kind: u16, flags: u16, body: &[u8]) -> Vec<u8> {
+        let mut bytes = capture_notification(kind, body);
+        bytes[6..8].copy_from_slice(&flags.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&sequence.to_ne_bytes());
+        bytes
+    }
+
+    #[test]
+    fn dump_retry_restarts_full_snapshot_after_interruption() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        for interrupt_on_done in [false, true] {
+            let budget = MemoryBudget::new(RTNL_BUFFER_BYTES);
+            let mut buffer = CaptureBuffer::new(&budget).unwrap();
+            let buffer_address = buffer.bytes.as_ptr();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut previous_peer: Option<UnixStream> = None;
+            let mut opened = 0;
+            let mut read = 0;
+            let snapshot = with_topology_dump_socket(
+                Some(42),
+                deadline,
+                &mut buffer.bytes,
+                || {
+                    if let Some(mut peer) = previous_peer.take() {
+                        assert_eq!(peer.read(&mut [0]).unwrap(), 0, "old dump socket is open");
+                    }
+                    let (socket, mut peer) = UnixStream::pair()?;
+                    peer.set_nonblocking(true)?;
+                    opened += 1;
+                    peer.write_all(&[opened])?;
+                    previous_peer = Some(peer);
+                    Ok((socket.into(), 42))
+                },
+                |dump| {
+                    assert_eq!(dump.deadline, deadline);
+                    assert_eq!(dump.buffer.as_ptr(), buffer_address);
+                    read += 1;
+                    let mut marker = [0];
+                    UnixStream::from(dump.fd.try_clone_to_owned()?).read_exact(&mut marker)?;
+                    assert_eq!(marker, [read]);
+
+                    let index = u32::from(read) + 10;
+                    let mut link =
+                        dump_message(1, libc::RTM_NEWLINK, 2, &capture_link_body(index, 1500, 1));
+                    link.extend(dump_message(1, 3, 2, &[0; 4]));
+                    let mut snapshot = Snapshot::default();
+                    let mut record = |kind, body: &[u8]| snapshot.push(kind, body);
+                    assert!(dump_datagram(&link, 1, libc::RTM_GETLINK, &mut record)?);
+
+                    let mut route = vec![0; 12];
+                    route[0] = 2;
+                    route[4] = 254;
+                    route[7] = 1;
+                    attribute(&mut route, 4, &index.to_ne_bytes());
+                    let route_flags = if read == 1 && !interrupt_on_done {
+                        2 | NLM_F_DUMP_INTR
+                    } else {
+                        2
+                    };
+                    let route = dump_message(2, libc::RTM_NEWROUTE, route_flags, &route);
+                    assert!(!dump_datagram(&route, 2, libc::RTM_GETROUTE, &mut record)?);
+                    let done_flags = if read == 1 && interrupt_on_done {
+                        2 | NLM_F_DUMP_INTR
+                    } else {
+                        2
+                    };
+                    let done = dump_message(2, 3, done_flags, &[0; 4]);
+                    assert!(dump_datagram(&done, 2, libc::RTM_GETROUTE, &mut record)?);
+                    Ok(snapshot)
+                },
+            )
+            .unwrap();
+            assert_eq!((opened, read), (2, 2));
+            assert_eq!(snapshot.links.len(), 1);
+            assert_eq!(snapshot.links[0].index, 12);
+            assert_eq!(snapshot.routes.len(), 1);
+            assert_eq!(snapshot.routes[0].output, 12);
+            assert_eq!(budget.used(), RTNL_BUFFER_BYTES);
+        }
+    }
+
+    #[test]
+    fn dump_retry_exhausts_after_eight_socket_attempts() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let done = dump_message(1, 3, 2 | NLM_F_DUMP_INTR, &[0; 4]);
+        let mut opened = 0;
+        let error = with_topology_dump_socket(
+            None,
+            deadline,
+            &mut [],
+            || {
+                opened += 1;
+                Ok((std::fs::File::open("/dev/null")?.into(), 42))
+            },
+            |dump| {
+                assert_eq!(dump.deadline, deadline);
+                dump_datagram(&done, 1, libc::RTM_GETLINK, |_, _| unreachable!())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(opened, 8);
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(error.to_string(), DUMP_INTERRUPTED);
+    }
+
+    #[test]
+    fn dump_retry_preserves_terminal_kernel_timeout() {
+        let done = dump_message(1, 3, NLM_F_DUMP_INTR, &(-libc::EINTR).to_ne_bytes());
+        let kernel_error = dump_message(1, 2, 0, &(-libc::ETIMEDOUT).to_ne_bytes());
+        let mut replies = [done, kernel_error].into_iter();
+        let error = with_topology_dump_socket(
+            None,
+            Instant::now() + Duration::from_secs(10),
+            &mut [],
+            || Ok((std::fs::File::open("/dev/null")?.into(), 42)),
+            |_| {
+                dump_datagram(
+                    &replies.next().unwrap(),
+                    1,
+                    libc::RTM_GETLINK,
+                    |_, _| unreachable!(),
+                )
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ETIMEDOUT));
+        assert!(replies.next().is_none());
+    }
+
+    #[test]
+    fn dump_retry_only_retries_matched_dump_interruptions() {
+        use io::ErrorKind::{Interrupted, InvalidData, Unsupported};
+
+        for (message, kind, errno) in [
+            (
+                dump_message(2, 3, NLM_F_DUMP_INTR, &[0; 4]),
+                Unsupported,
+                None,
+            ),
+            (
+                dump_message(1, 3, NLM_F_DUMP_INTR, &[0; 2]),
+                InvalidData,
+                None,
+            ),
+            (
+                dump_message(1, 3, NLM_F_DUMP_INTR, &(-libc::EINVAL).to_ne_bytes()),
+                InvalidData,
+                None,
+            ),
+            (
+                dump_message(1, 2, 0, &(-libc::EOPNOTSUPP).to_ne_bytes()),
+                Unsupported,
+                Some(libc::EOPNOTSUPP),
+            ),
+            (
+                dump_message(1, 2, 0, &(-libc::EINTR).to_ne_bytes()),
+                Interrupted,
+                Some(libc::EINTR),
+            ),
+            (
+                dump_message(1, libc::RTM_NEWLINK, 2, &[0; 16]),
+                Unsupported,
+                None,
+            ),
+        ] {
+            let mut opened = 0;
+            let error = with_topology_dump_socket(
+                None,
+                Instant::now() + Duration::from_secs(10),
+                &mut [],
+                || {
+                    opened += 1;
+                    Ok((std::fs::File::open("/dev/null")?.into(), 42))
+                },
+                |_| {
+                    dump_datagram(&message, 1, libc::RTM_GETLINK, |_, _| {
+                        Err(unsupported("test topology policy refusal"))
+                    })
+                },
+            )
+            .unwrap_err();
+            assert_eq!(opened, 1);
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.raw_os_error(), errno);
+        }
+    }
+
+    #[test]
+    fn dump_retry_fences_namespace() {
+        let done = dump_message(1, 3, NLM_F_DUMP_INTR, &[0; 4]);
+        for (expected_cookie, first_cookie, expected_counts) in [
+            (None, 42, (2, 1)),
+            (Some(42), 42, (2, 1)),
+            (Some(41), 42, (1, 0)),
+        ] {
+            let mut opened = 0;
+            let mut read = 0;
+            let error = with_topology_dump_socket(
+                expected_cookie,
+                Instant::now() + Duration::from_secs(10),
+                &mut [],
+                || {
+                    opened += 1;
+                    let cookie = if opened == 1 { first_cookie } else { 43 };
+                    Ok((std::fs::File::open("/dev/null")?.into(), cookie))
+                },
+                |_| {
+                    read += 1;
+                    dump_datagram(&done, 1, libc::RTM_GETLINK, |_, _| unreachable!())
+                },
+            )
+            .unwrap_err();
+            assert_eq!((opened, read), expected_counts);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    pub(super) fn capture_notification(kind: u16, body: &[u8]) -> Vec<u8> {
         let length = 16 + body.len();
         let mut bytes = vec![0; 16];
         bytes[..4].copy_from_slice(&(length as u32).to_ne_bytes());
@@ -2636,12 +3058,13 @@ mod tests {
         };
         let other = address_body(2, 3, &[198, 51, 100, 1], None);
         let owned = address_body(2, 9, &[192, 0, 2, 1], None);
+        let spec = spec.spec();
         assert!(!tun_notifications(&message(20, &other), &spec, 9).unwrap());
         assert!(tun_notifications(&message(21, &owned), &spec, 9).unwrap());
         assert!(tun_notifications(&[1, 2, 3], &spec, 9).is_err());
     }
 
-    fn attribute(bytes: &mut Vec<u8>, kind: u16, value: &[u8]) {
+    pub(super) fn attribute(bytes: &mut Vec<u8>, kind: u16, value: &[u8]) {
         let length = value.len() + 4;
         bytes.extend_from_slice(&(length as u16).to_ne_bytes());
         bytes.extend_from_slice(&kind.to_ne_bytes());

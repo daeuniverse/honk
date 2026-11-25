@@ -962,6 +962,7 @@ async fn admitted_packet_tcp_keeps_route_and_mode_after_publication() -> anyhow:
                 "tcp",
                 flow.dscp(),
                 flow.packet_source(),
+                flow.process(),
                 #[cfg(feature = "native-api")]
                 false,
             )
@@ -1092,6 +1093,42 @@ async fn packet_tcp_sniffing_preserves_domain_plus_and_initial_must() -> anyhow:
         Ok(())
     })
     .await?
+}
+
+#[tokio::test]
+async fn packet_tcp_sniff_keeps_the_admitted_process() -> anyhow::Result<()> {
+    let upstream = TcpListener::bind("127.0.0.1:0").await?;
+    let (mut wire, flow) = Wire::connect(upstream.local_addr()?)?;
+    let mut config = config();
+    config.global.dial_mode = "domain++".into();
+    let name = "abcdefghijkl�猫";
+    config.routing = honk_config::parser::parse_dae_config(&format!(
+        "routing {{\n domain(full:allowed.example) && !pname('{name}') -> block\n pname('{name}') -> direct\n fallback: block\n}}",
+    ))?.routing;
+    let flow = flow.with_process_input(crate::control::netstack::ProcessMeta::test_gateway(
+        417, name,
+    ));
+    let plane = plane(config)?;
+    let handle = plane.spawn_handle();
+    handle.connection_tracker.enable();
+    let worker = handle.clone();
+    let serving = tokio::spawn(async move { worker.serve_packet_connection(flow).await });
+    let request = b"GET / HTTP/1.1\r\nHost: allowed.example\r\n\r\n";
+    wire.send(request);
+    let (mut server, _) = tokio::time::timeout(Duration::from_secs(5), upstream.accept()).await??;
+    let mut received = [0; 64];
+    server.read_exact(&mut received[..request.len()]).await?;
+    assert_eq!(&received[..request.len()], request);
+    let tracked = handle.connection_tracker.snapshot();
+    assert_eq!(tracked.len(), 1);
+    assert_eq!(tracked[0].process.as_deref(), Some(name));
+    wire.client.tcp_shutdown(wire.id).unwrap();
+    server.shutdown().await?;
+    wire.until(|wire| wire.eof).await?;
+    wire.settle(&serving).await?;
+    serving.await??;
+    wire.finish().await;
+    Ok(())
 }
 
 #[tokio::test]

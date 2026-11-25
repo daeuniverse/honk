@@ -155,11 +155,14 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
+pub const MAX_L3_LANS: usize = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterfaceRole {
     Lan,
     Wan,
+    L3Lan,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -350,29 +353,64 @@ impl TunConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+pub(crate) const REMOVED_HOST_XSK_MODE_CODE: &str = "removed-host-xsk-mode";
+pub(crate) const REMOVED_HOST_XSK_MODE_MESSAGE: &str = "delete datapath.host.xsk_mode / 请删除 datapath.host.xsk_mode. See doc/migration/en/gateway-host.md / 参见 doc/migration/zh/gateway-host.md";
+
+pub(crate) fn removed_host_xsk_mode_setting() -> crate::diagnostic::SettingPath {
+    crate::diagnostic::SettingPath::new("datapath")
+        .field("host")
+        .field("xsk_mode")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct HostConfig {
     pub interfaces: Vec<String>,
-    pub xsk_mode: XskMode,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename = "HostConfig")]
+struct HostInput {
+    #[serde(default)]
+    interfaces: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
+    xsk_mode: Option<serde::de::IgnoredAny>,
+}
+
+impl HostInput {
+    fn into_config<E: serde::de::Error>(self, on_removed: impl FnOnce()) -> Result<HostConfig, E> {
+        if self.xsk_mode.is_some() {
+            on_removed();
+            return Err(E::custom(REMOVED_HOST_XSK_MODE_MESSAGE));
+        }
+        Ok(HostConfig {
+            interfaces: self
+                .interfaces
+                .ok_or_else(|| E::missing_field("interfaces"))?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for HostConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        HostInput::deserialize(deserializer)?.into_config(|| {})
+    }
 }
 
 impl HostConfig {
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
         let invalid =
             |message: &str| crate::ConfigError::Parse(format!("datapath.host: {message}"));
-        if self.xsk_mode != XskMode::Copy {
-            return Err(invalid("requires explicit xsk_mode: copy"));
-        }
-        if self.interfaces.is_empty() || self.interfaces.len() > 16 {
-            return Err(invalid(
-                "requires between one and sixteen explicit interfaces",
-            ));
+        if !(1..=4).contains(&self.interfaces.len()) {
+            return Err(invalid("requires between one and four explicit interfaces"));
         }
         for (index, name) in self.interfaces.iter().enumerate() {
-            if !explicit_interface_name(name) || self.interfaces[..index].contains(name) {
+            if !explicit_interface_name(name)
+                || crate::config::is_auto_interface(name)
+                || matches!(name.as_str(), "." | "..")
+                || self.interfaces[..index].contains(name)
+            {
                 return Err(invalid(
-                    "interfaces must have unique, explicit Ethernet names",
+                    "interfaces must have unique, explicit interface names",
                 ));
             }
         }
@@ -446,59 +484,71 @@ impl Serialize for DatapathConfig {
     }
 }
 
-impl<'de> Deserialize<'de> for DatapathConfig {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            #[serde(default)]
-            backend: Backend,
-            #[serde(default)]
-            direct: Option<DirectProfile>,
-            #[serde(default, deserialize_with = "present")]
-            xsk_mode: Option<Option<XskMode>>,
-            #[serde(default, deserialize_with = "present")]
-            workers: Option<u8>,
-            #[serde(default, deserialize_with = "present")]
-            poll_mode: Option<PollMode>,
-            #[serde(default, deserialize_with = "present")]
-            dns_projection: Option<bool>,
-            #[serde(default, deserialize_with = "present")]
-            busy_poll: Option<BusyPollConfig>,
-            #[serde(default, deserialize_with = "present")]
-            interfaces: Option<Vec<XdpInterface>>,
-            #[serde(default, deserialize_with = "present")]
-            firewall: Option<Option<FirewallConfig>>,
-            #[serde(default)]
-            nat: NatConfig,
-            #[serde(default, deserialize_with = "present")]
-            tun: Option<TunConfig>,
-            #[serde(default, deserialize_with = "present")]
-            host: Option<HostConfig>,
-        }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DatapathInput {
+    #[serde(default)]
+    backend: Backend,
+    #[serde(default)]
+    direct: Option<DirectProfile>,
+    #[serde(default, deserialize_with = "present")]
+    xsk_mode: Option<Option<XskMode>>,
+    #[serde(default, deserialize_with = "present")]
+    workers: Option<u8>,
+    #[serde(default, deserialize_with = "present")]
+    poll_mode: Option<PollMode>,
+    #[serde(default, deserialize_with = "present")]
+    dns_projection: Option<bool>,
+    #[serde(default, deserialize_with = "present")]
+    busy_poll: Option<BusyPollConfig>,
+    #[serde(default, deserialize_with = "present")]
+    interfaces: Option<Vec<XdpInterface>>,
+    #[serde(default, deserialize_with = "present")]
+    firewall: Option<Option<FirewallConfig>>,
+    #[serde(default)]
+    nat: NatConfig,
+    #[serde(default, deserialize_with = "present")]
+    tun: Option<TunConfig>,
+    #[serde(default, deserialize_with = "present")]
+    host: Option<HostInput>,
+}
 
-        let wire = Wire::deserialize(deserializer)?;
-        if wire.backend == Backend::Tun
-            && (wire.interfaces.is_some() || wire.xsk_mode.is_some() || wire.firewall.is_some())
+impl DatapathInput {
+    pub(crate) fn into_config<E: serde::de::Error>(
+        self,
+        on_removed: impl FnOnce(),
+    ) -> Result<DatapathConfig, E> {
+        let host = self
+            .host
+            .map(|host| host.into_config(on_removed))
+            .transpose()?;
+        if self.backend == Backend::Tun
+            && (self.interfaces.is_some() || self.xsk_mode.is_some() || self.firewall.is_some())
         {
-            return Err(serde::de::Error::custom(
+            return Err(E::custom(
                 "datapath: TUN does not accept interfaces, xsk_mode or firewall fields",
             ));
         }
-        Ok(Self {
-            backend: wire.backend,
-            direct: wire.direct,
-            xsk_mode: wire.xsk_mode.flatten(),
-            workers: wire.workers,
-            poll_mode: wire.poll_mode,
-            dns_projection: wire.dns_projection,
-            busy_poll: wire.busy_poll,
-            interfaces: wire.interfaces.unwrap_or_default(),
-            firewall: wire.firewall.flatten(),
-            nat: wire.nat,
-            tun: wire.tun,
-            host: wire.host,
+        Ok(DatapathConfig {
+            backend: self.backend,
+            direct: self.direct,
+            xsk_mode: self.xsk_mode.flatten(),
+            workers: self.workers,
+            poll_mode: self.poll_mode,
+            dns_projection: self.dns_projection,
+            busy_poll: self.busy_poll,
+            interfaces: self.interfaces.unwrap_or_default(),
+            firewall: self.firewall.flatten(),
+            nat: self.nat,
+            tun: self.tun,
+            host,
         })
+    }
+}
+
+impl<'de> Deserialize<'de> for DatapathConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        DatapathInput::deserialize(deserializer)?.into_config(|| {})
     }
 }
 
@@ -512,14 +562,42 @@ impl DatapathConfig {
         {
             return Err(invalid("workers requires XDP and must be 1 or 2"));
         }
-        if self.effective_workers() == 2 && self.interfaces.is_empty() {
+        let auxiliary = self
+            .interfaces
+            .iter()
+            .filter(|interface| interface.role == InterfaceRole::L3Lan)
+            .count();
+        let physical = self.interfaces.len() - auxiliary;
+        if self.effective_workers() == 2 && physical == 0 {
             return Err(invalid("workers: 2 requires physical XDP interfaces"));
+        }
+        if auxiliary != 0 {
+            if self.backend != Backend::Xdp
+                || self.direct != Some(DirectProfile::Endpoint)
+                || physical == 0
+            {
+                return Err(invalid(
+                    "l3_lan requires XDP Endpoint with a physical LAN or WAN",
+                ));
+            }
+            if auxiliary > MAX_L3_LANS {
+                return Err(invalid("XDP accepts at most eight l3_lan interfaces"));
+            }
         }
         if let Some(host) = &self.host {
             if self.backend != Backend::Xdp || self.direct != Some(DirectProfile::Endpoint) {
                 return Err(invalid("Host requires backend: xdp and direct: endpoint"));
             }
             host.validate()?;
+            if self
+                .interfaces
+                .iter()
+                .any(|interface| host.interfaces.contains(&interface.name))
+            {
+                return Err(invalid(
+                    "host.interface must not overlap physical or l3_lan interfaces",
+                ));
+            }
         }
         match self.backend {
             Backend::Tc => {
@@ -547,10 +625,9 @@ impl DatapathConfig {
                         "XDP requires explicit direct: core or direct: endpoint",
                     ));
                 }
-                if (self.interfaces.is_empty() && self.host.is_none()) || self.interfaces.len() > 16
-                {
+                if (physical == 0 && self.host.is_none()) || physical > 16 {
                     return Err(invalid(
-                        "XDP requires between one and sixteen explicit interfaces",
+                        "XDP requires between one and sixteen explicit physical interfaces",
                     ));
                 }
                 for (index, interface) in self.interfaces.iter().enumerate() {
@@ -609,15 +686,17 @@ impl DatapathConfig {
     fn supports_dns_projection(&self) -> bool {
         self.backend == Backend::Xdp
             && self.direct == Some(DirectProfile::Endpoint)
-            && self
-                .interfaces
-                .iter()
-                .any(|interface| interface.role == InterfaceRole::Lan)
+            && (self.host.is_some()
+                || self.interfaces.iter().any(|interface| {
+                    matches!(interface.role, InterfaceRole::Lan | InterfaceRole::L3Lan)
+                }))
     }
 
     pub(crate) fn validate_dns_projection(&self) -> Result<(), &'static str> {
         if self.dns_projection.is_some() && !self.supports_dns_projection() {
-            return Err("dns_projection requires XDP Endpoint with a physical LAN interface");
+            return Err(
+                "dns_projection requires XDP Endpoint with a LAN, l3_lan or Host interface",
+            );
         }
         Ok(())
     }

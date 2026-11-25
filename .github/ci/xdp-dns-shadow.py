@@ -233,7 +233,7 @@ def possible_cpus():
     return count
 
 
-def snapshot(device, enabled):
+def snapshot(device, enabled, *, tcp=False):
     with namespace('dut'):
         program = probe.program_fd(device, 'data')
         try:
@@ -241,14 +241,22 @@ def snapshot(device, enabled):
             maps = program_maps(program)
             assert SHADOW_MAPS.intersection(maps) == (SHADOW_MAPS if enabled else set()), maps
             stats = maps['honk_gw_stats']
-            assert stats[1:5] == (6, 4, 8, 19), stats
+            assert stats[1:5] == (6, 4, 8, 32), stats
             counter = maps['honk_xdp_count']
             length = 8 * possible_cpus()
-            counters = {label: sum(x[0] for x in struct.iter_unpack('=Q', map_value(stats, struct.pack('=I', key), length)))
-                        for label, key in [('pass_d1', 8), ('xsk_new', 9), ('would_pass_dns', 18)]}
+            reasons = [('pass_d1', 8), ('xsk_new', 9), ('would_pass_dns', 18), ('pass_dns_d1', 19), ('dns_retry', 20)]
+            reasons.extend(zip(('pending_conflict', 'pending_capped', 'hold_contention', 'hold_unavailable',
+                                'release_failed', 'retire_failed'), range(21, 27), strict=True))
+            if not tcp:
+                reasons.extend([('ct_reply', 4), ('pass_fragment', 5), ('xsk_fragment', 6), ('fragment_miss', 14),
+                                ('fragment_publish_failed', 15)])
+            per_cpu = {label: [x[0] for x in struct.iter_unpack('=Q', map_value(stats, struct.pack('=I', key), length))]
+                       for label, key in reasons}
+            counters = {label: sum(values) for label, values in per_cpu.items()}
             assert counter[1:4] == (2, 4, 8) and 5 <= counter[4] <= 260, counter
-            counters['capture'] = sum(struct.unpack('=Q', map_value(counter, struct.pack('=I', queue), 8))[0]
-                                      for queue in range(counter[4] - 4))
+            queues = [struct.unpack('=Q', map_value(counter, struct.pack('=I', queue), 8))[0]
+                      for queue in range(counter[4] - 4)]
+            counters['capture'] = sum(queues)
             realm = struct.unpack('=I', map_value(maps['honk_gw_realms'],
                                                  struct.pack('=I12x', socket.if_nametoindex(device)), 4))[0]
             assert 0 < realm <= 64, (device, realm)
@@ -260,9 +268,9 @@ def snapshot(device, enabled):
                 value = map_value(epochs, struct.pack('=I', realm), 64)
                 assert value is not None, ('missing captured realm slot', device, realm)
                 epoch = struct.unpack_from('=Q', value)[0]
-                assert (epoch > 0) == (device == 'dut0'), (device, realm, epoch)
+                assert (epoch > 0) == (device in ('dut0', 'dut2')), (device, realm, epoch)
             return {'program': identity, 'maps': maps, 'realm': realm, 'epoch': epoch, 'counters': counters,
-                    'forward': probe.forward_fence_packets()}
+                    'queues': queues, 'dns_by_cpu': per_cpu['pass_dns_d1']}
         finally:
             os.close(program)
 
@@ -286,13 +294,17 @@ def address_bytes(address):
     return socket.inet_pton(family(address), address)
 
 
-def live_dns_fact(state, ip, nonzero):
+def dns_fact(state, ip):
     canonical = address_bytes(ip)
     if family(ip) == socket.AF_INET:
         canonical = b'\0' * 10 + b'\xff\xff' + canonical
     key = struct.pack('=QII', state['epoch'], state['realm'], 0) + canonical
     with namespace('dut'):
-        fact = map_value(state['maps']['dns_facts'], key, 40)
+        return map_value(state['maps']['dns_facts'], key, 40)
+
+
+def live_dns_fact(state, ip, nonzero):
+    fact = dns_fact(state, ip)
     assert fact is not None, ('missing current DNS fact', ip, state)
     deadline, bitmap = struct.unpack('=Q32s', fact)
     now = time.monotonic_ns()
@@ -304,19 +316,24 @@ def name_wire(name):
     return b''.join(bytes([len(label)]) + label.encode('ascii') for label in name.split('.')) + b'\0'
 
 
-def endpoint_peer(owned):
-    sockets = {}
+def verify_answer(result, question, serial, qtype, ip, maximum_ttl):
+    identifier, flags, questions, answers, _, _ = struct.unpack_from('!HHHHHH', result)
+    assert identifier == serial and flags & 0x800f == 0x8000 and questions == answers == 1
+    assert result[12:12 + len(question)] == question
+    start = probe.dns_name_end(result, 12 + len(question))
+    rtype, rclass, ttl, size = struct.unpack_from('!HHIH', result, start)
+    assert (rtype, rclass) == (qtype, 1) and 0 < ttl <= maximum_ttl
+    assert result[start + 10:start + 10 + size] == address_bytes(ip)
+
+
+def endpoint_peer(owned, answer=answer_ip, *, record_peer_identity=False):
+    ip, port = '10.77.0.2', 15353
     with namespace('server'):
         uplink = socket.if_nametoindex('su')
-        for ip, port in [('10.77.0.2', 15353), (TARGET4, PORT), (TARGET6, PORT), (EXPIRING, PORT),
-                         (STATIC, PORT), (TARGET4, 53)]:
-            sock = owned.enter_context(socket.socket(family(ip), socket.SOCK_DGRAM))
-            if family(ip) == socket.AF_INET:
-                sock.setsockopt(socket.IPPROTO_IP, 8, 1)  # IP_PKTINFO
-            else:
-                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_RECVPKTINFO, 1)
-            sock.bind((ip, port))
-            sockets[sock] = (ip, port)
+        nsid = os.stat('/proc/thread-self/ns/net').st_ino
+        sock = owned.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+        sock.setsockopt(socket.IPPROTO_IP, 8, 1)  # IP_PKTINFO
+        sock.bind((ip, port))
     stop_read, stop_write = socket.socketpair()
     owned.enter_context(stop_read)
     owned.enter_context(stop_write)
@@ -325,42 +342,34 @@ def endpoint_peer(owned):
     def run():
         try:
             while True:
-                read, _, _ = select.select([stop_read, *sockets], [], [], 30)
+                read, _, _ = select.select([stop_read, sock], [], [], 30)
                 assert read, 'independent peer idle deadline'
                 if stop_read in read:
                     return
-                for sock in read:
-                    data, ancillary, flags, source = sock.recvmsg(4096, socket.CMSG_SPACE(20))
-                    ip, port = sockets[sock]
-                    assert flags == 0 and len(ancillary) == 1
-                    [(level, kind, wire)] = ancillary
-                    if family(ip) == socket.AF_INET:
-                        assert (level, kind) == (socket.IPPROTO_IP, 8), ancillary
-                        ifindex, _, destination = struct.unpack('=I4s4s', wire)
-                    else:
-                        assert (level, kind) == (socket.IPPROTO_IPV6, socket.IPV6_PKTINFO), ancillary
-                        destination, ifindex = struct.unpack('=16sI', wire)
-                    assert destination == address_bytes(ip) and ifindex == uplink, (destination, ifindex, ip)
-                    assert source[0] == (UP4 if family(ip) == socket.AF_INET else UP6), source
-                    if port == 15353:
-                        end = probe.dns_name_end(data, 12)
-                        qtype, qclass = struct.unpack_from('!HH', data, end)
-                        question = data[12:end + 4]
-                        name = next(label for label in ('learn.pass-shadow.test', 'wan.pass-shadow.test', 'conflict.test',
-                                                         'zero.test', 'expire.pass-shadow.test')
-                                    if question == name_wire(label) + struct.pack('!HH', qtype, 1))
-                        assert qclass == 1
-                        address, ttl = answer_ip(name, qtype)
-                        body = address_bytes(address)
-                        response = (data[:2] + struct.pack('!HHHHH', 0x8180, 1, 1, 0, 0) + question
-                                    + b'\xc0\x0c' + struct.pack('!HHIH', qtype, 1, ttl, len(body)) + body)
-                        events.append({'kind': 'dns', 'name': name, 'qtype': qtype, 'source': source[0], 'destination': ip,
-                                       'port': port, 'ingress': 'su'})
-                    else:
-                        response = data
-                        events.append({'kind': 'echo', 'payload': data.decode(), 'source': source[0], 'destination': ip,
-                                       'port': port, 'ingress': 'su'})
-                    sock.sendto(response, source)
+                data, ancillary, flags, source = sock.recvmsg(4096, socket.CMSG_SPACE(12))
+                assert flags == 0 and len(ancillary) == 1
+                [(level, kind, wire)] = ancillary
+                assert (level, kind) == (socket.IPPROTO_IP, 8), ancillary
+                ifindex, _, destination = struct.unpack('=I4s4s', wire)
+                assert destination == address_bytes(ip) and ifindex == uplink, (destination, ifindex, ip)
+                assert source[0] == UP4, source
+                end = probe.dns_name_end(data, 12)
+                qtype, qclass = struct.unpack_from('!HH', data, end)
+                question = data[12:end + 4]
+                name = next(label for label in ('learn.pass-shadow.test', 'wan.pass-shadow.test', 'conflict.test',
+                                                 'zero.test', 'expire.pass-shadow.test')
+                            if question == name_wire(label) + struct.pack('!HH', qtype, 1))
+                assert qclass == 1
+                address, ttl = answer(name, qtype)
+                body = address_bytes(address)
+                response = (data[:2] + struct.pack('!HHHHH', 0x8180, 1, 1, 0, 0) + question
+                            + b'\xc0\x0c' + struct.pack('!HHIH', qtype, 1, ttl, len(body)) + body)
+                event = {'kind': 'dns', 'name': name, 'qtype': qtype, 'source': source[0], 'destination': ip,
+                         'port': port, 'ingress': 'su'}
+                if record_peer_identity:
+                    event.update(namespace='server', inode=nsid, source_port=source[1])
+                events.append(event)
+                assert sock.sendto(response, source) == len(response)
         except BaseException as error:
             errors.append(error)
 
@@ -378,131 +387,15 @@ def endpoint_peer(owned):
     return events
 
 
-def client_exchange(realm, source, destination, payload, expect_reply=True):
+def client_exchange(realm, source, destination, payload):
     with namespace(realm):
         sock = socket.socket(family(source[0]), socket.SOCK_DGRAM)
     with sock:
-        sock.settimeout(5 if expect_reply else 0.4)
+        sock.settimeout(5)
         sock.bind(source)
         sock.connect(destination)
         assert sock.send(payload) == len(payload)
-        if expect_reply:
-            return sock.recv(4096)
-        try:
-            data = sock.recv(4096)
-        except TimeoutError:
-            return None
-        raise AssertionError(('static D1 leaked through the independent native-forward fence', data))
-
-
-def wire(enabled):
-    expected_rows = []
-    with contextlib.ExitStack() as owned:
-        events = endpoint_peer(owned)
-        first = {}
-
-        def trial(label, destination, payload, *, realm='client', source=LAN4, hit=False, static=False,
-                  live_bitmap=None, same_fact_as=None):
-            device = 'dut0' if realm == 'client' else 'dut1'
-            before, event_count = snapshot(device, enabled), len(events)
-            if device in first:
-                assert (before['program'], before['maps']) == first[device], ('live program/map changed', device)
-            else:
-                first[device] = before['program'], before['maps']
-            fact = None
-            expected_bitmap = True if hit else live_bitmap
-            if enabled and expected_bitmap is not None:
-                fact = live_dns_fact(before, destination[0], expected_bitmap)
-                if same_fact_as is not None:
-                    assert (device, before['realm'], before['epoch'], fact['value']) == (
-                        same_fact_as['interface'], same_fact_as['realm'], same_fact_as['dns_epoch'],
-                        same_fact_as['dns_fact']['value']), (label, fact, same_fact_as)
-            origin = (source, 43100 + len(expected_rows))
-            result = client_exchange(realm, origin, destination, payload, not static)
-            after = snapshot(device, enabled)
-            assert (after['program'], after['maps']) == first[device], ('live program/map changed', device)
-            if fact is not None:
-                assert (after['realm'], after['epoch']) == (before['realm'], before['epoch']), (label, before, after)
-            delta = {key: value - before['counters'][key] for key, value in after['counters'].items()}
-            assert delta == {'pass_d1': int(static), 'xsk_new': int(not static), 'capture': int(not static),
-                             'would_pass_dns': int(enabled and hit)}, (label, delta, before, after)
-            forward = after['forward'] - before['forward']
-            assert forward == int(static), (label, before, after)
-            branches = events[event_count:]
-            assert len(branches) == int(not static), (label, branches, events)
-            expected_rows.append({'case': label, 'origin': list(origin), 'target': list(destination), 'interface': device,
-                                  'realm': before['realm'], 'program_id': before['program'], 'dns_epoch': after['epoch'],
-                                  'dns_fact': fact, 'delta': delta, 'native_forward': forward,
-                                  'peer': branches[0] if branches else None})
-            print(json.dumps(expected_rows[-1]), flush=True)
-            return result
-
-        def echo(label, ip, *, port=PORT, **checks):
-            data = ('shadow-wire/' + label).encode()
-            result = trial(label, (ip, port), data, **checks)
-            assert result == data, (label, result)
-            assert expected_rows[-1]['peer']['payload'] == data.decode()
-            return expected_rows[-1]
-
-        def learn(label, name, qtype, *, realm='client', source=LAN4):
-            question = name_wire(name) + struct.pack('!HH', qtype, 1)
-            serial = 0xa000 + len(expected_rows)
-            request = struct.pack('!HHHHHH', serial, 0x0100, 1, 0, 0, 0) + question
-            result = trial(label, DNS, request, realm=realm, source=source)
-            identifier, flags, questions, answers, _, _ = struct.unpack_from('!HHHHHH', result)
-            assert identifier == serial and flags & 0x800f == 0x8000 and questions == answers == 1
-            assert result[12:12 + len(question)] == question
-            start = probe.dns_name_end(result, 12 + len(question))
-            rtype, rclass, ttl, size = struct.unpack_from('!HHIH', result, start)
-            ip, maximum_ttl = answer_ip(name, qtype)
-            assert (rtype, rclass) == (qtype, 1) and 0 < ttl <= maximum_ttl
-            assert result[start + 10:start + 10 + size] == address_bytes(ip)
-            assert expected_rows[-1]['peer']['name'] == name and expected_rows[-1]['peer']['qtype'] == qtype
-            return time.monotonic_ns() + maximum_ttl * 1_000_000_000
-
-        echo('lan-missing', TARGET4)
-        learn('learn-a', 'learn.pass-shadow.test', 1)
-        ipv4 = echo('lan-a', TARGET4, hit=True)
-        # The AAAA observation can rotate this realm; use the same IPv4 lease for the port-53 check.
-        echo('dns-dependent-port-53', TARGET4, port=53, live_bitmap=True, same_fact_as=ipv4)
-        learn('learn-aaaa', 'learn.pass-shadow.test', 28)
-        echo('lan-aaaa', TARGET6, source=LAN6, hit=True)
-        learn('learn-wan', 'wan.pass-shadow.test', 1, realm='shadow-wan', source=WAN4)
-        echo('wan', TARGET4, realm='shadow-wan', source=WAN4)
-        trial('static-port-53', (STATIC, 53), b'shadow-static-53', static=True)
-        learn('learn-conflict', 'conflict.test', 1)
-        echo('lan-conflict', TARGET4)
-        learn('learn-zero', 'zero.test', 1)
-        echo('lan-known-zero', STATIC, live_bitmap=False)
-        deadline = learn('learn-expiry', 'expire.pass-shadow.test', 1)
-        expiring = echo('lan-before-expiry', EXPIRING, hit=True)
-        if enabled:
-            deadline = expiring['dns_fact']['value']['valid_before_mono_ns']
-        time.sleep(max(0, (deadline - time.monotonic_ns()) / 1e9) + 0.05)
-        echo('lan-expired', EXPIRING)
-        assert len(events) == len(expected_rows) - 1
-        realms = {row['interface']: row['realm'] for row in expected_rows}
-        assert realms['dut0'] != realms['dut1'], 'fixture lacks distinct LAN and WAN realms'
-
-
-def compare(baseline, shadow):
-    expected = ['lan-missing', 'learn-a', 'lan-a', 'dns-dependent-port-53', 'learn-aaaa', 'lan-aaaa',
-                'learn-wan', 'wan', 'static-port-53', 'learn-conflict', 'lan-conflict', 'learn-zero',
-                'lan-known-zero', 'learn-expiry', 'lan-before-expiry', 'lan-expired']
-    left, right = ([json.loads(line) for line in path.read_text().splitlines()] for path in (baseline, shadow))
-    assert [row['case'] for row in left] == [row['case'] for row in right] == expected
-    expected_hits = {'lan-a', 'lan-aaaa', 'lan-before-expiry'}
-    for before, after in zip(left, right, strict=True):
-        assert before['program_id'] != after['program_id']
-        assert before['delta']['would_pass_dns'] == 0
-        assert after['delta']['would_pass_dns'] == int(after['case'] in expected_hits)
-        for key in ('origin', 'target', 'interface', 'realm', 'peer', 'native_forward'):
-            assert before[key] == after[key], (key, before, after)
-        for key in ('pass_d1', 'capture', 'xsk_new'):
-            assert before['delta'][key] == after['delta'][key], (key, before, after)
-    print(json.dumps({'gateway_dns_wire': {'cases': expected, 'would_pass_dns': sorted(expected_hits),
-                                         'shadow_native_forward': sum(row['native_forward'] for row in right if row['case'] != 'static-port-53'),
-                                         'static_native_forward': right[expected.index('static-port-53')]['native_forward']}}), flush=True)
+        return sock.recv(4096)
 
 
 def main(args):
@@ -513,12 +406,20 @@ def main(args):
         dump_jit(kind, role, int(identity), Path(out))
     elif mode == 'budget':
         verifier_budget(Path(values[0]))
-    elif mode == 'wire':
-        [profile] = values
-        assert profile in ('static', 'shadow')
-        wire(profile == 'shadow')
-    elif mode == 'compare':
-        compare(*map(Path, values))
+    elif mode == 'udp-wire':
+        from xdp_dns_udp import wire as udp_wire
+        profile, pid, log = values
+        udp_wire(sys.modules[__name__], profile, int(pid), Path(log))
+    elif mode == 'tcp-wire':
+        from xdp_dns_tcp import wire as tcp_wire
+        profile, pid, log = values
+        tcp_wire(sys.modules[__name__], profile, int(pid), Path(log))
+    elif mode == 'tcp-compare':
+        from xdp_dns_tcp import compare as compare_tcp
+        compare_tcp(*map(Path, values))
+    elif mode == 'udp-compare':
+        from xdp_dns_udp import compare as compare_udp
+        compare_udp(*map(Path, values))
     else:
         raise ValueError(mode)
 

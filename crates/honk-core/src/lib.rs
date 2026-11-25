@@ -368,9 +368,7 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
             config.validate()?;
             honk_outbound::util::init_dae_socket_mark(
                 config.global.effective_so_mark(),
-                config.datapath.as_ref().is_some_and(|datapath| {
-                    datapath.backend == honk_config::datapath::Backend::Tun
-                }),
+                config.required_socket_mark().is_some(),
             )?;
             honk_outbound::bootstrap::set_global(
                 honk_outbound::bootstrap::BootstrapResolver::parse(
@@ -1048,7 +1046,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     honk_outbound::util::init_dae_socket_mark(
         config.global.effective_so_mark(),
-        backend == Backend::Tun,
+        config.required_socket_mark().is_some(),
     )?;
     honk_outbound::proxy::wireguard::init_memory_share(resource_budget.wireguard_memory)?;
 
@@ -1703,13 +1701,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Backend::Xdp => {
             #[cfg(target_os = "linux")]
             {
-                xdp::run(
-                    control_plane,
-                    &cli.bpf_pin_root,
-                    packet_admission,
-                    pname_support,
-                )
-                .await
+                xdp::run(control_plane, packet_admission, pname_support).await
             }
             #[cfg(not(target_os = "linux"))]
             unreachable!("XDP admission requires Linux")

@@ -29,6 +29,18 @@ test "$(stat -f -c %T /sys/fs/bpf)" = bpf_fs
 log_dir="${GITHUB_WORKSPACE:?}/target/vm-tests/${HONK_CI_VM_LANE:?}"
 mkdir -p "$log_dir"
 
+host_smoke() {
+  HONK_XDP_DAEMON="$HONK_XDP_DAEMON" \
+  bash "$repo/.github/ci/host-daemon-smoke.sh" \
+    "${HONK_CI_HOST_INPUTS:?}" "${HONK_CI_HOST_INPUTS_SHA256:?}" \
+    2>&1 | tee "$log_dir/honk-host-daemon.log"
+}
+case ${HONK_CI_HOST_SELECTION:?} in
+  all) ;;
+  host-ct-reply|host-pname) host_smoke; exit ;;
+  *) exit 2 ;;
+esac
+
 "$HONK_CORE_TEST_BIN" ebpf::real::tests --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-core-real.log"
 for real_test in \
@@ -129,3 +141,4 @@ test "$("$HONK_CORE_TEST_BIN" "$tun_readiness_test" --exact --list --format ters
 HONK_TUN_ARTIFACT_ROOT="$log_dir" \
   bash "$repo/.github/ci/tun-daemon-smoke.sh" "$HONK_XDP_DAEMON" \
   2>&1 | tee "$log_dir/honk-tun-daemon.log"
+host_smoke

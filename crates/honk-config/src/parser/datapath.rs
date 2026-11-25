@@ -1,8 +1,9 @@
 use super::{ParseFailure, cursor::Segment, diagnostics::ParserDiagnostics, read};
 use crate::datapath::{
     Backend, BusyPollConfig, CalibrationStatus, DatapathConfig, DirectProfile, HostConfig,
-    InterfaceRole, PollCalibration, PollMode, TunConfig, XdpInterface, XskMode,
-    canonical_tun_capture, default_tun_mtu, parse_tun_address4, parse_tun_address6,
+    InterfaceRole, PollCalibration, PollMode, REMOVED_HOST_XSK_MODE_CODE,
+    REMOVED_HOST_XSK_MODE_MESSAGE, TunConfig, XdpInterface, XskMode, canonical_tun_capture,
+    default_tun_mtu, parse_tun_address4, parse_tun_address6, removed_host_xsk_mode_setting,
 };
 use crate::diagnostic::{SettingPath, Severity};
 use crate::error::{DetailedConfigError, ErrorCategory};
@@ -57,7 +58,7 @@ pub(super) fn parse_section(
                                     entry.header_span(),
                                     crate::diagnostic::Severity::Error,
                                     "nested-interface-block",
-                                    "interface entries must be name: lan or wan without a body",
+                                    "interface entries must be name: lan, wan or l3_lan without a body",
                                 );
                                 diagnostic.setting =
                                     crate::diagnostic::SettingPath::new("datapath")
@@ -71,10 +72,11 @@ pub(super) fn parse_section(
                             }
                             let (name, role) = read::Text::segment(&entry)
                                 .kv()
-                                .ok_or_else(|| invalid("expected interface: lan or wan"))?;
+                                .ok_or_else(|| invalid("expected interface: lan, wan or l3_lan"))?;
                             let role = match role.unquote().raw() {
                                 "lan" => InterfaceRole::Lan,
                                 "wan" => InterfaceRole::Wan,
+                                "l3_lan" => InterfaceRole::L3Lan,
                                 _ => return Err(invalid("unknown interface role")),
                             };
                             config.interfaces.push(XdpInterface {
@@ -189,7 +191,6 @@ pub(super) fn parse_section(
 
 fn parse_host(section: &Segment<'_, '_>) -> Result<HostConfig, ParseFailure> {
     let mut interfaces = None;
-    let mut xsk_mode = None;
     for child in section
         .body()
         .ok_or_else(|| invalid("expected host block"))?
@@ -215,27 +216,30 @@ fn parse_host(section: &Segment<'_, '_>) -> Result<HostConfig, ParseFailure> {
             }
             interfaces = Some(names);
         } else {
-            let (key, value) = read::Text::segment(&child)
+            let (key, _) = read::Text::segment(&child)
                 .kv()
-                .ok_or_else(|| invalid("expected host setting: value"))?;
-            if key.raw() != "xsk_mode" {
-                return Err(invalid("unknown host setting"));
+                .ok_or_else(|| invalid("expected host interface block"))?;
+            if key.raw() == "xsk_mode" {
+                let mut diagnostic = key.source.diagnostic(
+                    key.span,
+                    Severity::Error,
+                    REMOVED_HOST_XSK_MODE_CODE,
+                    REMOVED_HOST_XSK_MODE_MESSAGE,
+                );
+                diagnostic.setting = removed_host_xsk_mode_setting();
+                diagnostic.terminal = true;
+                return Err(DetailedConfigError {
+                    category: ErrorCategory::Parse,
+                    diagnostic: Box::new(diagnostic),
+                }
+                .into());
             }
-            if xsk_mode.is_some() {
-                return Err(invalid("duplicate host xsk_mode"));
-            }
-            if value.unquote().raw() != "copy" {
-                return Err(invalid("host requires explicit xsk_mode: copy"));
-            }
-            xsk_mode = Some(XskMode::Copy);
+            return Err(invalid("unknown host setting"));
         }
     }
-    let config = HostConfig {
+    Ok(HostConfig {
         interfaces: interfaces.ok_or_else(|| invalid("host.interface is required"))?,
-        xsk_mode: xsk_mode.ok_or_else(|| invalid("host.xsk_mode is required"))?,
-    };
-    config.validate()?;
-    Ok(config)
+    })
 }
 
 fn parse_tun(section: &Segment<'_, '_>) -> Result<TunConfig, ParseFailure> {

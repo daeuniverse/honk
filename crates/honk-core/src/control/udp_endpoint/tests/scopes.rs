@@ -4,6 +4,73 @@ fn slow_permit() -> OwnedSemaphorePermit {
     Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn first_send_accounts_unexpected_exit_but_not_auxiliary_pause() {
+    for pause in [true, false] {
+        let root = honk_netstack::MemoryBudget::new(4 << 20);
+        let (scope, owner) = crate::control::netstack::auxiliary_scope(1500, &root).unwrap();
+        let mut driver = owner.hand_off();
+        driver.resume_auxiliary(1500, || true).unwrap();
+        let pool = Arc::new(UdpEndpointPool::with_capacity_limit(1));
+        let stats = Arc::new(StatsManager::new());
+        let outbound = OutboundTracker::new();
+        let client = make_addr("192.0.2.1", 40000);
+        let target = make_addr("198.51.100.1", 443);
+        let work = scope.hold_source(client.ip()).unwrap();
+        let EndpointReservation::Initializing(mut lease) = pool.reserve_payload_or_enqueue_at(
+            scope.scope(),
+            client,
+            target,
+            DatagramPayload::Borrowed(b"first"),
+            None,
+            UdpFlowOwner::packet(),
+            pool.initialization_epoch(),
+            slow_permit(),
+            queue_now(),
+            &stats,
+            Some(work.clone()),
+        ) else {
+            panic!("auxiliary tuple must initialize");
+        };
+        let mut endpoint = UdpEndpoint::new(
+            transport(test_reply_socket().await, target),
+            target,
+            TEST_NODE_ID,
+        );
+        endpoint.bind_packet_source(Some(work)).unwrap();
+        let endpoint = Arc::new(endpoint);
+        let mut udp = pool.spawn_driver(
+            scope.scope(),
+            client,
+            target,
+            lease.generation(),
+            lease.decision_token(),
+            Arc::clone(&endpoint),
+            lease.take_queue_receiver().unwrap(),
+            test_reply_socket().await,
+            Arc::new(honk_outbound::alive::AliveDialerSet::new()),
+            stats,
+            outbound.clone(),
+        );
+        udp.wait_ready().await.unwrap();
+        assert!(lease.commit_ready(endpoint));
+        udp.start(lease.take_first().unwrap()).unwrap();
+        if pause {
+            driver.begin_auxiliary_pause().unwrap();
+            assert!(!udp.confirm_first_send(&outbound).await.unwrap());
+            assert_eq!(outbound.snapshot().errors, 0);
+        } else {
+            udp.abort();
+            assert!(udp.confirm_first_send(&outbound).await.is_err());
+            assert_eq!(outbound.snapshot().errors, 1);
+        }
+        assert_eq!(outbound.snapshot().tx_bytes, 0);
+        drop(lease);
+        assert!(pool.shutdown().await.joined);
+    }
+}
+
 #[tokio::test]
 async fn pending_scopes_share_capacity_but_not_queues_or_retirement() {
     let pool = Arc::new(UdpEndpointPool::with_capacity_limit(2));
@@ -229,6 +296,7 @@ async fn host_lineage_fences_followers_tracker_close_and_retirement() {
             &stats,
             Some(changed.context().lineage),
             Some(pool.initialization_epoch()),
+            None,
         ),
         Some((EndpointReservation::Enqueued, false))
     ));

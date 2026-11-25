@@ -58,7 +58,6 @@ impl Fixture {
 
     async fn start_config_inner(mut config: Config, defer_gateway: bool) -> anyhow::Result<Self> {
         guard();
-        let pins = guarded_pin_root();
         let artifacts = PathBuf::from(std::env::var_os("HONK_XDP_ARTIFACT_ROOT").unwrap());
         let direct = config
             .datapath
@@ -105,16 +104,8 @@ impl Fixture {
         let shutdown = plane.shutdown_intent();
         let router = plane.traffic_router();
         let authority = plane.core_forward_policy(Execution::MixedEndpoints).await?;
-        let (runtime, owner) = start_runtime(
-            plane,
-            &config,
-            &pins,
-            &artifacts,
-            admission,
-            pname,
-            defer_gateway,
-        )
-        .await?;
+        let (runtime, owner) =
+            start_runtime(plane, &config, &artifacts, admission, pname, defer_gateway).await?;
         ensure!(runtime.gateway.is_some() == (direct == DirectProfile::Endpoint));
         ensure!(runtime.core.is_some() == (direct == DirectProfile::Core));
         Ok(Self {
@@ -182,9 +173,12 @@ impl Fixture {
             &mut warned,
         )
         .await??;
+        if let Some(tasks) = self.runtime.workers.auxiliary.get() {
+            tasks.join().await?;
+        }
         result?;
         drain_transmit(
-            || self.runtime.complete_transmit(),
+            || self.runtime.complete_physical_tx(None),
             Instant::now(),
             &mut warned,
         )
@@ -719,4 +713,126 @@ async fn quiet_core_detects_revoked_link_with_a_blocked_reader() -> anyhow::Resu
 #[ignore = "requires the daemon smoke's private disposable-VM interfaces"]
 async fn quiet_gateway_detects_revoked_link() -> anyhow::Result<()> {
     quiet_link_loss(DirectProfile::Endpoint).await
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+#[ignore = "requires the guarded auxiliary WireGuard and native XDP disposable-VM fixture"]
+async fn kernel_gateway_auxiliary_mixed_rollback() -> anyhow::Result<()> {
+    guard();
+    let config = honk_config::parser::parse_dae_config(
+        "global { dial_mode: ip\n nfqueue_enable: false\n so_mark_from_dae: 0x100 }
+         dns { bind: '' }
+         datapath { backend: xdp\n direct: endpoint\n xsk_mode: copy\n dns_projection: false\n interface { dut0: lan\n wg0: l3_lan } }
+         routing { fallback: direct }",
+    )?;
+    let fixture = Fixture::start_config(config).await?;
+    let publisher = fixture.runtime.gateway.as_ref().context("gateway")?;
+    let physical = fixture
+        .runtime
+        .devices
+        .first()
+        .context("physical interface")?
+        .info
+        .ifindex;
+    let outer: u32 = std::fs::read_to_string("/sys/class/net/wg0/ifindex")?
+        .trim()
+        .parse()?;
+    let old_tcx = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(id) = publisher.auxiliary_program(outer)? {
+                return Ok::<_, io::Error>(id);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    let attached = || -> anyhow::Result<(u32, u32)> {
+        Ok((
+            honk_xsk::xdp_state(physical)?.prog_id,
+            publisher
+                .auxiliary_program(outer)?
+                .context("attached TCX program")?,
+        ))
+    };
+    let old = attached()?;
+    assert_ne!(old.0, 0);
+    assert_eq!(old.1, old_tcx);
+    publisher.check_unhealthy_auxiliary_retry()?;
+    let old_fingerprint = publisher.fingerprint();
+    let mut next = fixture.config.clone();
+    next.routing.rules = honk_config::parser::parse_dae_config(
+        "routing { dport(18098) -> packet-proof\n fallback: direct }",
+    )?
+    .routing
+    .rules;
+    let plan = ControlPlane::compile_routing_plan(
+        &next,
+        &crate::routing::Router::from_config(&next.routing)?,
+    )?;
+    assert_ne!(plan.fingerprint, old_fingerprint);
+    publisher.publish(&plan)?;
+    let staged = attached()?;
+    assert_ne!(staged.0, old.0);
+    assert_ne!(staged.1, old.1);
+    let shared_maps = |id: u32| -> anyhow::Result<std::collections::BTreeMap<String, u32>> {
+        let program = aya::programs::loaded_programs()
+            .filter_map(Result::ok)
+            .find(|p| p.id() == id)
+            .context("installed program ID")?;
+        let mut maps = std::collections::BTreeMap::new();
+        for map_id in program.map_ids()?.context("installed program map IDs")? {
+            let info = aya::maps::MapInfo::from_id(map_id)?;
+            if let Some(name @ ("honk_gw_hold" | "honk_gw_frag" | "honk_gw_mode")) =
+                info.name_as_str()
+            {
+                maps.insert(name.to_owned(), map_id);
+            }
+        }
+        Ok(maps)
+    };
+    let maps = shared_maps(staged.0)?;
+    assert_eq!(maps.len(), 3);
+    assert_eq!(shared_maps(staged.1)?, maps);
+    assert_eq!(publisher.fingerprint(), plan.fingerprint);
+    publisher.rollback()?;
+    assert_eq!(attached()?, old);
+    assert_eq!(publisher.fingerprint(), old_fingerprint);
+
+    // Commit a real configuration, then change the program ID on the owned TCX FD during the final readback.
+    let before = fixture.diagnostics.read().generation;
+    publisher
+        .replace_tcx_before_final
+        .store(true, Ordering::Release);
+    let (result, reply) = tokio::sync::oneshot::channel();
+    fixture
+        .commands
+        .send(crate::control::ControlCommand::ReloadConfig {
+            request_id: 9,
+            config: Box::new(next),
+            diagnostics: Vec::new(),
+            #[cfg(feature = "native-api")]
+            sources: None,
+            #[cfg(feature = "native-api")]
+            expected_group_revision: None,
+            result,
+        })
+        .await?;
+    let reply = tokio::time::timeout(Duration::from_secs(30), reply).await??;
+    assert_eq!(
+        reply.outcome,
+        crate::control::ReloadOutcome::CommittedDegraded {
+            generation: before + 1
+        }
+    );
+    assert_eq!(fixture.diagnostics.read().generation, before + 1);
+    assert_eq!(
+        publisher
+            .capture_error()
+            .context("missing final TCX readback failure")?
+            .to_string(),
+        "auxiliary TCX link identity changed"
+    );
+    assert!(!fixture.runtime.admission.load(Ordering::Acquire));
+    fixture.finish().await
 }

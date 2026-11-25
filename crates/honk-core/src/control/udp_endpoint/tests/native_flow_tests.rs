@@ -186,6 +186,62 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
     api.shutdown().await;
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn auxiliary_pause_before_udp_ready_commit_preserves_retirement_reason() {
+    let api = NativeFlowApi::new().await;
+    let budget = honk_netstack::MemoryBudget::new(4 << 20);
+    let (scope, owner) = crate::control::netstack::auxiliary_scope(1500, &budget).unwrap();
+    let mut driver = owner.hand_off();
+    driver.resume_auxiliary(1500, || true).unwrap();
+    let pool = Arc::new(UdpEndpointPool::with_capacity_limit(1));
+    let client = make_addr("192.0.2.1", 40000);
+    let dst = make_addr("198.51.100.1", 443);
+    let source = scope.hold_source(client.ip()).unwrap();
+    let EndpointReservation::Initializing(mut lease) = pool.reserve_payload_or_enqueue_at(
+        scope.scope(),
+        client,
+        dst,
+        DatagramPayload::Borrowed(b"first"),
+        None,
+        UdpFlowOwner::packet(),
+        pool.initialization_epoch(),
+        Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+        queue_now(),
+        &StatsManager::new(),
+        Some(source.clone()),
+    ) else {
+        panic!("expected an initializing auxiliary tuple")
+    };
+    let flow = Arc::new(
+        api.flows
+            .begin(crate::observe::vocab::Network::Udp, client, dst)
+            .unwrap(),
+    );
+    let id = flow.id().to_owned();
+    let terminal = lease.set_native_flow(Some(flow)).unwrap();
+    let initializer = terminal.initializer();
+    let mut endpoint =
+        UdpEndpoint::new(transport(test_reply_socket().await, dst), dst, TEST_NODE_ID);
+    endpoint.bind_packet_source(Some(source)).unwrap();
+    driver.begin_auxiliary_pause().unwrap();
+    assert!(lease.still_initializing());
+    assert!(!lease.commit_ready(Arc::new(endpoint)));
+    terminal.outcome(UdpTerminal::InitializerCancelled);
+    drop(initializer);
+    drop(lease);
+    let detail = api.detail(&id).await;
+    assert_eq!(detail["state"], "closed");
+    let steps = detail["trace"]["steps"].as_array().unwrap();
+    assert!(
+        steps
+            .iter()
+            .any(|step| step["data"]["milestone"] == "terminal"
+                && step["data"]["reason"] == "intentional_retirement")
+    );
+    api.shutdown().await;
+}
+
 #[tokio::test]
 async fn native_udp_block_loser_does_not_close_direct_winner_with_sniffed_domain() {
     assert_native_udp_builtin_plan(false).await;

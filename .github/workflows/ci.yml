@@ -135,6 +135,7 @@ jobs:
               - '.github/ci/pins.env'
               - '.github/ci/run-vm-gate.sh'
               - '.github/ci/ebpf-vm-tests.sh'
+              - '.github/ci/host-daemon-*'
               - '.github/ci/xdp*'
               - 'rust-toolchain.toml'
               - '.cargo/**'
@@ -733,7 +734,7 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             busybox-static clang cmake coreutils ethtool file iproute2 iptables jq kbd kmod nftables \
             libbpf-dev libclang-dev libvirt-clients llvm pkg-config python3-argcomplete \
-            python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd zstd
+            python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd wireguard-tools zstd
       - name: Configure KVM
         run: |
           set -euo pipefail
@@ -1037,7 +1038,7 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             busybox-static clang cmake coreutils ethtool file iproute2 iptables jq kbd kmod nftables \
             libbpf-dev libclang-dev libvirt-clients llvm pkg-config python3-argcomplete \
-            python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd zstd
+            python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd wireguard-tools zstd
       - name: Configure KVM
         run: |
           set -euo pipefail

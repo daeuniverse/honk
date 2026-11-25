@@ -432,8 +432,9 @@ impl Drop for TcpFlowGuard {
     allow(dead_code)
 )]
 pub(crate) mod xdp {
+    use honk_ebpf_common::xdp_gateway::GatewayReason;
     use honk_netstack::{MemoryBudget, MemoryReservation};
-    use honk_xsk::{RingSnapshot, SocketStats};
+    use honk_xsk::{GatewayMaps, RingSnapshot, SocketStats};
     use parking_lot::Mutex;
     use serde_json::{Value, json};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -553,7 +554,7 @@ pub(crate) mod xdp {
                 Self::Disabled => "disabled_by_config",
                 Self::NoDomainRules => "inactive_no_domain_rules",
                 Self::Staged => "staged_closed",
-                Self::Active => "shadow_active",
+                Self::Active => "active_tcp_udp",
                 Self::Closed => "closed",
                 Self::Fallback(_) => "degraded_fallback",
             }
@@ -567,12 +568,49 @@ pub(crate) mod xdp {
         would_pass: Option<u64>,
     }
 
+    const DNS_DECISIONS: [(&str, GatewayReason); 12] = [
+        ("pass_dns_d1", GatewayReason::PassDnsD1),
+        (
+            "pass_dns_d1_pending_retry",
+            GatewayReason::PassDnsD1PendingRetry,
+        ),
+        (
+            "drop_native_pending_conflict",
+            GatewayReason::DropNativePendingConflict,
+        ),
+        (
+            "dns_native_pending_capped",
+            GatewayReason::DnsNativePendingCapped,
+        ),
+        ("drop_hold_contention", GatewayReason::DropHoldContention),
+        ("drop_hold_unavailable", GatewayReason::DropHoldUnavailable),
+        (
+            "hold_guard_release_failed",
+            GatewayReason::HoldGuardReleaseFailed,
+        ),
+        ("hold_retire_failed", GatewayReason::HoldRetireFailed),
+        (
+            "host_meta_insert_failed",
+            GatewayReason::HostMetaInsertFailed,
+        ),
+        (
+            "host_direct_unrecorded",
+            GatewayReason::HostDirectUnrecorded,
+        ),
+        ("host_late_packet", GatewayReason::HostLatePacket),
+        (
+            "host_direct_tcp_insert_failed",
+            GatewayReason::HostDirectTcpInsertFailed,
+        ),
+    ];
+
     #[derive(Debug)]
     struct State {
         lifecycle: Lifecycle,
         changed_at: SystemTime,
         queues: Box<[QueueObservation]>,
         dns: DnsObservation,
+        dns_decisions: Option<[Option<u64>; DNS_DECISIONS.len()]>,
         dns_bank: std::sync::Weak<crate::xdp::gateway::dns::GatewayDnsBank>,
     }
 
@@ -613,6 +651,7 @@ pub(crate) mod xdp {
                     changed_at: SystemTime::now(),
                     queues: storage.into_boxed_slice(),
                     dns: DnsObservation::default(),
+                    dns_decisions: None,
                     dns_bank: std::sync::Weak::new(),
                 }),
                 count,
@@ -632,7 +671,7 @@ pub(crate) mod xdp {
                 if let DnsProjectionState::Fallback(reason) = status {
                     tracing::warn!(
                         reason,
-                        "XDP DNS shadow unavailable; using static D1 and Endpoint"
+                        "XDP DNS direct routing unavailable; using static D1 and Endpoint"
                     );
                 }
             }
@@ -652,6 +691,11 @@ pub(crate) mod xdp {
                 }
                 state.dns.would_pass = would_pass;
             }
+        }
+
+        pub(crate) fn sample_dns_decisions(&self, maps: &GatewayMaps) {
+            let counts = DNS_DECISIONS.map(|(_, reason)| maps.reason_count(reason).ok());
+            self.state.lock().dns_decisions = Some(counts);
         }
 
         pub(crate) fn sample(
@@ -682,17 +726,23 @@ pub(crate) mod xdp {
         }
 
         pub(crate) fn json(&self, full: bool) -> Value {
-            let (lifecycle, changed_at, dns, bank) = {
+            let (lifecycle, changed_at, dns, decisions, bank) = {
                 let state = self.state.lock();
                 (
                     state.lifecycle,
                     state.changed_at,
                     state.dns,
+                    state.dns_decisions,
                     full.then(|| state.dns_bank.upgrade()).flatten(),
                 )
             };
             let mut rows = Vec::new();
-            let mut remaining = 64 * 1024 - if bank.is_some() { 4096 } else { 1024 };
+            let mut remaining = 64 * 1024
+                - if bank.is_some() || decisions.is_some() {
+                    4096
+                } else {
+                    1024
+                };
             if full {
                 let mut encoded = Vec::new();
                 for index in 0..self.count {
@@ -716,6 +766,9 @@ pub(crate) mod xdp {
                 "dns_projection_reason": if let DnsProjectionState::Fallback(reason) = dns.state { Some(reason) } else { None },
                 "dns_projection_counters": dns.counters,
                 "would_pass_dns": dns.would_pass.map(|v| v.to_string()),
+                "dns_decisions": decisions.map(|counts| DNS_DECISIONS.into_iter().zip(counts).map(|((name, _), n)| {
+                    (name.to_owned(), n.map_or(Value::Null, |n| Value::String(n.to_string())))
+                }).collect::<serde_json::Map<_, _>>()),
                 "state_changed_at_unix_ms": changed_at.duration_since(SystemTime::UNIX_EPOCH).ok().map(|at| at.as_millis().to_string()),
             });
             if full {

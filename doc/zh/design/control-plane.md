@@ -49,9 +49,9 @@
 
 配置为 XDP 和 TUN 的 daemon 共用 packet supervisor、mode/flags coordinator、订阅 authorization 及完整 control-command dispatch。软件 flags 在 scope 准入前以禁用 NFQUEUE 的状态初始化，保持恢复后的 mode；发布失败进入 joined startup cleanup。这两条路径不创建 TC listener 或 NFQUEUE helper；原 `PacketEndpoints::new()` 嵌入生命周期保持不变。
 
-TUN 在改路前准备 DNS bind 候选，把保留的 `Option<PreparedDnsBind>` 交给 `start_driven`；XDP 传 `None`。两个设备 runtime 在等待 `owner.poll_ready` 或失败启动清理时都持续服务唯一 `PacketDriver`。Supervisor ready 不等于 capture ready：只有真实设备/拓扑提交后调用 `capture_ready()`，才允许 lifecycle Running。TUN 的 setup/FD owner 与[保留 guard 的停止顺序](./datapath.md#停止与失败保留)不属于共享 policy backend。
+TUN 和启用 Host 的 XDP 在捕获前准备 DNS bind 地址，并将候选交给 `start_driven`；未启用 Host 的 XDP 无需预备地址。两个设备 runtime 在等待 `owner.poll_ready` 或失败启动清理时都持续服务唯一 `PacketDriver`。Supervisor ready 不等于 capture ready：只有真实设备/拓扑提交后调用 `capture_ready()`，才允许 lifecycle Running。TUN 的 setup/FD owner 与[保留 guard 的停止顺序](./datapath.md#停止与失败保留)不属于共享 policy backend。
 
-启动拒绝外来的物理 XDP，不接管旧对象或 reader；物理 link 由 FD 持有。Host 保留独立的 receipt 和持久托管。
+启动拒绝外来的物理 XDP，不接管旧对象或 reader；物理 link 由 FD 持有。Host 出口使用 FD 持有的 TCX link，每个绑定有独立的私有 TUN；持久 setup 收据属于独立 TUN 后端。
 
 物理 XDP Endpoint 策略重载先准备候选，逐成员替换 link，再发布软件 Router/config。已保留的流保持原 owner，重载面向新流；跨设备及与软件发布之间并非原子。策略更新期间同一新 tuple 的并发首包可能分别进入内核和 Endpoint；回滚不撤销窗口中建立的 hold 或 CT。UDP 没有 CT（包括 NOTRACK 或 CT 尚未确认）时，即使没有重载，DSCP/MAC 或策略变化也可能改变执行者。hold 收集器最后重读一个空闲、未保留条目后，XDP 可能命中并刷新，收集器仍将其删除：该新流首包进入 Endpoint，后续包可能进入内核。RX owner 或 worker 在 Endpoint 建立保留前停顿约 29 秒也可能丢失 hold。这些是已接受的窗口。
 

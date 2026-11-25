@@ -50,7 +50,7 @@ flowchart LR
 | 路径 | Socket 与目的地址模型 | 应答模型 |
 | --- | --- | --- |
 | 透明 53 端口，无终局用户 `must` 结果 | 按[流量规则所有权](../reference/routing.md#出站目标与-must)准入的有效查询进入 `DnsController`。 | 控制器接管的透明 UDP 使用绑定到原始目的地址的 anyfrom socket；TCP 在被拦截的 stream 上应答。请求动作 `asis` 拨该原始目的地址并保留 TCP/UDP，包括 UDP `TC` 后回退 TCP。 |
-| 独立 `dns.bind` | 普通 host-netns socket，没有拦截所得目的地址；TC/XDP/普通嵌入无 mark，TUN 在 bind/listen 前严格设置 required bypass mark。 | TCP 在 accepted socket 上应答；UDP 用 packet info 从查询实际命中的本地地址与网卡应答。 |
+| 独立 `dns.bind` | 普通 host-netns socket，没有拦截所得目的地址；TUN 和启用 XDP Host 时在 bind/listen 前严格设置 bypass mark，其他路径不打 mark。 | TCP 在 accepted socket 上应答；UDP 用 packet info 从查询实际命中的本地地址与网卡应答。 |
 
 `DnsRequestMeta { source_ip, original_dst }` 以一个不可变值承载逻辑客户端来源与拦截所得目的地址。透明 adapter 和独立 adapter 都从 socket peer 设置 `source_ip`；只有透明拦截设置 `original_dst`。IPv4-mapped IPv6 peer 会规范化为 IPv4。代表已接纳 TCP/UDP 流执行的查询使用该流的客户端地址，且没有拦截所得的 DNS 目的地址。内部、bootstrap、prefetch 与 Clash API 查询两者都为空。
 
@@ -60,11 +60,9 @@ flowchart LR
 
 过期缓存刷新与偏好地址族的附加查询保留发起者的 `DnsRequestMeta`。为流执行的 DNS 解析按客户端来源进行，但没有被拦截的目的地址；策略选择 `asis` 时会 fail-closed。
 
-配置为 TUN 时，独立 listener 是 mark 规则的明确例外。安装任何 capture rule/blackhole 前，`PacketEndpoints::prepare_dns_bind(&Config)` 先解析启用的 endpoint，用 `PreparedDnsBind` 保留非空实际地址候选、transport 与 port。TUN setup 在实际 bind 前创建配置地址；启动消费该次候选，不在 containment 生效后再次 NSS。关闭监听返回 `None`；TUN 启用监听却没有准备好的候选时拒绝启动。
+TUN 和启用 XDP Host 时，先解析 `dns.bind` 地址，再开放捕获。DNS、Clash 和原生 API socket 在 bind/listen 前严格设置并回读有效 bypass mark；accepted TCP 继承该 mark，UDP 保留 packet-info 源选择。其他嵌入和 TC 的独立监听仍不打 mark。
 
-每个 TUN listener socket 先创建，严格设置并回读有效 bypass mark M，再 bind/listen、转换为 Tokio。Accepted TCP 继承 M，UDP 保留 packet-info 源选择。bind 仍是普通 host-netns 服务，从 peer 取得 source，`original_dst=None`。TC/XDP/普通嵌入继续使用无 mark 独立 socket。Clash/native API listener 遵循同样的 TUN pre-bind/listen mark 顺序，使面向 capture 内远端客户端的回复经 main 旁路。
-
-配置 TUN 的独立 listener 使用已注册的 plain 非 HOST scope，即使绑定 loopback/LAN 也一样。UDP 使用当前 packet-query admission，持久 TCP 每帧重查。透明 DNS 使用实际 packet scope，包括启用时独立的认证 Host scope。两者均不借用 HOST 事实；TC/XDP/非 TUN 独立调用者保留 HOST。不新增 tuple 永久 permit cache 或第二个 projector。
+TUN 的独立监听始终在已注册的 plain 域学习。XDP Host 的独立监听按真实客户端对端选择：回环（含映射成 IPv6 的 IPv4 回环地址）使用活动 Host 出口共享域，非回环使用独立监听域。所有 Host 口离线时，回环查询仍可获得应答，但不能写入 Host 事实。透明查询保留原执行绑定直到结果提交；单口掉线撤销该口待决查询，最后一口掉线才撤回共享事实和 epoch。Host 不能为 LAN 授权。其他嵌入仍沿用各自的来源与注册规则。
 
 独立监听器具有以下生命周期与准入不变量：
 
@@ -304,9 +302,9 @@ deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者�
 
 每个 policy generation 内，HOST 域名关联仍与客户端来源无关。Packet endpoint 注册自己拥有的非 HOST `ScopeId`，每个 scope 分别保留学到的 owner 与 IP 事实；packet observation 不会成为 HOST domain-map 条目，也不借用其他 scope 的事实。DNS 交换/缓存 scope 仍不会在同一个 packet scope 或 HOST 内按客户端划分流量路由。投影独立于其他条件逐一计算全部域名谓词，包括用于否定的谓词；已知域名没有匹配项时可投影为存在的零 bitmap。
 
-符合条件的物理 XDP LAN 能以影子模式计算依赖 DNS 的有序直连决策。只有已准入的 IP、1–32 个未过期 owner 且贡献相同完整位图（可为已知全零）才可导出，取最早到期时间。DNS 参与的结果永不授权端口 53；WAN 和 HOST 不能导出。内核命中时只计 `WouldPassDns`，包仍走原有 Endpoint 路径，不新增 DNS 应答缓存或原生转发路径。
+符合条件的物理 LAN、辅助 LAN 和共享 Host 事实域只导出已准入的 IP：1–32 个未过期 owner 须贡献相同的完整位图（含已知全零），以最早到期时间为准。WAN 和 HOST 不授予导出权；辅助绑定离线时无许可，旧绑定准入的查询结果不能填入新绑定。DNS 永不授权端口 53。符合条件的 TCP SYN 或完整 UDP 数据报须先[确定唯一归属](../reference/global.md#xdp-endpoint-dns-投影)才可走原生路由。两者按原有序策略求值，不另建 DNS 缓存。
 
-每代 bank 的 epoch 初始关闭。重载在换链或重建事实前撤销旧许可；启动或最终 flags 发布成功后，只有匹配已提交代才开门。降级提交保持关闭。同一缓存 revision 与地址集的命中不延长也不缩短原许可。容量、JIT 或 verifier 拒绝时退回静态 D1 加 Endpoint；计数不是原生放行包数。
+每代 bank 的 epoch 初始关闭。重载在换链或重建事实前撤销旧许可；启动或最终 flags 发布成功后，只有匹配已提交代才开门。降级提交保持关闭。同一缓存 revision 与地址集的命中不改变原截止时间。容量、JIT 或 verifier 拒绝时退回静态 D1 加 Endpoint。关闭 bank 不会将仍待 conntrack 接管的原生流改归 Endpoint。
 
 Packet scope 注册由嵌入方的同一共享预算计费，一次性原子提交；重复、HOST 或外部预算的 scope 不会部分注册。注册表及计费保留到最后一个真实 projection/authority owner 释放，与 projection worker 关闭相互独立。每个注册 scope 使用不回绕的撤销 revision；耗尽后永久拒绝其 fact 权威，不回绕重用。
 

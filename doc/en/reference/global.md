@@ -254,10 +254,11 @@ Do not also set `global.lan_interface` or `global.wan_interface` for XDP.
 The backend, Direct profile, effective AF_XDP binding mode, and interface/zone setup
 require restart. Supported firewall/NAT rules use transactional policy publication.
 Unknown settings and unsupported marked continuation requests are rejected, not ignored.
-Interface entries are plain `name: lan` or `name: wan` declarations; bodies,
-including empty nested blocks, are rejected rather than ignored.
+Use `name: lan` or `name: wan` for physical capture. XDP Endpoint also accepts
+`name: l3_lan` for an [auxiliary IP interface](#auxiliary-l3-lan). Interface
+declarations with a nested body, even an empty one, are rejected.
 
-`datapath.xsk_mode` accepts `copy`, `zerocopy`, or `auto` for physical capture. Omission remains forced ZeroCopy; Auto selects per member from its capabilities and required segments. Every bind is read back; a failed selected bind does not retry another mode. Omitted and explicit `zerocopy` are equivalent for reload; changing mode requires restart. TC and TUN reject an explicit mode. The private Host queue requires Copy independently.
+`datapath.xsk_mode` accepts `copy`, `zerocopy`, or `auto` for physical capture. Omission remains forced ZeroCopy; Auto selects per member from its capabilities and required segments. Every bind is read back; a failed selected bind does not retry another mode. Omitted and explicit `zerocopy` are equivalent for reload; changing mode requires restart. TC and TUN reject an explicit mode. Host uses no AF_XDP queue.
 
 `datapath.workers` is an XDP-only integer, either `1` (default) or `2`; changing it
 requires restart. Two workers require at least two actual physical queue owners
@@ -277,63 +278,75 @@ Core Direct requires `dial_mode: ip`; domain predicates use facts learned in the
 
 Core's input-context FIB contract rejects nonzero IPv6 flow labels and router-specific extension/options execution it cannot preserve; Endpoint IPv6 support does not establish equivalent Core authority.
 
-### XDP Endpoint DNS projection
-
-`datapath.dns_projection` is an optional boolean for `backend: xdp` with
-`direct: endpoint` and at least one physical interface declared `lan`. Omission
-and `true` both enable DNS shadow evaluation. Set `false` to turn it off. A
-change to the effective value requires a restart. TC, TUN, XDP Core and XDP
-Endpoint without a physical LAN require omission. Either explicit boolean is
-rejected in those configurations. Duplicate declarations across merged sections
-or includes and explicit null in structured input are also rejected.
-
-Shadow evaluation uses accepted transparent DNS answers from the same logical
-LAN realm to count `WouldPassDns` decisions for new flows. A bond's members share
-the bond's realm, while each VLAN has its own realm and inherits the role of its
-configured root. WAN and Host supply no facts for this evaluation. Standalone
-`dns.bind` remains independent. Packet actions continue to follow Endpoint and
-static D1. If the optional evaluation cannot start safely, honk warns and
-continues with those packet actions.
-
-### XDP Host Endpoint
-
-Host-originated TCP/UDP capture requires an explicit `host` block and a build with
-`ebpf`. Select `backend: xdp` and `direct: endpoint`:
+### Auxiliary L3 LAN
 
 ```dae
 datapath {
     backend: xdp
     direct: endpoint
-    host {
-        xsk_mode: copy
-        interface {
-            eth0
-        }
+    interface {
+        eth1: lan
+        wg0: l3_lan
     }
 }
 ```
 
-`host.interface` requires 1–16 unique explicit Ethernet names, as bare entries
-without roles or bodies. `host.xsk_mode: copy` is mandatory; it controls the owned
-private Host queue independently of the physical `datapath.xsk_mode` default.
-Unknown or duplicate Host fields/blocks are rejected. Physical `interface` capture
-may be omitted or added beside `host`; both use the same global Endpoint Direct
-profile. The complete Host configuration is restart-required. Keep NFQUEUE off,
-TC interface lists empty and the required bypass-mark routing in place.
+`l3_lan` adds a raw-IP ingress beside at least one physical XDP `lan` or `wan`.
+Configure up to eight distinct auxiliary names. They do not count as physical
+workers or RX queues. The interface must actually carry bare IP (`ARPHRD_NONE`),
+have an MTU of at least 1280, and not be used by a default route. An Ethernet,
+PPP or GRE device is not admitted merely because of its name. The role is not
+available with TC, TUN or Core Direct. Host egress interfaces must be distinct. A physical
+interface that fails XDP admission never falls back to TCX.
 
-Admission currently requires x86-64 little endian, matching running-kernel BTF,
-active BPF LSM, exclusive effective root-cgroup hooks and plain source-namespace
-custody. Ordinary operator veths, stacked/mastered/tunnel links and foreign
-reinjection paths are refused; only the daemon's owned private veth pair is excepted.
-Consumers and actual Copy binding must be ready before the one-shot capture gate
-opens. Stale custody receipts refuse restart without adoption. See
-[Host source custody](../design/datapath.md#host-source-custody) for the full limits
-and retained-stop behavior.
+An absent auxiliary interface can start in `waiting_link`. A present but
+incompatible interface rejects startup. An active binding uses TCX ingress
+and its own unnumbered, nonpersistent `honk-l3-<n>` TUN. Do not use those
+generated names for configured interfaces. honk creates no routes, policy
+rules or addresses for the internal TUN. It does not remove existing ingress
+filters: if Endpoint redirection would skip an existing legacy classifier,
+the auxiliary cannot bind. A WireGuard server listening on UDP port 53 on a
+*physical capture interface* needs an explicit static `direct(must)` traffic
+rule for that listener; the local-service exemption does not include port 53.
 
-Authenticated Host facts may supply process routing. With `direct: endpoint`,
-Direct terminates and creates a new marked outbound; generated replies use ordinary
-Linux demultiplexing, not original socket-operation continuation. TUN's separate
-opt-in HostFacts support is described below.
+### XDP Endpoint DNS projection
+
+`datapath.dns_projection` is an optional boolean for `backend: xdp` with
+`direct: endpoint` and at least one `lan`, `l3_lan` or Host interface. Omission
+and `true` both enable DNS projection. Set `false` to turn it off. A
+change to the effective value requires a restart. TC, TUN, XDP Core and XDP
+Endpoint without an eligible interface require omission. Either explicit boolean is
+rejected in those configurations. Duplicate declarations across merged sections
+or includes and explicit null in structured input are also rejected.
+
+Only transparent DNS answers accepted on the same logical LAN realm supply facts. A bond's members share its realm; each VLAN has its own realm and inherits its configured root's role. Each auxiliary LAN has its own scope; losing the binding withdraws its facts. Neither WAN, Host nor standalone `dns.bind` supplies LAN facts.
+
+A pure TCP SYN or complete UDP datagram to a port other than 53 can take the kernel route when the ordered policy selects unmarked `direct(must)`, or ordinary unmarked `direct` in `dial_mode: ip` and Rule mode. Missing, expired or conflicting facts do not authorize a new native flow; static D1 rules, including `:53 direct(must)`, are unchanged.
+
+A complete UDP datagram may have an empty payload or an IPv6 atomic fragment header. A first fragment that actually needs reassembly cannot acquire or renew DNS-native ownership: a new flow takes the Endpoint path, and an existing native-pending flow without a conntrack match drops that packet. Later fragments have no ports and follow the existing fragment verdict, not a new DNS decision. Static Direct and confirmed conntrack matches keep their original behavior.
+
+TCP and UDP share at most 8,192 DNS-native flows awaiting matching conntrack evidence. At capacity, a fresh flow competes for Endpoint ownership instead. Until conntrack takes over, a repeated SYN or subsequent datagram must still qualify under the current policy; loss of permission drops that packet rather than splitting a flow. If bounded checks cannot determine the owner during a same-flow race, only that packet is dropped. A matching conntrack entry or collection after 30 seconds of inactivity can retire a pending record; 30 seconds is not a guaranteed deletion time.
+
+If honk observes `notrack`, it closes DNS permission for the rest of this capture and warns. Static D1 and Endpoint remain available. Runtime legacy raw-table checks are periodic, not an atomic fence against concurrent firewall edits. See [XDP diagnostics](./api.md) for the sampled counters and fallback reason.
+
+### XDP Host Endpoint
+
+Use an `ebpf` build to classify locally originated TCP/UDP on explicit egress interfaces:
+
+```dae
+global { nfqueue_enable: false }
+datapath {
+    backend: xdp
+    direct: endpoint
+    host { interface { eth0 } }
+}
+```
+
+Configure 1–4 distinct names. `lo`, `auto`, overlap with physical capture (including bond members and VLANs) or with an auxiliary LAN, and the former `host.xsk_mode` are rejected. See the [migration note](../../migration/en/gateway-host.md). A Host-only configuration needs no physical queue; `workers: 2` still requires two physical queue owners. Changing the interface list requires a restart.
+
+A supported Ethernet, VLAN, bridge or raw-IP egress (for example WireGuard) needs MTU 1280 or larger. PPP and GRE are not supported. A missing device waits for a link; an incompatible device cannot acquire a hook. Each active egress owns one unnumbered, nonpersistent `honk-host-<n>` TUN. Do not add addresses, routes or packet-rewriting programs to these private devices. honk does not change main routes or require the host firewall to be empty.
+
+Packets already proved Direct continue on the original socket. Endpoint traffic stays on its original binding; replies enter Linux on that egress. Process names are socket observations, not evidence of the caller of every `sendmsg`. In Host mode honk requires its effective bypass mark on originated sockets and management/DNS listeners. See [capture and ownership](../design/datapath.md#host-source-custody) for capacity and delayed packets. `backend: tun` has its own independent `host_facts` contract.
 
 ### Linux TUN Endpoint
 

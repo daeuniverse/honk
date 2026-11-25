@@ -293,7 +293,6 @@ impl Owner {
         config: Config,
         binding: PollBudgetBinding,
         namespace: OwnedNamespace,
-        pins: PathBuf,
         artifacts: PathBuf,
         deadline: Instant,
     ) -> anyhow::Result<Self> {
@@ -347,7 +346,6 @@ impl Owner {
                         owner_config,
                         binding,
                         namespace,
-                        pins,
                         artifacts,
                         started,
                         Arc::clone(&thread_custody),
@@ -889,7 +887,6 @@ async fn serve(
     config: Config,
     binding: PollBudgetBinding,
     namespace: OwnedNamespace,
-    pins: PathBuf,
     artifacts: PathBuf,
     started: oneshot::Sender<Ready>,
     custody: Arc<std::sync::Mutex<Option<NamespaceCustody>>>,
@@ -922,16 +919,8 @@ async fn serve(
     let publication = plane.config_handle();
     let shutdown = plane.shutdown_intent();
     let backend = plane.policy_backend_handle();
-    let (mut runtime, mut owner) = start_runtime(
-        plane,
-        &config,
-        &pins,
-        &artifacts,
-        admission,
-        pname_support,
-        false,
-    )
-    .await?;
+    let (mut runtime, mut owner) =
+        start_runtime(plane, &config, &artifacts, admission, pname_support, false).await?;
     let binding_failure = record_bindings(&runtime, &config, &namespace, &artifacts).err();
     let control = runtime.polling.test_control();
     let budget = runtime.polling.budget.as_ref().unwrap().clone();
@@ -1107,8 +1096,12 @@ async fn serve(
     if let Err(error) = result {
         failure.get_or_insert(error);
     }
-    if let Err(error) =
-        drain_transmit(|| runtime.complete_transmit(), Instant::now(), &mut warned).await
+    if let Err(error) = drain_transmit(
+        || runtime.complete_physical_tx(None),
+        Instant::now(),
+        &mut warned,
+    )
+    .await
     {
         std::mem::forget((runtime, owner, plane));
         return Err(error.into());
@@ -1147,10 +1140,6 @@ async fn serve(
             .find(|(name, _)| *name == device.info.name)
             .context("owner captured an unowned device")?;
         devices.push((device.info.ifindex, mac));
-    }
-    #[cfg(feature = "ebpf")]
-    if let Some(host) = runtime.host.take() {
-        host.finish()?;
     }
     backend.write().await.cleanup().await?;
     Ok(Retired {
@@ -1255,7 +1244,6 @@ impl Rig {
             config,
             PollBudgetBinding::Participant(self.budget.clone()),
             self.b_namespace.clone(),
-            self.pins.join("b"),
             self.artifacts.clone(),
             self.deadline,
         )
@@ -1855,7 +1843,6 @@ async fn actual_owner_fixture(xsk_mode: XskMode) -> anyhow::Result<()> {
         configuration(true, xsk_mode)?,
         PollBudgetBinding::Publisher(publisher),
         a_namespace,
-        pins.join("a"),
         artifacts.clone(),
         deadline,
     )
@@ -1864,7 +1851,6 @@ async fn actual_owner_fixture(xsk_mode: XskMode) -> anyhow::Result<()> {
         configuration(false, xsk_mode)?,
         PollBudgetBinding::Participant(budget.clone()),
         b_namespace.clone(),
-        pins.join("b"),
         artifacts.clone(),
         deadline,
     )

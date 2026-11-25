@@ -293,6 +293,26 @@ impl UdpEndpointPool {
         self.flush_removal_dirty();
     }
 
+    #[cfg(any(target_os = "linux", test))]
+    /// The caller has closed this binding. Existing tombstones keep their source
+    /// work until the removal worker acknowledges the exact incarnation.
+    pub(in crate::control) fn retire_auxiliary_scope(&self, scope: ScopeId) {
+        self.retire_scope_sources(scope);
+        let entries: Vec<_> = self
+            .endpoints
+            .iter()
+            .filter(|entry| {
+                entry.key().scope == scope
+                    && !matches!(entry.value(), EndpointEntry::Retiring { .. })
+            })
+            .map(|entry| (*entry.key(), entry.owner().token, entry.generation()))
+            .collect();
+        for (key, token, generation) in entries {
+            self.close_if_same(key, token, generation);
+        }
+        self.foreign_replies.clear_scope(scope);
+    }
+
     /// Begin exact retirement of the currently observed incarnation.
     pub fn remove(&self, scope: ScopeId, client: SocketAddr, dst: SocketAddr) {
         let key = EndpointKey::new(scope, client, dst, None);
@@ -374,6 +394,12 @@ impl UdpEndpointPool {
                     && !matches!(occupied.get(), EndpointEntry::Retiring { .. }) =>
             {
                 if let EndpointEntry::Initializing(initializing) = occupied.get() {
+                    #[cfg(feature = "native-api")]
+                    if !packet_binding_active(initializing.packet_source.as_ref())
+                        && let Some(terminal) = initializing.native_terminal.get()
+                    {
+                        terminal.outcome(UdpTerminal::IntentionalRetirement);
+                    }
                     initializing.cancel();
                 }
                 self.active_retirements.fetch_add(1, Ordering::AcqRel);

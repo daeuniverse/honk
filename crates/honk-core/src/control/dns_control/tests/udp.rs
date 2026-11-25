@@ -199,7 +199,7 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
     assert!(!outcome.expiry().is_cacheable());
     controller.try_submit_projection(
         runtime.runtime(),
-        honk_datapath::ScopeId::HOST,
+        crate::dns::projection::QueryScope::HOST,
         &outcome,
         tokio::time::Instant::now(),
     );

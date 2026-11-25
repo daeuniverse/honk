@@ -69,7 +69,7 @@ routing {
 
 The DNS rule is only needed when that address and local listener should receive port 53; put it before domain rules. See [gateway admission and limits](./design/datapath.md#full-xdp-startup).
 
-Physical LAN XDP Endpoint enables DNS shadow evaluation by default. It counts `WouldPassDns` decisions while retaining the existing packet actions. To disable it, set `dns_projection: false` in `datapath` and restart. This setting is available only for configurations with physical LAN XDP Endpoint capture. See the [DNS projection reference](./reference/global.md#xdp-endpoint-dns-projection).
+On an XDP Endpoint LAN, an eligible TCP SYN or complete UDP datagram can follow the kernel route using DNS answers learned on that LAN. IP fragments requiring reassembly cannot establish a DNS-native UDP flow. Alongside a physical interface you can declare, for example, `wg0: l3_lan` as a separate [auxiliary LAN](./reference/global.md#auxiliary-l3-lan). Set `datapath.dns_projection: false` and restart to disable [DNS-derived routing](./reference/global.md#xdp-endpoint-dns-projection) for both protocols. An optional [Host egress](./reference/global.md#xdp-host-endpoint) uses a separate shared DNS scope; it does not supply LAN facts.
 
 ## Runtime data directory
 

@@ -83,8 +83,7 @@ async fn flush_after_snapshot(
     after_snapshot();
     #[cfg(target_os = "linux")]
     if let Some(bank) = gateway {
-        let pending = bank.pending.lock().take();
-        if let Some(fill) = pending {
+        if let Some(fill) = bank.take_fill() {
             projection.write_gateway_dns(&bank, fill);
         }
         if bank.reclaim_due(now) {

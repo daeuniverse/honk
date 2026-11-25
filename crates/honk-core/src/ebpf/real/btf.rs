@@ -1,6 +1,6 @@
 //! Raw BTF reader for the few kernel and object layouts aya does not expose.
 
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use honk_netstack::{MemoryBudget, MemoryReservation};
 use std::io::Read as _;
 use std::ops::Range;
@@ -35,67 +35,12 @@ pub(crate) fn load_kernel() -> anyhow::Result<(Vec<u8>, aya::Btf)> {
     Ok((data, btf))
 }
 
-/// Fields drop in declaration order: both representations are released before
-/// their charges, on successful use and every early-error path.
-pub(crate) struct AccountedKernelBtf {
+pub(crate) struct RawKernelBtf {
     pub(crate) data: Vec<u8>,
-    pub(crate) btf: aya::Btf,
-    raw_memory: MemoryReservation,
-    parsed_memory: MemoryReservation,
+    _memory: MemoryReservation,
 }
 
-impl AccountedKernelBtf {
-    pub(crate) fn memory_bytes(&self) -> usize {
-        self.raw_memory.bytes() + self.parsed_memory.bytes()
-    }
-}
-
-struct RawKernelBtf {
-    data: Vec<u8>,
-    memory: MemoryReservation,
-}
-
-/// Charge Host raw input and Aya's parsed representation before allocation.
-/// Ordinary TC retains `load_kernel`'s existing behavior.
-pub(crate) fn load_kernel_accounted(
-    budget: &Arc<MemoryBudget>,
-) -> anyhow::Result<AccountedKernelBtf> {
-    let raw = if let Some(path) = std::env::var_os(VMLINUX_BTF_ENV) {
-        read_kernel_accounted_file(std::path::Path::new(&path), budget).with_context(|| {
-            format!(
-                "reading kernel BTF from {VMLINUX_BTF_ENV}={}",
-                std::path::Path::new(&path).display()
-            )
-        })?
-    } else {
-        match read_kernel_accounted_file(std::path::Path::new(VMLINUX_BTF_PATH), budget) {
-            Ok(value) => value,
-            // Match load_kernel: fallback after an I/O failure, including one
-            // during the read, but never after a parse or budget refusal.
-            Err(error) if error.downcast_ref::<std::io::Error>().is_some() => {
-                read_kernel_accounted_file(std::path::Path::new(VMLINUX_BTF_FALLBACK_PATH), budget)
-                    .context("reading fallback Host kernel BTF")?
-            }
-            Err(error) => return Err(error),
-        }
-    };
-    let parsed_bytes = Btf::parse(&raw.data)
-        .and_then(|btf| btf.aya_parse_allocation_bound())
-        .context("Host kernel BTF record/allocation bounds")?;
-    let parsed_memory = budget
-        .reserve(parsed_bytes)
-        .context("Host parsed kernel BTF memory capacity")?;
-    let btf = aya::Btf::parse(&raw.data, Default::default())
-        .context("parsing charged Host kernel BTF")?;
-    Ok(AccountedKernelBtf {
-        data: raw.data,
-        btf,
-        raw_memory: raw.memory,
-        parsed_memory,
-    })
-}
-
-fn read_kernel_accounted_file(
+pub(crate) fn read_kernel_accounted_file(
     path: &std::path::Path,
     budget: &Arc<MemoryBudget>,
 ) -> anyhow::Result<RawKernelBtf> {
@@ -127,7 +72,7 @@ fn read_kernel_accounted_file(
         file.read(&mut header[..1])? == 0,
         "Host kernel BTF has undeclared trailing bytes"
     );
-    Ok(RawKernelBtf { data, memory: raw })
+    Ok(RawKernelBtf { data, _memory: raw })
 }
 
 fn read_btf_exact(file: &mut std::fs::File, output: &mut [u8]) -> anyhow::Result<()> {
@@ -473,6 +418,131 @@ impl<'a> Btf<'a> {
         }
         Some(cursor)
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Leaf {
+    Integer(u32),
+    Pointer(&'static str),
+    Function,
+}
+
+// Kernel BTF can nest the named field in anonymous structs and unions.
+fn member(btf: &Btf<'_>, owner: usize, name: &str, depth: u8) -> Option<(u32, u32)> {
+    if depth == 8 || !matches!(btf.kind(owner)?, 4 | 5) {
+        return None;
+    }
+    let info = btf.u32_at(owner + 4)?;
+    let owner_size = btf.u32_at(owner + 8)?;
+    let mut found = None;
+    for index in 0..info & 0xffff {
+        let at = owner.checked_add(12 + index as usize * 12)?;
+        let member_name = btf.string(btf.u32_at(at)?)?;
+        let ty = btf.u32_at(at + 4)?;
+        let bits = btf.u32_at(at + 8)?;
+        if info >> 31 != 0 && bits >> 24 != 0 {
+            continue;
+        }
+        let bits = if info >> 31 != 0 {
+            bits & 0xffffff
+        } else {
+            bits
+        };
+        if bits % 8 != 0 {
+            continue;
+        }
+        let offset = bits / 8;
+        if offset.checked_add(btf.type_size(ty)?)? > owner_size {
+            return None;
+        }
+        let candidate = if member_name == name {
+            Some((ty, offset))
+        } else if member_name.is_empty() {
+            member(btf, btf.resolve_composite(ty)?, name, depth + 1)
+                .and_then(|(ty, inner)| Some((ty, offset.checked_add(inner)?)))
+        } else {
+            None
+        };
+        if let Some(candidate) = candidate {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(candidate);
+        }
+    }
+    found
+}
+
+pub(crate) fn field(btf: &Btf<'_>, root: &str, names: &[&str], leaf: Leaf) -> anyhow::Result<u32> {
+    let mut owner = btf
+        .find_type(4, root)
+        .with_context(|| format!("Host BTF struct {root}"))?;
+    let mut offset = 0u32;
+    let mut terminal = None;
+    for (index, name) in names.iter().enumerate() {
+        let (ty, part) = member(btf, owner, name, 0)
+            .with_context(|| format!("Host BTF {root}.{}", names.join(".")))?;
+        offset = offset
+            .checked_add(part)
+            .context("Host BTF offset overflow")?;
+        let cursor = btf.resolve_modifiers(ty).context("Host BTF member type")?;
+        if index + 1 == names.len() {
+            terminal = Some((ty, cursor));
+        } else {
+            owner = btf
+                .resolve_composite(ty)
+                .context("Host BTF non-composite member chain")?;
+        }
+    }
+    let (ty, cursor) = terminal.context("empty Host BTF member chain")?;
+    let width = match leaf {
+        Leaf::Integer(width) => {
+            ensure!(
+                btf.kind(cursor) == Some(1) && btf.type_size(ty) == Some(width),
+                "Host BTF integer width"
+            );
+            let encoding = btf
+                .u32_at(cursor + 12)
+                .context("Host BTF integer encoding")?;
+            ensure!(
+                encoding & 0x00ff_ffff == width * 8,
+                "Host BTF partial integer"
+            );
+            width
+        }
+        Leaf::Pointer(target) => {
+            ensure!(btf.kind(cursor) == Some(2), "Host BTF pointer required");
+            let target = btf
+                .find_type(4, target)
+                .context("Host BTF pointer target")?;
+            let pointee =
+                btf.resolve_modifiers(btf.u32_at(cursor + 8).context("Host BTF pointer type")?);
+            ensure!(pointee == Some(target), "Host BTF pointer target mismatch");
+            8
+        }
+        Leaf::Function => {
+            ensure!(
+                btf.kind(cursor) == Some(2),
+                "Host BTF function pointer required"
+            );
+            let pointee = btf
+                .resolve_modifiers(
+                    btf.u32_at(cursor + 8)
+                        .context("Host BTF function pointer type")?,
+                )
+                .context("Host BTF function pointer target")?;
+            ensure!(
+                btf.kind(pointee) == Some(13),
+                "Host BTF function prototype required"
+            );
+            8
+        }
+    };
+    ensure!(
+        offset.is_multiple_of(width) && offset <= i32::MAX as u32 - width,
+        "Host BTF unaligned/out-of-range field"
+    );
+    Ok(offset)
 }
 
 fn read_u32(data: &[u8], offset: usize, endian: Endian) -> Option<u32> {

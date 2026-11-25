@@ -1,3 +1,8 @@
+mod auxiliary;
+mod host;
+pub(super) use host::build as build_host;
+mod ownership;
+
 use super::*;
 use honk_ebpf_common::xdp_gateway::{
     FRAGMENT_TTL_NS, GATEWAY_DNS_BITMAP_OFFSET, GATEWAY_DNS_READY, GATEWAY_ROUTE_NEED_DNS,
@@ -23,6 +28,11 @@ const MAX_EXTENSION_HEADERS: usize = 8;
 const MAX_EXTENSION_BYTES: i32 = 256;
 const MAX_PACKET_CURSOR: i32 = 22 + 40 + MAX_EXTENSION_BYTES + 8 + 40 + MAX_EXTENSION_BYTES;
 const PACKET_CURSOR_MASK: i32 = 1023;
+
+// The fragment map preserves the original XDP verdict values across both hooks.
+const VERDICT_DROP: i32 = 1;
+const VERDICT_PASS: i32 = 2;
+const VERDICT_ENDPOINT: i32 = 4;
 
 const REALM: i16 = -16;
 const KEY: i16 = -64;
@@ -65,6 +75,8 @@ struct GatewayBuilder {
     program: Program,
     labels: Vec<Option<usize>>,
     jumps: Vec<(usize, Target)>,
+    auxiliary: Option<auxiliary::Ingress>,
+    host_broadcasts: Option<RawFd>,
 }
 
 impl GatewayBuilder {
@@ -73,6 +85,8 @@ impl GatewayBuilder {
             program: Builder::new().program,
             labels: Vec::new(),
             jumps: Vec::new(),
+            auxiliary: None,
+            host_broadcasts: None,
         }
     }
 
@@ -167,18 +181,29 @@ impl GatewayBuilder {
         self.jump(JGT_K, 0, 0, MAX_PACKET_CURSOR, bad);
         self.emit(AND_K, 0, 0, 0, PACKET_CURSOR_MASK);
         self.store(STX_W, 10, CURSOR, 0);
-        self.load(LDX_W, 6, 9, 0);
+        let data = if self.auxiliary.is_some() {
+            auxiliary::SKB_DATA
+        } else {
+            0
+        };
+        self.load(LDX_W, 6, 9, data);
         self.emit(ADD_X, 6, 0, 0, 0);
-        self.jump(JGT_X, 6, 7, 0, bad);
+        if self.auxiliary.is_none() {
+            self.jump(JGT_X, 6, 7, 0, bad);
+        }
         for register in 0..=4 {
             self.imm(register, 0);
         }
     }
 
+    fn load_cursor(&mut self, dst: u8, bad: Target) {
+        self.load(LDX_W, dst, 10, CURSOR);
+        self.jump(JGT_K, dst, 0, MAX_PACKET_CURSOR, bad);
+        self.emit(AND_K, dst, 0, 0, PACKET_CURSOR_MASK);
+    }
+
     fn advance_cursor(&mut self, length: u8, bad: Target) {
-        self.load(LDX_W, 0, 10, CURSOR);
-        self.jump(JGT_K, 0, 0, MAX_PACKET_CURSOR, bad);
-        self.emit(AND_K, 0, 0, 0, PACKET_CURSOR_MASK);
+        self.load_cursor(0, bad);
         self.emit(ADD_X, 0, length, 0, 0);
         self.rebase_cursor(bad);
     }
@@ -186,8 +211,33 @@ impl GatewayBuilder {
     fn bound(&mut self, bytes: i32, bad: Target) {
         self.mov(0, 6);
         self.add(0, bytes);
-        self.jump(JGT_X, 0, 7, 0, bad);
+        if self.auxiliary.is_some() {
+            self.pull_prefix(bytes, bad);
+        } else {
+            self.jump(JGT_X, 0, 7, 0, bad);
+        }
     }
+
+    fn pull_prefix(&mut self, bytes: i32, bad: Target) {
+        let linear = self.target();
+        self.jump(JLE_X, 0, 7, 0, linear);
+        // The cursor bound is independent of any IP length declared on the wire.
+        self.load_cursor(2, bad);
+        self.add(2, bytes);
+        self.load(LDX_W, 1, 10, FULL_LEN);
+        self.jump(JGT_X, 2, 1, 0, bad);
+        self.mov(1, 9);
+        self.helper(auxiliary::SKB_PULL_DATA);
+        self.jump(JNE_K, 0, 0, 0, bad);
+        self.load(LDX_W, 7, 9, auxiliary::SKB_DATA_END);
+        self.load(LDX_W, 0, 10, CURSOR);
+        self.rebase_cursor(bad);
+        self.mov(0, 6);
+        self.add(0, bytes);
+        self.jump(JGT_X, 0, 7, 0, bad);
+        self.bind(linear);
+    }
+
     fn prefix(&mut self, bytes: i32, remaining: i16, bad: Target) {
         self.load_remaining(0, remaining, bad);
         self.jump(JLT_K, 0, 0, bytes, bad);
@@ -508,9 +558,16 @@ fn parse_ip(
                     0,
                     0,
                     u32::from_be(prefix as u32) as i32,
-                    targets.drop,
+                    if b.auxiliary.is_some() {
+                        targets.pass
+                    } else {
+                        targets.drop
+                    },
                 );
                 b.bind(other);
+            }
+            if b.auxiliary.is_some() {
+                auxiliary::special_ipv6(b, targets.pass);
             }
         }
         b.load(LDX_B, 5, 6, 6);
@@ -542,6 +599,10 @@ fn parse_ip(
             b.goto(advance);
             b.bind(fragment);
             b.prefix(8, remaining, bad);
+            if b.host_broadcasts.is_some() {
+                b.load(LDX_B, 0, 6, 0);
+                b.store(STX_W, 10, FRAGMENT + 44, 0);
+            }
             b.load(LDX_W, 0, 10, ext_bytes);
             b.emit(AND_K, 0, 0, 0, 511);
             b.jump(JGT_K, 0, 0, MAX_EXTENSION_BYTES - 8, bad);
@@ -605,9 +666,11 @@ fn parse_ip(
         b.emit(AND_K, 2, 0, 0, 15);
         b.jump(JLT_K, 2, 0, 5, bad);
         b.emit(LSH_K, 2, 0, 0, 2);
-        b.mov(0, 6);
-        b.emit(ADD_X, 0, 2, 0, 0);
-        b.jump(JGT_X, 0, 7, 0, bad);
+        if b.auxiliary.is_none() {
+            b.mov(0, 6);
+            b.emit(ADD_X, 0, 2, 0, 0);
+            b.jump(JGT_X, 0, 7, 0, bad);
+        }
         b.load(LDX_H, 0, 6, 2);
         b.emit(BE16, 0, 0, 0, 16);
         b.emit(AND_K, 0, 0, 0, 0xffff);
@@ -654,13 +717,37 @@ fn parse_ip(
             b.store(STX_W, 10, FRAGMENT + 40, 0);
             for offset in [12, 16] {
                 b.load(LDX_H, 0, 6, offset);
+                if b.host_broadcasts.is_some() {
+                    b.jump(JEQ_K, 0, 0, u16::from_be(0xa9fe) as i32, targets.pass);
+                }
                 b.jump(
                     JEQ_K,
                     0,
                     0,
                     u16::from_be((honk_ebpf_common::DAE0_IPV4_NET >> 16) as u16) as i32,
-                    targets.drop,
+                    if b.auxiliary.is_some() {
+                        targets.pass
+                    } else {
+                        targets.drop
+                    },
                 );
+            }
+            if b.auxiliary.is_some() {
+                special_ipv4(b, broadcasts, targets.pass);
+                if let Some(root) = b.host_broadcasts {
+                    // Preserve the checked IHL and reload the saved next protocol
+                    // after the lookup clobbers argument registers.
+                    b.mov(8, 2);
+                    b.word(INDEX, 0);
+                    b.lookup(root, INDEX);
+                    b.jump(JEQ_K, 0, 0, 0, bad);
+                    b.mov(1, 0);
+                    b.address(2, KEY + 36);
+                    b.helper(1);
+                    b.jump(JNE_K, 0, 0, 0, targets.pass);
+                    b.mov(2, 8);
+                    b.load(LDX_W, 5, 10, KEY + 44);
+                }
             }
         }
         b.load(LDX_H, 0, 6, 6);
@@ -680,33 +767,41 @@ fn parse_ip(
         b.bind(whole);
         b.word(state, 1);
         b.bind(unfragmented);
-        if !quote {
-            b.load(LDX_W, 0, 6, 16);
-            b.jump(JEQ_K, 0, 0, 0, targets.pass);
-            b.jump(JEQ32_K, 0, 0, -1, targets.pass);
-            for address in broadcasts {
-                b.jump(
-                    JEQ32_K,
-                    0,
-                    0,
-                    u32::from_ne_bytes(address.octets()) as i32,
-                    targets.pass,
-                );
-            }
-            b.load(LDX_B, 0, 6, 16);
-            b.emit(AND_K, 0, 0, 0, 0xf0);
-            b.jump(JEQ_K, 0, 0, 0xe0, targets.pass);
+        if !quote && b.auxiliary.is_none() {
+            special_ipv4(b, broadcasts, targets.pass);
         }
         b.advance_cursor(2, bad);
         b.goto(targets.done);
     }
 }
 
+fn special_ipv4(b: &mut GatewayBuilder, broadcasts: &[Ipv4Addr], pass: Target) {
+    b.load(LDX_W, 0, 6, 16);
+    b.jump(JEQ_K, 0, 0, 0, pass);
+    b.jump(JEQ32_K, 0, 0, -1, pass);
+    for address in broadcasts {
+        b.jump(
+            JEQ32_K,
+            0,
+            0,
+            u32::from_ne_bytes(address.octets()) as i32,
+            pass,
+        );
+    }
+    b.load(LDX_B, 0, 6, 16);
+    b.emit(AND_K, 0, 0, 0, 0xf0);
+    b.jump(JEQ_K, 0, 0, 0xe0, pass);
+}
+
 fn check_packet_length(b: &mut GatewayBuilder, bad: Target) {
     b.load(LDX_W, 1, 10, FULL_LEN);
     b.load(LDX_W, 4, 10, L2_LEN);
     b.emit(SUB_X, 1, 4, 0, 0);
-    b.jump(JGT_X, 0, 1, 0, bad);
+    if b.auxiliary.is_some() {
+        b.jump(JNE_X, 0, 1, 0, bad);
+    } else {
+        b.jump(JGT_X, 0, 1, 0, bad);
+    }
 }
 
 fn refresh_hold(b: &mut GatewayBuilder, done: Target) {
@@ -730,30 +825,7 @@ fn conntrack(
     original: Target,
     reply: Target,
 ) {
-    b.zero(TUPLE, 36);
-    b.zero(OPTS, 16);
-    b.word(OPTS, -1);
-    b.load(LDX_B, 0, 10, KEY + 44);
-    b.store(STX_B, 10, OPTS + 8, 0);
-    let ipv6 = b.target();
-    let ready = b.target();
-    b.load(LDX_W, 0, 10, KEY + 4);
-    b.jump(JEQ_K, 0, 0, 6, ipv6);
-    b.copy(10, TUPLE, 10, KEY + 20, 4);
-    b.copy(10, TUPLE + 4, 10, KEY + 36, 4);
-    b.copy(10, TUPLE + 8, 10, KEY + 40, 4);
-    b.imm(3, 12);
-    b.goto(ready);
-    b.bind(ipv6);
-    b.copy(10, TUPLE, 10, KEY + 8, 32);
-    b.copy(10, TUPLE + 32, 10, KEY + 40, 4);
-    b.imm(3, 36);
-    b.bind(ready);
-    b.mov(1, 9);
-    b.address(2, TUPLE);
-    b.address(4, OPTS);
-    b.imm(5, 16);
-    b.emit(CALL, 0, 2, ct.lookup_offset, ct.lookup as i32);
+    lookup_conntrack(b, ct, false);
     let missing = b.target();
     b.jump(JEQ_K, 0, 0, 0, missing);
     b.mov(1, 0);
@@ -768,6 +840,46 @@ fn conntrack(
     b.goto(error);
 }
 
+fn lookup_conntrack(b: &mut GatewayBuilder, ct: &ConntrackKfuncs, reverse: bool) {
+    b.zero(TUPLE, 36);
+    b.zero(OPTS, 16);
+    b.word(OPTS, -1);
+    b.load(LDX_B, 0, 10, KEY + 44);
+    b.store(STX_B, 10, OPTS + 8, 0);
+    let ipv6 = b.target();
+    let ready = b.target();
+    b.load(LDX_W, 0, 10, KEY + 4);
+    b.jump(JEQ_K, 0, 0, 6, ipv6);
+    let (src, dst) = if reverse { (24, 8) } else { (8, 24) };
+    b.copy(10, TUPLE, 10, KEY + src + 12, 4);
+    b.copy(10, TUPLE + 4, 10, KEY + dst + 12, 4);
+    copy_ct_ports(b, TUPLE + 8, reverse);
+    b.imm(3, 12);
+    b.goto(ready);
+    b.bind(ipv6);
+    b.copy(10, TUPLE, 10, KEY + src, 16);
+    b.copy(10, TUPLE + 16, 10, KEY + dst, 16);
+    copy_ct_ports(b, TUPLE + 32, reverse);
+    b.imm(3, 36);
+    b.bind(ready);
+    b.mov(1, 9);
+    b.address(2, TUPLE);
+    b.address(4, OPTS);
+    b.imm(5, 16);
+    b.emit(CALL, 0, 2, ct.lookup_offset, ct.lookup as i32);
+}
+
+fn copy_ct_ports(b: &mut GatewayBuilder, output: i16, reverse: bool) {
+    if reverse {
+        for (from, to) in [(42, 0), (40, 2)] {
+            b.load(LDX_H, 0, 10, KEY + from);
+            b.store(STX_H, 10, output + to, 0);
+        }
+    } else {
+        b.copy(10, output, 10, KEY + 40, 4);
+    }
+}
+
 fn release_dns_scratch(b: &mut GatewayBuilder, double_exchange: bool) {
     b.imm(1, 0);
     if double_exchange {
@@ -778,16 +890,31 @@ fn release_dns_scratch(b: &mut GatewayBuilder, double_exchange: bool) {
     b.emit(ATOMIC_ADD_DW, 8, 1, 0, XCHG);
 }
 
+fn skip_incomplete_udp(b: &mut GatewayBuilder, miss: Target) {
+    let eligible = b.target();
+    b.load(LDX_W, 0, 10, FRAG_STATE);
+    b.jump(JEQ_K, 0, 0, 0, eligible);
+    b.load(LDX_B, 1, 10, KEY + 44);
+    b.jump(JNE_K, 1, 0, 17, eligible);
+    // Only an IPv6 atomic fragment header describes a complete fragmented-form datagram.
+    b.jump(JNE_K, 0, 0, 4, miss);
+    b.bind(eligible);
+}
+
 fn dns_shadow(
     b: &mut GatewayBuilder,
     dns: &crate::GatewayDnsMaps,
-    maps: &GatewayMaps,
-    data: bool,
+    shadow_stats: Option<&GatewayMaps>,
+    qualified: Option<Target>,
     new_flow: Target,
     bad: Target,
+    stale: Target,
 ) -> usize {
     // CT has released its reference; its tuple buffer is now private stack space for the DNS key.
     let miss = b.target();
+    if qualified.is_some() {
+        skip_incomplete_udp(b, miss);
+    }
     b.lookup(dns.epochs.as_raw_fd(), KEY);
     b.jump(JEQ_K, 0, 0, 0, miss);
     b.load(LDX_DW, 1, 0, 0);
@@ -816,6 +943,9 @@ fn dns_shadow(
     b.imm(3, GATEWAY_DNS_READY);
     let call = b.emit(CALL, 0, 1, 0, 0);
     release_dns_scratch(b, cfg!(target_arch = "aarch64"));
+    if let Some(auxiliary) = b.auxiliary {
+        auxiliary.after_policy(b, stale);
+    }
     b.jump(JEQ_K, 0, 0, 0, new_flow);
     b.jump(JNE_K, 0, 0, 1, bad);
     // After the barrier only the invocation's stack, copied deadline, and independent epoch are live.
@@ -826,14 +956,133 @@ fn dns_shadow(
     b.jump(JNE_X, 0, 1, 0, new_flow);
     b.helper(5);
     b.jump(JLE_X, 7, 0, 0, new_flow);
-    if data {
-        b.stat(maps, GatewayReason::WouldPassDns);
+    if let Some(qualified) = qualified {
+        b.goto(qualified);
+    } else {
+        if let Some(maps) = shadow_stats {
+            b.stat(maps, GatewayReason::WouldPassDns);
+        }
+        b.goto(new_flow);
     }
-    b.goto(new_flow);
     b.bind(miss);
     b.emit(ST_DW, 8, 0, 0, 0);
     b.goto(new_flow);
     call
+}
+
+fn routing_call(
+    b: &mut GatewayBuilder,
+    maps: &GatewayMaps,
+    scratch: RawFd,
+    classify_bad: Target,
+    identity: Option<i16>,
+) -> usize {
+    b.stat(maps, GatewayReason::D1Evaluated);
+    b.word(INDEX, 0);
+    b.lookup(scratch, INDEX);
+    b.jump(JEQ_K, 0, 0, 0, classify_bad);
+    b.mov(8, 0);
+    b.imm(0, 0);
+    b.imm(1, 1);
+    b.emit(ATOMIC_ADD_DW, 8, 1, 0, CMPXCHG);
+    b.jump(JNE_K, 0, 0, 0, classify_bad);
+    // Only cold classification initializes the canonical input. The callee owns output initialization.
+    for offset in (0..128).step_by(4) {
+        b.emit(ST_W, 8, 0, SCRATCH_INPUT + offset, 0);
+    }
+    b.copy(8, SCRATCH_INPUT, 10, KEY + 8, 32);
+    if b.auxiliary.is_none() {
+        for half in 0..3 {
+            b.load(LDX_H, 0, 10, MAC + half * 2);
+            b.store(STX_H, 8, SCRATCH_INPUT + 42 + half * 2, 0);
+        }
+    }
+    if let Some(identity) = identity {
+        b.copy(
+            8,
+            SCRATCH_INPUT + 48,
+            10,
+            identity + 8,
+            honk_ebpf_common::ROUTING_PROCESS_MAX_LEN as i16,
+        );
+        b.load(LDX_B, 0, 10, identity + 4);
+        b.store(STX_W, 8, SCRATCH_INPUT + 120, 0);
+    }
+    for (source, destination) in [(KEY + 40, 96), (KEY + 42, 100)] {
+        b.load(LDX_H, 0, 10, source);
+        b.emit(BE16, 0, 0, 0, 16);
+        b.store(STX_W, 8, SCRATCH_INPUT + destination, 0);
+    }
+    for (source, wire_first, first, other, destination) in [
+        (
+            KEY + 44,
+            6,
+            L4ProtoType::Tcp as i32,
+            L4ProtoType::Udp as i32,
+            104,
+        ),
+        (
+            KEY + 4,
+            4,
+            IpVersionType::V4 as i32,
+            IpVersionType::V6 as i32,
+            108,
+        ),
+    ] {
+        b.load(LDX_W, 0, 10, source);
+        b.imm(1, other);
+        let converted = b.target();
+        b.jump(JNE_K, 0, 0, wire_first, converted);
+        b.imm(1, first);
+        b.bind(converted);
+        b.store(STX_W, 8, SCRATCH_INPUT + destination, 1);
+    }
+    b.load(LDX_W, 0, 10, DSCP);
+    b.store(STX_W, 8, SCRATCH_INPUT + 112, 0);
+    b.lookup(maps.mode_flags.as_raw_fd(), INDEX);
+    let flags_present = b.target();
+    b.jump(JNE_K, 0, 0, 0, flags_present);
+    b.emit(ST_DW, 8, 0, 0, 0);
+    b.goto(classify_bad);
+    b.bind(flags_present);
+    b.load(LDX_W, 0, 0, 0);
+    b.emit(AND_K, 0, 0, 0, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as i32);
+    let no_finality = b.target();
+    let mac_flag = if b.auxiliary.is_none() {
+        ROUTING_INPUT_MAC_PRESENT as i32
+    } else {
+        0
+    };
+    b.imm(1, mac_flag);
+    b.jump(JEQ_K, 0, 0, 0, no_finality);
+    b.emit(OR_K, 1, 0, 0, ROUTING_INPUT_ALLOW_DIRECT_FINALITY as i32);
+    b.bind(no_finality);
+    b.store(STX_W, 8, SCRATCH_INPUT + 124, 1);
+    // Discard parser history before the shared canonical call, including its saved caller frame.
+    for slot in [
+        REMAIN,
+        EXT_BYTES,
+        L2_LEN,
+        FULL_LEN,
+        IS_QUOTE,
+        HOP_LIMIT,
+        TCP_FLAGS,
+        DSCP,
+        INNER_FRAG,
+        INNER_REMAIN,
+        QUOTE_AVAILABLE,
+        CURSOR,
+    ] {
+        b.word(slot, 0);
+    }
+    for register in 0..=7 {
+        b.imm(register, 0);
+    }
+    b.mov(1, 8);
+    b.add(1, i32::from(SCRATCH_INPUT));
+    b.mov(2, 8);
+    b.add(2, i32::from(SCRATCH_OUTPUT));
+    b.emit(CALL, 0, 1, 0, 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -852,29 +1101,92 @@ pub(in crate::bpf) fn build(
         || ipv4_broadcasts.len() > crate::topology::MAX_BROADCASTS
         || capture.vlan_metadata != vlan_kfunc.is_some()
         || vlan_kfunc == Some(0)
-        || gateway.conntrack.lookup == 0
-        || gateway.conntrack.release == 0
+    {
+        return Err(invalid_data("invalid gateway capture or kfunc authority"));
+    }
+    build_ingress(
+        Ingress::Xdp {
+            capture,
+            broadcasts: ipv4_broadcasts,
+            queues,
+            counters,
+            xsks,
+            data,
+            vlan_kfunc,
+        },
+        gateway,
+        gateway
+            .conntrack
+            .ok_or_else(|| invalid_data("physical gateway requires XDP conntrack"))?,
+    )
+}
+
+pub(super) fn build_auxiliary(
+    pair: &crate::AuxDevicePair,
+    realm: u32,
+    ipv4_broadcasts: &[Ipv4Addr],
+    gateway: &GatewayLoad<'_>,
+    ct: &SkbConntrackKfuncs,
+) -> io::Result<Program> {
+    if ipv4_broadcasts.len() > crate::topology::MAX_BROADCASTS {
+        return Err(invalid_data("auxiliary IPv4 broadcast capacity exceeded"));
+    }
+    build_ingress(
+        Ingress::Auxiliary {
+            hook: auxiliary::Ingress::new(pair, gateway.maps, realm),
+            broadcasts: ipv4_broadcasts,
+        },
+        gateway,
+        &ct.0,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum Ingress<'a> {
+    Xdp {
+        capture: &'a GeneralCapture,
+        broadcasts: &'a [Ipv4Addr],
+        queues: u32,
+        counters: RawFd,
+        xsks: RawFd,
+        data: bool,
+        vlan_kfunc: Option<u32>,
+    },
+    Auxiliary {
+        hook: auxiliary::Ingress,
+        broadcasts: &'a [Ipv4Addr],
+    },
+}
+
+fn build_ingress(
+    ingress: Ingress<'_>,
+    gateway: &GatewayLoad<'_>,
+    conntrack_kfuncs: &ConntrackKfuncs,
+) -> io::Result<Program> {
+    if conntrack_kfuncs.lookup == 0
+        || conntrack_kfuncs.release == 0
         || [
-            gateway.conntrack.lookup_offset,
-            gateway.conntrack.release_offset,
+            conntrack_kfuncs.lookup_offset,
+            conntrack_kfuncs.release_offset,
         ]
         .iter()
-        .any(|offset| {
-            !matches!(*offset, 0 | 1) || (*offset == 1 && gateway.conntrack.btf.is_none())
-        })
+        .any(|offset| !matches!(*offset, 0 | 1) || (*offset == 1 && conntrack_kfuncs.btf.is_none()))
     {
         return Err(invalid_data("invalid gateway capture or kfunc authority"));
     }
     let maps = gateway.maps;
     let mut b = GatewayBuilder::new();
-    b.program.flags = 1 << 5;
-    if vlan_kfunc.is_some() {
-        b.program.flags |= 1 << 6;
-        b.program.ifindex = capture.authority.ifindex;
-    }
+    let (data, scratch, ipv4_broadcasts, auxiliary) = match ingress {
+        Ingress::Xdp {
+            data, broadcasts, ..
+        } => (data, maps.scratch.as_raw_fd(), broadcasts, None),
+        Ingress::Auxiliary { hook, broadcasts } => (true, hook.scratch, broadcasts, Some(hook)),
+    };
+    b.auxiliary = auxiliary;
     let drop = b.target();
     let bad = b.target();
     let unknown = b.target();
+    let foreign = b.target();
     let pass = b.target();
     let xsk = b.target();
     let final_pass = b.target();
@@ -905,19 +1217,40 @@ pub(in crate::bpf) fn build(
     let fragment_pass = b.target();
     let fragment_xsk = b.target();
     let nd = b.target();
+    let owner = gateway
+        .arbitration
+        .map(|arb| ownership::Owner::new(&mut b, arb, conntrack_kfuncs));
     b.mov(9, 1);
-    b.load(LDX_W, 0, 9, 12);
-    b.jump(JNE32_K, 0, 0, capture.authority.ifindex as i32, unknown);
-    b.mov(1, 9);
-    b.helper(188); // Total XDP length includes SG payload; data_end bounds only headers.
-    b.store(STX_W, 10, FULL_LEN, 0);
-    layer2(&mut b, capture, maps, vlan_kfunc, bad, unknown);
-    b.jump(JEQ_K, 5, 0, 0x0806, non_transport);
+    match ingress {
+        Ingress::Xdp {
+            capture,
+            vlan_kfunc,
+            ..
+        } => {
+            b.program.flags = 1 << 5;
+            if vlan_kfunc.is_some() {
+                b.program.flags |= 1 << 6;
+                b.program.ifindex = capture.authority.ifindex;
+            }
+            b.load(LDX_W, 0, 9, 12);
+            b.jump(JNE32_K, 0, 0, capture.authority.ifindex as i32, unknown);
+            b.mov(1, 9);
+            b.helper(188); // Total XDP length includes SG payload; data_end bounds only headers.
+            b.store(STX_W, 10, FULL_LEN, 0);
+            layer2(&mut b, capture, maps, vlan_kfunc, bad, unknown);
+            b.jump(JEQ_K, 5, 0, 0x0806, non_transport);
+        }
+        Ingress::Auxiliary { hook, .. } => hook.prologue(&mut b, foreign, unknown),
+    }
     b.jump(JEQ_K, 5, 0, 0x0800, ipv4);
     b.jump(JEQ_K, 5, 0, 0x86dd, ipv6);
-    b.load(LDX_W, 0, 10, DSCP);
-    b.jump(JNE_K, 0, 0, 0, non_transport);
-    b.goto(drop);
+    if auxiliary.is_some() {
+        b.goto(non_transport);
+    } else {
+        b.load(LDX_W, 0, 10, DSCP);
+        b.jump(JNE_K, 0, 0, 0, non_transport);
+        b.goto(drop);
+    }
     b.bind(ipv4);
     parse_ip(
         &mut b,
@@ -949,14 +1282,16 @@ pub(in crate::bpf) fn build(
         },
     );
     b.bind(parsed6);
-    b.load(LDX_B, 0, 10, KEY + 24);
-    b.jump(JNE_K, 0, 0, 0xff, parsed);
-    b.jump(JNE_K, 5, 0, 58, non_transport);
-    b.prefix(2, REMAIN, bad);
-    b.load(LDX_B, 0, 6, 0);
-    b.jump(JLT_K, 0, 0, 133, non_transport);
-    b.jump(JGT_K, 0, 0, 137, non_transport);
-    b.goto(nd);
+    if auxiliary.is_none() {
+        b.load(LDX_B, 0, 10, KEY + 24);
+        b.jump(JNE_K, 0, 0, 0xff, parsed);
+        b.jump(JNE_K, 5, 0, 58, non_transport);
+        b.prefix(2, REMAIN, bad);
+        b.load(LDX_B, 0, 6, 0);
+        b.jump(JLT_K, 0, 0, 133, non_transport);
+        b.jump(JGT_K, 0, 0, 137, non_transport);
+        b.goto(nd);
+    }
     b.bind(parsed);
     b.store(STX_W, 10, KEY + 44, 5);
     b.jump(JEQ_K, 5, 0, 6, transport);
@@ -1034,8 +1369,10 @@ pub(in crate::bpf) fn build(
     b.helper(1);
     b.jump(JNE_K, 0, 0, 0, local);
     b.bind(hold_lookup);
-    b.lookup(maps.hold.as_raw_fd(), KEY);
-    b.jump(JNE_K, 0, 0, 0, held);
+    if owner.is_none() {
+        b.lookup(maps.hold.as_raw_fd(), KEY);
+        b.jump(JNE_K, 0, 0, 0, held);
+    }
     let ct = b.target();
     b.goto(ct);
 
@@ -1097,131 +1434,64 @@ pub(in crate::bpf) fn build(
     b.store(STX_H, 10, KEY + 42, 0);
     b.load(LDX_H, 0, 6, 2);
     b.store(STX_H, 10, KEY + 40, 0);
-    b.lookup(maps.hold.as_raw_fd(), KEY);
-    b.jump(JNE_K, 0, 0, 0, held);
-    b.goto(ct);
-    b.bind(ct);
-    conntrack(
-        &mut b,
-        gateway.conntrack,
-        ct_miss,
-        ct_error,
-        ct_original,
-        ct_reply,
-    );
-    b.bind(ct_miss);
-    b.load(LDX_W, 0, 10, IS_QUOTE);
-    b.jump(JNE_K, 0, 0, 0, quote_unresolved);
-    b.load(LDX_B, 0, 10, KEY + 44);
-    b.jump(JEQ_K, 0, 0, 17, d1);
-    b.load(LDX_W, 0, 10, TCP_FLAGS);
-    b.emit(AND_K, 0, 0, 0, 0x17);
-    b.jump(JNE_K, 0, 0, 2, non_syn);
-    b.goto(d1);
-    b.bind(held);
-    let refreshed = b.target();
-    refresh_hold(&mut b, refreshed);
-    b.bind(refreshed);
-    b.reason(GatewayReason::XskEndpointHold, xsk);
-    b.bind(ct_original);
-    b.reason(GatewayReason::PassCtOriginal, pass);
-    b.bind(ct_reply);
-    b.reason(GatewayReason::PassCtReply, pass);
-    b.bind(ct_error);
-    b.stat(maps, GatewayReason::CtLookupError);
-    b.goto(drop);
-    b.bind(non_syn);
-    b.reason(GatewayReason::PassTcpNonSynMiss, pass);
+    if let Some(owner) = &owner {
+        b.bind(ct);
+        owner.observe(&mut b, gateway, data, d1, pass, drop);
+    } else {
+        b.lookup(maps.hold.as_raw_fd(), KEY);
+        b.jump(JNE_K, 0, 0, 0, held);
+        b.goto(ct);
+        b.bind(ct);
+        conntrack(
+            &mut b,
+            conntrack_kfuncs,
+            ct_miss,
+            ct_error,
+            ct_original,
+            ct_reply,
+        );
+        b.bind(ct_miss);
+        b.load(LDX_W, 0, 10, IS_QUOTE);
+        b.jump(JNE_K, 0, 0, 0, quote_unresolved);
+        b.load(LDX_B, 0, 10, KEY + 44);
+        b.jump(JEQ_K, 0, 0, 17, d1);
+        b.load(LDX_W, 0, 10, TCP_FLAGS);
+        b.emit(AND_K, 0, 0, 0, 0x17);
+        b.jump(JNE_K, 0, 0, 2, non_syn);
+        b.goto(d1);
+        b.bind(held);
+        let refreshed = b.target();
+        refresh_hold(&mut b, refreshed);
+        b.bind(refreshed);
+        b.reason(GatewayReason::XskEndpointHold, xsk);
+        b.bind(ct_original);
+        b.reason(GatewayReason::PassCtOriginal, pass);
+        b.bind(ct_reply);
+        b.reason(GatewayReason::PassCtReply, pass);
+        b.bind(ct_error);
+        b.stat(maps, GatewayReason::CtLookupError);
+        b.goto(drop);
+        b.bind(non_syn);
+        b.reason(GatewayReason::PassTcpNonSynMiss, pass);
+    }
 
     b.bind(d1);
-    b.stat(maps, GatewayReason::D1Evaluated);
-    b.word(INDEX, 0);
-    b.lookup(maps.scratch.as_raw_fd(), INDEX);
-    b.jump(JEQ_K, 0, 0, 0, bad);
-    b.mov(8, 0);
-    b.imm(0, 0);
-    b.imm(1, 1);
-    b.emit(ATOMIC_ADD_DW, 8, 1, 0, CMPXCHG);
-    b.jump(JNE_K, 0, 0, 0, bad);
-    // Only cold classification initializes the canonical input. The callee owns output initialization.
-    for offset in (0..128).step_by(4) {
-        b.emit(ST_W, 8, 0, SCRATCH_INPUT + offset, 0);
+    let classify_bad = owner.as_ref().map_or(bad, |owner| owner.bad);
+    let classify_stale = owner
+        .as_ref()
+        .and_then(|owner| owner.stale)
+        .unwrap_or(unknown);
+    let routing_call = routing_call(&mut b, maps, scratch, classify_bad, None);
+    if let Some(auxiliary) = auxiliary {
+        let stale = b.target();
+        let active = b.target();
+        auxiliary.after_policy(&mut b, stale);
+        b.goto(active);
+        b.bind(stale);
+        b.emit(ST_DW, 8, 0, 0, 0);
+        b.goto(classify_stale);
+        b.bind(active);
     }
-    b.copy(8, SCRATCH_INPUT, 10, KEY + 8, 32);
-    for half in 0..3 {
-        b.load(LDX_H, 0, 10, MAC + half * 2);
-        b.store(STX_H, 8, SCRATCH_INPUT + 42 + half * 2, 0);
-    }
-    for (source, destination) in [(KEY + 40, 96), (KEY + 42, 100)] {
-        b.load(LDX_H, 0, 10, source);
-        b.emit(BE16, 0, 0, 0, 16);
-        b.store(STX_W, 8, SCRATCH_INPUT + destination, 0);
-    }
-    for (source, wire_first, first, other, destination) in [
-        (
-            KEY + 44,
-            6,
-            L4ProtoType::Tcp as i32,
-            L4ProtoType::Udp as i32,
-            104,
-        ),
-        (
-            KEY + 4,
-            4,
-            IpVersionType::V4 as i32,
-            IpVersionType::V6 as i32,
-            108,
-        ),
-    ] {
-        b.load(LDX_W, 0, 10, source);
-        b.imm(1, other);
-        let converted = b.target();
-        b.jump(JNE_K, 0, 0, wire_first, converted);
-        b.imm(1, first);
-        b.bind(converted);
-        b.store(STX_W, 8, SCRATCH_INPUT + destination, 1);
-    }
-    b.load(LDX_W, 0, 10, DSCP);
-    b.store(STX_W, 8, SCRATCH_INPUT + 112, 0);
-    b.lookup(maps.mode_flags.as_raw_fd(), INDEX);
-    let flags_present = b.target();
-    b.jump(JNE_K, 0, 0, 0, flags_present);
-    b.emit(ST_DW, 8, 0, 0, 0);
-    b.goto(bad);
-    b.bind(flags_present);
-    b.load(LDX_W, 0, 0, 0);
-    b.emit(AND_K, 0, 0, 0, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as i32);
-    let no_finality = b.target();
-    b.imm(1, ROUTING_INPUT_MAC_PRESENT as i32);
-    b.jump(JEQ_K, 0, 0, 0, no_finality);
-    b.emit(OR_K, 1, 0, 0, ROUTING_INPUT_ALLOW_DIRECT_FINALITY as i32);
-    b.bind(no_finality);
-    b.store(STX_W, 8, SCRATCH_INPUT + 124, 1);
-    // Discard parser history before the shared canonical call, including its saved caller frame.
-    for slot in [
-        REMAIN,
-        EXT_BYTES,
-        L2_LEN,
-        FULL_LEN,
-        IS_QUOTE,
-        HOP_LIMIT,
-        TCP_FLAGS,
-        DSCP,
-        INNER_FRAG,
-        INNER_REMAIN,
-        QUOTE_AVAILABLE,
-        CURSOR,
-    ] {
-        b.word(slot, 0);
-    }
-    for register in 0..=7 {
-        b.imm(register, 0);
-    }
-    b.mov(1, 8);
-    b.add(1, i32::from(SCRATCH_INPUT));
-    b.mov(2, 8);
-    b.add(2, i32::from(SCRATCH_OUTPUT));
-    let routing_call = b.emit(CALL, 0, 1, 0, 0);
     let dns_path = gateway.dns.map(|dns| {
         let target = b.target();
         b.jump(JEQ_K, 0, 0, GATEWAY_ROUTE_NEED_DNS, target);
@@ -1229,35 +1499,52 @@ pub(in crate::bpf) fn build(
     });
     b.emit(ST_DW, 8, 0, 0, 0);
     b.jump(JEQ_K, 0, 0, 1, d1_pass);
-    b.jump(JNE_K, 0, 0, 0, bad);
+    b.jump(JNE_K, 0, 0, 0, classify_bad);
     b.goto(new_flow);
     b.bind(d1_pass);
-    b.reason(GatewayReason::PassD1, pass);
+    if let Some(owner) = &owner {
+        owner.static_pass(&mut b);
+    } else {
+        b.reason(GatewayReason::PassD1, pass);
+    }
     let dns_call = dns_path.map(|(dns, target)| {
         b.bind(target);
-        dns_shadow(&mut b, dns, maps, data, new_flow, bad)
+        let qualified = owner.as_ref().filter(|_| data).map(|owner| owner.qualified);
+        dns_shadow(
+            &mut b,
+            dns,
+            data.then_some(maps),
+            qualified,
+            new_flow,
+            classify_bad,
+            classify_stale,
+        )
     });
     b.bind(new_flow);
-    if data {
-        b.helper(5);
-        b.store(STX_DW, 10, VALUE, 0);
-        b.store(STX_DW, 10, VALUE + 8, 0);
-        b.update(maps.hold.as_raw_fd(), KEY, VALUE, 1);
-        let inserted = b.target();
-        b.jump(JEQ_K, 0, 0, 0, inserted);
-        b.jump(JNE32_K, 0, 0, -libc::EEXIST, insert_failed);
-        b.lookup(maps.hold.as_raw_fd(), KEY);
-        b.jump(JEQ_K, 0, 0, 0, insert_failed);
-        let raced = b.target();
-        refresh_hold(&mut b, raced);
-        b.bind(raced);
-        b.bind(inserted);
-    }
-    b.reason(GatewayReason::XskNewFlow, xsk);
-    if data {
-        b.bind(insert_failed);
-        b.stat(maps, GatewayReason::HoldInsertFailed);
-        b.goto(drop);
+    if let Some(owner) = &owner {
+        owner.finish(&mut b, gateway, data, final_pass, drop);
+    } else {
+        if data {
+            b.helper(5);
+            b.store(STX_DW, 10, VALUE, 0);
+            b.store(STX_DW, 10, VALUE + 8, 0);
+            b.update(maps.hold.as_raw_fd(), KEY, VALUE, 1);
+            let inserted = b.target();
+            b.jump(JEQ_K, 0, 0, 0, inserted);
+            b.jump(JNE32_K, 0, 0, -libc::EEXIST, insert_failed);
+            b.lookup(maps.hold.as_raw_fd(), KEY);
+            b.jump(JEQ_K, 0, 0, 0, insert_failed);
+            let raced = b.target();
+            refresh_hold(&mut b, raced);
+            b.bind(raced);
+            b.bind(inserted);
+        }
+        b.reason(GatewayReason::XskNewFlow, xsk);
+        if data {
+            b.bind(insert_failed);
+            b.stat(maps, GatewayReason::HoldInsertFailed);
+            b.goto(drop);
+        }
     }
 
     b.bind(later);
@@ -1271,8 +1558,8 @@ pub(in crate::bpf) fn build(
     b.constant(1, FRAGMENT_TTL_NS);
     b.jump(JGT_X, 0, 1, 0, fragment_miss);
     b.load(LDX_W, 0, 8, 0);
-    b.jump(JEQ_K, 0, 0, XDP_PASS, fragment_pass);
-    b.jump(JEQ_K, 0, 0, 4, fragment_xsk);
+    b.jump(JEQ_K, 0, 0, VERDICT_PASS, fragment_pass);
+    b.jump(JEQ_K, 0, 0, VERDICT_ENDPOINT, fragment_xsk);
     b.goto(fragment_miss);
     b.bind(fragment_pass);
     b.reason(GatewayReason::PassFragment, pass);
@@ -1286,7 +1573,12 @@ pub(in crate::bpf) fn build(
     b.bind(local);
     b.reason(GatewayReason::PassLocal, pass);
     b.bind(quote_unresolved);
-    b.reason(GatewayReason::IcmpQuoteUnresolved, xsk);
+    if auxiliary.is_some() {
+        b.stat(maps, GatewayReason::IcmpQuoteUnresolved);
+        b.goto(drop);
+    } else {
+        b.reason(GatewayReason::IcmpQuoteUnresolved, xsk);
+    }
     b.bind(bad);
     b.stat(maps, GatewayReason::UnclassifiableHeader);
     b.goto(drop);
@@ -1295,12 +1587,16 @@ pub(in crate::bpf) fn build(
     b.goto(drop);
 
     b.bind(pass);
-    b.word(VERDICT, XDP_PASS);
+    b.word(VERDICT, VERDICT_PASS);
     b.goto(final_pass);
     b.bind(xsk);
-    b.word(VERDICT, 4);
+    b.word(VERDICT, VERDICT_ENDPOINT);
     b.goto(final_pass);
     b.bind(final_pass);
+    if let Some(auxiliary) = auxiliary {
+        auxiliary.authorize(&mut b, unknown, unknown);
+        auxiliary::check_endpoint_gso(&mut b, bad);
+    }
     b.load(LDX_W, 0, 10, FRAG_STATE);
     let no_fragment = b.target();
     b.emit(AND_K, 0, 0, 0, 1);
@@ -1318,41 +1614,63 @@ pub(in crate::bpf) fn build(
     b.store(STX_W, 10, INDEX, 0);
     b.stat_index(maps.stats.as_raw_fd());
     b.load(LDX_W, 0, 10, VERDICT);
-    b.jump(JNE_K, 0, 0, XDP_PASS, final_xsk);
-    b.imm(0, XDP_PASS);
+    b.jump(JNE_K, 0, 0, VERDICT_PASS, final_xsk);
+    let native_action = if auxiliary.is_some() {
+        auxiliary::TCX_NEXT
+    } else {
+        XDP_PASS
+    };
+    b.bind(foreign);
+    b.imm(0, native_action);
     b.emit(EXIT, 0, 0, 0, 0);
     b.bind(final_xsk);
-    b.load(LDX_W, 8, 9, 16);
-    b.jump(JGE_K, 8, 0, queues as i32, drop);
-    if data && capture.vlan_metadata {
-        b.mov(1, 9);
-        b.imm(2, -(METADATA_LEN as i32));
-        b.helper(54);
-        let metadata_failed = b.target();
-        let metadata_ready = b.target();
-        b.jump(JNE_K, 0, 0, 0, metadata_failed);
-        b.load(LDX_W, 6, 9, 8);
-        b.load(LDX_W, 7, 9, 0);
-        b.bound(METADATA_LEN as i32, metadata_failed);
-        b.copy(6, 0, 10, META, METADATA_LEN as i16);
-        b.goto(metadata_ready);
-        b.bind(metadata_failed);
-        b.word(INDEX, (queues + 3) as i32);
-        b.stat_index(counters);
-        b.goto(drop);
-        b.bind(metadata_ready);
-    }
-    b.store(STX_W, 10, INDEX, 8);
-    b.stat_index(counters);
-    if data {
-        b.map(1, xsks);
-        b.mov(2, 8);
-        b.imm(3, XDP_DROP);
-        b.helper(51);
-        b.emit(EXIT, 0, 0, 0, 0);
+    match ingress {
+        Ingress::Xdp {
+            capture,
+            queues,
+            counters,
+            xsks,
+            ..
+        } => {
+            b.load(LDX_W, 8, 9, 16);
+            b.jump(JGE_K, 8, 0, queues as i32, drop);
+            if data && capture.vlan_metadata {
+                b.mov(1, 9);
+                b.imm(2, -(METADATA_LEN as i32));
+                b.helper(54);
+                let metadata_failed = b.target();
+                let metadata_ready = b.target();
+                b.jump(JNE_K, 0, 0, 0, metadata_failed);
+                b.load(LDX_W, 6, 9, 8);
+                b.load(LDX_W, 7, 9, 0);
+                b.bound(METADATA_LEN as i32, metadata_failed);
+                b.copy(6, 0, 10, META, METADATA_LEN as i16);
+                b.goto(metadata_ready);
+                b.bind(metadata_failed);
+                b.word(INDEX, (queues + 3) as i32);
+                b.stat_index(counters);
+                b.goto(drop);
+                b.bind(metadata_ready);
+            }
+            b.store(STX_W, 10, INDEX, 8);
+            b.stat_index(counters);
+            if data {
+                b.map(1, xsks);
+                b.mov(2, 8);
+                b.imm(3, XDP_DROP);
+                b.helper(51);
+                b.emit(EXIT, 0, 0, 0, 0);
+            }
+        }
+        Ingress::Auxiliary { .. } => auxiliary::Ingress::redirect(&mut b),
     }
     b.bind(drop);
-    b.imm(0, XDP_DROP);
+    let drop_action = if auxiliary.is_some() {
+        auxiliary::TCX_DROP
+    } else {
+        XDP_DROP
+    };
+    b.imm(0, drop_action);
     b.emit(EXIT, 0, 0, 0, 0);
     b.finish(
         gateway.routing,

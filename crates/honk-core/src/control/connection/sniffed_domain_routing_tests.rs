@@ -181,6 +181,8 @@ async fn handoff_process_fields_decode_and_fail_closed() {
 #[test]
 fn packet_process_facts_preserve_routing_before_and_after_sniff() {
     use honk_ebpf_common::host::{HOST_PROCESS_PRESENT, HostSourceFacts};
+    let packet_process_name =
+        |facts: &HostSourceFacts| crate::control::netstack::ProcessMeta::from_facts(facts).name();
 
     let config = honk_config::parser::parse_dae_config(
         "routing { pname(curl) -> direct\n fallback: block }",

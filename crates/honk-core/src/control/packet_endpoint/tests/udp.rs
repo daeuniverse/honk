@@ -311,7 +311,7 @@ async fn nonfinal_raw_udp53_keeps_sniffing_but_cannot_alias_a_must_route() {
 #[tokio::test]
 async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
     tokio::time::timeout(Duration::from_secs(20), async {
-        for disposition in ["controller", "block", "must", "quota", "runtime_capacity"] {
+        for disposition in ["controller", "block", "must", "quota", "runtime_capacity", "pname_raw", "missing_pname_controller"] {
             let mut proxy = Peer::start("dns-raw").await;
             let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let mut config = config(&[&proxy]);
@@ -353,6 +353,11 @@ async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
                     mark: None,
                 });
             }
+            if matches!(disposition, "pname_raw" | "missing_pname_controller") {
+                config.routing = honk_config::parser::parse_dae_config(
+                    "routing {\n pname(curl) -> dns-raw(must)\n !pname(curl) -> direct\n fallback: block\n}",
+                ).unwrap().routing;
+            }
             let (plane, _health) = plane(config).await;
             let backend = Arc::clone(&plane.ebpf);
             let stats = Arc::clone(&plane.stats);
@@ -385,27 +390,26 @@ async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
                 PacketEndpoints::new(plane, vec![(scope.clone(), scope_owner)], 2)
                     .await
                     .unwrap();
-            let source = "192.0.2.10:41000".parse().unwrap();
+            let source: SocketAddr = "192.0.2.10:41000".parse().unwrap();
             let destination = "198.51.100.53:53".parse().unwrap();
             let query = dns_query_payload();
-            let received = endpoints
-                .receive_with_source(
-                    scope.scope(),
-                    &packet(source, destination, 0, &query),
-                    Instant::now(),
-                    false,
-                    |_, _| true,
-                )
-                .unwrap();
-            assert!(
-                received.taken_over,
-                "actual DNS ingress queue owns {disposition} work"
-            );
-            assert!(
-                !received.qualified_rx,
-                "DNS policy is unresolved at queue takeover"
-            );
-            if disposition == "controller" {
+            if matches!(disposition, "pname_raw" | "missing_pname_controller") {
+                let name = if disposition == "pname_raw" { "curl" } else { "" };
+                let process = crate::control::netstack::ProcessMeta::test_gateway(417, name);
+                let work = scope.hold_source(source.ip()).unwrap().with_process_input(process);
+                let received = endpoints.queue_datagram(&scope, source, destination, 0, None,
+                    Some(PacketSource::Completed(work)), None,
+                    |budget| FundedDatagram::copy_from(&query, budget),
+                ).unwrap();
+                assert_eq!(received, (false, true));
+            } else {
+                let received = endpoints.receive_with_source(scope.scope(),
+                    &packet(source, destination, 0, &query), Instant::now(), false, |_, _| true,
+                ).unwrap();
+                assert!(received.taken_over, "actual DNS queue owns {disposition} work");
+                assert!(!received.qualified_rx, "DNS policy is unresolved at queue takeover");
+            }
+            if matches!(disposition, "controller" | "missing_pname_controller") {
                 let mut response = [0; 1024];
                 let (length, sender) = dns.recv_from(&mut response).await.unwrap();
                 assert_eq!(stats.udp_snapshot().slow_permit_accepted, 1);
@@ -435,7 +439,7 @@ async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
                     crate::dns::forwarder::extract_answer_ips(&received),
                     vec!["203.0.113.99".parse::<std::net::IpAddr>().unwrap()]
                 );
-            } else if disposition == "must" {
+            } else if matches!(disposition, "must" | "pname_raw") {
                 let mut unexpected = [0; 1024];
                 tokio::select! {
                     received = proxy.seen.recv() => assert_eq!(received.unwrap(), query),
@@ -461,7 +465,7 @@ async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
                 stats.udp_snapshot().slow_permit_accepted,
                 u64::from(matches!(
                     disposition,
-                    "controller" | "must" | "runtime_capacity"
+                    "controller" | "must" | "runtime_capacity" | "pname_raw" | "missing_pname_controller"
                 ))
             );
             assert_eq!(
@@ -495,6 +499,68 @@ async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
     })
     .await
     .expect("UDP53 policy must precede controller and raw transport admission");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn auxiliary_pause_cancels_a_running_controller_dns_query() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut config = config(&[]);
+        config.dns.upstream = vec![honk_config::dns::DnsUpstream {
+            name: "loopback".into(),
+            address: upstream.local_addr().unwrap().to_string(),
+            protocol: honk_config::types::DnsProtocol::Udp,
+            tls_server_name: None,
+            outbound: None,
+        }];
+        config.dns.routing.fallback = "loopback".into();
+        config.routing.default_outbound = "direct".into();
+        let (plane, _health) = plane(config).await;
+        let projection = plane.dns_controller.routing_projection();
+        let budget = MemoryBudget::new(32 << 20);
+        let (scope, owner) = crate::control::netstack::auxiliary_scope(1500, &budget).unwrap();
+        let id = scope.scope();
+        projection.register_aux_scopes(&[id], &budget).unwrap();
+        let (endpoints, mut supervisor, mut drivers) =
+            PacketEndpoints::start_driven(plane, vec![(scope, owner)], 2, None, ScopeId::HOST)
+                .await
+                .unwrap();
+        let driver = drivers.first_mut().unwrap();
+        std::future::poll_fn(|cx| {
+            driver.service(cx, Instant::now());
+            supervisor.poll_ready(cx)
+        })
+        .await
+        .unwrap();
+        endpoints.resume_auxiliary(driver, 1500).unwrap();
+        projection.set_aux_binding(id, true).unwrap();
+
+        let source: SocketAddr = "192.0.2.10:41000".parse().unwrap();
+        let destination = "198.51.100.53:53".parse().unwrap();
+        let query = packet(source, destination, 0, &dns_query_payload());
+        endpoints.receive(id, &query, Instant::now()).unwrap();
+        upstream.recv_from(&mut [0; 512]).await.unwrap();
+        assert!(endpoints.retains_source(id, source.ip()));
+
+        projection.set_aux_binding(id, false).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), endpoints.pause_auxiliary(driver))
+            .await
+            .expect("the old DNS application must exit before the unanswered exchange times out")
+            .unwrap();
+        assert!(!endpoints.retains_source(id, source.ip()));
+
+        endpoints.close();
+        let (_, result) = std::future::poll_fn(|cx| {
+            driver.service(cx, Instant::now());
+            supervisor.poll_join_plane(cx)
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+    })
+    .await
+    .expect("the upstream must receive the real auxiliary DNS query");
 }
 
 #[tokio::test]
@@ -872,6 +938,7 @@ async fn admitted_udp_keeps_route_and_mode_after_publication() {
                 "udp",
                 0,
                 None,
+                None,
                 #[cfg(feature = "native-api")]
                 false,
             )
@@ -1023,6 +1090,7 @@ async fn admitted_udp_keeps_route_after_fact_withdrawal() {
                 "udp",
                 0,
                 None,
+                None,
                 #[cfg(feature = "native-api")]
                 false,
             )
@@ -1046,6 +1114,7 @@ async fn admitted_udp_keeps_route_after_fact_withdrawal() {
                 destination,
                 "udp",
                 0,
+                None,
                 None,
                 #[cfg(feature = "native-api")]
                 false,

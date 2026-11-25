@@ -15,6 +15,10 @@ pub(super) enum TcpInput {
     Packet(FlowIo),
 }
 
+// Bound what each shared connection future carries, including non-Host connections.
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64"))]
+const _: () = assert!(size_of::<TcpFlow>() <= 448);
+
 pub(super) enum TcpFlow {
     Kernel(super::super::handoff::TcpFlowGuard),
     Packet(PacketFlow),

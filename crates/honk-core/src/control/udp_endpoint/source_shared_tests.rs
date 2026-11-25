@@ -981,11 +981,19 @@ async fn shared_source_keeps_last_endpoint_slot_until_receiver_exits() {
     drop(owner);
     transport.reply(c, b"foreign");
     hook.entered.notified().await;
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    {
+        assert!(f.pool.retains_host_udp(ScopeId::HOST, client, a));
+        assert!(f.pool.retains_host_udp(ScopeId::HOST, client, c));
+        assert!(!f.pool.retains_host_udp(ScopeId::HOST, client, f.target(1)));
+    }
 
     f.pool.remove(honk_datapath::ScopeId::HOST, client, a);
     drop(endpoint);
     f.wait_until("retired view to leave the pool", || f.pool.is_empty())
         .await;
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    assert!(!f.pool.retains_host_udp(ScopeId::HOST, client, a));
     assert!(
         f.pool
             .retains_source(honk_datapath::ScopeId::HOST, client.ip())
@@ -1016,6 +1024,8 @@ async fn shared_source_keeps_last_endpoint_slot_until_receiver_exits() {
         "slot outlived the transport"
     );
     assert_eq!(received(&f.client).await, (b"foreign".to_vec(), c));
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    assert!(!f.pool.retains_host_udp(ScopeId::HOST, client, c));
     assert!(
         !f.pool
             .retains_source(honk_datapath::ScopeId::HOST, client.ip())

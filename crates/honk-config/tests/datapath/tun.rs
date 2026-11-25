@@ -71,6 +71,7 @@ routing { fallback: direct }
     let config = honk_config::parser::parse_dae_config(source).unwrap();
     config.validate_detailed().unwrap();
     config.validate_assembled().unwrap();
+    assert_eq!(config.required_socket_mark(), Some(0x100));
     let datapath = config.datapath.as_ref().unwrap();
     assert_eq!(datapath.backend, Backend::Tun);
     assert_eq!(datapath.direct, Some(DirectProfile::Endpoint));

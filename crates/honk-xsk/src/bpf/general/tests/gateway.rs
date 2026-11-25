@@ -1,13 +1,15 @@
 use super::*;
 use aya_obj::generated::bpf_insn;
 use honk_ebpf_common::xdp_gateway::{
-    CaptureRealmKey, EndpointHold, FRAGMENT_TTL_NS, FragmentKey, FragmentVerdict,
-    GATEWAY_DNS_BITMAP_OFFSET, GATEWAY_DNS_READY, GATEWAY_ROUTE_NEED_DNS, GatewayDnsKey,
-    GatewayDnsValue, GatewayKey, GatewayReason, HOLD_REFRESH_NS, LocalAddressKey,
+    CaptureRealmKey, FRAGMENT_TTL_NS, FragmentKey, FragmentVerdict, GATEWAY_DNS_BITMAP_OFFSET,
+    GATEWAY_DNS_READY, GATEWAY_ROUTE_NEED_DNS, GatewayDnsKey, GatewayDnsValue, GatewayHold,
+    GatewayKey, GatewayReason, HOLD_REFRESH_NS, LocalAddressKey,
 };
 use honk_ebpf_common::{DATAPATH_FLAG_OFFLOAD_ALL, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT};
 use honk_ebpf_common::{IpVersionType, L4ProtoType, RoutingInput};
 use std::os::fd::FromRawFd;
+
+mod ownership;
 
 struct Fixture {
     maps: GatewayMaps,
@@ -67,8 +69,9 @@ impl Fixture {
             &GatewayLoad {
                 routing: &routing,
                 maps: &self.maps,
-                conntrack: &self.ct,
+                conntrack: Some(&self.ct),
                 dns: None,
+                arbitration: None,
             },
         )
         .unwrap();
@@ -328,19 +331,19 @@ fn kernel_gateway_g17_tcp_non_syn_miss_and_monotonic_hold_refresh() {
     assert_eq!(run(&program, &syn, 0).0, XDP_DROP as u32);
     assert_eq!(fixture.stat(GatewayReason::D1Evaluated), 1);
     let first = fixture.maps.lookup_hold(&key).unwrap().unwrap();
-    assert_eq!(first.first_seen_ns, first.last_seen_ns);
+    assert_eq!(first.stamp, first.last_seen_ns);
     ack[15] = 46 << 2;
     ack[6..12].copy_from_slice(&[2, 8, 7, 6, 5, 4]);
     ipv4_checksum(&mut ack, 20);
     let before = now();
-    let old = EndpointHold {
-        first_seen_ns: first.first_seen_ns,
+    let old = GatewayHold {
+        stamp: first.stamp,
         last_seen_ns: past_time(2 * HOLD_REFRESH_NS),
     };
     put(fixture.maps.hold.as_fd(), &key, &old);
     assert_eq!(run(&program, &ack, 0).0, XDP_DROP as u32);
     let refreshed = fixture.maps.lookup_hold(&key).unwrap().unwrap();
-    assert_eq!(refreshed.first_seen_ns, old.first_seen_ns);
+    assert_eq!(refreshed.stamp, old.stamp);
     assert!(refreshed.last_seen_ns >= before);
     assert_eq!(fixture.stat(GatewayReason::D1Evaluated), 1);
     let before = now();
@@ -353,12 +356,12 @@ fn kernel_gateway_g17_tcp_non_syn_miss_and_monotonic_hold_refresh() {
     assert_eq!(
         fixture
             .maps
-            .retire_if_unretained(now(), std::time::Duration::from_secs(30), |_| false)
+            .retire_if_unretained(now(), std::time::Duration::from_secs(30), None, |_| false)
             .unwrap(),
         0
     );
     assert_eq!(fixture.maps.lookup_hold(&key).unwrap(), Some(refreshed));
-    let future = EndpointHold {
+    let future = GatewayHold {
         last_seen_ns: now() + 60 * HOLD_REFRESH_NS,
         ..refreshed
     };
@@ -855,7 +858,11 @@ fn insert_conntrack_aliases(key: GatewayKey, reply: GatewayKey) {
     );
 }
 
-fn load_dns_fixture(fixture: &Fixture, dns: &crate::GatewayDnsMaps) -> Programs {
+fn load_dns_fixture(
+    fixture: &Fixture,
+    dns: &crate::GatewayDnsMaps,
+    arbitration: Option<&crate::GatewayArbitration>,
+) -> Programs {
     // A reachable domain condition in both calls. The last bitmap word catches partial copies.
     let routing = [
         instruction(JNE_K, 3, 0, 2, GATEWAY_DNS_READY),
@@ -871,8 +878,9 @@ fn load_dns_fixture(fixture: &Fixture, dns: &crate::GatewayDnsMaps) -> Programs 
         GatewayLoad {
             routing: &routing,
             maps: &fixture.maps,
-            conntrack: &fixture.ct,
+            conntrack: Some(&fixture.ct),
             dns: Some(dns),
+            arbitration,
         },
     )
     .unwrap()
@@ -883,7 +891,7 @@ fn load_dns_fixture(fixture: &Fixture, dns: &crate::GatewayDnsMaps) -> Programs 
 fn kernel_gateway_dns_shadow_counts_only_authorized_data_and_keeps_xsk_fragment() {
     let fixture = Fixture::new();
     let dns = crate::GatewayDnsMaps::new(9).unwrap();
-    let programs = load_dns_fixture(&fixture, &dns);
+    let programs = load_dns_fixture(&fixture, &dns, None);
     let other = crate::GatewayDnsMaps::new(9).unwrap();
     for (fd, id) in [
         (&programs.discover, programs.discover_id),
@@ -983,7 +991,7 @@ fn kernel_gateway_dns_shadow_counts_only_authorized_data_and_keeps_xsk_fragment(
 fn kernel_gateway_dns_shadow_concurrent_epoch_reuse() {
     let fixture = Fixture::new();
     let dns = crate::GatewayDnsMaps::new(9).unwrap();
-    let programs = load_dns_fixture(&fixture, &dns);
+    let programs = load_dns_fixture(&fixture, &dns, None);
     let mut key = GatewayDnsKey {
         realm_id: 7,
         export_epoch: 1,
@@ -1065,8 +1073,9 @@ fn kernel_gateway_reload_preserves_xsk_and_counter_map_identity() {
         GatewayLoad {
             routing: &endpoint,
             maps: &fixture.maps,
-            conntrack: &fixture.ct,
+            conntrack: Some(&fixture.ct),
             dns: None,
+            arbitration: None,
         },
     )
     .unwrap();
@@ -1076,8 +1085,9 @@ fn kernel_gateway_reload_preserves_xsk_and_counter_map_identity() {
         .reload_general_gateway(GatewayLoad {
             routing: &direct,
             maps: &fixture.maps,
-            conntrack: &fixture.ct,
+            conntrack: Some(&fixture.ct),
             dns: None,
+            arbitration: None,
         })
         .unwrap();
     #[repr(C)]
@@ -1163,7 +1173,7 @@ fn kernel_gateway_local_dns_exception_and_full_hold_drop() {
         &mut MapCreateAttr {
             map_type: 1,
             key_size: size_of::<GatewayKey>() as u32,
-            value_size: size_of::<EndpointHold>() as u32,
+            value_size: size_of::<GatewayHold>() as u32,
             max_entries: 1,
             map_flags: 0,
             inner_map_fd: 0,
@@ -1215,8 +1225,8 @@ fn kernel_gateway_g17_production_capacity_hold_full_drops_before_xsk() {
     assert_eq!(capacity, 65536);
     let (base, _) = udp(0);
     let inserted_at = now();
-    let initial = EndpointHold {
-        first_seen_ns: inserted_at,
+    let initial = GatewayHold {
+        stamp: inserted_at,
         last_seen_ns: inserted_at,
     };
     for port in 0..capacity {
@@ -1224,10 +1234,7 @@ fn kernel_gateway_g17_production_capacity_hold_full_drops_before_xsk() {
             sport: (port as u16).to_be(),
             ..base
         };
-        fixture
-            .maps
-            .insert_hold(&key, initial.first_seen_ns)
-            .unwrap();
+        fixture.maps.insert_hold(&key, initial.stamp).unwrap();
     }
     let entries = || {
         let mut cursor: Option<GatewayKey> = None;

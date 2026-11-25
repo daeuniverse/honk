@@ -326,6 +326,7 @@ impl RoutingAuthority {
         };
         PacketRoutingSnapshot {
             source_mac: input.mac.clone(),
+            process: None,
             decision: RoutingDecision::from_router(
                 &read.router,
                 &input,

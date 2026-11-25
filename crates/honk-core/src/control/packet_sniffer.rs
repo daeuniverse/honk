@@ -348,6 +348,16 @@ impl PacketSnifferPool {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(in crate::control) fn clear_scope(&self, scope: honk_datapath::ScopeId) {
+        for shard in &self.sessions {
+            shard.lock().retain(|key, _| key.scope != scope);
+        }
+        for shard in &self.failed_dcids {
+            shard.lock().retain(|key, _| key.scope != scope);
+        }
+    }
+
     #[cfg(test)]
     pub(in crate::control) fn expire_for_test(&self) {
         for shard in &self.sessions {

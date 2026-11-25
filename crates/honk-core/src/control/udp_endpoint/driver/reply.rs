@@ -96,6 +96,9 @@ pub(super) async fn receive_loop(
                         .dropped("reply_socket_capacity", Some("capacity"));
                     continue;
                 }
+                Err(error) if is_auxiliary_retirement(&error) => {
+                    return Err(local_reply_error(error));
+                }
                 Err(error) => {
                     endpoint
                         .native
@@ -106,7 +109,10 @@ pub(super) async fn receive_loop(
             }
         };
         let delivered = reply_socket.send_to(&buf[..n], client_addr).await;
-        if delivered.is_err() {
+        if delivered
+            .as_ref()
+            .is_err_and(|error| !is_auxiliary_retirement(error))
+        {
             endpoint
                 .native
                 .dropped("client_delivery_failed", Some("client_send_failed"));

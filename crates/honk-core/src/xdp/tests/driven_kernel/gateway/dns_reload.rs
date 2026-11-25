@@ -1,5 +1,9 @@
 #![cfg(feature = "ebpf")]
 
+mod batch_udp;
+mod pending;
+mod quic_udp;
+
 use super::{Config, ControlPlane, Fixture};
 use crate::{
     control::{ControlCommand, ReloadOutcome, ReloadReply, routing_matcher::RoutingPushPlan},
@@ -69,29 +73,34 @@ impl BankMaps {
     }
 
     fn retired(self) -> anyhow::Result<bool> {
-        for id in [self.epochs, self.facts] {
-            match MapInfo::from_id(id) {
-                Ok(_) => return Ok(false),
-                Err(MapError::SyscallError(error))
-                    if error.io_error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(true)
+        maps_retired(&[self.epochs, self.facts])
     }
+}
+
+fn maps_retired(ids: &[u32]) -> anyhow::Result<bool> {
+    for &id in ids {
+        match MapInfo::from_id(id) {
+            Ok(_) => return Ok(false),
+            Err(MapError::SyscallError(error))
+                if error.io_error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(true)
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct Attached {
     programs: [u32; 2],
     bank: Option<BankMaps>,
+    arbitration: Option<(u32, u32)>,
     mode: u32,
 }
 
 impl Attached {
     fn read(fixture: &Fixture) -> anyhow::Result<Self> {
         let mut programs = [0; 2];
-        let mut members = [(None, 0); 2];
+        let mut members = [(None, None, 0); 2];
         for ((slot, maps), name) in programs.iter_mut().zip(&mut members).zip(["dut0", "dut1"]) {
             let device = fixture
                 .runtime
@@ -106,11 +115,15 @@ impl Attached {
                 .context("attached XDP program")?;
             let mut facts = None;
             let mut epochs = None;
+            let mut guards = None;
+            let mut control = None;
             let mut mode = None;
             for id in program.map_ids()?.context("attached program map IDs")? {
                 match MapInfo::from_id(id)?.name_as_str() {
                     Some("dns_facts") => facts = Some(id),
                     Some("dns_epochs") => epochs = Some(id),
+                    Some("honk_gw_guards") => guards = Some(id),
+                    Some("honk_gw_ctl") => control = Some(id),
                     Some("honk_gw_mode") => mode = Some(id),
                     _ => {}
                 }
@@ -119,21 +132,36 @@ impl Attached {
                 facts.is_some() == epochs.is_some(),
                 "partial DNS bank on {name}"
             );
+            ensure!(
+                guards.is_some() == control.is_some(),
+                "partial arbitration on {name}"
+            );
+            ensure!(
+                facts.is_none() || guards.is_some(),
+                "DNS bank without arbitration on {name}"
+            );
             let bank = epochs
                 .zip(facts)
                 .map(|(epochs, facts)| BankMaps { epochs, facts });
-            *maps = (bank, mode.context("gateway mode map")?);
+            *maps = (bank, guards.zip(control), mode.context("gateway mode map")?);
         }
         assert_eq!(
             members[0], members[1],
             "gateway members disagree on map identity"
         );
-        let (bank, mode) = members[0];
+        let (bank, arbitration, mode) = members[0];
         Ok(Self {
             programs,
             bank,
+            arbitration,
             mode,
         })
+    }
+
+    fn last_issued(&self) -> anyhow::Result<u64> {
+        let (_, control) = self.arbitration.context("attached arbitration maps")?;
+        let control = Array::<_, [u64; 8]>::try_from(Map::Array(MapData::from_id(control)?))?;
+        Ok(control.get(&0, 0)?[1])
     }
 }
 
@@ -308,7 +336,8 @@ async fn shadow_staged_rollback_retires_memory_and_reopens_fresh_epoch() -> anyh
         let lan = realm(&fixture, "dut0")?;
         let wan = realm(&fixture, "dut1")?;
         let budget = fixture.runtime.polling_budget.clone();
-        assert_eq!(Attached::read(&fixture)?.bank, None);
+        let pristine = Attached::read(&fixture)?;
+        assert_eq!((pristine.bank, pristine.arbitration), (None, None));
         fixture.runtime.endpoints.reap_completed_udp_tasks();
         let static_used = budget.used();
         let mut domain_config = baseline.clone();
@@ -349,6 +378,7 @@ async fn shadow_staged_rollback_retires_memory_and_reopens_fresh_epoch() -> anyh
         publisher.publish(&next)?;
         let staged = Attached::read(&fixture)?;
         let staged_bank = staged.bank.context("candidate must attach a shadow bank")?;
+        assert_eq!(staged.arbitration, old.arbitration);
         assert_ne!(staged.programs, old.programs);
         assert_ne!(staged_bank.epochs, old_bank.epochs);
         assert_ne!(staged_bank.facts, old_bank.facts);
@@ -388,9 +418,13 @@ async fn shadow_staged_rollback_retires_memory_and_reopens_fresh_epoch() -> anyh
         assert_eq!(publisher.fingerprint(), next.fingerprint);
         assert_eq!(new_bank.epoch(wan)?, 0);
         assert_fact(&mut fixture, new_bank, lan, OLD_IP).await?;
+        assert_eq!(committed.arbitration, old.arbitration);
+        let last_issued = committed.last_issued()?;
+        ensure!(last_issued > 0, "DNS query did not establish a managed Endpoint hold");
 
         reload(&mut fixture, baseline).await?;
-        assert_eq!(Attached::read(&fixture)?.bank, None);
+        let pristine = Attached::read(&fixture)?;
+        assert_eq!((pristine.bank, pristine.arbitration), (None, None));
         // A delivered DNS reply can leave its completed task charged until the next ingress joins it.
         let before_join = budget.used();
         fixture.runtime.endpoints.reap_completed_udp_tasks();
@@ -409,10 +443,47 @@ async fn shadow_staged_rollback_retires_memory_and_reopens_fresh_epoch() -> anyh
         })
         .await
         .context("retired generations still hold kernel maps")??;
+        {
+            let _backend = fixture.backend.write().await;
+            publisher.publish(&next)?;
+            let staged = Attached::read(&fixture)?;
+            assert_ne!(staged.arbitration, committed.arbitration);
+            assert!(staged.last_issued()? >= last_issued);
+            assert_eq!(staged.bank.context("restaged bank")?.epoch(lan)?, 0);
+            publisher.rollback()?;
+            assert_eq!(Attached::read(&fixture)?, pristine);
+            assert_eq!(budget.used(), static_used);
+        }
         fixture.finish().await
     })
     .await
     .context("bounded staged shadow rollback and recovery")?
+}
+
+#[tokio::test]
+#[ignore = "requires the daemon smoke's private disposable-VM namespaces and real Endpoint AF_XDP"]
+async fn native_pending_survives_static_downshift_until_idle_retirement() -> anyhow::Result<()> {
+    timeout(Duration::from_secs(100), pending::downshift())
+        .await
+        .context("bounded pending downshift and real idle sweep")?
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable gateway guest with both real UDP peer paths"]
+async fn udp_quic_early_native_and_revoke() -> anyhow::Result<()> {
+    super::guard();
+    timeout(Duration::from_secs(120), quic_udp::run())
+        .await
+        .context("bounded QUIC early-data and DNS revocation cases")?
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable gateway guest, DUT NAPI tracing and the real attached owner maps"]
+async fn udp_native_one_queue_batch_and_quota_delivery() -> anyhow::Result<()> {
+    super::guard();
+    timeout(Duration::from_secs(140), batch_udp::run())
+        .await
+        .context("bounded UDP batch and Endpoint delivery at capacity")?
 }
 
 fn freeze_mode_map(id: u32) -> anyhow::Result<()> {
@@ -526,7 +597,7 @@ fn activate_capture(
             .as_ref()
             .and_then(|datapath| datapath.direct),
     )?;
-    backend.activate_gateway_start(publisher, plan.fingerprint, generation);
+    backend.activate_gateway_start(publisher, plan.fingerprint, generation)?;
     fixture
         .runtime
         .diagnostics
@@ -614,9 +685,9 @@ async fn shadow_late_gateway_registration_waits_for_final_flags() -> anyhow::Res
             {
                 let mut writer = fixture.backend.write().await;
                 let backend = writer.userspace_mut()?;
-                backend.finish_gateway_dns_reload(generation - 1, plan.fingerprint);
-                backend.finish_gateway_dns_reload(generation, plan.fingerprint);
-                backend.activate_gateway_start(publisher, plan.fingerprint, generation);
+                backend.finish_gateway_dns_reload(generation - 1, plan.fingerprint)?;
+                backend.finish_gateway_dns_reload(generation, plan.fingerprint)?;
+                backend.activate_gateway_start(publisher, plan.fingerprint, generation)?;
             }
             assert_eq!(bank.epoch(lan)?, epoch, "settled generation reopened");
             assert_eq!(bank.epoch(wan)?, 0);

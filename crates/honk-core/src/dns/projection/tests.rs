@@ -7,7 +7,7 @@ use honk_outbound::alive::IpVersion;
 
 use super::state::{DesiredState, family_of};
 use super::worker;
-use super::{ProjectionObservation, RoutingProjection, RoutingProjectionSnapshot};
+use super::{ProjectionObservation, QueryScope, RoutingProjection, RoutingProjectionSnapshot};
 use crate::ebpf::maps;
 use crate::ebpf::mock::MockEbpfBackend;
 use crate::ebpf::{PolicyBackend, ProjectionMapOperation};
@@ -779,7 +779,7 @@ async fn cache_hit_refresh_is_coalesced_only_inside_its_bounds() {
     let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 70));
     let submit = |ttl| {
         assert!(projection.try_submit_cache_hit(
-            honk_datapath::ScopeId::HOST,
+            QueryScope::HOST,
             &snapshot(1, 1, 2),
             positive("a.test", &[ip], tokio::time::Instant::now() + ttl),
         ))
@@ -823,7 +823,7 @@ async fn cache_hit_after_owner_change_is_never_coalesced() {
     let other = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 72));
     let hit = |generation, ips: &[IpAddr]| {
         assert!(projection.try_submit_cache_hit(
-            honk_datapath::ScopeId::HOST,
+            QueryScope::HOST,
             &snapshot(generation, 1, 2),
             positive(
                 "a.test",
@@ -863,7 +863,7 @@ async fn ordinary_ttl_change_invalidates_the_cache_hit_hint() {
     let ip = [IpAddr::V4(Ipv4Addr::new(192, 0, 2, 81))];
     let hit = |ttl| {
         assert!(projection.try_submit_cache_hit(
-            honk_datapath::ScopeId::HOST,
+            QueryScope::HOST,
             &snapshot(1, 1, 2),
             positive("a.test", &ip, tokio::time::Instant::now() + ttl),
         ))
@@ -915,7 +915,7 @@ async fn worker_map_writes_do_not_exclude_same_generation_submissions() {
     let worker_batch = projection.publication_fence.read();
     assert!(
         projection.try_submit(
-            honk_datapath::ScopeId::HOST,
+            QueryScope::HOST,
             &snapshot(1, 1, 2),
             positive(
                 "a.test",
@@ -937,11 +937,7 @@ async fn held_publication_defers_submission_without_blocking() {
     let publication = projection.prepare_snapshot_publication();
     let expires_at = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut submission = std::pin::pin!(projection.submit_after_publication(|| {
-        projection.try_submit(
-            honk_datapath::ScopeId::HOST,
-            &next,
-            positive("a.test", &ip, expires_at),
-        )
+        projection.try_submit(QueryScope::HOST, &next, positive("a.test", &ip, expires_at))
     }));
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
     assert!(

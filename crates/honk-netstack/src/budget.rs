@@ -30,6 +30,7 @@ pub(crate) fn map_peak<K, V>(len: usize) -> Option<usize> {
 pub struct MemoryBudget {
     limit: usize,
     used: AtomicUsize,
+    backing: Option<MemoryReservation>,
 }
 
 /// A fixed capacity charge. Keep it until the storage or commitment it funds is released.
@@ -53,12 +54,21 @@ impl MemoryReservation {
 
     /// Transfers another live charge from the same budget without refunding either one.
     pub fn absorb(&mut self, mut other: Self) {
-        assert!(other.belongs_to(&self.budget));
+        assert!(Arc::ptr_eq(&other.budget, &self.budget));
         self.bytes += std::mem::take(&mut other.bytes);
     }
 
     pub(crate) fn belongs_to(&self, budget: &Arc<MemoryBudget>) -> bool {
-        Arc::ptr_eq(&self.budget, budget)
+        let mut current = &self.budget;
+        loop {
+            if Arc::ptr_eq(current, budget) {
+                return true;
+            }
+            let Some(backing) = &current.backing else {
+                return false;
+            };
+            current = &backing.budget;
+        }
     }
 }
 
@@ -75,7 +85,19 @@ impl MemoryBudget {
         Arc::new(MemoryBudget {
             limit: limit_bytes,
             used: AtomicUsize::new(0),
+            backing: None,
         })
+    }
+
+    /// A fixed share held against this budget until the last child reservation is gone.
+    pub fn child(self: &Arc<Self>, bytes: usize) -> Option<Arc<Self>> {
+        let overhead = size_of::<Self>() + 2 * size_of::<usize>();
+        let limit = bytes.checked_sub(overhead)?;
+        Some(Arc::new(Self {
+            limit,
+            used: AtomicUsize::new(0),
+            backing: Some(self.reserve(bytes)?),
+        }))
     }
 
     pub fn limit(&self) -> usize {
@@ -111,4 +133,21 @@ impl MemoryBudget {
         let before = self.used.fetch_sub(bytes, Ordering::Relaxed);
         debug_assert!(bytes <= before, "budget refunded more than it holds");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn child_payload_retains_its_exact_root_grant() {
+    let root = MemoryBudget::new(8192);
+    let child = root.child(4096).unwrap();
+    let other = root.child(4096).unwrap();
+    let payload = child.reserve(child.limit()).unwrap();
+    assert!(payload.belongs_to(&root));
+    assert!(!payload.belongs_to(&other));
+    assert!(child.reserve(1).is_none());
+    assert!(root.reserve(1).is_none());
+    drop((child, other));
+    assert_eq!(root.used(), 4096);
+    drop(payload);
+    assert_eq!(root.used(), 0);
 }

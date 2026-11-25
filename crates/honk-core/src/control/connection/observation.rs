@@ -11,6 +11,7 @@ use honk_outbound::{
 };
 
 use super::{handoff::HandoffResult, routing::RoutingDecision};
+use crate::control::netstack::ProcessMeta;
 use crate::{
     observe::{
         Observation,
@@ -114,7 +115,7 @@ struct RecordedConnection {
     network: Network,
     source: SocketAddr,
     destination: SocketAddr,
-    packet_facts: Option<(honk_ebpf_common::host::HostSourceFacts, u8)>,
+    packet_facts: Option<(ProcessMeta, u8, Option<u32>)>,
     kernel_evaluation: Option<String>,
     kernel_route: Option<RouteObservation>,
     evaluation: Option<String>,
@@ -251,26 +252,19 @@ impl ConnectionObservation {
 
     pub(in crate::control) fn packet_facts(
         &mut self,
-        facts: &honk_ebpf_common::host::HostSourceFacts,
+        process: ProcessMeta,
         dscp: u8,
+        mark: Option<u32>,
     ) {
         let Some(record) = &mut self.recorded else {
             return;
         };
-        record.packet_facts = Some((*facts, dscp));
-        let pname = super::routing::packet_process_name(facts);
-        let pid = (facts.flags & honk_ebpf_common::host::HOST_PROCESS_PRESENT != 0)
-            .then_some(facts.pid)
-            .filter(|pid| *pid != 0);
-        record.flow.update_input(
-            None,
-            None,
-            pname.as_deref(),
-            pid,
-            None,
-            Some(dscp),
-            Some(facts.skb_mark),
-        );
+        record.packet_facts = Some((process, dscp, mark));
+        let pname = process.name();
+        let pid = (process.pid != 0).then_some(process.pid);
+        record
+            .flow
+            .update_input(None, None, pname.as_deref(), pid, None, Some(dscp), mark);
         record.flow.step(
             None,
             StepData::Input {
@@ -287,7 +281,7 @@ impl ConnectionObservation {
                         ingress: (),
                         domain_rule_ids: (),
                         dscp: Some(dscp),
-                        mark: Some(facts.skb_mark),
+                        mark,
                     },
                     pname,
                 },
@@ -433,19 +427,17 @@ impl ConnectionObservation {
         handoff: Option<&HandoffResult>,
     ) {
         if let Some(record) = &self.recorded {
-            if let Some((facts, dscp)) = &record.packet_facts {
-                let pname = super::routing::packet_process_name(facts);
-                let pid = (facts.flags & honk_ebpf_common::host::HOST_PROCESS_PRESENT != 0)
-                    .then_some(facts.pid)
-                    .filter(|pid| *pid != 0);
+            if let Some((process, dscp, mark)) = record.packet_facts {
+                let pname = process.name();
+                let pid = (process.pid != 0).then_some(process.pid);
                 record.flow.update_input(
                     domain,
                     source,
                     pname.as_deref(),
                     pid,
                     None,
-                    Some(*dscp),
-                    Some(facts.skb_mark),
+                    Some(dscp),
+                    mark,
                 );
             } else {
                 update_input(&record.flow, domain, source, handoff);
@@ -1038,6 +1030,33 @@ mod tests {
         );
         assert!(!observation.is_recording());
         assert!(observation.flow().is_none());
+    }
+
+    #[test]
+    fn gateway_process_survives_sniff_without_socket_mark_or_path() {
+        let native = crate::native_api::observation::NativeObservation::new(&Config::default());
+        native.core.flows.set_recording(true);
+        for (network, domain_source, name) in [
+            (Network::Tcp, DomainSource::HttpHost, "abcdefghijkl�猫"),
+            (Network::Udp, DomainSource::QuicSni, ""),
+        ] {
+            let mut observation = ConnectionObservation::begin(
+                Some(&native.core),
+                network,
+                "192.0.2.1:41000".parse().unwrap(),
+                "198.51.100.7:53".parse().unwrap(),
+            );
+            observation.packet_facts(ProcessMeta::test_gateway(417, name), 12, None);
+            observation.sniffed(Some("example.test"), Some(domain_source), None);
+            let detail = native
+                .core
+                .flows
+                .test_detail(observation.flow().unwrap().id());
+            assert_eq!(detail["input"]["pid"], 417);
+            assert_eq!(detail["pname"].as_str(), (!name.is_empty()).then_some(name));
+            assert!(detail["input"]["mark"].is_null());
+            assert!(detail["input"]["process_path"].is_null());
+        }
     }
 
     #[test]

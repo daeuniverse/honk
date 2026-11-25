@@ -1,206 +1,120 @@
-//! Locked TCP pre-connect admission and drained-attempt renewal.
-//!
-//! The owner admits the complete plain-Ethernet prefix before opening HOST_GATE.
-//! No timeout, tuple guess, or per-connect replacement of a Host executor is used.
+//! All hooks publish best effort and leave the application's operation alone.
 
-use aya_ebpf::{EbpfContext, Global, helpers::bpf_probe_read_kernel, programs::SockAddrContext};
-use aya_ebpf_bindings::helpers::{
-    bpf_get_netns_cookie, bpf_get_socket_cookie, bpf_spin_lock, bpf_spin_unlock,
+use aya_ebpf::{
+    macros::{cgroup_sock, cgroup_sock_addr},
+    programs::{SockAddrContext, SockContext},
+};
+use aya_ebpf_bindings::{
+    bindings::{BPF_SK_STORAGE_GET_F_CREATE, bpf_sock},
+    helpers::bpf_sk_storage_get,
 };
 use core::ptr;
-use honk_ebpf_common::host::{
-    HOST_ID_MAX, HOST_SOCKET_BUCKETS, HOST_SOCKET_CANDIDATE, HOST_SOCKET_ENDPOINT,
-    HOST_SOCKET_TRANSITION, HostConnectLayout, HostSocketEntry,
-};
+use honk_ebpf_common::{ROUTING_PROCESS_MAX_LEN, TASK_COMM_LEN, host::HostSkIdentity, routing_policy::ProcessNameNormalizer};
+use crate::host_maps::HOST_SK_IDENTITY;
 
-use crate::{
-    host_identity::{begin_write, copy_entry, end_write, lookup, positions},
-    host_kernel::socket_address,
-    host_maps::{
-        HOST_GATE, HOST_SEQUENCE, HOST_SOCKET_LOCKS, HOST_SOCKETS, HOST_SOURCE_NETNS_COOKIE,
-    },
-};
-
+/// # Safety
+/// Non-null pointers must address valid, non-overlapping state and byte arrays.
 #[unsafe(no_mangle)]
-pub static HOST_CONNECT_LAYOUT: Global<HostConnectLayout> = Global::new(HostConnectLayout {
-    valid: 0,
-    state: 0,
-    lock_owned: 0,
-    wmem_alloc: 0,
-    refcnt: 0,
-    write_queue_len: 0,
-    rtx_root: 0,
-    send_head: 0,
-    backlog_head: 0,
-    disconnect_generation: 0,
-    socket_mark: 0,
-    reserved: 0,
-});
+#[inline(never)]
+pub unsafe extern "C" fn honk_normalize_process_step(
+    state: *mut ProcessNameNormalizer,
+    input: *const [u8; TASK_COMM_LEN],
+    output: *mut [u8; ROUTING_PROCESS_MAX_LEN],
+) -> i32 {
+    if state.is_null() || input.is_null() || output.is_null() {
+        return 1;
+    }
+    let advance = unsafe { (*state).advance(&*input, &mut *output) };
+    i32::from(!advance)
+}
 
+/// A global call boundary lets the verifier check decoding independently of capture.
+///
+/// # Safety
+/// Non-null input and output must address valid, non-overlapping byte arrays.
 #[unsafe(no_mangle)]
-pub static HOST_BYPASS_MARK: Global<u32> = Global::new(0);
-
-#[inline(always)]
-fn read_at<T: Copy>(address: u64, offset: u32) -> Option<T> {
-    let address = address.checked_add(u64::from(offset))?;
-    unsafe { bpf_probe_read_kernel(address as *const T) }.ok()
+#[inline(never)]
+pub unsafe extern "C" fn honk_normalize_process_name(
+    input: *const [u8; TASK_COMM_LEN],
+    output: *mut [u8; ROUTING_PROCESS_MAX_LEN],
+) -> u32 {
+    if input.is_null() || output.is_null() {
+        return 0;
+    }
+    unsafe { (*output).fill(0) };
+    let mut state = ProcessNameNormalizer::default();
+    for _ in 0..TASK_COMM_LEN {
+        if unsafe { honk_normalize_process_step(&mut state, input, output) } != 0 {
+            break;
+        }
+    }
+    state.normalized_len() as u32
 }
 
-#[inline(always)]
-fn ready() -> bool {
-    HOST_GATE
-        .get(0)
-        .is_some_and(|gate| unsafe { ptr::read_volatile(gate) } == 1)
+#[inline(never)]
+fn normalized(raw: &[u8; TASK_COMM_LEN], identity: &mut HostSkIdentity) -> bool {
+    identity.pname_len = unsafe { honk_normalize_process_name(raw, &mut identity.pname) } as u8;
+    identity.pname_len != 0
 }
 
-#[inline(always)]
-fn reserve_selection() -> Option<u64> {
-    let sequence = HOST_SEQUENCE.get_ptr_mut(0)?;
-    let id = unsafe {
-        bpf_spin_lock(&raw mut (*sequence).lock);
-        let next = (&raw const (*sequence).value).read_volatile();
-        let id = if next != 0 && next <= HOST_ID_MAX {
-            (&raw mut (*sequence).value).write_volatile(next + 1);
-            next
-        } else {
-            0
-        };
-        bpf_spin_unlock(&raw mut (*sequence).lock);
-        id
-    };
-    (id != 0).then_some(id)
-}
-
-/// The cgroup caller turns zero into its real EPERM refusal before protocol connect.
-#[inline(always)]
-pub(crate) fn admit_connect(ctx: &SockAddrContext) -> i32 {
-    let raw = ctx.sock_addr;
-    // UDP connect is not a TCP drain event. Its actual datagram selector owns admission.
-    if unsafe { (*raw).protocol != 6 || (*raw).type_ != 1 } {
-        return 1;
-    }
-    let expected_netns = HOST_SOURCE_NETNS_COOKIE.load();
-    let netns = unsafe { bpf_get_netns_cookie(ctx.as_ptr()) };
-    if expected_netns == 0 || netns == 0 {
-        return 0;
-    }
-    if netns != expected_netns {
-        return 1;
-    }
-    let socket = unsafe { (*raw).__bindgen_anon_1.sk };
-    let Some(address) = socket_address(socket.cast()) else {
-        return 0;
-    };
-    let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr()) };
-    if cookie == 0 {
-        return 0;
-    }
-    let layout = HOST_CONNECT_LAYOUT.load();
-    if layout.valid != 1 || layout.reserved != 0 {
-        return 0;
-    }
-    let Some(mark) = read_at::<u32>(address, layout.socket_mark) else {
-        return 0;
-    };
-    let previous = lookup(cookie, address);
-    let bypass = HOST_BYPASS_MARK.load();
-    if bypass != 0 && mark == bypass {
-        return 1;
-    }
-    if !ready()
-        || read_at::<u8>(address, layout.state) != Some(7) // TCP_CLOSE
-        || read_at::<u32>(address, layout.lock_owned) != Some(1)
-    {
-        return 0;
-    }
-    if previous.is_some_and(|entry| entry.selection == HOST_SOCKET_ENDPOINT) {
-        // Endpoint tails can outlive TCP_CLOSE and retain their original source.
-        return 1;
-    }
-    if previous.is_some_and(|entry| entry.selection == HOST_SOCKET_TRANSITION) {
-        return 0;
-    }
-    // TCP's sk_send_head and tcp_rtx_queue are one union, admitted as the same offset.
-    if read_at::<u32>(address, layout.write_queue_len) != Some(0)
-        || read_at::<u64>(address, layout.rtx_root) != Some(0)
-        || read_at::<u64>(address, layout.backlog_head) != Some(0)
-    {
-        return 0;
-    }
-    // Ordering is material: the admitted prefix permits W->R, not R->W before TCX.
-    // The checked helper calls must remain outside every BPF value lock.
-    if read_at::<u32>(address, layout.wmem_alloc) != Some(1) {
-        return 0;
-    }
-    if read_at::<u32>(address, layout.refcnt) != Some(1) {
-        return 0;
-    }
-    let Some(disconnect_generation) = read_at::<u32>(address, layout.disconnect_generation) else {
-        return 0;
-    };
-    let Some(bucket) = HOST_SOCKETS.get_ptr_mut((cookie & (HOST_SOCKET_BUCKETS as u64 - 1)) as u32)
-    else {
-        return 0;
-    };
-    let Some(lock) =
-        HOST_SOCKET_LOCKS.get_ptr_mut((cookie & (HOST_SOCKET_BUCKETS as u64 - 1)) as u32)
-    else {
-        return 0;
-    };
-    let Some(gate) = HOST_GATE.get_ptr_mut(0) else {
-        return 0;
-    };
-    let Some(incarnation) = reserve_selection() else {
-        return 0;
-    };
-    if !ready() {
-        return 0;
-    }
-    let empty_value = HostSocketEntry {
-        cookie,
-        socket_address: address,
-        ..HostSocketEntry::default()
-    };
-    let mut exhausted = false;
+/// Fills identity from the caller of the cgroup socket hook.
+///
+/// # Safety
+/// A non-null output must point to one writable HostSkIdentity for the call.
+/// The loader specializes the two immediates within this named BTF function.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub unsafe extern "C" fn honk_host_name(out: *mut HostSkIdentity) -> i32 {
+    if out.is_null() { return 0; }
+    // The loader specializes these two MOV64 immediates from running BTF. A
+    // disabled argv0 branch is verifier-dead even on kernels denying its helpers.
+    let (task_mm, arg_start): (u64, u64);
     unsafe {
-        bpf_spin_lock(&raw mut (*lock).lock);
-        let (found, empty) = positions(bucket, cookie, address);
-        let target = if found.is_null() { empty } else { found };
-        let unchanged = if found.is_null() {
-            previous.is_none()
-        } else {
-            match previous {
-                Some(old) => {
-                    (&raw const (*found).selection).read_volatile() == old.selection
-                        && (&raw const (*found).operation_incarnation).read_volatile()
-                            == old.operation_incarnation
-                }
-                None => {
-                    (&raw const (*found).selection).read_volatile() == 0
-                        && (&raw const (*found).operation_incarnation).read_volatile() == 0
-                }
-            }
-        };
-        let mut admitted = !target.is_null() && unchanged && gate.read_volatile() == 1;
-        if admitted {
-            if let Some(version) = begin_write(bucket) {
-                if found.is_null() {
-                    copy_entry(target, &raw const empty_value);
-                }
-                (&raw mut (*target).operation_incarnation).write_volatile(incarnation);
-                (&raw mut (*target).disconnect_generation).write_volatile(disconnect_generation);
-                (&raw mut (*target).output_ifindex).write_volatile(0);
-                (&raw mut (*target).selection).write_volatile(HOST_SOCKET_CANDIDATE);
-                end_write(bucket, version);
-            } else {
-                exhausted = true;
-                admitted = false;
-            }
-        }
-        bpf_spin_unlock(&raw mut (*lock).lock);
-        if exhausted {
-            gate.write_volatile(0);
-        }
-        i32::from(admitted)
+        core::arch::asm!(
+            "{task} = 0x484f4e31", "{arg} = 0x484f4e32",
+            task = out(reg) task_mm, arg = out(reg) arg_start,
+            options(nomem, nostack),
+        );
     }
+    let argv0 = task_mm != u64::MAX;
+    let Some(raw) = crate::process_name::capture(argv0, argv0, task_mm as _, arg_start as _) else { return 0 };
+    if raw.pid == 0 { return 0; }
+    let identity = unsafe { &mut *out };
+    identity.pid = raw.pid;
+    if normalized(&raw.pname, identity) { return 1; }
+    if !argv0 { return 0; }
+    let Some(comm) = crate::process_name::capture(false, false, 0, 0) else { return 0 };
+    i32::from(normalized(&comm.pname, identity))
 }
+
+#[inline(never)]
+fn capture(sk: *mut bpf_sock) {
+    let map = (&raw const HOST_SK_IDENTITY).cast_mut().cast();
+    if !unsafe { bpf_sk_storage_get(map, sk.cast(), ptr::null_mut(), 0) }.is_null() { return; }
+    let mut identity = HostSkIdentity { pid: 0, pname_len: 0, reserved: [0; 3], pname: [0; ROUTING_PROCESS_MAX_LEN] };
+    if unsafe { honk_host_name(&mut identity) } == 0 { return; }
+    // CREATE publishes an initialized element atomically. Never overwrite a concurrent winner.
+    unsafe { bpf_sk_storage_get(map, sk.cast(), ptr::from_mut(&mut identity).cast(), BPF_SK_STORAGE_GET_F_CREATE.into()) };
+}
+
+#[cgroup_sock(sock_create)]
+pub fn host_create(ctx: SockContext) -> i32 {
+    capture(ctx.sock);
+    1
+}
+
+#[inline(always)]
+fn observe_addr(ctx: SockAddrContext) -> i32 {
+    let sk = unsafe { (*ctx.sock_addr).__bindgen_anon_1.sk };
+    if !sk.is_null() { capture(sk); }
+    1
+}
+
+#[cgroup_sock_addr(connect4)]
+pub fn host_connect4(ctx: SockAddrContext) -> i32 { observe_addr(ctx) }
+#[cgroup_sock_addr(connect6)]
+pub fn host_connect6(ctx: SockAddrContext) -> i32 { observe_addr(ctx) }
+#[cgroup_sock_addr(sendmsg4)]
+pub fn host_sendmsg4(ctx: SockAddrContext) -> i32 { observe_addr(ctx) }
+#[cgroup_sock_addr(sendmsg6)]
+pub fn host_sendmsg6(ctx: SockAddrContext) -> i32 { observe_addr(ctx) }

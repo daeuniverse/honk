@@ -113,7 +113,7 @@ pub struct RoutingBytecode {
     pub trace_layout: Option<KernelTraceLayout>,
 }
 
-/// Gateway function body: R1 is LAN input and R2 is caller-guarded scratch.
+/// Gateway function body: R1 is `RoutingInput` and R2 is caller-guarded scratch.
 /// With DNS shadow, R3 is zero on the first pass and `GATEWAY_DNS_READY` with a bitmap.
 /// Return 1 for proven direct, 0 for Endpoint, `GATEWAY_ROUTE_NEED_DNS` for the
 /// first reachable domain predicate without a bitmap, or a negative input error.
@@ -315,7 +315,7 @@ pub fn emit_routing_program(
     plan: &RoutingPushPlan,
     fds: RoutingMapFds,
 ) -> anyhow::Result<RoutingBytecode> {
-    emit_routing_program_inner(plan, fds, false, false, false)
+    emit_routing_program_inner(plan, fds, false, false, false, true)
 }
 
 /// Host callers reserve the output's unused trace payload as scratch under their busy guard.
@@ -324,21 +324,29 @@ pub fn emit_host_routing_program(
     plan: &RoutingPushPlan,
     fds: RoutingMapFds,
 ) -> anyhow::Result<RoutingBytecode> {
-    emit_routing_program_inner(plan, fds, true, false, false)
+    emit_routing_program_inner(plan, fds, true, false, false, true)
 }
 
-/// Emit LAN gateway classification using canonical predicates and map-backed scratch.
-/// The caller supplies a complete TCP SYN/UDP input and owns the scratch busy guard;
-/// LAN process identity is always Missing, regardless of the input's pname bytes.
-/// The caller captures mode authority in the input's ALLOW_DIRECT_FINALITY bit.
+/// Emit gateway classification using canonical predicates and map-backed scratch.
+/// The caller supplies a complete TCP SYN/UDP input and owns the scratch busy guard.
+/// Host supplies a normalized pname and length. LAN and auxiliary inputs always
+/// have Missing process identity. The caller captures Rule-mode direct authority
+/// in the input's ALLOW_DIRECT_FINALITY bit.
 pub fn emit_gateway_routing_program(
     plan: &RoutingPushPlan,
     fds: RoutingMapFds,
     dns_shadow: bool,
+    allow_process: bool,
 ) -> std::io::Result<GatewayBytecode> {
-    let bytecode =
-        emit_routing_program_inner(plan, fds, true, true, dns_shadow && plan.has_domain_rules)
-            .map_err(std::io::Error::other)?;
+    let bytecode = emit_routing_program_inner(
+        plan,
+        fds,
+        true,
+        true,
+        dns_shadow && plan.has_domain_rules,
+        allow_process,
+    )
+    .map_err(std::io::Error::other)?;
     Ok(GatewayBytecode {
         insns: bytecode.insns,
         source_lines: bytecode.lines,
@@ -425,6 +433,7 @@ fn emit_routing_program_inner(
     host_scratch: bool,
     gateway: bool,
     dns_shadow: bool,
+    allow_process: bool,
 ) -> anyhow::Result<RoutingBytecode> {
     validate_plan(plan)?;
     validate_map_fds(&fds, !gateway)?;
@@ -494,12 +503,25 @@ fn emit_routing_program_inner(
         let mut conditional = false;
         let mut missing_process = false;
         let mut domain_barrier = false;
-        if gateway {
-            domain_prefix |= rule
-                .runtime_conditions()
+        let conditions = rule.runtime_conditions();
+        let gateway_domain = gateway
+            && conditions
+                .clone()
                 .any(|(_, condition)| matches!(condition.predicate, KernelPredicate::Domain(_)));
-        }
-        for (rank, (_, condition)) in rule.runtime_conditions().enumerate() {
+        domain_prefix |= gateway_domain;
+        // An unavailable domain need not defer a rule the Host process has already excluded.
+        let process_first =
+            gateway_domain && allow_process && plan.features & ROUTING_FEATURE_PROCESS != 0;
+        let early = |(_, condition): &(usize, &KernelCondition)| {
+            condition.predicate.is_port()
+                || matches!(condition.predicate, KernelPredicate::ProcessName(_))
+        };
+        let conditions = process_first
+            .then(|| conditions.clone().filter(early))
+            .into_iter()
+            .flatten()
+            .chain(conditions.filter(|condition| !process_first || !early(condition)));
+        for (rank, (_, condition)) in conditions.enumerate() {
             domain_prefix |= matches!(condition.predicate, KernelPredicate::Domain(_));
             if gateway {
                 match condition.predicate {
@@ -515,7 +537,7 @@ fn emit_routing_program_inner(
                             break;
                         }
                     }
-                    KernelPredicate::ProcessName(_) => {
+                    KernelPredicate::ProcessName(_) if !allow_process => {
                         if !condition.not {
                             asm.ja(fail)?;
                             conditional = true;

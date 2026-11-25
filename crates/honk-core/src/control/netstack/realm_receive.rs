@@ -241,10 +241,11 @@ impl PacketScope {
             return Err(DropReason::NotForUs);
         }
         self.0.with(|inner| {
-            if inner
-                .capture_admission
-                .as_ref()
-                .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
+            if inner.aborted
+                || inner
+                    .capture_admission
+                    .as_ref()
+                    .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
             {
                 return Err(DropReason::Stale);
             }
@@ -276,10 +277,11 @@ impl PacketScope {
             return Err(DropReason::NotForUs);
         }
         self.0.with(|inner| {
-            if inner
-                .capture_admission
-                .as_ref()
-                .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
+            if inner.aborted
+                || inner
+                    .capture_admission
+                    .as_ref()
+                    .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
             {
                 return Err(DropReason::Stale);
             }
@@ -424,34 +426,7 @@ impl PacketScope {
             if let Some(hold) = peer.as_ref().filter(|peer| peer.learned()) {
                 inner.remember_peer(hold);
             }
-            if let honk_netstack::ReceiveOutcome::TcpNew(id) = report.outcome {
-                if let Some(index) = inner.slots.iter().position(Option::is_none) {
-                    let source = report.source.expect("new TCP has verified tuple");
-                    inner.slots[index] = Some(FlowSlot {
-                        id,
-                        client: source.src,
-                        destination: source.dst,
-                        app_open: true,
-                        close_pending: false,
-                        retiring: false,
-                        outputs: 0,
-                        rx: None,
-                        tx: None,
-                        callback: None,
-                        accepted: false,
-                        rx_admitted: false,
-                        routing: admission.take(),
-                        source: None,
-                    });
-                    inner.pending_routing += 1;
-                } else {
-                    inner
-                        .stack
-                        .as_mut()
-                        .expect("live realm stack")
-                        .tcp_refuse(id, honk_netstack::Refuse::Drop);
-                }
-            }
+            inner.register_tcp_new(&report, admission, None);
             inner.advance(service_at);
             inner.drain_half_open();
             // Shutdown can abort the scope as soon as this receive releases its lock.
@@ -473,6 +448,71 @@ impl PacketScope {
 }
 
 impl Inner {
+    #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+    pub(super) fn bind_host_process(
+        &mut self,
+        rx: Rx,
+        report: honk_netstack::ReceiveReport,
+        lookup: impl FnOnce(&Self, honk_netstack::ValidatedSource) -> io::Result<ProcessMeta>,
+    ) -> (Rx, super::super::packet_endpoint::PacketReceive) {
+        if let honk_netstack::ReceiveOutcome::TcpNew(id) = report.outcome {
+            let source = report
+                .source
+                .expect("new TCP admission has a validated tuple");
+            match lookup(self, source) {
+                Ok(process) => self.register_tcp_new(&report, &mut None, Some(process)),
+                Err(error) => {
+                    self.stack
+                        .as_mut()
+                        .expect("new TCP flow")
+                        .tcp_refuse(id, honk_netstack::Refuse::Drop);
+                    tracing::debug!(%error, "gateway Host TCP admission refused");
+                    return (Rx::Dropped(DropReason::Stale), Default::default());
+                }
+            }
+        }
+        (rx, self.receive_result(report))
+    }
+
+    pub(super) fn register_tcp_new(
+        &mut self,
+        report: &honk_netstack::ReceiveReport,
+        admission: &mut Option<super::super::packet_endpoint::EndpointAdmission>,
+        process: Option<ProcessMeta>,
+    ) {
+        let honk_netstack::ReceiveOutcome::TcpNew(id) = report.outcome else {
+            return;
+        };
+        let Some(vacant) = self.slots.iter_mut().find(|slot| slot.is_none()) else {
+            self.stack
+                .as_mut()
+                .expect("new TCP flow")
+                .tcp_refuse(id, honk_netstack::Refuse::Drop);
+            return;
+        };
+        let source = report
+            .source
+            .expect("new TCP admission has a validated tuple");
+        *vacant = Some(FlowSlot {
+            id,
+            client: source.src,
+            destination: source.dst,
+            app_open: true,
+            close_pending: false,
+            retiring: false,
+            outputs: 0,
+            rx: None,
+            tx: None,
+            callback: None,
+            accepted: false,
+            rx_admitted: false,
+            routing: admission.take(),
+            process,
+            source: report.source_context,
+        });
+        self.pending_routing += 1;
+    }
+
     pub(super) fn receive_checked(
         &mut self,
         packet: &[u8],
@@ -481,10 +521,11 @@ impl Inner {
         service_at: Instant,
         on_source: impl FnMut(honk_netstack::ValidatedSource) -> bool,
     ) -> (Rx, honk_netstack::ReceiveReport) {
-        if self
-            .capture_admission
-            .as_ref()
-            .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
+        if self.aborted
+            || self
+                .capture_admission
+                .as_ref()
+                .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
         {
             return (Rx::Dropped(DropReason::Stale), Default::default());
         }

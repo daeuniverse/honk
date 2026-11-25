@@ -4,7 +4,7 @@ use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
-pub(crate) fn bpf<T>(command: u32, attr: &mut T) -> std::io::Result<i32> {
+pub(super) fn bpf<T>(command: u32, attr: &mut T) -> std::io::Result<i32> {
     let mut storage: aya_obj::generated::bpf_attr = unsafe { std::mem::zeroed() };
     assert!(size_of::<T>() <= size_of_val(&storage));
     // These private command structures are initialized UAPI prefixes. Zero the
@@ -30,7 +30,7 @@ pub(crate) fn bpf<T>(command: u32, attr: &mut T) -> std::io::Result<i32> {
         .and_then(|value| i32::try_from(value).map_err(std::io::Error::other))
 }
 
-pub(crate) fn pin(fd: BorrowedFd<'_>, path: &Path) -> anyhow::Result<()> {
+pub(super) fn pin(fd: BorrowedFd<'_>, path: &Path) -> anyhow::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
     let name = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     #[repr(C)]
@@ -50,7 +50,7 @@ pub(crate) fn pin(fd: BorrowedFd<'_>, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn identity(fd: BorrowedFd<'_>) -> anyhow::Result<(u32, u32)> {
+pub(super) fn identity(fd: BorrowedFd<'_>) -> anyhow::Result<(u32, u32)> {
     #[repr(C)]
     struct Attr {
         fd: u32,
@@ -70,7 +70,7 @@ pub(crate) fn identity(fd: BorrowedFd<'_>) -> anyhow::Result<(u32, u32)> {
     Ok((info[0], info[1]))
 }
 
-pub(crate) fn link_program(fd: BorrowedFd<'_>) -> anyhow::Result<u32> {
+pub(super) fn link_program(fd: BorrowedFd<'_>) -> anyhow::Result<u32> {
     #[repr(C)]
     struct Attr {
         fd: u32,
@@ -90,7 +90,7 @@ pub(crate) fn link_program(fd: BorrowedFd<'_>) -> anyhow::Result<u32> {
     Ok(info[2])
 }
 
-pub(crate) fn open_pin(path: &Path, expected: u32) -> anyhow::Result<OwnedFd> {
+pub(super) fn open_pin(path: &Path, expected: u32) -> anyhow::Result<OwnedFd> {
     use std::os::unix::ffi::OsStrExt as _;
     let name = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     #[repr(C)]
@@ -117,12 +117,7 @@ pub(crate) fn open_pin(path: &Path, expected: u32) -> anyhow::Result<OwnedFd> {
     Ok(fd)
 }
 
-pub(super) fn newly_pinned_id(path: &Path) -> anyhow::Result<u32> {
-    let fd = open_pin(path, 0)?;
-    Ok(identity(fd.as_fd())?.1)
-}
-
-pub(crate) fn detach(fd: BorrowedFd<'_>) -> anyhow::Result<()> {
+pub(super) fn detach(fd: BorrowedFd<'_>) -> anyhow::Result<()> {
     #[repr(C)]
     struct Attr {
         fd: u32,
@@ -139,7 +134,7 @@ pub(crate) fn detach(fd: BorrowedFd<'_>) -> anyhow::Result<()> {
     }
 }
 
-pub(crate) fn attach_selector(
+pub(super) fn attach_selector(
     program: BorrowedFd<'_>,
     cgroup: &File,
     pin_path: &Path,
@@ -168,7 +163,7 @@ pub(crate) fn attach_selector(
     Ok(link)
 }
 
-pub(crate) struct Grace {
+pub(super) struct Grace {
     outer: OwnedFd,
     inner: OwnedFd,
 }
@@ -270,7 +265,7 @@ fn effective(fd: BorrowedFd<'_>, kind: u32) -> anyhow::Result<([u32; 64], usize)
     Ok((ids, attr.count as usize))
 }
 
-pub(crate) struct Cgroups {
+pub(super) struct Cgroups {
     roots: Vec<(PathBuf, File, [i64; 4])>,
     required: Vec<(u32, u32)>,
 }

@@ -8,11 +8,10 @@ use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-pub(crate) struct Receipt {
+pub(super) struct Receipt {
     directory: File,
     file: File,
     name: String,
-    location: PathBuf,
     value: Value,
 }
 
@@ -66,7 +65,6 @@ impl Receipt {
             directory,
             file,
             name,
-            location: data_dir.join(crate::state::STATE_DIR),
             value: json!({
                 "format": 1, "source_sha": env!("HONK_SOURCE_SHA"),
                 "pid": std::process::id(), "starttime": starttime,
@@ -77,10 +75,6 @@ impl Receipt {
         receipt.write(&receipt.file)?;
         receipt.directory.sync_all()?;
         Ok(receipt)
-    }
-
-    pub fn path(&self) -> PathBuf {
-        self.location.join(&self.name)
     }
 
     fn write(&self, mut file: &File) -> anyhow::Result<()> {
@@ -178,7 +172,7 @@ impl Receipt {
             "Host pin directory replaced"
         );
         let mut pins = Vec::new();
-        for (index, entry) in entries.iter().enumerate() {
+        for entry in entries {
             if entry["state"] == "removed" {
                 continue;
             }
@@ -191,35 +185,21 @@ impl Receipt {
             let observed = &entry["observed"];
             if let Some(path) = identity["pin_path"].as_str() {
                 let path = PathBuf::from(path);
-                let names: &[(&str, &str, bool)] = match kind {
-                    "source_tcx" | "return_tcx" => &[
-                        ("program", "program_id", false),
-                        ("guard", "guard_id", false),
-                        ("link", "link_id", true),
-                    ],
-                    "private_xdp" => &[("guard", "guard_id", false), ("data", "data_id", false)],
-                    "map" => &[("", "id", false)],
-                    "raw_program" => &[("", "program_id", false)],
-                    "tracing_link" => &[("", "link_id", false)],
-                    "selector" | "cgroup_link" => &[("", "link_id", true)],
-                    "lsm_link" => &[("", "link_id", false)],
+                let (id, link) = match kind {
+                    "map" => ("id", false),
+                    "raw_program" => ("program_id", false),
+                    "tracing_link" | "lsm_link" => ("link_id", false),
+                    "selector" | "cgroup_link" => ("link_id", true),
                     _ => anyhow::bail!("unknown Host pinned resource"),
                 };
-                for &(name, id, link) in names {
-                    let expected =
-                        u32::try_from(observed[id].as_u64().context("unobserved Host pin ID")?)?;
-                    let path = if name.is_empty() {
-                        path.clone()
-                    } else {
-                        path.join(name)
-                    };
-                    ensure!(
-                        path.starts_with(root) && expected != 0,
-                        "Host pin outside custody"
-                    );
-                    let fd = super::sys::open_pin(&path, expected)?;
-                    pins.push((index, path, fd, link));
-                }
+                let expected =
+                    u32::try_from(observed[id].as_u64().context("unobserved Host pin ID")?)?;
+                ensure!(
+                    path.starts_with(root) && expected != 0,
+                    "Host pin outside custody"
+                );
+                let fd = super::sys::open_pin(&path, expected)?;
+                pins.push((path, fd, link));
             }
         }
         let indices: Vec<_> = (0..entries.len())
@@ -228,12 +208,12 @@ impl Receipt {
         for &index in &indices {
             self.begin_removal(index)?;
         }
-        for (_, _, fd, link) in &pins {
+        for (_, fd, link) in &pins {
             if *link {
                 super::sys::detach(fd.as_fd())?;
             }
         }
-        for (_, path, _, _) in &pins {
+        for (path, _, _) in &pins {
             std::fs::remove_file(path)?;
         }
         for entry in std::fs::read_dir(root)? {
@@ -280,9 +260,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut receipt =
             Receipt::create(directory.path(), 41, 7, Path::new("/sys/fs/bpf/test-host")).unwrap();
-        let path = receipt.path();
+        let path = directory
+            .path()
+            .join(crate::state::STATE_DIR)
+            .join("host-41.json");
         let index = receipt
-            .intent("private_veth", json!({"name":"owned"}))
+            .intent("tun_filter", json!({"ifindex":17,"attachment":7}))
             .unwrap();
         assert!(receipt.finish().is_err());
         assert!(

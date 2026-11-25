@@ -4,7 +4,7 @@
 
 ## XDP Endpoint 网关
 
-D1 遵循配置的规则顺序，只放行可证明的静态终局 Direct。非 must Direct 要求 Rule mode、目的端口非 53 且 direct finality 成立；可静态决定的 `direct(must)` 也覆盖 53。更早的 block/proxy 或无法静态决定的正向、否定 domain/geosite 条件会阻止放行后面的 Direct。源 MAC、IP、端口、协议及 DSCP 可用；LAN pname 为 Missing，正向不匹配、否定匹配。未启用 Host 时 pname 规则通过 `pname_routing` 报告降级，本机发起的流留在内核。TCP 仅在 hold/CT miss 后对纯 SYN 使用 D1；UDP 每个 miss 包求值。mode 在运行时读取。
+D1 遵循配置的规则顺序。静态放行要求终态 Direct：普通 Direct 需要 Rule mode、目的端口非 53 且 direct finality 成立；可静态决定的 `direct(must)` 也可覆盖 53。不能越过更早命中的 block/proxy。遇到实际可达的 domain/geosite 条件时，静态求值停止；此后只有[源自同一 LAN 的 DNS 投影](./global.md#xdp-endpoint-dns-投影)可授权纯 TCP SYN 或完整 UDP 数据报走内核路由，绝不授权目的端口 53。源 MAC、IP、端口、协议及 DSCP 可用；LAN pname 为 Missing，正向不匹配、否定匹配。未启用 Host 时 pname 规则通过 `pname_routing` 报告降级，本机发起的流留在内核。mode 在运行时读取。
 
 本机 DNS listener 需要接收流量时，可在域名规则前配置合适的静态规则，例如 `dip(10.10.10.1) && dport(53) -> direct(must)`；honk 不自动生成此规则。
 
