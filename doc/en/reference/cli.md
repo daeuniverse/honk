@@ -327,20 +327,14 @@ Build for development:
 cargo build --release -p honk-tool
 ```
 
-For a gateway, build the static musl target with the repository's Zig wrappers and copy the single binary:
+For a gateway, build the static musl binary (requires Docker or Podman) and copy it:
 
 ```bash
-ZIGCC_TARGET=x86_64-linux-musl \
-CC_x86_64_unknown_linux_musl=$PWD/ci/zigcc \
-CXX_x86_64_unknown_linux_musl=$PWD/ci/zigcxx \
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=$PWD/ci/zigcc \
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-self-contained=no" \
-BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env x86_64-linux-musl)" \
-cargo build --release -p honk-tool --target x86_64-unknown-linux-musl
+just build-musl-tool   # or: ci/build-musl.sh honk-tool
 scp target/x86_64-unknown-linux-musl/release/honk-tool root@GATEWAY:/tmp/
 ```
 
-The current `just build-musl` and `just deploy-vyos` recipes build and deploy only `honk-core`; they do not include `honk-tool`. A GNU-linked build may not execute on a musl-only gateway.
+On `aarch64`, the target directory uses `aarch64-unknown-linux-musl`. `just build-musl` and `just deploy-vyos` handle only `honk-core`; a GNU-linked build may not execute on a musl-only gateway.
 
 ### Command families
 

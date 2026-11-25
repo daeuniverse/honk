@@ -14,14 +14,8 @@ production gateway (VyOS/Debian) as a single copied file.
 # Dev (glibc, your workstation)
 cargo build --release -p honk-tool
 
-# Static musl for the gateway (needs zig 0.14+, uses the ci/ wrappers)
-ZIGCC_TARGET=x86_64-linux-musl \
-CC_x86_64_unknown_linux_musl=$PWD/ci/zigcc \
-CXX_x86_64_unknown_linux_musl=$PWD/ci/zigcxx \
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=$PWD/ci/zigcc \
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-self-contained=no" \
-BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env x86_64-linux-musl)" \
-cargo build --release -p honk-tool --target x86_64-unknown-linux-musl
+# Static musl for the gateway (needs docker or podman)
+just build-musl-tool   # or: ci/build-musl.sh honk-tool
 
 scp target/x86_64-unknown-linux-musl/release/honk-tool vyos@<gateway>:/tmp/
 ```
