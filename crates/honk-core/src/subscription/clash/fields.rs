@@ -1,4 +1,4 @@
-use honk_config::options::vocab::{coalesce_equal, optional_text};
+use honk_config::options::vocab::{coalesce_equal, optional_text, port_hopping_ranges};
 use serde_yaml::{Mapping, Value};
 
 use super::super::yaml_value;
@@ -210,12 +210,29 @@ pub(super) fn alpn_list(value: &Value) -> Result<Vec<String>, &'static str> {
     }
 }
 
-pub(super) fn ports(value: &Value) -> Result<Option<String>, &'static str> {
-    let Some(value) = list_text(value)? else {
+struct PortHoppingClaim {
+    normalized: String,
+    ranges: Vec<(u16, u16)>,
+}
+
+impl PartialEq for PortHoppingClaim {
+    fn eq(&self, other: &Self) -> bool {
+        self.ranges == other.ranges
+    }
+}
+
+fn port_hopping_claim(value: &Value) -> Result<Option<PortHoppingClaim>, &'static str> {
+    match value {
+        Value::Null => return Ok(None),
+        Value::String(text) if text.trim().is_empty() => return Ok(None),
+        Value::Sequence(values) if values.is_empty() => return Ok(None),
+        _ => {}
+    }
+    let Some(raw) = list_text(value)? else {
         return Ok(None);
     };
     let mut normalized = String::new();
-    for part in value
+    for part in raw
         .split(',')
         .map(str::trim)
         .filter(|part| !part.is_empty())
@@ -230,7 +247,20 @@ pub(super) fn ports(value: &Value) -> Result<Option<String>, &'static str> {
     if normalized.is_empty() {
         return Err("port range is empty");
     }
-    Ok(Some(normalized))
+    let ranges =
+        port_hopping_ranges(&normalized).ok_or("Hysteria2 port hopping range is invalid")?;
+    Ok(Some(PortHoppingClaim { normalized, ranges }))
+}
+
+pub(super) fn port_hopping_alias(mapping: &Mapping) -> Result<Option<String>, &'static str> {
+    coalesce_equal(
+        ["ports", "mport", "port-hopping", "port_hopping"]
+            .into_iter()
+            .filter_map(|key| yaml_value(mapping, key))
+            .map(port_hopping_claim),
+        "Hysteria2 port hopping aliases conflict",
+    )
+    .map(|claim| claim.map(|claim| claim.normalized))
 }
 
 pub(super) fn active(value: &Value) -> bool {
