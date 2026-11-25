@@ -281,13 +281,15 @@ Supported spelling aliases normalize before node identity is derived.
 
 | Protocol | Imported options |
 | --- | --- |
-| Hysteria2 | `password`/`auth`; `obfs: salamander` with `obfs-password`; upload/download bandwidth; `ports`/`mport` hopping ranges; `hop-interval`/`mhop`; receive windows; MTU and MTU-discovery settings. |
+| Hysteria2 | `password`/`auth`; `obfs: salamander` with `obfs-password`; upload/download bandwidth; `ports`/`mport`/`port-hopping`/`port_hopping` hopping ranges; `hop-interval`/`mhop`; receive windows; MTU and MTU-discovery settings. |
 | TUIC | UUID/password, congestion control, ALPN, receive windows, MTU. |
 | AnyTLS | `idle-session-check-interval`, `idle-session-timeout`, `min-idle-session`. |
 
 Explicit disabled feature blocks are treated as disabled, not as unsupported active features. `udp: true` is accepted for intrinsically UDP-capable protocols, and ignored on VMess, which has no UDP path, so the node still imports for TCP. An explicit UDP restriction is rejected where the node model cannot preserve it.
 
 TUIC permits an absent or empty password. Hysteria2 and Juicity accept an explicit `h3` ALPN matching their fixed runtime selection.
+
+Hysteria2 port-hopping aliases are resolved in this order: `ports`, `mport`, `port-hopping`, then `port_hopping`. Null, empty or whitespace-only text, and empty arrays supply no claim. Supplied strings, finite numbers, or arrays normalize `:` range separators to `-` and compare by their canonical nonzero port set, so equivalent spellings such as `["4000:5000", 6000]` and `6000,4000-5000` or adjacent ranges agree and retain the first non-absent alias's normalized spelling. Conflicting ranges or any invalid, empty-after-normalization, or duplicate-port alias reject the entry even beside a valid alias.
 
 Juicity starts with 8 MiB stream and connection receive windows. Adaptive flow control can raise each of them up to 32 MiB. Imported initial-window fields accept absent values, `0`, or `8388608`. Other overrides are rejected.
 

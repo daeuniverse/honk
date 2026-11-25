@@ -964,3 +964,289 @@ fn clash_imports_websocket_upgrade_headers() {
     );
     assert_ne!(nodes[0].id, nodes[1].id);
 }
+
+#[test]
+fn clash_hysteria2_coalesces_equivalent_port_hopping_aliases() {
+    let fixture = r#"proxies:
+  - name: hy2-range-both
+    type: hysteria2
+    server: hy2-1.example
+    port: 443
+    password: secret
+    ports: "35000-39000"
+    mport: "35000-39000"
+  - name: hy2-mixed-both
+    type: hysteria2
+    server: hy2-2.example
+    port: 443
+    password: secret
+    ports: "443,5000-5010"
+    mport: "443,5000-5010"
+  - name: hy2-single-port
+    type: hysteria2
+    server: hy2-3.example
+    port: 443
+    password: secret
+  - name: vless-control
+    type: vless
+    server: vless.example
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    tls: true
+"#;
+    let mut diagnostics = Vec::new();
+    let nodes = parse_subscription_content_with_diagnostics(
+        &Subscription {
+            sub_type: SubscriptionType::Clash,
+            ..Default::default()
+        },
+        fixture,
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "hy2-range-both",
+            "hy2-mixed-both",
+            "hy2-single-port",
+            "vless-control"
+        ]
+    );
+    assert_eq!(
+        nodes[0].hysteria2().unwrap().port_hopping.as_deref(),
+        Some("35000-39000")
+    );
+    assert_eq!(
+        nodes[1].hysteria2().unwrap().port_hopping.as_deref(),
+        Some("443,5000-5010")
+    );
+    assert_eq!(nodes[2].hysteria2().unwrap().port_hopping, None);
+    assert_eq!(nodes[3].protocol(), NodeProtocol::VLess);
+
+    let equivalent = r#"proxies:
+  - name: seq-and-reordered
+    type: hysteria2
+    server: eq-1.example
+    port: 443
+    password: secret
+    ports: ["4000:5000", 6000]
+    mport: "6000, 4000-5000"
+  - name: adjacent-merged
+    type: hysteria2
+    server: eq-2.example
+    port: 443
+    password: secret
+    ports: "5000-5005,5006-5010"
+    mport: "5000-5010"
+  - name: colon-and-hyphen
+    type: hysteria2
+    server: eq-3.example
+    port: 443
+    password: secret
+    mport: "4000:5000"
+    port-hopping: "4000-5000"
+    port_hopping: "4000:5000"
+"#;
+    let nodes = parse_clash_subscription(equivalent, None).unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| (
+                node.name.as_str(),
+                node.hysteria2().unwrap().port_hopping.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("seq-and-reordered", Some("4000-5000,6000")),
+            ("adjacent-merged", Some("5000-5005,5006-5010")),
+            ("colon-and-hyphen", Some("4000-5000")),
+        ]
+    );
+}
+
+#[test]
+fn clash_hysteria2_port_hopping_handles_blank_null_conflict_and_invalid_aliases() {
+    let valid_absent = r#"proxies:
+  - name: blank-mport
+    type: hysteria2
+    server: absent-1.example
+    port: 443
+    password: secret
+    ports: "35000-39000"
+    mport: ""
+  - name: null-mport
+    type: hysteria2
+    server: absent-2.example
+    port: 443
+    password: secret
+    ports: "35000-39000"
+    mport: null
+    port-hopping: "  "
+    port_hopping: []
+  - name: standalone-empty-string
+    type: hysteria2
+    server: absent-3.example
+    port: 443
+    password: secret
+    ports: ""
+  - name: standalone-empty-seq
+    type: hysteria2
+    server: absent-4.example
+    port: 443
+    password: secret
+    ports: []
+"#;
+    let nodes = parse_clash_subscription(valid_absent, None).unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| (
+                node.name.as_str(),
+                node.hysteria2().unwrap().port_hopping.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("blank-mport", Some("35000-39000")),
+            ("null-mport", Some("35000-39000")),
+            ("standalone-empty-string", None),
+            ("standalone-empty-seq", None),
+        ]
+    );
+
+    let rejected = r#"proxies:
+  - name: genuine-conflict
+    type: hysteria2
+    server: conflict.example
+    port: 443
+    password: secret
+    ports: "35000-39000"
+    mport: "20000-25000"
+  - name: invalid-beside-valid
+    type: hysteria2
+    server: invalid-1.example
+    port: 443
+    password: secret
+    ports: "35000-39000"
+    mport: "bad"
+  - name: duplicate-port-beside-valid
+    type: hysteria2
+    server: invalid-2.example
+    port: 443
+    password: secret
+    ports: "35000-39000"
+    mport: "35000-39000,35000"
+  - name: comma-only
+    type: hysteria2
+    server: invalid-3.example
+    port: 443
+    password: secret
+    ports: ","
+  - name: spaced-comma-only
+    type: hysteria2
+    server: invalid-4.example
+    port: 443
+    password: secret
+    ports: " , "
+  - name: seq-empty-string
+    type: hysteria2
+    server: invalid-5.example
+    port: 443
+    password: secret
+    ports: [""]
+  - name: seq-null-entry
+    type: hysteria2
+    server: invalid-6.example
+    port: 443
+    password: secret
+    ports: [null]
+  - name: survivor
+    type: hysteria2
+    server: survivor.example
+    port: 443
+    password: secret
+"#;
+    let mut diagnostics = Vec::new();
+    let nodes = parse_subscription_content_with_diagnostics(
+        &Subscription {
+            sub_type: SubscriptionType::Clash,
+            ..Default::default()
+        },
+        rejected,
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["survivor"]
+    );
+    assert_eq!(diagnostics.len(), 7);
+    for (index, diagnostic) in diagnostics.iter().enumerate() {
+        assert_eq!(diagnostic.code, "malformed-subscription-entry");
+        assert_eq!(diagnostic.entry_index, Some(index + 1));
+    }
+    assert_eq!(
+        diagnostics[0].message,
+        "Hysteria2 port hopping aliases conflict"
+    );
+}
+
+#[test]
+fn clash_hysteria2_ports_only_and_ports_with_mport_preserve_identity_and_reuse() {
+    use honk_outbound::runtime::OutboundRuntimeRegistry;
+    use std::sync::Arc;
+
+    let ports_only = parse_clash_subscription(
+        r#"proxies:
+  - name: hy2
+    type: hysteria2
+    server: 127.0.0.1
+    port: 443
+    password: secret
+    ports: ["4000:5000", 6000]
+"#,
+        None,
+    )
+    .unwrap()
+    .remove(0);
+    let with_mport = parse_clash_subscription(
+        r#"proxies:
+  - name: hy2
+    type: hysteria2
+    server: 127.0.0.1
+    port: 443
+    password: secret
+    ports: ["4000:5000", 6000]
+    mport: "6000,4000-5000"
+"#,
+        None,
+    )
+    .unwrap()
+    .remove(0);
+
+    assert_eq!(ports_only.id, with_mport.id);
+    assert_eq!(
+        ports_only.hysteria2().unwrap().port_hopping,
+        with_mport.hysteria2().unwrap().port_hopping
+    );
+    assert_eq!(
+        with_mport.hysteria2().unwrap().port_hopping.as_deref(),
+        Some("4000-5000,6000")
+    );
+    assert_eq!(ports_only.outbound, with_mport.outbound);
+
+    let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&ports_only)).unwrap();
+    let original = first.get(&ports_only.id).unwrap();
+    let (next, reused) =
+        OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&with_mport), 64, Some(&first))
+            .unwrap();
+    assert!(reused.contains(&with_mport.id));
+    assert!(Arc::ptr_eq(&original, &next.get(&with_mport.id).unwrap()));
+}
