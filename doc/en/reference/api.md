@@ -1363,8 +1363,8 @@ Both directories must contain `index.html`. `HONK_DOONA_DIR` is the only require
 
 | Pin in `.github/ci/pins.env` | Value |
 | --- | --- |
-| doona release | `0.1.0-rc.5` |
-| Commit | `6102778700c6cd15908cf2a76be7121d0355da21` |
+| doona release | `0.1.0-rc.7` |
+| Commit | `4e8d50407298bb71338181607ea3f6ede5689124` |
 | Archive checksums | `DOONA_SHA256`, `DOONA_LITE_SHA256` |
 
 From the repository root, run `export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`. The script:
@@ -1379,7 +1379,7 @@ From the repository root, run `export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`. The 
 
 Full release builds include the embedded UI. The lean `-clash-api` and `-native-api` artifacts do not. The binary embeds each edition's own notices, and every full release tarball carries them under `doona/` and `doona-lite/`, respectively.
 
-The release workflow attaches `doona-source-0.1.0-rc.5.tar.gz` to the tag release and to the rolling Debug release. `ci/fetch-doona.sh --source` checks that the tag still points at the pinned commit and generates it with `git archive --format=tar --prefix=doona/ v0.1.0-rc.5 | gzip -n` (GNU gzip). Redistributors of a `native-ui` binary must preserve the notices and provide corresponding source through a method permitted by GPL-3.0 section 6.
+The release workflow attaches `doona-source-0.1.0-rc.7.tar.gz` to the tag release and to the rolling Debug release. `ci/fetch-doona.sh --source` checks that the tag still points at the pinned commit and generates it with `git archive --format=tar --prefix=doona/ v0.1.0-rc.7 | gzip -n` (GNU gzip). Redistributors of a `native-ui` binary must preserve the notices and provide corresponding source through a method permitted by GPL-3.0 section 6.
 
 To reproduce the assets, extract the source archive into its own directory, use Node matching `^22.13.0 || ^24.0.0 || >=26.0.0` and `pnpm@11.15.1`. From the extracted source directory:
 

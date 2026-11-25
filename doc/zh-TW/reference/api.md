@@ -1299,8 +1299,8 @@ geodata owner 存在時，`GET /geodata` 還會報告下面這些欄位：
 
 | `.github/ci/pins.env` 中的固定項 | 值 |
 | --- | --- |
-| doona 版本 | `0.1.0-rc.5` |
-| 提交 | `6102778700c6cd15908cf2a76be7121d0355da21` |
+| doona 版本 | `0.1.0-rc.7` |
+| 提交 | `4e8d50407298bb71338181607ea3f6ede5689124` |
 | 壓縮檔檢查碼 | `DOONA_SHA256`、`DOONA_LITE_SHA256` |
 
 在倉庫根目錄執行 `export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`。指令碼依序執行：
@@ -1315,7 +1315,7 @@ geodata owner 存在時，`GET /geodata` 還會報告下面這些欄位：
 
 完整發行產物包含內嵌 UI，精簡的 `-clash-api` 與 `-native-api` 產物不包含。二進位檔中內嵌兩個版本各自的宣告；每個完整發行壓縮檔也會在 `doona/` 與 `doona-lite/` 目錄中附帶這些檔案。lite 版使用系統字型。
 
-兩個版本共用的 GPL-3.0-only 原始碼，是 doona 標籤 [`v0.1.0-rc.5`](https://github.com/Zakkaus/doona/tree/v0.1.0-rc.5)。發行流程會把 `doona-source-0.1.0-rc.5.tar.gz` 附加到正式標籤發行與滾動 Debug 發行上。這個包由 `ci/fetch-doona.sh --source` 產生：先確認標籤仍指向固定的提交，再執行 `git archive --format=tar --prefix=doona/ v0.1.0-rc.5 | gzip -n`，使用 GNU gzip。
+兩個版本共用的 GPL-3.0-only 原始碼，是 doona 標籤 [`v0.1.0-rc.7`](https://github.com/Zakkaus/doona/tree/v0.1.0-rc.7)。發行流程會把 `doona-source-0.1.0-rc.7.tar.gz` 附加到正式標籤發行與滾動 Debug 發行上。這個包由 `ci/fetch-doona.sh --source` 產生：先確認標籤仍指向固定的提交，再執行 `git archive --format=tar --prefix=doona/ v0.1.0-rc.7 | gzip -n`，使用 GNU gzip。
 
 再散布 `native-ui` 二進位檔時，要保留宣告，並依 GPL-3.0 第 6 條允許的方式提供對應的原始碼。
 
