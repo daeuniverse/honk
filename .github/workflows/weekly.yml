@@ -52,8 +52,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
-          sudo apt-get update
-          sudo apt-get install -y cmake libclang-dev clang llvm zstd
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y cmake libclang-dev clang llvm zstd
       - name: Install geo assets for the geosite tests
         run: |
           set -euo pipefail
@@ -61,11 +61,11 @@ jobs:
           geo_dir="$RUNNER_TEMP/geo-assets"
           mkdir -p "$geo_dir"
           if ! test -f "$geo_dir/geosite.dat"; then
-            curl -fsSL --retry 3 -o "$geo_dir/geosite.dat" \
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$geo_dir/geosite.dat" \
               "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat"
           fi
           if ! test -f "$geo_dir/geoip.dat"; then
-            curl -fsSL --retry 3 -o "$geo_dir/geoip.dat" \
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$geo_dir/geoip.dat" \
               "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat"
           fi
           echo "$GEOSITE_SHA256  $geo_dir/geosite.dat" | sha256sum -c -
@@ -76,7 +76,7 @@ jobs:
         run: |
           set -euo pipefail
           source .github/ci/pins.env
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
             "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
           echo "$BPF_LINKER_SHA256  $RUNNER_TEMP/bpf-linker.tar.zst" | sha256sum -c -
           zstd -dc "$RUNNER_TEMP/bpf-linker.tar.zst" | tar -xf - -C "$CARGO_HOME/bin"
@@ -122,17 +122,17 @@ jobs:
         run: |
           set -euo pipefail
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
-          sudo apt-get update
-          sudo apt-get install -y cmake libclang-dev unzip
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y cmake libclang-dev unzip
       - name: Install pinned official Xray prerelease and sing-box
         run: |
           set -euo pipefail
           source .github/ci/pins.env
           tools="$RUNNER_TEMP/public-vless-interop"
           mkdir -p "$tools"
-          curl -fsSL --retry 3 -o "$tools/Xray-linux-64.zip" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$tools/Xray-linux-64.zip" \
             "https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-64.zip"
-          curl -fsSL --retry 3 -o "$tools/sing-box.tar.gz" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$tools/sing-box.tar.gz" \
             "https://github.com/SagerNet/sing-box/releases/download/v$SING_BOX_VERSION/sing-box-$SING_BOX_VERSION-linux-amd64-musl.tar.gz"
           echo "$XRAY_SHA256  $tools/Xray-linux-64.zip" | sha256sum -c -
           echo "$SING_BOX_SHA256  $tools/sing-box.tar.gz" | sha256sum -c -
@@ -194,7 +194,7 @@ jobs:
           trap 'rm -rf "$downloads"' EXIT
           fetch() {
             local url=$1 sha256=$2 name=$3
-            curl -fsSL --retry 3 --retry-all-errors -H 'Cache-Control: no-cache' -o "$downloads/$name" "$url"
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -H 'Cache-Control: no-cache' -o "$downloads/$name" "$url"
             printf '%s  %s\n' "$sha256" "$downloads/$name" | sha256sum -c -
           }
           fetch "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat" "$GEOSITE_SHA256" geosite.dat
@@ -254,8 +254,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
-          sudo apt-get update
-          sudo apt-get install -y clang
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y clang
           source .github/ci/pins.env
           cargo +"$FUZZ_NIGHTLY" install --locked "cargo-fuzz@$CARGO_FUZZ_VERSION"
           rustc +"$FUZZ_NIGHTLY" -V | tee -a "$GITHUB_STEP_SUMMARY"

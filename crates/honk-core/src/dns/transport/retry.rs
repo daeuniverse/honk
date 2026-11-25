@@ -256,8 +256,16 @@ mod tests {
         }
     }
 
+    // tracing caches each callsite's interest process-wide; a callsite another
+    // test thread registers while this subscriber is being installed can stay
+    // disabled for it. Only this test runs in the child.
     #[tokio::test]
     async fn failed_exchange_records_reset_before_successful_retry() {
+        const NAME: &str =
+            "dns::transport::retry::tests::failed_exchange_records_reset_before_successful_retry";
+        if crate::test_support::run_exact_in_child("HONK_DNS_RETRY_LOG_CHILD", NAME) {
+            return;
+        }
         let before = crate::stats::dns_snapshot();
         let calls = AtomicUsize::new(0);
         let resets = AtomicUsize::new(0);

@@ -2742,11 +2742,14 @@ async fn pinned_custom_check_url_automatic_group_probes_and_recovers_pin_only() 
 
     // Start the health loop and advance past initial stagger jitter while unpinned
     // so the next periodic tick is 3600s away (cannot mask immediate pin wakes).
+    // The loop schedules its first tick when first polled, so let it run before
+    // advancing; otherwise the jittered tick can land inside the waits below.
     let loop_task = alive.spawn_health_check_loop_concurrent(
         Duration::from_secs(3600),
         Duration::from_secs(1),
         2,
     );
+    tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(6)).await;
     tokio::task::yield_now().await;
     assert!(calls.lock().is_empty());
