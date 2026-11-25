@@ -243,8 +243,9 @@ new input, and flush pending writes whenever input becomes idle. Each direction
 starts with an 8 KiB buffer. The first read that fills it marks a bulk flow, and
 that direction then uses a 65,535-byte buffer. Saturated reads therefore fit one
 maximum AnyTLS frame instead of fragmenting into 8 KiB writes or leaving a
-one-byte tail; only the first frame is small. Idle and chatty flows never grow,
-so a held connection costs 16 KiB of copy buffers instead of 128 KiB. Buffering never
+one-byte tail; only the first frame is small. Expanded directions shrink in place to 8 KiB
+after 60–120 s with no reads and writes flushed (re-expanding on a full read) and drop the
+buffer on EOF before drain; idle and chatty flows settle at 16 KiB, not 128 KiB. Buffering never
 requires the application to send another request or close before its current request leaves.
 
 The copy relay starts a 30-second idle window at the first source EOF, before the final flush and write-side shutdown. It samples copy progress every 100 ms but measures idle time with a monotonic clock. If polling is delayed past the deadline, the next poll ends the drain unless it observes a nonempty read or a destination-accepted write. Either renews the window; activity inside a pending transport flush does not. On expiry the totals include only destination-accepted bytes, and cleanup does not wait again for graceful shutdown. Native splice keeps its existing half-close and idle-drain policy.
