@@ -718,7 +718,7 @@ def config_file(state, workers, static=STATIC, project=True, *, dns_projection=T
 dns {{
     bind: ''
     optimistic_cache: false
-    upstream {{ default: 'udp://10.77.0.2:15353' }}
+    upstream {{ default: 'udp://10.77.0.2:15353' -> direct }}
 }}
 datapath {{
     backend: xdp
