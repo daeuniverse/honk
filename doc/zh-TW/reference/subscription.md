@@ -288,13 +288,15 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 
 | 協定 | 匯入的選項 |
 | --- | --- |
-| Hysteria2 | `password`/`auth`，以及 `obfs: salamander` 與 `obfs-password`。支援上傳/下載頻寬、`ports`/`mport` 跳躍埠範圍、`hop-interval`/`mhop`、接收視窗、MTU 與 MTU 探索設定。 |
+| Hysteria2 | `password`/`auth`，以及 `obfs: salamander` 與 `obfs-password`。支援上傳/下載頻寬、`ports`/`mport`/`port-hopping`/`port_hopping` 跳躍埠範圍、`hop-interval`/`mhop`、接收視窗、MTU 與 MTU 探索設定。 |
 | TUIC | UUID/密碼、擁塞控制、ALPN、接收視窗、MTU。 |
 | AnyTLS | `idle-session-check-interval`、`idle-session-timeout`、`min-idle-session`。 |
 
 明確關閉的 feature block 按停用處理，honk 不會把它當成已啟用的不支援的 feature。原生支援 UDP 的協定接受 `udp: true`；VMess 沒有 UDP 路徑，honk 忽略這個宣告，節點仍按 TCP 匯入。節點模型保留不了明確 UDP 限制時，honk 拒絕匯入。
 
 TUIC 允許省略密碼或使用空密碼。Hysteria2 和 Juicity 接受與執行時固定選擇一致的 `h3` ALPN。
+
+Hysteria2 埠跳躍別名按 `ports`、`mport`、`port-hopping`、`port_hopping` 的順序解析。null、空字串或純空白文字，以及空陣列不提供宣告。已提供的字串、有限數字或陣列會把範圍分隔符 `:` 正規化為 `-`，再按標準的非零埠集合比較，因此 `["4000:5000", 6000]` 與 `6000,4000-5000` 或相鄰區間這類等價寫法會視為一致，並保留第一個非空別名的正規化寫法。範圍衝突，或者任意別名無效、正規化後為空或包含重複埠時，即使同時存在有效別名，條目也會被拒絕。
 
 Juicity 的流接收視窗和連線接收視窗初始都是 8 MiB，自適應流控可以分別把它們調高到最多 32 MiB。匯入時的初始視窗欄位接受缺失、`0` 或 `8388608`，其他覆寫值拒絕。
 
