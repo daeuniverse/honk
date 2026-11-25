@@ -27,7 +27,7 @@ mkdir -p "$log_dir"
 # A hung gate prints nothing before the step timeout; record every task's
 # state and kernel stack first so the uploaded guest output shows where.
 (
-  sleep 1500
+  sleep 2100
   echo 1 > /proc/sys/kernel/sysrq
   echo t > /proc/sysrq-trigger
   dmesg > "$log_dir/hang-dmesg.txt"
@@ -36,7 +36,7 @@ mkdir -p "$log_dir"
 watchdog=$!
 # vng waits for the console to close, so the watchdog and its sleep must not
 # hold it or outlive the gate.
-trap 'pkill -P "$watchdog" 2>/dev/null; kill "$watchdog" 2>/dev/null || true' EXIT
+trap 'pkill -P "$watchdog" 2>/dev/null || true; kill "$watchdog" 2>/dev/null || true' EXIT
 
 "$HONK_CORE_TEST_BIN" ebpf::real::tests --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-core-real.log"
