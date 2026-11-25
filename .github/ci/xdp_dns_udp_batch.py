@@ -173,8 +173,11 @@ def trace(offsets, cpu, nonce, sport, port, ifindex):
         (instance / 'buffer_size_kb').write_text('64')
 
         def register(text):
-            with (root / 'kprobe_events').open('a') as events:
-                events.write(text + '\n')
+            command = (text + '\n').encode()
+            # tracefs takes one command per write and rejects seeking to the end.
+            with os.fdopen(os.open(root / 'kprobe_events', os.O_WRONLY), 'wb', buffering=0) as events:
+                if events.write(command) != len(command):
+                    raise OSError('short kprobe_events command')
 
         for kind, name, symbol, args in definitions:
             event_name = f'{group}_{name}'
@@ -235,9 +238,14 @@ def main():
             assert all(re.search(rf'^{name}:\s+1\s*$', settings, re.M) for name in ('RX', 'TX')), (ns, interface, settings)
         cpu = min(os.sched_getaffinity(0))
         os.sched_setaffinity(0, {cpu})
-        before = batch_features()
-        result = trace(json.loads(sys.argv[5]), cpu, nonce, sport, port, ifindex)
-        after = batch_features()
+        tx_checksum = ['ip', 'netns', 'exec', 'client', 'ethtool', '-K', 'c0', 'tx-checksum-ip-generic']
+        try:
+            subprocess.run([*tx_checksum, 'on', 'gso', 'off'], check=True, timeout=3)
+            before = batch_features()
+            result = trace(json.loads(sys.argv[5]), cpu, nonce, sport, port, ifindex)
+            after = batch_features()
+        finally:
+            subprocess.run([*tx_checksum, 'off'], check=True, timeout=3)
         result['offloads'] = {'before': before, 'after': after}
     else:
         result = dict(delivery=exchange(sport, port, nonce, False))

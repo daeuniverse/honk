@@ -425,8 +425,6 @@ run_dns_udp_batch_test() (
         exit "$status"' EXIT
     dns_wire_channels 1 server
     ip netns exec dut ethtool -K dut0 gro on
-    ip netns exec client ethtool -K c0 tx-checksum-ip-generic on gso off
-    [[ $(dns_udp_batch_tx_checksum) == on ]] || fail 'batch fixture needs client TX checksum for UDP_SEGMENT'
     ip netns exec dut nft -f - <<'NFT'
 table inet honk_dns_udp_batch {
     chain forward {
