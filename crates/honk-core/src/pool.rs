@@ -1025,7 +1025,6 @@ mod tests {
     #[tokio::test]
     async fn live_bare_check_prunes_expired_entry_for_repin() {
         let mut pool = ConnectionPool::new();
-        pool.idle_timeout = Duration::from_millis(20);
         let addr = spawn_hold_open_listener().await.to_string();
 
         let first = TcpStream::connect(&addr).await.unwrap();
@@ -1034,11 +1033,15 @@ mod tests {
         assert_eq!(pool.ready_metrics().entries, 1);
         pool.check_invariants();
 
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Expire the entry by shrinking the TTL rather than racing a short
+        // one, so a slow runner cannot expire it before the first check.
+        pool.idle_timeout = Duration::ZERO;
+        tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(!pool.has_live_bare_entry(&addr));
         assert_eq!(pool.ready_metrics().entries, 0);
         pool.check_invariants();
 
+        pool.idle_timeout = DEFAULT_IDLE_TIMEOUT;
         let replacement = TcpStream::connect(&addr).await.unwrap();
         pool.deposit_tcp(&addr, replacement).await;
         assert!(pool.has_live_bare_entry(&addr));
