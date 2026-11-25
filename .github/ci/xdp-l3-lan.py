@@ -667,11 +667,25 @@ def offload(artifacts, state):
         record('observed-skb', protocol=protocol, wireguard_ingress=gro, internal_tun_xmit=tun_tx, wireguard_xmit=wg_tx)
 
 
+@contextlib.contextmanager
+def udp_gro_window():
+    # Keep freshly decrypted segments eligible for GRO across WireGuard NAPI polls.
+    path = f'/sys/class/net/{OUTER}/gro_flush_timeout'
+    previous = inside('dut', 'cat', path)
+    try:
+        inside('dut', 'tee', path, input='200000\n')
+        assert int(inside('dut', 'cat', path)) == 200000
+        yield
+    finally:
+        inside('dut', 'tee', path, input=previous)
+        assert inside('dut', 'cat', path) == previous
+
+
 def udp_offload(artifacts, state, address, route):
     version = 6 if ':' in address else 4
     protocol = 0x86dd if version == 6 else 0x0800
     headers = (40 if version == 6 else 20) + 8
-    with observe_ingress(address, artifacts / f'udp-ingress-{version}-{route}.json') as ingress:
+    with udp_gro_window(), observe_ingress(address, artifacts / f'udp-ingress-{version}-{route}.json') as ingress:
         with trace_guest(state, [('net_dev_start_xmit', (INNER,))]) as trace:
             try:
                 flow = trial(f'wireguard-udp-segment-{route}', 'wgpeer', address, socket.SOCK_DGRAM, route, segmented=True)
