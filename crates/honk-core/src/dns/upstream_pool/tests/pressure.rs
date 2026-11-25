@@ -252,13 +252,15 @@ async fn borrowed_udp_completion_releases_blocked_query() {
     .await;
 }
 
+// On one thread, a_task counts the pool references before the receive task
+// resumes from its yield, so the receive task holds the last reference.
 #[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn receive_task_last_arc_releases_blocked_creator() {
     stall_guard(async {
-        let a_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let a_address = a_socket.local_addr().unwrap();
-        drop(a_socket);
+        // A privileged port no test binds; a freed ephemeral port can be
+        // taken by another test's echo server, which then answers.
+        let a_address: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let (b_address, b_server) = spawn_udp_echo(1).await;
         let budget = DnsSocketBudget::new(1);
         let pool = Arc::new(
