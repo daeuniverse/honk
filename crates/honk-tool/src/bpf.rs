@@ -1,8 +1,11 @@
-//! `honk-tool bpf` — quick reads of the running engine's pinned eBPF maps.
+//! `honk-tool bpf` — quick reads and cross-map flow correlation of the running
+//! engine's pinned eBPF maps.
 //!
 //! Maps live at `<pin-root>/<NAME>` (default `/sys/fs/bpf`).  These commands
 //! open them via raw `bpf(2)` calls and decode the wire structs — no aya, no
 //! program loading, no attach.
+
+mod lookup;
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -319,6 +322,9 @@ pub struct BpfArgs {
 pub enum BpfCommand {
     /// Dump (or point-query) entries of a pinned map.
     Show(ShowArgs),
+    /// Correlate domain-routing, conn-state, redirect-track, and routing-handoff
+    /// entries for an IP or 5-tuple and explain kernel disposition.
+    Lookup(lookup::LookupArgs),
     /// OUTBOUND_STATS per-outbound counters + conn-state occupancy + overflow.
     Stats(StatsArgs),
 }
@@ -348,6 +354,7 @@ pub struct StatsArgs {
 pub async fn run(args: BpfArgs) -> anyhow::Result<()> {
     match args.command {
         BpfCommand::Show(a) => show(a),
+        BpfCommand::Lookup(a) => lookup::run(a),
         BpfCommand::Stats(a) => stats(a),
     }
 }
@@ -439,14 +446,20 @@ fn query_map_layout(
     check_map_layout(map_name, info, kind, key_size, value_size)
 }
 
-fn open_domain_map(pin_root: &Path) -> anyhow::Result<OwnedFd> {
+fn open_domain_policy(
+    pin_root: &Path,
+) -> anyhow::Result<Option<(RoutingPolicyDescriptor, OwnedFd)>> {
     let root = unsafe { OwnedFd::from_raw_fd(open(pin_root, ROUTING_POLICY_ROOT_NAME)?) };
     query_map_layout(root.as_raw_fd(), ROUTING_POLICY_ROOT_NAME, 12, 4, 4)?;
     let key = 0u32.to_ne_bytes();
     // A generation can retire between reading its ID and acquiring an FD.
     for _ in 0..3 {
-        let descriptor_id = read_value::<u32>(root.as_raw_fd(), &key)?
-            .context("no routing policy has been published")?;
+        let Some(descriptor_id) = read_value::<u32>(root.as_raw_fd(), &key)? else {
+            return Ok(None);
+        };
+        if descriptor_id == 0 {
+            return Ok(None);
+        }
         let descriptor = match map_by_id(descriptor_id) {
             Ok(fd) => fd,
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
@@ -473,9 +486,33 @@ fn open_domain_map(pin_root: &Path) -> anyhow::Result<OwnedFd> {
             16,
             std::mem::size_of::<DomainRouting>() as u32,
         )?;
-        return Ok(domain);
+        return Ok(Some((policy, domain)));
     }
     anyhow::bail!("routing changed while opening the domain map; retry the command")
+}
+
+fn open_domain_map(pin_root: &Path) -> anyhow::Result<OwnedFd> {
+    open_domain_policy(pin_root)?
+        .context("no routing policy has been published")
+        .map(|(_, domain)| domain)
+}
+
+fn try_open_domain_policy(
+    pin_root: &Path,
+) -> anyhow::Result<Option<(RoutingPolicyDescriptor, OwnedFd)>> {
+    match open_domain_policy(pin_root) {
+        Ok(policy) => Ok(policy),
+        Err(error)
+            if error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<io::Error>())
+                .and_then(io::Error::raw_os_error)
+                == Some(libc::ENOENT) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn matches_ip(key: &TuplesKey, ip: &Option<IpAddr>) -> bool {
@@ -506,8 +543,8 @@ fn batch_error(error: BatchError, elem_flags: u64) -> io::Error {
     }
 }
 
-fn flow_entries<K: Copy, V: Copy>(args: &ShowArgs, name: &str) -> anyhow::Result<Vec<(K, V)>> {
-    let fd = open(&args.pin_root, name)?;
+fn flow_entries<K: Copy, V: Copy>(pin_root: &Path, name: &str) -> anyhow::Result<Vec<(K, V)>> {
+    let fd = open(pin_root, name)?;
     let (key_len, value_len) = (
         std::mem::size_of::<K>(),
         std::mem::size_of::<FlowMapValue<V>>(),
@@ -548,7 +585,7 @@ fn flow_entries<K: Copy, V: Copy>(args: &ShowArgs, name: &str) -> anyhow::Result
 fn show(args: ShowArgs) -> anyhow::Result<()> {
     match args.map.as_str() {
         "conn-state" => {
-            let entries = flow_entries::<TuplesKey, ConnState>(&args, "CONN_STATE_MAP")?;
+            let entries = flow_entries::<TuplesKey, ConnState>(&args.pin_root, "CONN_STATE_MAP")?;
             let mut shown = 0usize;
             for (k, v) in &entries {
                 if !matches_ip(k, &args.ip) || (args.limit > 0 && shown >= args.limit) {
@@ -573,7 +610,8 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
             println!("-- {shown}/{} entries", entries.len());
         }
         "redirect-track" => {
-            let entries = flow_entries::<RedirectTuple, RedirectEntry>(&args, "REDIRECT_TRACK")?;
+            let entries =
+                flow_entries::<RedirectTuple, RedirectEntry>(&args.pin_root, "REDIRECT_TRACK")?;
             let mut shown = 0usize;
             for (k, v) in &entries {
                 if let Some(want) = &args.ip
@@ -624,8 +662,10 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
             println!("-- {shown}/{} entries", entries.len());
         }
         "routing-handoff" => {
-            let entries =
-                flow_entries::<TuplesKey, RoutingHandoffEntry>(&args, "ROUTING_HANDOFF_MAP")?;
+            let entries = flow_entries::<TuplesKey, RoutingHandoffEntry>(
+                &args.pin_root,
+                "ROUTING_HANDOFF_MAP",
+            )?;
             let mut shown = 0usize;
             for (k, v) in &entries {
                 if !matches_ip(k, &args.ip) || (args.limit > 0 && shown >= args.limit) {

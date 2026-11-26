@@ -405,3 +405,581 @@ fn sums_packed_outbound_counters_across_cpus() {
     assert_eq!(total.rx_packets, 10);
     assert_eq!(total.rx_bytes, 120);
 }
+
+fn tuple_wire(src: IpAddr, sport: u16, dst: IpAddr, dport: u16, l4proto: u8) -> [u8; 40] {
+    let mut out = [0u8; 40];
+    out[0..16].copy_from_slice(&lookup::encode_ip_key(src));
+    out[16..32].copy_from_slice(&lookup::encode_ip_key(dst));
+    out[32..34].copy_from_slice(&sport.to_ne_bytes());
+    out[34..36].copy_from_slice(&dport.to_ne_bytes());
+    out[36] = l4proto;
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conn_wire(
+    wan_ingress: u8,
+    state: u8,
+    syn_flags: u16,
+    token: u32,
+    meta_flags: u64,
+    outbound: u8,
+    mark: u32,
+    must: u8,
+    dscp: u8,
+    pname: &[u8],
+    pid: u32,
+    trace_id: u32,
+    incarnation: u64,
+) -> [u8; 80] {
+    let mut wire = [0u8; 80];
+    wire[0..8].fill(0xa5);
+    let p = &mut wire[8..80];
+    p[0] = wan_ingress;
+    p[1] = state;
+    p[2..4].copy_from_slice(&syn_flags.to_ne_bytes());
+    p[4..8].copy_from_slice(&token.to_ne_bytes());
+    p[8..16].copy_from_slice(&9000u64.to_ne_bytes());
+    let mut meta_bytes = meta_flags.to_ne_bytes();
+    meta_bytes[0] = outbound;
+    meta_bytes[1..5].copy_from_slice(&mark.to_ne_bytes());
+    meta_bytes[5] = must;
+    meta_bytes[6] = dscp;
+    p[16..24].copy_from_slice(&meta_bytes);
+    let copy_len = pname.len().min(16);
+    p[32..32 + copy_len].copy_from_slice(&pname[..copy_len]);
+    p[48..52].copy_from_slice(&pid.to_ne_bytes());
+    p[52..56].copy_from_slice(&trace_id.to_ne_bytes());
+    p[56..64].copy_from_slice(&incarnation.to_ne_bytes());
+    wire
+}
+
+fn redirect_wire(
+    from_wan: u8,
+    outbound: u8,
+    ifindex: u32,
+    token: u32,
+    incarnation: u64,
+) -> [u8; 48] {
+    let mut wire = [0u8; 48];
+    wire[0..8].fill(0x5a);
+    let p = &mut wire[8..48];
+    p[0..8].copy_from_slice(&9100u64.to_ne_bytes());
+    p[20] = from_wan;
+    p[21] = outbound;
+    p[24..28].copy_from_slice(&ifindex.to_ne_bytes());
+    p[28..32].copy_from_slice(&token.to_ne_bytes());
+    p[32..40].copy_from_slice(&incarnation.to_ne_bytes());
+    wire
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handoff_wire(
+    outbound: u8,
+    mark: u32,
+    must: u8,
+    dscp: u8,
+    pname: &[u8],
+    pid: u32,
+    token: u32,
+    generation: u64,
+    trace_id: u32,
+    incarnation: u64,
+) -> [u8; 80] {
+    let mut wire = [0u8; 80];
+    wire[0..8].fill(0x3c);
+    let p = &mut wire[8..80];
+    p[0..8].copy_from_slice(&9200u64.to_ne_bytes());
+    p[8..12].copy_from_slice(&mark.to_ne_bytes());
+    p[12] = must;
+    p[19] = outbound;
+    let copy_len = pname.len().min(16);
+    p[20..20 + copy_len].copy_from_slice(&pname[..copy_len]);
+    p[36..40].copy_from_slice(&pid.to_ne_bytes());
+    p[40] = dscp;
+    p[44..48].copy_from_slice(&token.to_ne_bytes());
+    p[48..56].copy_from_slice(&generation.to_ne_bytes());
+    p[56..60].copy_from_slice(&trace_id.to_ne_bytes());
+    p[64..72].copy_from_slice(&incarnation.to_ne_bytes());
+    wire
+}
+
+fn domain_bitmap_wire(bits: &[u32]) -> [u8; 32] {
+    let mut words = [0u32; 8];
+    for &b in bits {
+        words[(b / 32) as usize] |= 1u32 << (b % 32);
+    }
+    let mut out = [0u8; 32];
+    for (i, w) in words.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes());
+    }
+    out
+}
+
+#[test]
+fn correlates_native_direct_offload_and_multiword_domain_predicates_ignoring_lock_bytes() {
+    use honk_ebpf_common::{ROUTING_META_FLAG_OFFLOAD, ROUTING_META_FLAG_PUBLISHED};
+
+    let src: IpAddr = "192.168.1.10".parse().unwrap();
+    let dst: IpAddr = "172.217.75.94".parse().unwrap();
+    let key = tuple_wire(src, 51234, dst, 443, libc::IPPROTO_TCP as u8);
+    let conn = conn_wire(
+        0,
+        0,
+        0,
+        0,
+        ROUTING_META_FLAG_PUBLISHED | ROUTING_META_FLAG_OFFLOAD,
+        0,
+        0x200,
+        0,
+        0,
+        b"curl\0trailing",
+        4242,
+        0,
+        11,
+    );
+    let domain_entries = [(
+        lookup::encode_ip_key(dst),
+        domain_bitmap_wire(&[0, 65, 255]),
+    )];
+    let descriptor = RoutingPolicyDescriptor {
+        slot: 1,
+        features: 3,
+        generation: 19,
+        domain_map_id: 77,
+        trace_policy: 0,
+    };
+
+    let filter = lookup::FlowFilter {
+        ip: Some(dst),
+        ..Default::default()
+    };
+    let report = lookup::correlate_wire_records(
+        &filter,
+        lookup::DomainSnapshot::Published {
+            descriptor,
+            entries: &domain_entries,
+        },
+        &[(key, conn)],
+        &[],
+        &[],
+    );
+
+    assert!(report.policy_published);
+    assert_eq!(report.policy_generation, Some(19));
+    assert_eq!(
+        report.domain_lookups,
+        vec![lookup::DomainIpCorrelation {
+            ip: dst,
+            state: lookup::DomainEntryState::Matched(vec![0, 65, 255]),
+        }]
+    );
+    assert_eq!(report.flows.len(), 1);
+    let flow = &report.flows[0];
+    assert_eq!(flow.disposition, "native_direct_offload");
+    assert!(flow.anomalies.is_empty());
+    assert_eq!(flow.conn_state.as_ref().unwrap().pname, "curl");
+    assert_eq!(flow.conn_state.as_ref().unwrap().mark, 0x200);
+
+    let json = lookup::render_json(&report);
+    assert!(
+        json.contains(r#""disposition":"native_direct_offload""#),
+        "{json}"
+    );
+    assert!(json.contains(r#""predicates":[0,65,255]"#), "{json}");
+}
+
+#[test]
+fn distinguishes_known_zero_absent_and_unpublished_domain_states_and_sip_dst_lookup() {
+    use honk_ebpf_common::ROUTING_META_FLAG_PUBLISHED;
+    use honk_ebpf_common::conn::TCP_SYN_ORIGINAL_INTERCEPT;
+
+    let sip: IpAddr = "192.168.1.10".parse().unwrap();
+    let dst_zero: IpAddr = "172.217.75.94".parse().unwrap();
+    let dst_absent: IpAddr = "2001:db8::9".parse().unwrap();
+
+    let key1 = tuple_wire(sip, 50001, dst_zero, 443, libc::IPPROTO_TCP as u8);
+    let key2 = tuple_wire(sip, 50002, dst_absent, 443, libc::IPPROTO_TCP as u8);
+    let conn1 = conn_wire(
+        0,
+        0,
+        TCP_SYN_ORIGINAL_INTERCEPT,
+        0,
+        ROUTING_META_FLAG_PUBLISHED,
+        2,
+        0,
+        0,
+        0,
+        b"",
+        0,
+        7,
+        55,
+    );
+    let redir1 = redirect_wire(0, 2, 4, 0, 55);
+    let handoff1 = handoff_wire(2, 0, 0, 0, b"", 0, 0, 12, 7, 55);
+
+    let domain_entries = [(lookup::encode_ip_key(dst_zero), [0u8; 32])];
+    let descriptor = RoutingPolicyDescriptor {
+        slot: 0,
+        features: 1,
+        generation: 12,
+        domain_map_id: 9,
+        trace_policy: 0,
+    };
+
+    let report = lookup::correlate_wire_records(
+        &lookup::FlowFilter {
+            sip: Some(sip),
+            ..Default::default()
+        },
+        lookup::DomainSnapshot::Published {
+            descriptor,
+            entries: &domain_entries,
+        },
+        &[(key1, conn1), (key2, conn1)],
+        &[(key1, redir1), (key2, redir1)],
+        &[(key1, handoff1), (key2, handoff1)],
+    );
+    assert_eq!(report.flows.len(), 2);
+    assert_eq!(report.flows[0].disposition, "userspace_proxy");
+    assert!(report.flows[0].anomalies.is_empty());
+    assert_eq!(
+        report.domain_lookups,
+        vec![
+            lookup::DomainIpCorrelation {
+                ip: dst_zero,
+                state: lookup::DomainEntryState::KnownZero,
+            },
+            lookup::DomainIpCorrelation {
+                ip: dst_absent,
+                state: lookup::DomainEntryState::Absent,
+            },
+        ]
+    );
+
+    let unpublished = lookup::correlate_wire_records(
+        &lookup::FlowFilter {
+            dip: Some(dst_zero),
+            ..Default::default()
+        },
+        lookup::DomainSnapshot::Unpublished,
+        &[(key1, conn1)],
+        &[(key1, redir1)],
+        &[(key1, handoff1)],
+    );
+    assert!(!unpublished.policy_published);
+    assert_eq!(
+        unpublished.domain_lookups[0].state,
+        lookup::DomainEntryState::Unpublished
+    );
+    assert_eq!(unpublished.flows[0].disposition, "userspace_proxy");
+
+    let empty_flows = lookup::correlate_wire_records(
+        &lookup::FlowFilter {
+            dip: Some(dst_zero),
+            dport: Some(8443),
+            ..Default::default()
+        },
+        lookup::DomainSnapshot::Published {
+            descriptor,
+            entries: &domain_entries,
+        },
+        &[(key1, conn1)],
+        &[],
+        &[],
+    );
+    assert!(empty_flows.flows.is_empty());
+    assert_eq!(
+        empty_flows.domain_lookups[0].state,
+        lookup::DomainEntryState::KnownZero
+    );
+    assert!(lookup::render_json(&empty_flows).contains(r#""disposition":"no_flow_state""#));
+}
+
+#[test]
+fn detects_nfqueue_pending_token_mismatch_and_tcp_intercept_anomalies() {
+    use honk_ebpf_common::ROUTING_META_FLAG_PUBLISHED;
+    use honk_ebpf_common::conn::{TCP_SYN_ORIGINAL_INTERCEPT, UdpDecisionState};
+
+    let sip: IpAddr = "10.0.0.2".parse().unwrap();
+    let dip: IpAddr = "1.1.1.1".parse().unwrap();
+    let udp_key = tuple_wire(sip, 53001, dip, 443, libc::IPPROTO_UDP as u8);
+    let token = 0x1000_002a;
+    let udp_conn = conn_wire(
+        0,
+        UdpDecisionState::Pending as u8,
+        0,
+        token,
+        ROUTING_META_FLAG_PUBLISHED,
+        0xfd,
+        0,
+        0,
+        0,
+        b"",
+        0,
+        3,
+        99,
+    );
+    let udp_redir = redirect_wire(0, 0xfd, 2, token, 99);
+    let udp_handoff_ok = handoff_wire(0xfd, 0, 0, 0, b"", 0, token, 5, 3, 99);
+
+    let ok_report = lookup::correlate_wire_records(
+        &lookup::FlowFilter {
+            dip: Some(dip),
+            ..Default::default()
+        },
+        lookup::DomainSnapshot::Unpublished,
+        &[(udp_key, udp_conn)],
+        &[(udp_key, udp_redir)],
+        &[(udp_key, udp_handoff_ok)],
+    );
+    assert_eq!(ok_report.flows[0].disposition, "nfqueue_pending");
+    assert!(ok_report.flows[0].anomalies.is_empty());
+
+    let bad_handoff = handoff_wire(0xfd, 0, 0, 0, b"", 0, token + 1, 5, 3, 99);
+    let bad_udp = lookup::correlate_wire_records(
+        &lookup::FlowFilter {
+            dip: Some(dip),
+            ..Default::default()
+        },
+        lookup::DomainSnapshot::Unpublished,
+        &[(udp_key, udp_conn)],
+        &[],
+        &[(udp_key, bad_handoff)],
+    );
+    assert_eq!(
+        bad_udp.flows[0].anomalies,
+        vec!["token_mismatch", "missing_redirect_track"]
+    );
+
+    let tcp_key = tuple_wire(sip, 53002, dip, 443, libc::IPPROTO_TCP as u8);
+    let tcp_conn = conn_wire(
+        0,
+        0,
+        TCP_SYN_ORIGINAL_INTERCEPT,
+        0,
+        ROUTING_META_FLAG_PUBLISHED,
+        0xfd,
+        0,
+        0,
+        0,
+        b"",
+        0,
+        4,
+        8,
+    );
+    let stale_redir = redirect_wire(0, 0xfd, 2, 0, 7);
+    let bad_tcp = lookup::correlate_wire_records(
+        &lookup::FlowFilter {
+            dip: Some(dip),
+            proto: Some(lookup::BpfProto::Tcp),
+            ..Default::default()
+        },
+        lookup::DomainSnapshot::Unpublished,
+        &[(tcp_key, tcp_conn)],
+        &[(tcp_key, stale_redir)],
+        &[],
+    );
+    assert_eq!(
+        bad_tcp.flows[0].disposition,
+        "userspace_control_plane_routing"
+    );
+    assert_eq!(
+        bad_tcp.flows[0].anomalies,
+        vec!["incarnation_mismatch", "missing_routing_handoff"]
+    );
+}
+
+#[test]
+fn classifies_reverse_bypass_drop_marked_direct_and_stateless_udp() {
+    use honk_ebpf_common::conn::UdpDecisionState;
+    use honk_ebpf_common::{ROUTING_META_FLAG_PUBLISHED, ROUTING_META_FLAG_WAN_USERSPACE};
+
+    let sip: IpAddr = "10.0.0.2".parse().unwrap();
+    let dip: IpAddr = "8.8.4.4".parse().unwrap();
+
+    let k_rev = tuple_wire(sip, 40000, dip, 443, libc::IPPROTO_UDP as u8);
+    let c_rev = conn_wire(
+        1,
+        0,
+        0,
+        0,
+        ROUTING_META_FLAG_PUBLISHED,
+        2,
+        0,
+        0,
+        0,
+        b"",
+        0,
+        0,
+        1,
+    );
+
+    let k_abort = tuple_wire(sip, 40001, dip, 443, libc::IPPROTO_UDP as u8);
+    let c_abort = conn_wire(
+        0,
+        UdpDecisionState::Aborted as u8,
+        0,
+        5,
+        0,
+        0,
+        0,
+        0,
+        0,
+        b"",
+        0,
+        0,
+        2,
+    );
+
+    let k_wan_mark = tuple_wire(sip, 40002, dip, 443, libc::IPPROTO_UDP as u8);
+    let c_wan_mark = conn_wire(
+        0,
+        UdpDecisionState::None as u8,
+        0,
+        0,
+        ROUTING_META_FLAG_PUBLISHED | ROUTING_META_FLAG_WAN_USERSPACE,
+        0,
+        0x10,
+        1,
+        0,
+        b"",
+        0,
+        0,
+        3,
+    );
+
+    let k_drop = tuple_wire(sip, 40003, dip, 443, libc::IPPROTO_TCP as u8);
+    let c_drop = conn_wire(
+        0,
+        0,
+        0,
+        0,
+        ROUTING_META_FLAG_PUBLISHED,
+        1,
+        0,
+        0,
+        0,
+        b"",
+        0,
+        0,
+        4,
+    );
+
+    let k_dns = tuple_wire(sip, 40004, dip, 53, libc::IPPROTO_UDP as u8);
+    let h_dns = handoff_wire(0xfd, 0, 0, 0, b"", 0, 0, 9, 0, 0);
+
+    let report = lookup::correlate_wire_records(
+        &lookup::FlowFilter {
+            dip: Some(dip),
+            ..Default::default()
+        },
+        lookup::DomainSnapshot::Unpublished,
+        &[
+            (k_rev, c_rev),
+            (k_abort, c_abort),
+            (k_wan_mark, c_wan_mark),
+            (k_drop, c_drop),
+        ],
+        &[],
+        &[(k_dns, h_dns)],
+    );
+    let by_sport: std::collections::BTreeMap<u16, &str> = report
+        .flows
+        .iter()
+        .map(|f| (f.tuple.src_port, f.disposition))
+        .collect();
+    assert_eq!(by_sport[&40000], "reverse_bypass");
+    assert_eq!(by_sport[&40001], "udp_aborted");
+    assert_eq!(by_sport[&40002], "userspace_marked_direct");
+    assert_eq!(by_sport[&40003], "kernel_drop_block");
+    assert_eq!(by_sport[&40004], "stateless_userspace_udp");
+}
+
+#[test]
+fn canonicalizes_ipv4_mapped_ipv6_selectors_across_flows_and_domain_routing() {
+    use honk_ebpf_common::{ROUTING_META_FLAG_OFFLOAD, ROUTING_META_FLAG_PUBLISHED};
+
+    let sip_v4: IpAddr = "192.168.1.10".parse().unwrap();
+    let dip_v4: IpAddr = "172.217.75.94".parse().unwrap();
+    let sip_mapped: IpAddr = "::ffff:192.168.1.10".parse().unwrap();
+    let dip_mapped: IpAddr = "::ffff:172.217.75.94".parse().unwrap();
+
+    let key = tuple_wire(sip_v4, 51234, dip_v4, 443, libc::IPPROTO_TCP as u8);
+    let conn = conn_wire(
+        0,
+        0,
+        0,
+        0,
+        ROUTING_META_FLAG_PUBLISHED | ROUTING_META_FLAG_OFFLOAD,
+        0,
+        0,
+        0,
+        0,
+        b"",
+        0,
+        1,
+        11,
+    );
+    let mut bitmap = [0u8; 32];
+    bitmap[0] = 1;
+    let domain_entries = [(lookup::encode_ip_key(dip_v4), bitmap)];
+    let descriptor = RoutingPolicyDescriptor {
+        slot: 0,
+        features: 1,
+        generation: 3,
+        domain_map_id: 7,
+        trace_policy: 0,
+    };
+
+    let by_ip = lookup::correlate_wire_records(
+        &lookup::FlowFilter {
+            ip: Some(dip_mapped),
+            ..Default::default()
+        },
+        lookup::DomainSnapshot::Published {
+            descriptor,
+            entries: &domain_entries,
+        },
+        &[(key, conn)],
+        &[],
+        &[],
+    );
+    assert_eq!(by_ip.flows.len(), 1);
+    assert_eq!(by_ip.flows[0].disposition, "native_direct_offload");
+    assert_eq!(
+        by_ip.domain_lookups,
+        vec![lookup::DomainIpCorrelation {
+            ip: dip_v4,
+            state: lookup::DomainEntryState::Matched(vec![0]),
+        }]
+    );
+
+    let args = lookup::LookupArgs {
+        ip: None,
+        sip: Some(sip_mapped),
+        dip: Some(dip_mapped),
+        sport: None,
+        dport: Some(443),
+        proto: Some(lookup::BpfProto::Tcp),
+        limit: 50,
+        pin_root: std::path::PathBuf::from("/sys/fs/bpf"),
+        json: false,
+    };
+    let parsed_filter = lookup::FlowFilter::from_args(&args).unwrap();
+    assert_eq!(parsed_filter.sip, Some(sip_v4));
+    assert_eq!(parsed_filter.dip, Some(dip_v4));
+    let by_sip_dip = lookup::correlate_wire_records(
+        &parsed_filter,
+        lookup::DomainSnapshot::Published {
+            descriptor,
+            entries: &domain_entries,
+        },
+        &[(key, conn)],
+        &[],
+        &[],
+    );
+    assert_eq!(by_sip_dip.flows.len(), 1);
+    assert_eq!(by_sip_dip.domain_lookups.len(), 1);
+    assert_eq!(by_sip_dip.domain_lookups[0].ip, dip_v4);
+}

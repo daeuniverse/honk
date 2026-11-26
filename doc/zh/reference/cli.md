@@ -317,7 +317,7 @@ honk 依次检查 `DAE_LOCATION_ASSET`、`global.data_dir`、旧根目录 `/var/
 
 ## `honk-tool`
 
-`honk-tool` 负责订阅探测、已固定 map 检查、引擎健康检查和离线 Geo 资源搜索，不加载也不挂接 eBPF 程序。
+`honk-tool` 负责订阅探测、已固定 map 检查与流关联、离线路由追踪、引擎健康检查和离线 Geo 资源搜索，不加载也不挂接 eBPF 程序。
 
 ### 构建与部署
 
@@ -347,7 +347,8 @@ scp target/x86_64-unknown-linux-musl/release/honk-tool root@GATEWAY:/tmp/
 | Key | 含义 |
 | --- | --- |
 | `sub` | 拉取或解析节点，并探测 TCP 地址族、URLTest 和受支持的 UDP 路径。 |
-| `bpf` | 读取并解码运行中引擎已经 pin 的 map。 |
+| `bpf` | 读取、解码并关联运行中引擎已经 pin 的 map。 |
+| `route` | 离线模拟路由规则并检查原生 eBPF 卸载条件。 |
 | `diagnose` | 执行只读的引擎、网络设施、map 和 API 健康检查。 |
 | `geosite` | 列出、检查和反向搜索 `geosite.dat`。 |
 | `geoip` | 列出、检查和最长前缀搜索 `geoip.dat`。 |
@@ -498,6 +499,9 @@ VLESS carrier 和 session 按运行时和规范化的线协议形态复用。所
 ```text
 honk-tool bpf show <conn-state|redirect-track|domain-routing|routing-handoff>
                    [--ip IP] [--limit N] [--pin-root PATH]
+honk-tool bpf lookup [--ip IP | --sip IP | --dip IP]
+                     [--sport PORT] [--dport PORT] [--proto tcp|udp]
+                     [--limit N] [--pin-root PATH] [--json]
 honk-tool bpf stats [--pin-root PATH]
 ```
 
@@ -507,6 +511,15 @@ honk-tool bpf stats [--pin-root PATH]
 | `show --ip IP` | 省略，未设置 | 按源或目的 IP 过滤 tuple map；对 `domain-routing` 按精确 IP key 过滤。 |
 | `show --limit N` | 省略，`50` | 最多打印的条目数；`0` 表示全部。 |
 | `show --pin-root PATH` | 省略，`/sys/fs/bpf` | 所选 map 的 pin 根目录。 |
+| `lookup --ip IP` | 省略，未设置 | 匹配源或目的等于 `IP` 的 tuple，并在 `domain-routing` 中查询 `IP`。与 `--sip`、`--dip` 互斥。 |
+| `lookup --sip IP` | 省略，未设置 | 按源 IP 匹配 tuple，并在 `domain-routing` 中查询命中流的目的 IP。 |
+| `lookup --dip IP` | 省略，未设置 | 按目的 IP 匹配 tuple，并在 `domain-routing` 中查询 `IP`。 |
+| `lookup --sport PORT` | 省略，未设置 | 按源端口匹配 tuple。 |
+| `lookup --dport PORT` | 省略，未设置 | 按目的端口匹配 tuple。 |
+| `lookup --proto tcp\|udp` | 省略，未设置 | 按四层协议匹配 tuple。 |
+| `lookup --limit N` | 省略，`50` | 最多打印的关联流条数；`0` 表示全部。 |
+| `lookup --pin-root PATH` | 省略，`/sys/fs/bpf` | 策略与流 map 的 pin 根目录。 |
+| `lookup --json` | 省略，关 | 输出单个 JSON 对象，替代多行文本。 |
 | `stats --pin-root PATH` | 省略，`/sys/fs/bpf` | 统计 map 的 pin 根目录。 |
 
 | Key | 解码内容 |
@@ -523,6 +536,41 @@ honk-tool bpf stats [--pin-root PATH]
 命令通过原始 `bpf(2)` 读取 pin，不加载程序，也不挂接 hook；通常需要 root 或合适的 BPF capability。
 
 `routing-handoff` 在读取前检查 [handoff ABI](../design/datapath.md#map-清单)。工具、引擎和对象要一起升级。
+
+#### 流关联查询（`bpf lookup`）
+
+`bpf lookup` 至少需要 `--ip`、`--sip` 或 `--dip` 之一。它关联 `CONN_STATE_MAP`、`REDIRECT_TRACK` 和 `ROUTING_HANDOFF_MAP` 中匹配的五元组，并结合 `ROUTING_POLICY_ROOT` 指向的活动 `domain-routing` 条目解释内核流向，无需开启逐包数据面日志。
+
+如果 `ROUTING_POLICY_ROOT` 不存在或尚未发布策略，`domain-routing` 会报告为 `unpublished`，其余流 map 仍照常关联；不兼容的 map 布局或权限错误仍会直接报错。
+
+每条关联流都会给出内核处置状态（`native_direct_offload`、`reverse_bypass`、`nfqueue_pending`、`nfqueue_direct_armed`、`udp_preparing`、`udp_aborted`、`kernel_drop_block`、`userspace_proxy`、`userspace_control_plane_routing`、`userspace_marked_direct`、`userspace_reject`、`stateless_userspace_udp` 或 `orphan_auxiliary_state`），并标记 incarnation、decision token 或缺失辅助条目的不一致。没有任何 tuple 命中时，输出 `no_flow_state` 以及目标 IP 在 `domain-routing` 中的状态（`absent`、`known_zero` 或命中的谓词索引）。
+
+### `route`
+
+```text
+honk-tool route [-c|--config PATH] --proto <tcp|udp>
+                [--domain DOMAIN] [--dip IP] [--dport PORT]
+                [--sip IP] [--sport PORT] [--pname NAME]
+                [--dscp DSCP] [--mac MAC] [--json]
+```
+
+| Key | 默认值 | 含义 |
+| --- | --- | --- |
+| `-c`, `--config PATH` | 省略，`/etc/honk/config.dae` | 离线加载并校验的配置文件。 |
+| `--proto tcp\|udp` | 必填 | 规则求值使用的四层协议。 |
+| `--domain DOMAIN` | 省略，未设置 | 供 `domain(...)` 和 `geosite:` 谓词匹配的域名，同时模拟已学到的 `domain-routing` 事实。 |
+| `--dip IP` | 省略，未设置 | 目的 IPv4 或 IPv6 地址。 |
+| `--dport PORT` | 省略，未设置 | 目的端口（`1..=65535`）。 |
+| `--sip IP` | 省略，未设置 | 源 IPv4 或 IPv6 地址。 |
+| `--sport PORT` | 省略，未设置 | 源端口（`1..=65535`）。 |
+| `--pname NAME` | 省略，未设置 | 发起连接的进程名。 |
+| `--dscp DSCP` | 省略，未设置 | DSCP 值（`0..=63` 或 `0x00..=0x3f`）。 |
+| `--mac MAC` | 省略，未设置 | 源 MAC 地址（`aa:bb:cc:dd:ee:ff`、`aa-bb-cc-dd-ee-ff`、`aabb.ccdd.eeff` 或 `aabbccddeeff`）。 |
+| `--json` | 省略，关 | 输出单个 JSON 对象，替代多行文本。 |
+
+`route` 至少需要 `--domain` 或 `--dip` 之一。它离线加载 `--config` 并校验引用，按 `global.data_dir` 查找 `geosite.dat` 和 `geoip.dat`，不创建目录也不连接运行中的守护进程，按优先级顺序逐条评估规则及 `fallback`。
+
+缺失的输入保持三值 `indeterminate`，不会静默当成未命中：当前面的 `indeterminate` 规则与后续命中规则指向不同出站时，`decision` 为 `indeterminate`，并在 `missing_inputs` 中列出判定所需的字段。`route` 同时检查策略能否编译到原生 eBPF 决策面；对唯一确定的命中结果，还会报告 `domain_final` 以及 LAN 和 WAN 两侧的内核处置（`native_direct_offload`、`userspace_control_plane_routing`、`userspace_proxy`、`userspace_dns`、`userspace_marked_direct`、`userspace_reject` 或 `kernel_drop`）。
 
 #### 统计
 

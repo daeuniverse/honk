@@ -93,6 +93,17 @@ impl JsonBuf {
         self.0.push(']');
     }
 
+    pub fn u32_slice(&mut self, items: &[u32]) {
+        self.0.push('[');
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                self.0.push(',');
+            }
+            self.uint(*item);
+        }
+        self.0.push(']');
+    }
+
     pub fn key(&mut self, first: &mut bool, name: &str) {
         if !*first {
             self.0.push(',');

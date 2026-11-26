@@ -317,7 +317,7 @@ See the [global configuration reference](./global.md).
 
 ## `honk-tool`
 
-`honk-tool` is a diagnostics toolbox for subscription probing, pinned-map inspection, engine health checks, and offline Geo asset searches. It does not load or attach eBPF programs.
+`honk-tool` is a diagnostics toolbox for subscription probing, pinned-map inspection and flow correlation, offline routing traces, engine health checks, and offline Geo asset searches. It does not load or attach eBPF programs.
 
 ### Build and deployment
 
@@ -347,7 +347,8 @@ The current `just build-musl` and `just deploy-vyos` recipes build and deploy on
 | Key | Meaning |
 | --- | --- |
 | `sub` | Fetch or parse nodes and probe TCP-family, URLTest, and supported UDP paths. |
-| `bpf` | Read and decode maps already pinned by the running engine. |
+| `bpf` | Read, decode, and correlate maps already pinned by the running engine. |
+| `route` | Simulate routing rules offline and inspect native eBPF offloadability. |
 | `diagnose` | Run a read-only engine, network-plumbing, map, and API health check. |
 | `geosite` | List, inspect, and reverse-search `geosite.dat`. |
 | `geoip` | List, inspect, and longest-prefix search `geoip.dat`. |
@@ -498,6 +499,9 @@ Probe rows never render credentials, endpoint details, SNI, REALITY keys, URL qu
 ```text
 honk-tool bpf show <conn-state|redirect-track|domain-routing|routing-handoff>
                    [--ip IP] [--limit N] [--pin-root PATH]
+honk-tool bpf lookup [--ip IP | --sip IP | --dip IP]
+                     [--sport PORT] [--dport PORT] [--proto tcp|udp]
+                     [--limit N] [--pin-root PATH] [--json]
 honk-tool bpf stats [--pin-root PATH]
 ```
 
@@ -507,6 +511,15 @@ honk-tool bpf stats [--pin-root PATH]
 | `show --ip IP` | Omitted; unset | Filter tuple maps by source or destination IP; filter `domain-routing` by its exact IP key. |
 | `show --limit N` | Omitted; `50` | Maximum printed entries; `0` means all. |
 | `show --pin-root PATH` | Omitted; `/sys/fs/bpf` | Pin root for the selected map. |
+| `lookup --ip IP` | Omitted; unset | Match tuples where source or destination equals `IP` and query `IP` in `domain-routing`. Conflicts with `--sip` and `--dip`. |
+| `lookup --sip IP` | Omitted; unset | Match tuples by source IP and query matched destination IPs in `domain-routing`. |
+| `lookup --dip IP` | Omitted; unset | Match tuples by destination IP and query `IP` in `domain-routing`. |
+| `lookup --sport PORT` | Omitted; unset | Match tuples by source port. |
+| `lookup --dport PORT` | Omitted; unset | Match tuples by destination port. |
+| `lookup --proto tcp\|udp` | Omitted; unset | Match tuples by layer-4 protocol. |
+| `lookup --limit N` | Omitted; `50` | Maximum correlated flows to print; `0` means all. |
+| `lookup --pin-root PATH` | Omitted; `/sys/fs/bpf` | Pin root for policy and flow maps. |
+| `lookup --json` | Omitted; off | Emit one JSON object instead of text lines. |
 | `stats --pin-root PATH` | Omitted; `/sys/fs/bpf` | Pin root for statistics maps. |
 
 | Key | Decoded contents |
@@ -523,6 +536,41 @@ honk-tool bpf stats [--pin-root PATH]
 The commands read pins through raw `bpf(2)` without loading programs or attaching hooks. Reads normally require root or suitable BPF capabilities.
 
 `routing-handoff` validates the [handoff ABI](../design/datapath.md#map-inventory) before reading entries. Upgrade the tool with the engine/object.
+
+#### Flow correlation (`bpf lookup`)
+
+`bpf lookup` requires at least one of `--ip`, `--sip`, or `--dip`. It joins matching 5-tuples across `CONN_STATE_MAP`, `REDIRECT_TRACK`, and `ROUTING_HANDOFF_MAP` with active `domain-routing` lookups from `ROUTING_POLICY_ROOT`, without enabling per-packet datapath logging.
+
+If `ROUTING_POLICY_ROOT` is absent or holds no published policy, `domain-routing` is reported as `unpublished` while the flow maps still correlate. Incompatible map layouts and permission errors still fail.
+
+Each correlated flow reports its kernel disposition (`native_direct_offload`, `reverse_bypass`, `nfqueue_pending`, `nfqueue_direct_armed`, `udp_preparing`, `udp_aborted`, `kernel_drop_block`, `userspace_proxy`, `userspace_control_plane_routing`, `userspace_marked_direct`, `userspace_reject`, `stateless_userspace_udp`, or `orphan_auxiliary_state`) and flags incarnation, decision-token, or missing-auxiliary anomalies. When no tuple matches, `bpf lookup` reports `no_flow_state` alongside any `domain-routing` entry (`absent`, `known_zero`, or `matched` predicate indices).
+
+### `route`
+
+```text
+honk-tool route [-c|--config PATH] --proto <tcp|udp>
+                [--domain DOMAIN] [--dip IP] [--dport PORT]
+                [--sip IP] [--sport PORT] [--pname NAME]
+                [--dscp DSCP] [--mac MAC] [--json]
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `-c`, `--config PATH` | Omitted; `/etc/honk/config.dae` | Configuration file to load and validate offline. |
+| `--proto tcp\|udp` | Required | Layer-4 protocol for rule evaluation. |
+| `--domain DOMAIN` | Omitted; unset | Hostname for `domain(...)` and `geosite:` predicates, and simulated `domain-routing` presence. |
+| `--dip IP` | Omitted; unset | Destination IPv4 or IPv6 address. |
+| `--dport PORT` | Omitted; unset | Destination port (`1..=65535`). |
+| `--sip IP` | Omitted; unset | Source IPv4 or IPv6 address. |
+| `--sport PORT` | Omitted; unset | Source port (`1..=65535`). |
+| `--pname NAME` | Omitted; unset | Originating process name. |
+| `--dscp DSCP` | Omitted; unset | DSCP value (`0..=63` or `0x00..=0x3f`). |
+| `--mac MAC` | Omitted; unset | Source MAC address (`aa:bb:cc:dd:ee:ff`, `aa-bb-cc-dd-ee-ff`, `aabb.ccdd.eeff`, or `aabbccddeeff`). |
+| `--json` | Omitted; off | Emit one JSON object instead of text lines. |
+
+`route` requires at least `--domain` or `--dip`. It loads `--config`, validates references, resolves `geosite.dat` and `geoip.dat` using `global.data_dir` without creating directories or contacting a running daemon, and evaluates every rule in priority order plus the fallback.
+
+Missing inputs stay three-valued (`indeterminate`) rather than silently failing a condition: when an earlier indeterminate rule could select a different outbound than a later match, `decision` is `indeterminate` and `missing_inputs` lists the fields needed to settle it. `route` also checks whether the policy compiles to the native eBPF decision plane and, for unambiguous determinate matches, reports `domain_final` and the LAN and WAN kernel dispositions (`native_direct_offload`, `userspace_control_plane_routing`, `userspace_proxy`, `userspace_dns`, `userspace_marked_direct`, `userspace_reject`, or `kernel_drop`).
 
 #### Statistics
 
