@@ -462,12 +462,15 @@ impl DatapathFlagsHandle {
                 .set_datapath_flags(flags)
                 .with_context(|| format!("failed to publish datapath flags {flags:#010x}"))?;
             if quiesce {
-                match backend.tc_mut() {
-                    Ok(tc) => tc
-                        .quiesce_udp_staging()
+                match backend.quiesce_udp_staging_if_supported() {
+                    Ok(false) if state.nfqueue_enabled => Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "software policy has no TC capability",
+                    )
+                    .into()),
+                    result => result
+                        .map(|_| ())
                         .context("failed to quiesce staged UDP decisions"),
-                    Err(error) if state.nfqueue_enabled => Err(error),
-                    Err(_) => Ok(()),
                 }
             } else {
                 Ok(())
@@ -527,7 +530,7 @@ impl DatapathFlagsHandle {
         }
         let backend = Arc::clone(&inner.backend);
         let mut backend = backend.write().await;
-        if backend.tc().is_err() {
+        if !backend.supports_kernel_trace() {
             return Ok(());
         }
         // Demand may have changed while waiting for either publication lock.
@@ -796,8 +799,51 @@ mod tests {
         handle.fence_nfqueue().await.unwrap();
         handle.set_mode("Direct").await.unwrap();
         #[cfg(feature = "native-api")]
-        handle.reconcile_kernel_trace(|| true).await.unwrap();
+        {
+            let samples = std::cell::Cell::new(0);
+            handle
+                .reconcile_kernel_trace(|| {
+                    samples.set(samples.get() + 1);
+                    true
+                })
+                .await
+                .unwrap();
+            assert_eq!(samples.get(), 1);
+        }
         handle.disable().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tc_fence_propagates_quiescence_failure_with_nfqueue_disabled() {
+        let (handle, _, _, backend) = flags_fixture();
+        handle.initialize(false, false).await.unwrap();
+        backend.write().await.tc_mut().unwrap().arm_quiesce_fault();
+
+        let error = handle.fence_nfqueue().await.unwrap_err();
+        assert_eq!(error.root_cause().to_string(), "injected quiesce failure");
+        handle.fence_nfqueue().await.unwrap();
+    }
+
+    #[test]
+    fn tc_policy_rejects_packet_gateway_capabilities() {
+        use std::io::ErrorKind;
+
+        let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
+        let backend: &mut dyn crate::ebpf::PolicyBackend = &mut mock;
+        assert_eq!(
+            backend.mode_flags().unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            backend
+                .install_gateway(None)
+                .unwrap_err()
+                .downcast::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            ErrorKind::Unsupported
+        );
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ pub struct UserspaceBackend {
     pname_support: PnameSupportCell,
     mode_flags: u32,
     #[cfg(target_os = "linux")]
-    gateway: Option<Arc<crate::xdp::gateway::GatewayPublisher>>,
+    gateway: Option<Arc<GatewayPublisher>>,
     #[cfg(target_os = "linux")]
     gateway_capture_started: bool,
     #[cfg(target_os = "linux")]
@@ -52,78 +52,9 @@ impl UserspaceBackend {
         }
     }
 
-    pub(crate) fn mode_flags(&self) -> u32 {
-        self.mode_flags
-    }
-
     #[cfg(all(target_os = "linux", test, feature = "ebpf"))]
-    pub(crate) fn gateway(&self) -> Option<&Arc<crate::xdp::gateway::GatewayPublisher>> {
+    pub(crate) fn gateway(&self) -> Option<&Arc<GatewayPublisher>> {
         self.gateway.as_ref()
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn install_gateway(
-        &mut self,
-        gateway: Option<Arc<crate::xdp::gateway::GatewayPublisher>>,
-    ) -> anyhow::Result<()> {
-        if let Some(publisher) = &gateway {
-            anyhow::ensure!(
-                self.gateway_dns_reload != GatewayDnsReload::Closed,
-                "userspace backend is closed"
-            );
-            publisher.set_mode_flags(self.mode_flags)?;
-            if self.auxiliary_fenced {
-                publisher.pause_auxiliary();
-            }
-        }
-        if let Some(previous) = &self.gateway
-            && gateway
-                .as_ref()
-                .is_none_or(|next| !Arc::ptr_eq(previous, next))
-        {
-            previous.stop_dns();
-            self.gateway_capture_started = false;
-        }
-        if self.gateway_dns_reload == GatewayDnsReload::Degraded
-            && let Some(publisher) = &gateway
-        {
-            publisher.degrade_dns();
-        }
-        self.gateway = gateway;
-        Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn activate_gateway_start(
-        &mut self,
-        publisher: &Arc<crate::xdp::gateway::GatewayPublisher>,
-        fingerprint: [u8; 32],
-        generation: u64,
-    ) -> std::io::Result<()> {
-        if self.gateway_capture_started
-            || self
-                .gateway
-                .as_ref()
-                .is_none_or(|current| !Arc::ptr_eq(current, publisher))
-        {
-            return Ok(());
-        }
-        match self.gateway_dns_reload {
-            GatewayDnsReload::Pending(current) | GatewayDnsReload::Ready(current)
-                if current != generation =>
-            {
-                return Ok(());
-            }
-            GatewayDnsReload::Closed => return Ok(()),
-            _ => {}
-        }
-        if matches!(self.gateway_dns_reload, GatewayDnsReload::Initial)
-            || self.gateway_dns_reload == GatewayDnsReload::Ready(generation)
-        {
-            publisher.activate_dns(fingerprint, generation, false)?;
-        }
-        self.gateway_capture_started = true;
-        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -229,6 +160,68 @@ impl PolicyBackend for UserspaceBackend {
         Ok(self)
     }
 
+    #[cfg(target_os = "linux")]
+    fn install_gateway(&mut self, gateway: Option<Arc<GatewayPublisher>>) -> anyhow::Result<()> {
+        if let Some(publisher) = &gateway {
+            anyhow::ensure!(
+                self.gateway_dns_reload != GatewayDnsReload::Closed,
+                "userspace backend is closed"
+            );
+            publisher.set_mode_flags(self.mode_flags)?;
+            if self.auxiliary_fenced {
+                publisher.pause_auxiliary();
+            }
+        }
+        if let Some(previous) = &self.gateway
+            && gateway
+                .as_ref()
+                .is_none_or(|next| !Arc::ptr_eq(previous, next))
+        {
+            previous.stop_dns();
+            self.gateway_capture_started = false;
+        }
+        if self.gateway_dns_reload == GatewayDnsReload::Degraded
+            && let Some(publisher) = &gateway
+        {
+            publisher.degrade_dns();
+        }
+        self.gateway = gateway;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn activate_gateway_start(
+        &mut self,
+        publisher: &Arc<GatewayPublisher>,
+        fingerprint: [u8; 32],
+        generation: u64,
+    ) -> std::io::Result<()> {
+        if self.gateway_capture_started
+            || self
+                .gateway
+                .as_ref()
+                .is_none_or(|current| !Arc::ptr_eq(current, publisher))
+        {
+            return Ok(());
+        }
+        match self.gateway_dns_reload {
+            GatewayDnsReload::Pending(current) | GatewayDnsReload::Ready(current)
+                if current != generation =>
+            {
+                return Ok(());
+            }
+            GatewayDnsReload::Closed => return Ok(()),
+            _ => {}
+        }
+        if matches!(self.gateway_dns_reload, GatewayDnsReload::Initial)
+            || self.gateway_dns_reload == GatewayDnsReload::Ready(generation)
+        {
+            publisher.activate_dns(fingerprint, generation, false)?;
+        }
+        self.gateway_capture_started = true;
+        Ok(())
+    }
+
     fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -314,6 +307,10 @@ impl PolicyBackend for UserspaceBackend {
     }
     fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool> {
         Ok(self.policy.alive(outbound, domain, ipver))
+    }
+
+    fn mode_flags(&self) -> std::io::Result<u32> {
+        Ok(self.mode_flags)
     }
 
     fn set_datapath_flags(&mut self, flags: u32) -> anyhow::Result<()> {
@@ -466,6 +463,7 @@ mod tests {
                 .set_datapath_flags(DATAPATH_FLAG_TRACE_ENABLED)
                 .is_err()
         );
+        assert_eq!(backend.mode_flags().unwrap(), DATAPATH_FLAG_OFFLOAD_ALL);
         assert!(backend.tc().is_err());
         assert!(backend.tc_mut().is_err());
         backend.cleanup().await.unwrap();

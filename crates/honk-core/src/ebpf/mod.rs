@@ -11,6 +11,8 @@ mod policy_state;
 pub mod probe;
 mod retirement;
 pub mod userspace;
+#[cfg(target_os = "linux")]
+pub use crate::xdp::gateway::GatewayPublisher;
 pub use retirement::*;
 #[cfg(feature = "ebpf")]
 pub mod real;
@@ -507,6 +509,33 @@ pub trait PolicyBackend: DomainProjectionSink {
         anyhow::bail!("policy backend is not the userspace backend")
     }
 
+    /// Install or unregister the Linux packet gateway's publisher.
+    #[cfg(target_os = "linux")]
+    fn install_gateway(
+        &mut self,
+        _gateway: Option<std::sync::Arc<GatewayPublisher>>,
+    ) -> anyhow::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "policy backend does not support a gateway publisher",
+        )
+        .into())
+    }
+
+    /// Finish startup only for the installed publisher and the admitted policy.
+    #[cfg(target_os = "linux")]
+    fn activate_gateway_start(
+        &mut self,
+        _publisher: &std::sync::Arc<GatewayPublisher>,
+        _fingerprint: [u8; 32],
+        _generation: u64,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "policy backend does not support gateway startup",
+        ))
+    }
+
     /// Bounded readonly kernel/owner facts; never repairs or reopens the datapath.
     fn observe_datapath(&self) -> DatapathObservation {
         DatapathObservation::unknown(DatapathKind::Unknown)
@@ -551,6 +580,26 @@ pub trait PolicyBackend: DomainProjectionSink {
 
     /// Publish the composed mode/admission flags supported by this backend.
     fn set_datapath_flags(&mut self, flags: u32) -> anyhow::Result<()>;
+
+    /// Read the current flags for seeding a packet-owned gateway map.
+    fn mode_flags(&self) -> std::io::Result<u32> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "policy backend does not support reading packet mode flags",
+        ))
+    }
+
+    /// After READY was cleared, quiesce TC staging. `Ok(false)` means
+    /// TC staging is unavailable; a failed quiescence always returns `Err`.
+    fn quiesce_udp_staging_if_supported(&mut self) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    #[cfg(feature = "native-api")]
+    fn supports_kernel_trace(&self) -> bool {
+        false
+    }
+
     #[cfg(test)]
     fn arm_datapath_flags_write_fault(&mut self, _nth: usize) -> anyhow::Result<()> {
         anyhow::bail!("datapath flag fault injection is unsupported")

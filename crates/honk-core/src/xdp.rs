@@ -591,11 +591,7 @@ impl Runtime {
             && !self.topology_lost
         {
             let unregister = async {
-                backend
-                    .write()
-                    .await
-                    .userspace_mut()?
-                    .install_gateway(None)?;
+                backend.write().await.install_gateway(None)?;
                 loop {
                     match gateway.verify_attachments() {
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1330,9 +1326,7 @@ async fn run_capture(
                 let mut backend = backend.write().await;
                 let plan = active_routing_plan.read().plan.clone();
                 publisher.prepare_start(&plan)?;
-                backend
-                    .userspace_mut()?
-                    .install_gateway(Some(Arc::clone(publisher)))?;
+                backend.install_gateway(Some(Arc::clone(publisher)))?;
                 publisher.commit();
             }
             current_topology(
@@ -1367,7 +1361,7 @@ async fn run_capture(
             if let Some(publisher) = &runtime.gateway {
                 let mut backend = backend.write().await;
                 runtime.activate_capture(&shutdown, direct)?;
-                backend.userspace_mut()?.activate_gateway_start(
+                backend.activate_gateway_start(
                     publisher,
                     active_routing_plan.read().plan.fingerprint,
                     diagnostics_generation.read().generation,

@@ -7,7 +7,7 @@ mod quic_udp;
 use super::{Config, ControlPlane, Fixture};
 use crate::{
     control::{ControlCommand, ReloadOutcome, ReloadReply, routing_matcher::RoutingPushPlan},
-    ebpf::userspace::UserspaceBackend,
+    ebpf::PolicyBackend,
     routing::Router,
 };
 use anyhow::{Context, ensure};
@@ -584,7 +584,7 @@ fn compile(config: &Config) -> anyhow::Result<RoutingPushPlan> {
 
 fn activate_capture(
     fixture: &Fixture,
-    backend: &mut UserspaceBackend,
+    backend: &mut dyn PolicyBackend,
     plan: &RoutingPushPlan,
     generation: u64,
 ) -> anyhow::Result<()> {
@@ -640,11 +640,10 @@ async fn shadow_late_gateway_registration_waits_for_final_flags() -> anyhow::Res
                 drop(precommit);
                 postcommit.await
             };
-            let backend = writer.userspace_mut()?;
-            assert!(backend.gateway().is_none());
+            assert!(writer.userspace_mut()?.gateway().is_none());
             assert_eq!(fixture.diagnostics.read().generation, generation);
             publisher.prepare_start(&plan)?;
-            backend.install_gateway(Some(publisher.clone()))?;
+            writer.install_gateway(Some(publisher.clone()))?;
             publisher.commit();
             let attached = Attached::read(&fixture)?;
             let bank = attached
@@ -655,7 +654,7 @@ async fn shadow_late_gateway_registration_waits_for_final_flags() -> anyhow::Res
                 freeze_mode_map(attached.mode)?;
             }
             if capture_first {
-                activate_capture(&fixture, backend, &plan, generation)?;
+                activate_capture(&fixture, writer.as_mut(), &plan, generation)?;
                 assert_eq!(bank.epoch(lan)?, 0, "startup preceded final flags");
             }
             if stop_before_flags {
@@ -677,7 +676,7 @@ async fn shadow_late_gateway_registration_waits_for_final_flags() -> anyhow::Res
                 if !capture_first {
                     assert_eq!(bank.epoch(lan)?, 0, "final flags preceded capture");
                     let mut writer = fixture.backend.write().await;
-                    activate_capture(&fixture, writer.userspace_mut()?, &plan, generation)?;
+                    activate_capture(&fixture, writer.as_mut(), &plan, generation)?;
                 }
                 assert_eq!(bank.epoch(lan)? != 0, !stop_before_flags);
             }
@@ -687,7 +686,7 @@ async fn shadow_late_gateway_registration_waits_for_final_flags() -> anyhow::Res
                 let backend = writer.userspace_mut()?;
                 backend.finish_gateway_dns_reload(generation - 1, plan.fingerprint)?;
                 backend.finish_gateway_dns_reload(generation, plan.fingerprint)?;
-                backend.activate_gateway_start(publisher, plan.fingerprint, generation)?;
+                writer.activate_gateway_start(publisher, plan.fingerprint, generation)?;
             }
             assert_eq!(bank.epoch(lan)?, epoch, "settled generation reopened");
             assert_eq!(bank.epoch(wan)?, 0);
@@ -723,13 +722,12 @@ async fn shadow_optional_preparation_retains_complete_static_policy() -> anyhow:
         assert_eq!(early.bank, None);
         {
             let mut writer = fixture.backend.write().await;
-            let backend = writer.userspace_mut()?;
             publisher.prepare_start(&initial)?;
-            backend.install_gateway(Some(publisher.clone()))?;
+            writer.install_gateway(Some(publisher.clone()))?;
             publisher.commit();
             activate_capture(
                 &fixture,
-                backend,
+                writer.as_mut(),
                 &initial,
                 fixture.diagnostics.read().generation,
             )?;

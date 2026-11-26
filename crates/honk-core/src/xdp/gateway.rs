@@ -509,7 +509,8 @@ impl GatewayShadow {
     }
 }
 
-pub(crate) struct GatewayPublisher {
+/// Opaque identity of the publisher installed by the Linux capture owner.
+pub struct GatewayPublisher {
     state: PublisherState<PublisherInner, OwnedXdpLink>,
     maps: Arc<GatewayMaps>,
     conntrack: Option<Arc<ConntrackKfuncs>>,

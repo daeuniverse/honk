@@ -2981,9 +2981,8 @@ async fn canceled_auxiliary_reload_recovers_the_canonical_config_before_and_afte
             .unwrap();
         let before = flags.snapshot();
         let mut ebpf = cp.ebpf.write().await;
-        let gateway = ebpf.userspace_mut().unwrap();
-        let before_flags = gateway.mode_flags();
-        gateway.pause_gateway_auxiliary();
+        let before_flags = ebpf.mode_flags().unwrap();
+        ebpf.userspace_mut().unwrap().pause_gateway_auxiliary();
         drop(ebpf);
         assert_eq!(
             cp.apply_runtime_config(current, Default::default(), &drain)
@@ -2995,10 +2994,7 @@ async fn canceled_auxiliary_reload_recovers_the_canonical_config_before_and_afte
             before,
             "rejected source activation changed the native override or revision"
         );
-        assert_eq!(
-            cp.ebpf.write().await.userspace_mut().unwrap().mode_flags(),
-            before_flags
-        );
+        assert_eq!(cp.ebpf.read().await.mode_flags().unwrap(), before_flags);
     }
 }
 

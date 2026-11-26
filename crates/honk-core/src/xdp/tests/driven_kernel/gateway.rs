@@ -514,7 +514,7 @@ async fn gateway_close_detaches_links_after_backend_unregister_timeout() -> anyh
             }
 
             // The deadline prevented unregistering the now-detached publisher.
-            writer.userspace_mut()?.install_gateway(None)?;
+            writer.install_gateway(None)?;
         }
         fixture.finish_after_capture_close().await?;
         drop(std::mem::ManuallyDrop::into_inner(owned));

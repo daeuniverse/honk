@@ -537,7 +537,7 @@ pub(super) async fn prepare(
     let mut local_memory = None;
     if let Some(maps) = &gateway_maps {
         let backend = plane.policy_backend_handle();
-        maps.set_mode_flags(backend.write().await.userspace_mut()?.mode_flags())?;
+        maps.set_mode_flags(backend.read().await.mode_flags()?)?;
         local_memory = Some(
             budget
                 .reserve(honk_xsk::kernel_memory_bytes(maps.local_map_fd()?.as_fd())?)

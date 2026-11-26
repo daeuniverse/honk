@@ -500,9 +500,7 @@ async fn start_runtime(
         let mut backend = backend.write().await;
         let plan = active_plan.read().plan.clone();
         publisher.prepare_start(&plan)?;
-        backend
-            .userspace_mut()?
-            .install_gateway(Some(Arc::clone(publisher)))?;
+        backend.install_gateway(Some(Arc::clone(publisher)))?;
         publisher.commit();
     }
     let zero_copy = config
@@ -543,7 +541,7 @@ async fn start_runtime(
     if let Some(publisher) = &runtime.gateway {
         let mut backend = backend.write().await;
         runtime.activate_capture(&shutdown, direct)?;
-        backend.userspace_mut()?.activate_gateway_start(
+        backend.activate_gateway_start(
             publisher,
             active_plan.read().plan.fingerprint,
             diagnostics_generation.read().generation,

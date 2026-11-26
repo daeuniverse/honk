@@ -608,6 +608,15 @@ impl PolicyBackend for RealEbpfBackend {
         self.array_set("DATAPATH_FLAGS_MAP", 0, &flags)
     }
 
+    fn quiesce_udp_staging_if_supported(&mut self) -> anyhow::Result<bool> {
+        self.quiesce_udp_staging().map(|()| true)
+    }
+
+    #[cfg(feature = "native-api")]
+    fn supports_kernel_trace(&self) -> bool {
+        true
+    }
+
     fn publish_routing_plan(
         &mut self,
         plan: &crate::control::routing_matcher::RoutingPushPlan,

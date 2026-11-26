@@ -142,6 +142,15 @@ impl PolicyBackend for MockEbpfBackend {
         Ok(())
     }
 
+    fn quiesce_udp_staging_if_supported(&mut self) -> anyhow::Result<bool> {
+        self.quiesce_udp_staging().map(|()| true)
+    }
+
+    #[cfg(feature = "native-api")]
+    fn supports_kernel_trace(&self) -> bool {
+        true
+    }
+
     #[cfg(test)]
     fn arm_datapath_flags_write_fault(&mut self, nth: usize) -> anyhow::Result<()> {
         anyhow::ensure!(nth != 0, "datapath flags write ordinal must be non-zero");
