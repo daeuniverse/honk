@@ -55,9 +55,13 @@ pub use doh::DohClient;
 pub use doh3::Doh3Client;
 pub use doq::DoqClient;
 pub use dot::DotPool;
+#[cfg(test)]
+pub(crate) use framing::read_length_prefixed;
 pub use framing::{exchange_length_prefixed, force_dns_id_zero, restore_dns_id};
 pub(crate) use framing::{read_length_prefixed_into, write_length_prefixed};
 pub(crate) use lifecycle::LifecycleSlot;
 pub use tcp_pool::TcpPool;
+#[cfg(test)]
+pub(crate) use tests_proto::{insecure_quic_config, quic_server_endpoint};
 pub use udp_pool::UdpPool;
 pub(crate) use udp_pool::UdpPoolCapacity;

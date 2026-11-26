@@ -22,16 +22,18 @@ pub(super) async fn run_as_leader(
 }
 
 pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, DnsForwardError> {
+    let race_score = crate::dns::forwarder::RaceScoreContext::default();
     let upstream_result = context
         .forwarder
         .exchange(
             &context.request_scope,
             context.raw_query,
-            context.prepared.query().ingress(),
+            context.prepared.query(),
+            &race_score,
         )
         .await;
     let (mut response, mut upstream_name) = match upstream_result {
-        Ok(response) => (response, context.logical_upstream.clone()),
+        Ok((response, responder)) => (response, responder),
         Err(source) => {
             if context.reuse_eligible
                 && !honk_outbound::proxy::is_packet_rejection(&source)
@@ -51,7 +53,8 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
         }
     };
 
-    let mut traversal = ResponseTraversal::start(context.logical_upstream.clone());
+    let mut traversal =
+        ResponseTraversal::start_exchange(context.logical_upstream.clone(), upstream_name.clone());
     let mut strict_reusable = true;
     let mut rejected_wire = None;
     let (status, class, analyzed_answer_ips) = loop {
@@ -97,20 +100,27 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
             }
             ResponseDirective::Requery {
                 upstream,
-                traversal: next,
+                traversal: mut next,
                 strict_reusable: response_strict_reusable,
             } => {
                 strict_reusable &= response_strict_reusable;
-                response = context
+                let (requeried, responder) = context
                     .forwarder
-                    .upstream_pool
-                    .query(upstream.as_str(), context.raw_query)
+                    .exchange_upstream(
+                        &upstream,
+                        context.raw_query,
+                        context.prepared.query(),
+                        Some(&next),
+                        &race_score,
+                    )
                     .await
                     .map_err(|source| DnsForwardError::Exchange {
                         upstream: upstream.as_str().to_owned(),
                         source,
                     })?;
-                upstream_name = upstream;
+                next.record_responder(&upstream, responder.clone());
+                response = requeried;
+                upstream_name = responder;
                 traversal = next;
             }
         }

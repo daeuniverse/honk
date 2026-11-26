@@ -63,6 +63,7 @@ pub struct ResponseContext<'a> {
 pub struct ResponseTraversal {
     path: Vec<UpstreamTag>,
     current: UpstreamTag,
+    current_group: Option<UpstreamTag>,
     visited: BTreeSet<UpstreamTag>,
 }
 
@@ -72,6 +73,19 @@ impl ResponseTraversal {
         Self {
             path: vec![upstream.clone()],
             current: upstream,
+            current_group: None,
+            visited,
+        }
+    }
+
+    pub(crate) fn start_exchange(requested: UpstreamTag, responder: UpstreamTag) -> Self {
+        let current_group = (requested != responder).then(|| requested.clone());
+        let mut visited = BTreeSet::from([responder.clone()]);
+        visited.insert(requested);
+        Self {
+            path: vec![responder.clone()],
+            current: responder,
+            current_group,
             visited,
         }
     }
@@ -90,12 +104,33 @@ impl ResponseTraversal {
         &self.current
     }
 
+    pub(crate) fn current_group(&self) -> Option<&UpstreamTag> {
+        self.current_group.as_ref()
+    }
+
+    pub(crate) fn has_visited(&self, upstream: &UpstreamTag) -> bool {
+        self.visited.contains(upstream)
+    }
+
     pub fn path(&self) -> &[UpstreamTag] {
         &self.path
     }
 
-    pub fn advance(mut self, upstream: UpstreamTag) -> Result<Self, PlanError> {
+    pub fn advance(self, upstream: UpstreamTag) -> Result<Self, PlanError> {
+        self.advance_with_groups(&std::collections::HashMap::new(), upstream)
+    }
+
+    pub(crate) fn advance_with_groups(
+        mut self,
+        groups: &std::collections::HashMap<UpstreamTag, Arc<[UpstreamTag]>>,
+        upstream: UpstreamTag,
+    ) -> Result<Self, PlanError> {
         if self.visited.contains(&upstream) {
+            return Err(PlanError::UpstreamCycle { upstream });
+        }
+        if let Some(members) = groups.get(&upstream)
+            && members.iter().all(|member| self.visited.contains(member))
+        {
             return Err(PlanError::UpstreamCycle { upstream });
         }
         if self.path.len() >= MAX_RESPONSE_UPSTREAMS {
@@ -106,20 +141,42 @@ impl ResponseTraversal {
         self.visited.insert(upstream.clone());
         self.path.push(upstream.clone());
         self.current = upstream;
+        self.current_group = None;
         Ok(self)
+    }
+
+    pub(crate) fn record_responder(&mut self, requested: &UpstreamTag, responder: UpstreamTag) {
+        if responder != *requested {
+            if let Some(last) = self.path.last_mut() {
+                *last = responder.clone();
+            }
+            self.visited.insert(responder.clone());
+            self.current_group = Some(requested.clone());
+            self.current = responder;
+        }
     }
 }
 
 pub struct Planner {
     router: Arc<DnsRouter>,
     upstreams: BTreeSet<UpstreamTag>,
+    upstream_groups: Arc<std::collections::HashMap<UpstreamTag, Arc<[UpstreamTag]>>>,
 }
 
 impl Planner {
     pub fn new(router: impl Into<Arc<DnsRouter>>, upstreams: BTreeSet<UpstreamTag>) -> Self {
+        Self::with_groups(router, upstreams, Arc::default())
+    }
+
+    pub(crate) fn with_groups(
+        router: impl Into<Arc<DnsRouter>>,
+        upstreams: BTreeSet<UpstreamTag>,
+        upstream_groups: Arc<std::collections::HashMap<UpstreamTag, Arc<[UpstreamTag]>>>,
+    ) -> Self {
         Self {
             router: router.into(),
             upstreams,
+            upstream_groups,
         }
     }
 
@@ -172,18 +229,20 @@ impl Planner {
         context: ResponseContext<'_>,
         traversal: ResponseTraversal,
     ) -> Result<ResponsePlan, PlanError> {
-        match self.router.select_response_normalized(
+        match self.router.select_response_with_group(
             context.domain,
             context.qtype,
             context.answer_ips,
             traversal.current().as_str(),
+            traversal.current_group().map(UpstreamTag::as_str),
         ) {
             DnsResponseDecision::Accept => Ok(ResponsePlan::Accept),
             DnsResponseDecision::Reject => Ok(ResponsePlan::Reject),
             DnsResponseDecision::Requery(name) => {
                 let upstream = UpstreamTag::new(&name)?;
                 self.require_known(&upstream)?;
-                let traversal = traversal.advance(upstream.clone())?;
+                let traversal =
+                    traversal.advance_with_groups(&self.upstream_groups, upstream.clone())?;
                 Ok(ResponsePlan::Requery {
                     upstream,
                     traversal,

@@ -459,4 +459,95 @@ mod routing_syntax {
             );
         }
     }
+
+    #[test]
+    fn test_parse_dns_upstream_race_groups() {
+        use honk_config::dns::DnsUpstreamGroup;
+
+        let (config, diagnostics) = parse(
+            r#"
+dns {
+    upstream {
+        alidns: 'udp://223.5.5.5:53'
+        dnspod: 'https://doh.pub/dns-query'
+        fast: race(alidns, dnspod)
+        'overseas fast': race("alidns", 'dnspod')
+        literal_uri: 'race(alidns, dnspod)'
+    }
+    upstream {
+        fast: race(dnspod, alidns)
+        u1: '192.0.2.1:53'
+        u2: '192.0.2.2:53'
+        u3: '192.0.2.3:53'
+        u4: '192.0.2.4:53'
+        u5: '192.0.2.5:53'
+        u6: '192.0.2.6:53'
+        u7: '192.0.2.7:53'
+        u8: '192.0.2.8:53'
+        eight: race(u1, u2, u3, u4, u5, u6, u7, u8)
+    }
+}
+"#,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(
+            config.dns.upstream.iter().all(|u| u.name != "default"),
+            "explicit upstream block must clear default upstream"
+        );
+        assert!(
+            config
+                .dns
+                .upstream
+                .iter()
+                .any(|u| u.name == "literal_uri" && u.address == "race(alidns, dnspod)"),
+            "quoted race(...) must remain a literal URI"
+        );
+        assert_eq!(
+            config.dns.upstream_groups,
+            vec![
+                DnsUpstreamGroup {
+                    name: "fast".into(),
+                    upstreams: vec!["dnspod".into(), "alidns".into()],
+                },
+                DnsUpstreamGroup {
+                    name: "overseas fast".into(),
+                    upstreams: vec!["alidns".into(), "dnspod".into()],
+                },
+                DnsUpstreamGroup {
+                    name: "eight".into(),
+                    upstreams: (1..=8).map(|i| format!("u{i}")).collect(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_dns_upstream_race_rejects_malformed_declarations() {
+        for bad in [
+            "dns {\n upstream {\n  fast: race()\n }\n}",
+            "dns {\n upstream {\n  fast: race(alidns)\n }\n}",
+            "dns {\n upstream {\n  fast: race(u1, u2, u3, u4, u5, u6, u7, u8, u9)\n }\n}",
+            "dns {\n upstream {\n  fast: race(alidns, )\n }\n}",
+            "dns {\n upstream {\n  fast: race(, dnspod)\n }\n}",
+            "dns {\n upstream {\n  fast: race(alidns, '')\n }\n}",
+            "dns {\n upstream {\n  '': race(alidns, dnspod)\n }\n}",
+            "dns {\n upstream {\n  fast: race(fast, alidns)\n }\n}",
+            "dns {\n upstream {\n  fast: race(alidns, 'alidns')\n }\n}",
+            "dns {\n upstream {\n  fast: race(alidns dnspod, cf)\n }\n}",
+            "dns {\n upstream {\n  fast: race('alidns' extra, cf)\n }\n}",
+            "dns {\n upstream {\n  fast: race(alidns, dnspod\n }\n}",
+            "dns {\n upstream {\n  fast: race(alidns, dnspod) -> proxy\n }\n}",
+            "dns {\n upstream {\n  fast: race(alidns, dnspod) outbound: proxy\n }\n}",
+            "dns {\n upstream {\n  fast: race(alidns, dnspod) extra\n }\n}",
+        ] {
+            let mut diagnostics = Vec::new();
+            let error = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+                bad,
+                &mut diagnostics,
+            )
+            .expect_err(bad);
+            assert_eq!(error.diagnostic.code, "invalid-dns-race", "{bad}");
+            assert_eq!(error.diagnostic.line, Some(3), "{bad}");
+        }
+    }
 }

@@ -317,7 +317,7 @@ fn proxied_quic_fixture_for_protocol(
     }
 }
 
-pub(super) async fn insecure_quic_config(alpn: &[u8]) -> quinn::ClientConfig {
+pub(crate) async fn insecure_quic_config(alpn: &[u8]) -> quinn::ClientConfig {
     honk_outbound::quic::client_config(
         &Node {
             outbound: honk_config::node::OutboundConfig::Hysteria2(
@@ -341,7 +341,7 @@ pub(super) async fn insecure_quic_config(alpn: &[u8]) -> quinn::ClientConfig {
     .unwrap()
 }
 
-pub(super) fn quic_server_endpoint(alpn: &[u8]) -> (quinn::Endpoint, SocketAddr) {
+pub(crate) fn quic_server_endpoint(alpn: &[u8]) -> (quinn::Endpoint, SocketAddr) {
     let (endpoint, address, _) = quic_server_with_roots(alpn);
     (endpoint, address)
 }

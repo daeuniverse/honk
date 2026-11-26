@@ -78,7 +78,7 @@ where
     Ok(())
 }
 
-pub(super) async fn read_length_prefixed<S>(
+pub(crate) async fn read_length_prefixed<S>(
     stream: &mut S,
     query_timeout: Duration,
 ) -> anyhow::Result<Vec<u8>>

@@ -98,11 +98,12 @@ impl DnsEngine {
         router: &DnsRouter,
         policy_id: Option<PolicyId>,
     ) -> Result<Self, EngineError> {
-        Self::from_shared_router(Arc::new(router.clone()), policy_id)
+        Self::from_shared_router_and_groups(Arc::new(router.clone()), Arc::default(), policy_id)
     }
 
-    pub(crate) fn from_shared_router(
+    pub(crate) fn from_shared_router_and_groups(
         router: Arc<DnsRouter>,
+        upstream_groups: Arc<std::collections::HashMap<UpstreamTag, Arc<[UpstreamTag]>>>,
         policy_id: Option<PolicyId>,
     ) -> Result<Self, EngineError> {
         let upstreams = router
@@ -111,7 +112,7 @@ impl DnsEngine {
             .map(|name| UpstreamTag::new(&name))
             .collect::<Result<_, _>>()?;
         Ok(Self {
-            planner: Planner::new(router, upstreams),
+            planner: Planner::with_groups(router, upstreams, upstream_groups),
             policy_id,
         })
     }

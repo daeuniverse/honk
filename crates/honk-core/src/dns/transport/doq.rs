@@ -47,7 +47,7 @@ impl DoqClient {
         Ok(Self::with_quic_config(dial, quic_config))
     }
 
-    pub(super) fn with_quic_config(dial: DialContext, quic_config: ClientConfig) -> Arc<Self> {
+    pub(crate) fn with_quic_config(dial: DialContext, quic_config: ClientConfig) -> Arc<Self> {
         Arc::new(Self {
             dial,
             quic_config,
@@ -200,6 +200,11 @@ impl DoqClient {
 
     pub(crate) fn tasks_failed(&self) -> bool {
         self.quic_ep.tasks_failed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn init_count(&self) -> usize {
+        self.connection.init_count()
     }
 
     pub(crate) async fn close(&self) {

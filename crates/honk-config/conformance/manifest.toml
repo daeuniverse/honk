@@ -1709,7 +1709,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-dns-04"
-source = { file = "doc/en/reference/dns.md", fence = 16 }
+source = { file = "doc/en/reference/dns.md", fence = 17 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1732,7 +1732,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-dns-06"
-source = { file = "doc/en/reference/dns.md", fence = 10 }
+source = { file = "doc/en/reference/dns.md", fence = 11 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1778,8 +1778,19 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-dns-10"
-source = { file = "doc/en/reference/dns.md", fence = 9 }
+source = { file = "doc/en/reference/dns.md", fence = 10 }
 wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-en-reference-dns-11"
+source = { file = "doc/en/reference/dns.md", fence = 9 }
+wrap = "dns"
 layer = "structure"
 honk = "accept"
 dae = "accept"
@@ -2173,7 +2184,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-dns-04"
-source = { file = "doc/zh/reference/dns.md", fence = 16 }
+source = { file = "doc/zh/reference/dns.md", fence = 17 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2196,7 +2207,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-dns-06"
-source = { file = "doc/zh/reference/dns.md", fence = 10 }
+source = { file = "doc/zh/reference/dns.md", fence = 11 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2242,8 +2253,19 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-dns-10"
-source = { file = "doc/zh/reference/dns.md", fence = 9 }
+source = { file = "doc/zh/reference/dns.md", fence = 10 }
 wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-zh-reference-dns-11"
+source = { file = "doc/zh/reference/dns.md", fence = 9 }
+wrap = "dns"
 layer = "structure"
 honk = "accept"
 dae = "accept"

@@ -230,6 +230,22 @@ upstream {
 
 帶 [`exit`](./groups.md#出口) 的群組會透過路由的 TCP 串流傳輸 TCP、DoT、DoH 與經代理的 UDP 上游。DoQ 和 DoH3 在群組選路前排除由群組出口組成的多跳路由。支援 UDP 且符合條件的節點可以承載這兩種上游，包括支援 UDP 的設定鏈與折疊為一個合格節點的路由。選定的 `block` 仍是終止動作。
 
+### 並行競速群組
+
+`name: race(u1, u2, ...)` 宣告一個命名的並行競速上游群組，同時查詢 2 到 8 個已宣告的實體上游並取最快的有效應答：
+
+```dae
+upstream {
+    alidns: 'udp://223.5.5.5:53'
+    dnspod: 'https://doh.pub/dns-query'
+    domestic: race(alidns, dnspod)
+}
+```
+
+- `race(...)` 接受 2 到 8 個以逗號分隔的裸寫或加引號實體上游名。每個成員保留各自的協定、TLS 設定和 `->` 出站路由；`race(...)` 宣告本身不接受 `->` 或 `outbound:` 字尾。
+- 完整設定驗證會拒絕少於 2 個或多於 8 個成員、空名稱、自我參照、同一 `race(...)` 內重複成員、與實體上游重名或結構化設定中重複的競速群組名、巢狀競速群組以及未宣告的成員名（`invalid-dns-race`、`conflicting-dns-upstream-name`、`nested-dns-upstream-group`、`unknown-dns-upstream`）。在 `.dae` 語法中重複宣告同名競速群組會替換先前的成員清單。
+- 快取未命中時，honk 並行查詢所有未造訪過的成員，傳回首個有效的非截斷（`TC=0`）`NOERROR` 或 `NXDOMAIN` 應答，並立即取消其餘在途分支。較早分支傳回的錯誤、逾時、截斷應答（`TC=1`）、`SERVFAIL` 或其他錯誤 RCODE（如 `REFUSED`、`NOTIMP`、`FORMERR`、EDNS `BADVERS`）不會中止其餘存活分支；僅當沒有任何非截斷 `NOERROR`/`NXDOMAIN` 分支成功時，才依序回退使用有效的 `TC=1` `NOERROR`/`NXDOMAIN`、`SERVFAIL` 或其他錯誤 RCODE 應答，全部分支均失敗時保留型別化的本機封包拒絕錯誤。
+
 ## DNS 路由
 
 `routing` 裡是排好序的 `request` 和 `response` 規則，第一條匹配的生效。同一個條件裡的引數按 OR 組合；用 `&&` 連起來的條件按 AND 組合。條件前加 `!` 表示取反。
@@ -252,7 +268,7 @@ upstream {
 | `qtype(a, aaaa, ...)` | Request 與 response | 匹配 QTYPE 名稱或數字 `u16`。可識別名稱為 `A`、`AAAA`、`CNAME`、`MX`、`TXT`、`NS`、`PTR`、`SOA`、`SRV`、`HTTPS`、`SVCB`、`ANY` 和 `*`。`*` 是 `ANY` 的別名，不是萬用字元。 |
 | `sip(192.168.50.1, 100.64.0.0/10, 2001:db8::/32)` | 僅 request | 把邏輯用戶端來源和列出的任一個 IP 主機位址或 CIDR 匹配。 |
 | `subtag(MyAirport, keyword: Air, regex: ^Paid)` | 僅 request | 匹配[節點伺服器網域](#節點伺服器網域)查詢所屬訂閱的 tag：精確值、`keyword:` 或 `regex:`，區分大小寫。 |
-| `upstream(name, ...)` | 僅 response | 匹配產生目前應答的上游。名稱精確比較，且不像動作目標那樣轉為小寫。 |
+| `upstream(name, ...)` | 僅 response | 匹配產生目前應答的上游（對於競速交換，同時匹配實際獲勝的實體上游名與所屬競速群組名）。名稱精確比較，且不像動作目標那樣轉為小寫。 |
 | `ip(192.0.2.0/24, geoip: private, ...)` | 僅 response | 任一應答 IP 屬於所列 CIDR 或 GeoIP 集時匹配。 |
 
 `qname` 用去掉末尾點的小寫查詢名稱匹配。`full:` 和 `suffix:` 的模式會轉成小寫，但模式裡的末尾點會保留，所以帶末尾點的模式永遠匹配不上。`keyword:` 和 `regex:` 模式區分大小寫；應寫小寫，或者加 `(?i)`。
@@ -304,7 +320,7 @@ dns {
 - 被接管的查詢只發往選中的上游，遵守 `strategy` 和 `use_host`，不走快取和 response 規則，也不回退：查詢失敗就表示實體節點連線或探測連線失敗。
 - 接管按網域生效，不是端到端的下載目標解析策略。下載時為選路而預先解析 URL 網域，只是盡力而為；代理下載的 URL 網域仍由代理解析，而承載代理自身的節點伺服器解析遵守這條規則。明確使用 bootstrap 解析器的下載繞過這個 hook。
 - tag 屬於主機名，不屬於節點：不同訂閱裡共用同一主機名的節點，各自的 tag 會合併，所以第一條匹配的規則就為這個主機名選定一個上游。
-- 這條規則只能和 `qname()` 組合，而且所選上游的每條宣告都必須是 `-> direct`，否則驗證報錯：`subtag-dns-condition`、`subtag-dns-action` 或 `subtag-dns-upstream-route`。
+- 這條規則只能和 `qname()` 組合，而且所選上游的每條宣告都必須是 `-> direct`（若指向競速群組，則每個實體成員上游的每條宣告都必須是 `-> direct`），否則驗證報錯：`subtag-dns-condition`、`subtag-dns-action` 或 `subtag-dns-upstream-route`。
 - 上游自身的網域、ECH 發現和離線 `delay` 子命令仍使用 bootstrap 解析器。
 - 網域匹配到 `use_host` 中的[別名](#hosts-快照use_host)時，honk 改為解析別名目標。別名鏈停在位址條目上，就直接用這些位址；否則把目標網域當作節點網域解析，也就是交給接管該目標的 `subtag()` 規則，沒有接管就走 bootstrap。直接匹配原始網域的位址條目不會經這個 hook 接管；honk 用的是別名鏈終點的位址條目。所有被接管的查詢，包括本機位址結果和 bootstrap 目標，都遵守 DNS 執行時 admission 與取消機制。目標或 subtag 路徑一旦選定，該路徑失敗就是最終結果。查詢執行前 reload 刪掉了這個別名時，原網域按沒有別名的情況解析。
 - 別名匹配所有交給 bootstrap 解析器的網域，不限於節點伺服器網域：沒有指定明確 bootstrap 解析器的訂閱、Geo 資料和外部 UI 下載的 URL 網域，SOCKS5 節點的 UDP 中繼網域，以及健康檢查、延遲測試、連通性探測和內部解析回退到 bootstrap 時的網域。DNS 上游自身的網域和 ECH 發現不走這個 hook。
@@ -336,7 +352,7 @@ dns {
 
 `NXDOMAIN` 和 `SERVFAIL` 略過應答規則和回退動作。對可快取的查詢，如果上游交換失敗或返回 `SERVFAIL`，而[過期應答](#快取與固定-ttl)還在，honk 就改為返回它；本機封包拒絕不會觸發這一行為。
 
-一輪 response 最多查三個上游，初始上游也算在內；第四次交換 honk 會拒絕。重新查詢形成環路時，honk 同樣拒絕。
+一輪 response 最多查三個上游，初始上游也算在內；第四次交換 honk 會拒絕。重新查詢形成環路（包括再次查詢已使用過的競速群組或獲勝實體上游）時，honk 同樣拒絕；重新查詢另一個競速群組時，會自動略過同一輪遍歷中已經應答過的實體成員。
 
 ## 位址族策略
 

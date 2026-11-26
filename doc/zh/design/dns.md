@@ -30,12 +30,12 @@ flowchart LR
 独立 UDP listener 在同一个 socket 上运行 `min(runtime worker 数, 4)` 个接收 supervisor。每个 supervisor 每批最多收八个报文，各自保留目的地元数据、独立 admission，并复用自己的 512 KiB payload 缓冲，每个 listener 最多 2 MiB。socket 请求 4 MiB 的内核接收缓冲区，Linux 会静默截断到 `net.core.rmem_max`。每个查询先在 supervisor 上 poll 一次，再决定要不要 spawn，所以已经就绪的缓存应答不需要任务。未完成的查询在停止和排空期间仍被持有并 join，查询 panic 会让 teardown 失败。批处理不会绕过容量或 generation 检查。接收错误的 warning 按 supervisor 计，同一个 socket 故障最多记四次 warning。
 
 - [`src/dns.rs`](../../../crates/honk-config/src/dns.rs) — `DnsConfig`，字段包括
-  `bind`、`upstream`、`routing`、`strategy`、`cache` 和 `fixed_domain_ttl`。
+  `bind`、`upstream`、`upstream_groups`、`routing`、`strategy`、`cache` 和 `fixed_domain_ttl`。
   `DnsBindEndpoint`、`DnsBindTransport`、`DnsBindError` 负责解析当前的 dae
   listener 配置，并支持语义相等判断；`DnsConfig::bind_endpoint` 把空值映射为关闭。
   listener 绑定语法见[配置指南](../configuration.md)。`DnsUpstream` 包含 `name`、
   `address`、`protocol: DnsProtocol`、`tls_server_name`，以及拨号路径的代理 tag
-  `outbound: Option<String>`。Dae 路由按首次匹配执行
+  `outbound: Option<String>`；`DnsUpstreamGroup` 保存并发竞速组名称及 2 到 8 个有序物理成员名（`name: race(u1, u2, ...)`）。Dae 路由按首次匹配执行
   `DnsRequestRule`/`DnsResponseRule`；`DnsCond` 之间是 AND，支持否定。请求规则支
   持 `Qname`、`Qtype`、`Sip`；响应规则支持 `Qname`、`Qtype`、`Upstream`、`Ip`。
   `Sip` 接受混合的主机地址和 CIDR 参数，不能用在响应规则里。动作有 `Reject`、
@@ -126,8 +126,8 @@ Honk 的独立 bind 可以是 `:53530`、其他空闲端口，或者关闭；它
 | 3. 地址族 gate 与 hosts | `ipv4only`/`ipv6only` 在 hosts 或上游工作前，以 NODATA 拒绝另一地址族。除此之外，不可变 hosts 快照先于请求路由、缓存与上游交换执行。 |
 | 4. 请求规划 | 按源码顺序的请求规则依据路由域名、QTYPE 与逻辑客户端来源选择 reject、`asis` 或命名上游。首条命中。 |
 | 5. 复用 | 符合资格的请求先查询精确身份的正/负缓存；未命中时共用一次 singleflight 交换。不符合资格的请求绕过两者。 |
-| 6. 交换 | 请求 scope 选择拦截所得目的地址或某个 `UpstreamPool` transport。 |
-| 7. 响应规划 | 策略使用每个上游响应前，都会严格核对其与查询是否匹配。响应规则执行 accept、reject 或经命名上游重新查询；遍历无环且最多包含三个上游。 |
+| 6. 交换 | 请求 scope 选择拦截所得目的地址、单个 `UpstreamPool` transport，或对 `DnsUpstreamGroup` 中未访问的物理成员发起并发竞速（首个有效的非截断 `NOERROR`/`NXDOMAIN` 应答获胜并立即取消其余分支，`TC=1` `NOERROR`/`NXDOMAIN`、`SERVFAIL` 及其他错误 RCODE 仅作为有序回退；每个分支独立计入 `DnsSocketBudget`，并在单次逻辑查询内共享同一个 `RaceScoreContext` 业务延续）。 |
+| 7. 响应规划 | 策略使用每个上游响应前，都会严格核对其与查询是否匹配。响应 `upstream(...)` 同时匹配实际应答的物理上游与所属竞速组名；响应规则执行 accept、reject 或经命名上游/竞速组重新查询，遍历无环且最多包含三次交换。 |
 | 8. 发布与渲染 | 只有严格校验后的最终 wire 响应才能进入缓存或发布给 singleflight waiter。偏好地址族压制在保存已校验、可复用的应答后，才应用于调用方渲染。 |
 | 9. 结果与投影 | forwarder 返回类型化结果。`DnsController` 使用固定 generation 的投影快照提交该结果，随后入口 adapter 写应答。 |
 

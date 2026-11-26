@@ -27,7 +27,7 @@ pub(crate) fn response_rcode(wire: &[u8]) -> Result<u16, ResponseError> {
     checked_response_rcode(None, wire)
 }
 
-pub(super) fn checked_response_rcode(
+pub(crate) fn checked_response_rcode(
     request: Option<&QueryContext>,
     wire: &[u8],
 ) -> Result<u16, ResponseError> {

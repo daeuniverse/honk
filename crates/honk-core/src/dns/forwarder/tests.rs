@@ -401,6 +401,7 @@ mod cache_routing;
 #[cfg(feature = "native-api")]
 mod diagnostic;
 mod family_and_negative;
+mod race;
 mod rule_pipeline;
 mod service_flush;
 mod singleflight;

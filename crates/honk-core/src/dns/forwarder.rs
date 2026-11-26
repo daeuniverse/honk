@@ -23,6 +23,26 @@ use super::routing::DnsRouter;
 use super::singleflight::Singleflight;
 use honk_config::dns::{DnsConfig, DnsStrategy};
 
+#[derive(Default)]
+pub struct RaceScoreContext {
+    continuation: std::sync::OnceLock<honk_outbound::group::ScoreContinuation>,
+    first_admission: tokio::sync::Mutex<()>,
+}
+
+impl RaceScoreContext {
+    pub(crate) fn current(&self) -> Option<&honk_outbound::group::ScoreContinuation> {
+        self.continuation.get()
+    }
+
+    pub(crate) fn record(&self, continuation: &honk_outbound::group::ScoreContinuation) {
+        let _ = self.continuation.set(continuation.clone());
+    }
+
+    pub(crate) async fn lock_first_admission(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.first_admission.lock().await
+    }
+}
+
 /// Abstraction over a pool of DNS upstream servers.
 ///
 /// Implementations are expected to maintain connections to multiple
@@ -32,6 +52,16 @@ pub trait DnsUpstreamPool: Send + Sync {
     /// Send a raw DNS query to the named upstream and return the
     /// raw wire-format response.
     async fn query(&self, upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>>;
+
+    async fn query_race_leg(
+        &self,
+        upstream_name: &str,
+        raw_query: &[u8],
+        score: &RaceScoreContext,
+    ) -> anyhow::Result<Vec<u8>> {
+        let _ = score;
+        self.query(upstream_name, raw_query).await
+    }
 }
 
 #[derive(Debug, Error)]
@@ -155,6 +185,8 @@ pub struct DnsForwarder {
     /// Precomputed node-host policy decisions for this generation, including
     /// indexed hosts declined by every `subtag()` rule; empty without one.
     pub(crate) node_host_upstreams: Arc<HashMap<String, Option<String>>>,
+    pub(crate) upstream_groups:
+        Arc<HashMap<super::planner::UpstreamTag, Arc<[super::planner::UpstreamTag]>>>,
     pub(crate) query_timeout: Duration,
     pub(crate) dial_timeout: Duration,
     socket_budget: super::transport::DnsSocketBudget,
@@ -187,6 +219,7 @@ impl DnsForwarder {
             stale_reply_ttl: 30,
             policy_id: None,
             node_host_upstreams: Arc::default(),
+            upstream_groups: Arc::default(),
             query_timeout: Duration::from_secs(5),
             dial_timeout: Duration::from_secs(10),
             socket_budget: super::transport::DnsSocketBudget::default(),
@@ -274,10 +307,7 @@ impl DnsForwarder {
     }
 
     pub fn with_policy_from_config(self, config: &DnsConfig) -> anyhow::Result<Self> {
-        #[cfg(feature = "native-api")]
         let this = self.with_configured_upstreams(config);
-        #[cfg(not(feature = "native-api"))]
-        let this = self;
         let sources = hosts::HostsSourceSet::load(config)?;
         let policy_id = PolicyId::from_config_with_artifacts(
             config,
@@ -289,21 +319,41 @@ impl DnsForwarder {
         Ok(this.with_policy_id(policy_id).with_hosts_snapshot(snapshot))
     }
 
-    pub(crate) fn with_configured_upstreams(self, _config: &DnsConfig) -> Self {
+    pub(crate) fn with_configured_upstreams(mut self, config: &DnsConfig) -> Self {
+        let mut groups = HashMap::with_capacity(config.upstream_groups.len());
+        for group in &config.upstream_groups {
+            if let Ok(tag) = super::planner::UpstreamTag::new(&group.name) {
+                let members: Result<Vec<_>, _> = group
+                    .upstreams
+                    .iter()
+                    .map(|member| super::planner::UpstreamTag::new(member))
+                    .collect();
+                if let Ok(members) = members
+                    && !members.is_empty()
+                {
+                    groups.insert(tag, Arc::from(members));
+                }
+            }
+        }
+        if *self.upstream_groups != groups {
+            self.engine = Arc::new(OnceCell::new());
+        }
+        self.upstream_groups = Arc::new(groups);
         #[cfg(feature = "native-api")]
         {
-            let mut this = self;
-            this.configured_upstreams = _config
+            self.configured_upstreams = config
                 .upstream
                 .iter()
                 .map(|upstream| upstream.name.clone())
+                .chain(
+                    config
+                        .upstream_groups
+                        .iter()
+                        .map(|group| group.name.clone()),
+                )
                 .collect();
-            this
         }
-        #[cfg(not(feature = "native-api"))]
-        {
-            self
-        }
+        self
     }
 
     #[cfg(feature = "native-api")]
@@ -371,7 +421,11 @@ impl DnsForwarder {
     pub(crate) async fn engine(&self) -> Result<&DnsEngine, EngineError> {
         self.engine
             .get_or_try_init(|| async {
-                DnsEngine::from_shared_router(Arc::clone(&self.routing), self.policy_id.clone())
+                DnsEngine::from_shared_router_and_groups(
+                    Arc::clone(&self.routing),
+                    Arc::clone(&self.upstream_groups),
+                    self.policy_id.clone(),
+                )
             })
             .await
     }
@@ -391,6 +445,7 @@ impl DnsForwarder {
             stale_reply_ttl: self.stale_reply_ttl,
             policy_id: self.policy_id.clone(),
             node_host_upstreams: Arc::clone(&self.node_host_upstreams),
+            upstream_groups: Arc::clone(&self.upstream_groups),
             query_timeout: self.query_timeout,
             dial_timeout: self.dial_timeout,
             socket_budget: self.socket_budget.clone(),

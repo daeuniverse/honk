@@ -301,11 +301,13 @@ mod matcher {
         subscriptions: Option<&'a [String]>,
         answer_ips: &'a [IpAddr],
         from_upstream: &'a str,
+        from_group: Option<&'a str>,
     }
 
     pub(super) struct ResponseContext<'a> {
         pub(super) answer_ips: &'a [IpAddr],
         pub(super) from_upstream: &'a str,
+        pub(super) from_group: Option<&'a str>,
     }
 
     impl<'a> Evaluation<'a> {
@@ -317,6 +319,7 @@ mod matcher {
                 subscriptions: None,
                 answer_ips: &[],
                 from_upstream: "",
+                from_group: None,
             }
         }
 
@@ -330,6 +333,7 @@ mod matcher {
                 subscriptions: Some(subscriptions),
                 answer_ips: &[],
                 from_upstream: "",
+                from_group: None,
             }
         }
 
@@ -341,6 +345,7 @@ mod matcher {
                 subscriptions: None,
                 answer_ips: context.answer_ips,
                 from_upstream: context.from_upstream,
+                from_group: context.from_group,
             }
         }
     }
@@ -375,9 +380,12 @@ mod matcher {
                     };
                     (subscriptions.iter().any(|tag| pattern.is_match(tag)), *not)
                 }
-                CompiledCond::Upstream { not, names } => {
-                    (names.iter().any(|name| name == value.from_upstream), *not)
-                }
+                CompiledCond::Upstream { not, names } => (
+                    names.iter().any(|name| {
+                        name == value.from_upstream || value.from_group == Some(name.as_str())
+                    }),
+                    *not,
+                ),
                 CompiledCond::Ip { not, trie } => {
                     (value.answer_ips.iter().any(|ip| trie.matches(ip)), *not)
                 }
@@ -595,7 +603,6 @@ impl DnsRouter {
 
     /// Select a response route for a domain that has already been normalized
     /// to ASCII lowercase by the DNS query parser.
-    #[cfg_attr(not(feature = "native-api"), allow(clippy::unused_enumerate_index))]
     pub(crate) fn select_response_normalized(
         &self,
         domain: &str,
@@ -603,12 +610,25 @@ impl DnsRouter {
         answer_ips: &[IpAddr],
         from_upstream: &str,
     ) -> DnsResponseDecision {
+        self.select_response_with_group(domain, qtype, answer_ips, from_upstream, None)
+    }
+
+    #[cfg_attr(not(feature = "native-api"), allow(clippy::unused_enumerate_index))]
+    pub(crate) fn select_response_with_group(
+        &self,
+        domain: &str,
+        qtype: u16,
+        answer_ips: &[IpAddr],
+        from_upstream: &str,
+        from_group: Option<&str>,
+    ) -> DnsResponseDecision {
         let evaluation = Evaluation::response(
             domain,
             qtype,
             ResponseContext {
                 answer_ips,
                 from_upstream,
+                from_group,
             },
         );
         let mut capture = crate::observe::flows::dns::RuleCapture::response(

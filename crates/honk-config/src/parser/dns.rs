@@ -254,7 +254,12 @@ pub(super) fn parse_section(
                     cfg.upstream.clear();
                     saw_upstream = true;
                 }
-                cfg.upstream.extend(parse_dns_upstreams(&sub, diagnostics));
+                parse_dns_upstreams(
+                    &sub,
+                    &mut cfg.upstream,
+                    &mut cfg.upstream_groups,
+                    diagnostics,
+                )?;
             }
             "routing" => {
                 let mut blocks = Vec::new();
@@ -289,11 +294,129 @@ pub(super) fn parse_section(
     Ok(cfg)
 }
 
+fn race_error(line: Text<'_, '_>, ordinal: usize, message: &'static str) -> DetailedConfigError {
+    let mut error = DetailedConfigError::new(
+        ErrorCategory::Parse,
+        "invalid-dns-race",
+        line.source.reference(),
+        SettingPath::new("dns").field("upstream").index(ordinal),
+        message,
+    );
+    let (line_no, column) = line.source.location(line.span.start);
+    error.diagnostic.line = Some(line_no);
+    error.diagnostic.span = Some(line.span.start..line.span.end);
+    error.diagnostic.byte_column = Some(column);
+    error.diagnostic.entry_index = Some(ordinal);
+    error
+}
+
+fn parse_dns_race_group(
+    line: Text<'_, '_>,
+    name: Text<'_, '_>,
+    rest: Text<'_, '_>,
+    ordinal: usize,
+) -> Result<crate::dns::DnsUpstreamGroup, DetailedConfigError> {
+    let group_name = name.unquote().raw();
+    if group_name.is_empty() {
+        return Err(race_error(
+            line,
+            ordinal,
+            "DNS race group name must not be empty",
+        ));
+    }
+    let body = rest.sub(5, rest.raw().len());
+    let Some(close) = body.find(")") else {
+        return Err(race_error(
+            line,
+            ordinal,
+            "unclosed race(...) upstream group",
+        ));
+    };
+    let tail = body.sub(close + 1, body.raw().len()).trim();
+    if !tail.raw().is_empty() {
+        return Err(race_error(
+            line,
+            ordinal,
+            "unexpected trailing tokens or detour on race(...) upstream group",
+        ));
+    }
+    let arguments = body.sub(0, close).trim();
+    if arguments.raw().is_empty() {
+        return Err(race_error(
+            line,
+            ordinal,
+            "DNS race(...) requires between 2 and 8 upstreams",
+        ));
+    }
+    let mut members = Vec::new();
+    for item in arguments.split(",") {
+        let trimmed = item.trim();
+        let raw = trimmed.raw();
+        if raw.is_empty() {
+            return Err(race_error(
+                line,
+                ordinal,
+                "DNS race(...) contains an empty upstream argument",
+            ));
+        }
+        if raw.starts_with('\'') || raw.starts_with('"') {
+            if quoted_end(raw.as_bytes(), 0) != Some(raw.len()) {
+                return Err(race_error(
+                    line,
+                    ordinal,
+                    "DNS race(...) upstream arguments must be comma-separated",
+                ));
+            }
+        } else if raw.bytes().any(|byte| byte.is_ascii_whitespace()) {
+            return Err(race_error(
+                line,
+                ordinal,
+                "DNS race(...) upstream arguments must be comma-separated",
+            ));
+        }
+        let member = trimmed.unquote().raw();
+        if member.is_empty() {
+            return Err(race_error(
+                line,
+                ordinal,
+                "DNS race(...) member name must not be empty",
+            ));
+        }
+        if member == group_name {
+            return Err(race_error(
+                line,
+                ordinal,
+                "DNS race(...) cannot reference itself",
+            ));
+        }
+        if members.iter().any(|existing| existing == member) {
+            return Err(race_error(
+                line,
+                ordinal,
+                "DNS race(...) cannot list the same upstream twice",
+            ));
+        }
+        members.push(member.to_owned());
+    }
+    if !(2..=crate::dns::MAX_DNS_RACE_UPSTREAMS).contains(&members.len()) {
+        return Err(race_error(
+            line,
+            ordinal,
+            "DNS race(...) requires between 2 and 8 upstreams",
+        ));
+    }
+    Ok(crate::dns::DnsUpstreamGroup {
+        name: group_name.to_owned(),
+        upstreams: members,
+    })
+}
+
 fn parse_dns_upstreams(
     section: &Segment<'_, '_>,
+    upstreams: &mut Vec<crate::dns::DnsUpstream>,
+    groups: &mut Vec<crate::dns::DnsUpstreamGroup>,
     diagnostics: &mut ParserDiagnostics<'_>,
-) -> Vec<crate::dns::DnsUpstream> {
-    let mut upstreams = Vec::new();
+) -> Result<(), DetailedConfigError> {
     for (index, line) in
         read::child_statements(section, diagnostics, super::cursor::BodySyntax::Statements)
             .into_iter()
@@ -305,7 +428,8 @@ fn parse_dns_upstreams(
         let Some((name, rest)) = line.kv() else {
             continue;
         };
-        diagnostics.entry_text(line, index + 1);
+        let ordinal = index + 1;
+        diagnostics.entry_text(line, ordinal);
         if let Some(comment) = line.trailing_comment() {
             comment.notice(
                 diagnostics,
@@ -313,6 +437,16 @@ fn parse_dns_upstreams(
                 "legacy-upstream-comment",
                 "upstream comments start at an unquoted token-head `#`",
             );
+        }
+        let trimmed_rest = rest.trim();
+        if trimmed_rest.raw().starts_with("race(") {
+            let group = parse_dns_race_group(line, name, trimmed_rest, ordinal)?;
+            if let Some(existing) = groups.iter_mut().find(|entry| entry.name == group.name) {
+                existing.upstreams = group.upstreams;
+            } else {
+                groups.push(group);
+            }
+            continue;
         }
         let separator = rest
             .find("->")
@@ -351,7 +485,7 @@ fn parse_dns_upstreams(
             outbound,
         });
     }
-    upstreams
+    Ok(())
 }
 
 fn parse_upstream_uri(uri: &str) -> (crate::types::DnsProtocol, String) {

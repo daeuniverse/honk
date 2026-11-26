@@ -332,3 +332,236 @@ fn subtag_rules_need_a_direct_upstream_and_only_qname() {
         assert_eq!(error.diagnostic.setting.to_string(), setting);
     }
 }
+
+#[test]
+fn test_validate_dns_upstream_race_groups_and_routing_references() {
+    use honk_config::Config;
+    use honk_config::dns::{DnsRule, DnsUpstream, DnsUpstreamGroup};
+    use honk_config::types::DnsProtocol;
+
+    let dae = honk_config::parser::parse_dae_config(
+        r#"
+dns {
+    upstream {
+        fast: race(alidns, 'dnspod')
+        alidns: 'udp://223.5.5.5:53'
+        dnspod: 'https://doh.pub/dns-query'
+        overseas: race(googledns, cf)
+        googledns: 'https://dns.google/dns-query' -> direct
+        cf: 'https://cloudflare-dns.com/dns-query' -> direct
+    }
+    routing {
+        request {
+            qname(suffix: cn) -> fast
+            fallback: fast
+        }
+        response {
+            upstream(fast) && ip(geoip: private) -> overseas
+            fallback: overseas
+        }
+    }
+}
+"#,
+    )
+    .expect("parse race config");
+    dae.validate().expect("race group references must validate");
+
+    let mut legacy = Config::default();
+    legacy.dns.upstream = vec![
+        DnsUpstream {
+            name: "a".into(),
+            address: "223.5.5.5:53".into(),
+            protocol: DnsProtocol::Udp,
+            tls_server_name: None,
+            outbound: None,
+        },
+        DnsUpstream {
+            name: "b".into(),
+            address: "119.29.29.29:53".into(),
+            protocol: DnsProtocol::Udp,
+            tls_server_name: None,
+            outbound: None,
+        },
+    ];
+    legacy.dns.upstream_groups = vec![DnsUpstreamGroup {
+        name: "fast".into(),
+        upstreams: vec!["a".into(), "b".into()],
+    }];
+    legacy.dns.routing.rules = vec![DnsRule {
+        domain: "suffix:.cn".into(),
+        upstream: "fast".into(),
+    }];
+    legacy.dns.routing.fallback = "fast".into();
+    legacy
+        .validate()
+        .expect("legacy routing to race group must validate");
+}
+
+#[test]
+fn test_validate_rejects_invalid_and_conflicting_dns_upstream_groups() {
+    use honk_config::Config;
+    use honk_config::dns::{DnsRequestAction, DnsUpstream, DnsUpstreamGroup};
+    use honk_config::types::DnsProtocol;
+
+    let base_upstreams = || {
+        (1..=9)
+            .map(|index| DnsUpstream {
+                name: format!("u{index}"),
+                address: format!("192.0.2.{index}:53"),
+                protocol: DnsProtocol::Udp,
+                tls_server_name: None,
+                outbound: None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (groups, expected_code, expected_setting) in [
+        (
+            vec![DnsUpstreamGroup {
+                name: String::new(),
+                upstreams: vec!["u1".into(), "u2".into()],
+            }],
+            "invalid-dns-race",
+            "dns.upstream_groups[1].name",
+        ),
+        (
+            vec![DnsUpstreamGroup {
+                name: "fast".into(),
+                upstreams: vec!["u1".into()],
+            }],
+            "invalid-dns-race",
+            "dns.upstream_groups[1].upstreams",
+        ),
+        (
+            vec![DnsUpstreamGroup {
+                name: "fast".into(),
+                upstreams: (1..=9).map(|i| format!("u{i}")).collect(),
+            }],
+            "invalid-dns-race",
+            "dns.upstream_groups[1].upstreams",
+        ),
+        (
+            vec![DnsUpstreamGroup {
+                name: "fast".into(),
+                upstreams: vec!["u1".into(), String::new()],
+            }],
+            "invalid-dns-race",
+            "dns.upstream_groups[1].upstreams[2]",
+        ),
+        (
+            vec![DnsUpstreamGroup {
+                name: "fast".into(),
+                upstreams: vec!["fast".into(), "u1".into()],
+            }],
+            "invalid-dns-race",
+            "dns.upstream_groups[1].upstreams[1]",
+        ),
+        (
+            vec![DnsUpstreamGroup {
+                name: "fast".into(),
+                upstreams: vec!["u1".into(), "u1".into()],
+            }],
+            "invalid-dns-race",
+            "dns.upstream_groups[1].upstreams[2]",
+        ),
+        (
+            vec![DnsUpstreamGroup {
+                name: "u1".into(),
+                upstreams: vec!["u2".into(), "u3".into()],
+            }],
+            "conflicting-dns-upstream-name",
+            "dns.upstream_groups[1].name",
+        ),
+        (
+            vec![
+                DnsUpstreamGroup {
+                    name: "fast".into(),
+                    upstreams: vec!["u1".into(), "u2".into()],
+                },
+                DnsUpstreamGroup {
+                    name: "fast".into(),
+                    upstreams: vec!["u2".into(), "u3".into()],
+                },
+            ],
+            "conflicting-dns-upstream-name",
+            "dns.upstream_groups[2].name",
+        ),
+        (
+            vec![
+                DnsUpstreamGroup {
+                    name: "inner".into(),
+                    upstreams: vec!["u1".into(), "u2".into()],
+                },
+                DnsUpstreamGroup {
+                    name: "outer".into(),
+                    upstreams: vec!["inner".into(), "u3".into()],
+                },
+            ],
+            "nested-dns-upstream-group",
+            "dns.upstream_groups[2].upstreams[1]",
+        ),
+        (
+            vec![DnsUpstreamGroup {
+                name: "fast".into(),
+                upstreams: vec!["u1".into(), "missing".into()],
+            }],
+            "unknown-dns-upstream",
+            "dns.upstream_groups[1].upstreams[2]",
+        ),
+    ] {
+        let mut config = Config::default();
+        config.dns.upstream = base_upstreams();
+        config.dns.upstream_groups = groups;
+        config.dns.routing.request.fallback = DnsRequestAction::Upstream("u1".into());
+        config.dns.routing.fallback = "u1".into();
+        let error = config
+            .validate_detailed()
+            .expect_err("invalid upstream_groups must fail validation");
+        assert_eq!(error.diagnostic.code, expected_code, "{expected_setting}");
+        assert_eq!(error.diagnostic.setting.to_string(), expected_setting);
+    }
+}
+
+#[test]
+fn test_subtag_rule_targeting_race_group_requires_all_member_declarations_direct() {
+    let build = |extra_decl: &str, d2_route: &str| {
+        honk_config::parser::parse_dae_config(&format!(
+            r#"
+dns {{
+    upstream {{
+        d1: 'https://203.0.113.1/dns-query' -> direct
+        d2: 'https://203.0.113.2/dns-query'{d2_route}
+        {extra_decl}
+        provider_race: race(d1, d2)
+    }}
+    routing {{
+        request {{
+            subtag(MyAirport) && qname(suffix: private.example) -> provider_race
+            fallback: d1
+        }}
+    }}
+}}
+"#
+        ))
+        .expect("parse subtag race config")
+    };
+
+    build("", " -> direct")
+        .validate()
+        .expect("all-direct race group is valid for subtag()");
+
+    for (extra_decl, d2_route) in [
+        ("", ""),
+        ("", " -> proxy"),
+        ("d1: 'https://203.0.113.3/dns-query' -> proxy", " -> direct"),
+    ] {
+        let error = build(extra_decl, d2_route)
+            .validate_detailed()
+            .expect_err("non-direct race member must fail subtag validation");
+        assert_eq!(error.diagnostic.code, "subtag-dns-upstream-route");
+        assert_eq!(
+            error.diagnostic.setting.to_string(),
+            "dns.routing.request.rules[1].action"
+        );
+    }
+}

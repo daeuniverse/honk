@@ -97,6 +97,45 @@ fn effective_client_subnet_partitions_policy_identity() {
 }
 
 #[test]
+fn upstream_groups_partition_policy_identity_and_preserve_v2_when_empty() {
+    use honk_config::dns::DnsUpstreamGroup;
+
+    let base = representative_config();
+    let base_id = PolicyId::from_config(&base).unwrap();
+    assert_eq!(base_id.canonical_bytes()[0], 2);
+
+    let mut raced_ab = representative_config();
+    raced_ab.upstream.push(honk_config::dns::DnsUpstream {
+        name: "backup".into(),
+        address: "1.1.1.1:53".into(),
+        protocol: DnsProtocol::Udp,
+        tls_server_name: None,
+        outbound: None,
+    });
+    let no_group_id = PolicyId::from_config(&raced_ab).unwrap();
+    raced_ab.upstream_groups.push(DnsUpstreamGroup {
+        name: "fast".into(),
+        upstreams: vec!["default".into(), "backup".into()],
+    });
+    let ab_id = PolicyId::from_config(&raced_ab).unwrap();
+    assert_ne!(no_group_id, ab_id);
+    assert_eq!(ab_id.canonical_bytes()[0], 4);
+
+    let mut raced_ba = raced_ab.clone();
+    raced_ba.upstream_groups[0].upstreams = vec!["backup".into(), "default".into()];
+    assert_ne!(ab_id, PolicyId::from_config(&raced_ba).unwrap());
+
+    let mut renamed = raced_ab.clone();
+    renamed.upstream_groups[0].name = "faster".into();
+    assert_ne!(ab_id, PolicyId::from_config(&renamed).unwrap());
+
+    let mut with_ecs = raced_ab.clone();
+    with_ecs.client_subnet = "auto".into();
+    with_ecs.resolved_client_subnet = Some("198.51.100.0/24".parse().unwrap());
+    assert_ne!(ab_id, PolicyId::from_config(&with_ecs).unwrap());
+}
+
+#[test]
 fn canonical_policy_normalizes_equivalent_endpoint_spellings() {
     // Given
     let first = representative_config();

@@ -230,6 +230,22 @@ Only unquoted `->` and `outbound:` suffixes select detours. Inside a quoted URI 
 
 A group with an [`exit`](./groups.md#exit) carries TCP, DoT, DoH and proxied UDP upstreams over the route's TCP stream. DoQ and DoH3 filter out synthesized multi-hop routes before group selection. An eligible UDP-capable node, including a configured chain with UDP support or a route that collapses to one eligible node, can serve them. A selected `block` remains terminal.
 
+### Concurrent race groups
+
+`name: race(u1, u2, ...)` declares a named upstream group that races 2 to 8 declared physical upstreams concurrently and uses the fastest valid answer:
+
+```dae
+upstream {
+    alidns: 'udp://223.5.5.5:53'
+    dnspod: 'https://doh.pub/dns-query'
+    domestic: race(alidns, dnspod)
+}
+```
+
+- `race(...)` accepts 2 to 8 comma-separated bare or quoted physical upstream names. Each member keeps its own protocol, TLS settings, and `->` outbound route; a `race(...)` declaration takes no `->` or `outbound:` suffix of its own.
+- Validation rejects `< 2` or `> 8` members, empty names, self-references, duplicate members within one `race(...)`, name collisions with physical upstreams or duplicate structured group names, nested race groups, and undeclared member names (`invalid-dns-race`, `conflicting-dns-upstream-name`, `nested-dns-upstream-group`, `unknown-dns-upstream`). Re-declaring the same race group name in `.dae` syntax replaces its earlier member list.
+- On a cache miss, honk queries all unvisited members concurrently, returns the first valid non-truncated (`TC=0`) `NOERROR` or `NXDOMAIN` response, and cancels the remaining in-flight legs immediately. Earlier leg errors, timeouts, truncated (`TC=1`) answers, `SERVFAIL`, or other error RCODEs (`REFUSED`, `NOTIMP`, `FORMERR`, EDNS `BADVERS`) do not abort surviving legs; valid `TC=1` `NOERROR`/`NXDOMAIN`, `SERVFAIL`, and other error-RCODE replies are used in that fallback order only when no non-truncated `NOERROR`/`NXDOMAIN` leg succeeds, and typed local packet refusals are preserved when every leg fails.
+
 ## DNS routing
 
 `routing` contains ordered `request` and `response` rules. The first matching rule wins. Arguments inside one condition are OR-ed; conditions joined with `&&` are AND-ed. Prefix a condition with `!` to negate it.
@@ -252,7 +268,7 @@ Put each complete call and action on one physical line. Incomplete nonblank line
 | `qtype(a, aaaa, ...)` | Request and response | Match QTYPE names or a numeric `u16`. Recognized names are `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `PTR`, `SOA`, `SRV`, `HTTPS`, `SVCB`, `ANY`, and `*`. `*` is an alias for `ANY`, not a wildcard. |
 | `sip(192.168.50.1, 100.64.0.0/10, 2001:db8::/32)` | Request only | Match the logical client source against any listed IP host or CIDR. |
 | `subtag(MyAirport, keyword: Air, regex: ^Paid)` | Request only | Match the subscription tags of a [node server host](#node-server-hosts) lookup: exact, `keyword:` or `regex:`, case-sensitive. |
-| `upstream(name, ...)` | Response only | Match the upstream that produced the current response. Names compare exactly and, unlike action targets, are not lowercased. |
+| `upstream(name, ...)` | Response only | Match the upstream that produced the current response (for a raced exchange, matches both the winning physical upstream and the raced group name). Names compare exactly and, unlike action targets, are not lowercased. |
 | `ip(192.0.2.0/24, geoip: private, ...)` | Response only | Match when any answer IP belongs to a listed CIDR or GeoIP set. |
 
 `qname` matches the lowercase query name without a trailing dot. `full:` and `suffix:` patterns are lowercased, but a trailing dot in a pattern is kept and never matches. `keyword:` and `regex:` patterns are case-sensitive; write them in lowercase or add `(?i)`.
@@ -304,7 +320,7 @@ dns {
 - A claimed lookup queries only the selected upstream, honors `strategy` and `use_host`, and skips the cache and response rules. It never falls back, so its failure fails the physical node or probe connection.
 - A claim applies to the hostname. It is not an end-to-end policy for the download destination. A download's preliminary URL lookup for routing is best effort; proxied URL domains are still resolved by the proxy, while that proxy's own node-server lookup obeys the rule. Downloads using an explicit bootstrap resolver bypass the hook.
 - Tags attach to the hostname, not the node. Nodes from different subscriptions that share a hostname share the union of their tags, so the first matching rule picks one upstream for that hostname.
-- The rule may combine only with `qname()` and must select an upstream whose every declaration is `-> direct`. Otherwise validation fails with `subtag-dns-condition`, `subtag-dns-action` or `subtag-dns-upstream-route`.
+- The rule may combine only with `qname()` and must select an upstream whose every declaration is `-> direct` (for a race group, every declaration of every physical member upstream must be `-> direct`). Otherwise validation fails with `subtag-dns-condition`, `subtag-dns-action` or `subtag-dns-upstream-route`.
 - The upstream's own hostname, ECH discovery and the offline `delay` subcommand still use the bootstrap resolver.
 - A host matching a `use_host` [alias](#hosts-snapshot-use_host) resolves to its target instead. If the alias chain ends at an address entry, it resolves to those addresses. Otherwise it resolves as a node host with that name would: through a `subtag()` rule claiming the target, or else bootstrap. A direct address entry matching the original hostname does not claim it through this hook. An address entry at the end of an alias chain is used. Every claimed lookup, including a local address result or a bootstrap target, obeys DNS runtime admission and cancellation. Once the target/subtag path is selected, its failure is authoritative. A reload that removes the alias before the lookup runs resolves the original host as if it had no alias.
 - Aliases are matched against every hostname that reaches the bootstrap resolver, not only node server hosts. That includes the URL host of a subscription, geodata or external UI download that names no explicit bootstrap resolver. It also includes a SOCKS5 node's UDP relay host, and the bootstrap fallback of health checks, latency tests, connectivity probes and internal name resolution. DNS upstream hostnames and ECH discovery do not reach the hook.
@@ -336,7 +352,7 @@ Native `direct(must)` bypass differs from `asis` re-querying; see [DNS source/NA
 
 NXDOMAIN and SERVFAIL skip response rules and fallback. When the upstream exchange fails or returns SERVFAIL for a cacheable query, honk serves a retained [expired answer](#cache-and-fixed-ttl) instead if one exists. A local packet refusal never does.
 
-A response traversal allows at most three upstreams, including the initial upstream. The planner rejects a fourth exchange and any re-query cycle.
+A response traversal allows at most three upstreams, including the initial upstream. The planner rejects a fourth exchange and any re-query cycle, including re-querying an already-used race group or winning responder; re-querying a different race group skips members that already answered earlier in the same traversal.
 
 ## Address-family strategy
 

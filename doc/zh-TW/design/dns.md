@@ -40,12 +40,12 @@ hosts、快取、請求和回應策略，以及投影。
 接收錯誤的 warning 以 supervisor 為單位計，同一個 socket 故障最多記四次 warning。
 
 - [`src/dns.rs`](../../../crates/honk-config/src/dns.rs) — `DnsConfig`，欄位包括
-  `bind`、`upstream`、`routing`、`strategy`、`cache` 和 `fixed_domain_ttl`。
+  `bind`、`upstream`、`upstream_groups`、`routing`、`strategy`、`cache` 和 `fixed_domain_ttl`。
   `DnsBindEndpoint`、`DnsBindTransport`、`DnsBindError` 負責解析目前的 dae
   listener 設定，並支援語意相等判斷；`DnsConfig::bind_endpoint` 把空值對映為關閉。
   listener 繫結語法見[設定指南](../configuration.md)。`DnsUpstream` 包含 `name`、
   `address`、`protocol: DnsProtocol`、`tls_server_name`，以及撥號路徑的代理 tag
-  `outbound: Option<String>`。Dae 路由採首次匹配執行
+  `outbound: Option<String>`；`DnsUpstreamGroup` 保存並行競速群組名稱及 2 到 8 個有序實體成員名（`name: race(u1, u2, ...)`）。Dae 路由採首次匹配執行
   `DnsRequestRule`/`DnsResponseRule`；`DnsCond` 之間是 AND，支援否定。
   請求規則支援 `Qname`、`Qtype`、`Sip`；回應規則支援 `Qname`、`Qtype`、`Upstream`、
   `Ip`。`Sip` 接受混合的主機位址和 CIDR 引數，不能用在回應規則裡。動作有 `Reject`、
@@ -136,8 +136,8 @@ Honk 的獨立 bind 可以是 `:53530`、其他空閒埠，或者關閉；它不
 | 3. 位址族 gate 與 hosts | `ipv4only`/`ipv6only` 在 hosts 或上游工作前，以 NODATA 拒絕另一位址族。除此之外，不可變 hosts 快照先於請求路由、快取與上游交換執行。 |
 | 4. 請求規劃 | 依原始碼順序的請求規則使用路由網域、QTYPE 與邏輯用戶端來源選擇 reject、`asis` 或命名上游。首條命中。 |
 | 5. 重用 | 符合資格的請求先查詢精確身份的正/負快取；未命中時共用一次 singleflight 交換。不符合資格的請求繞過兩者。 |
-| 6. 交換 | 請求 scope 選擇攔截所得目的位址或某個 `UpstreamPool` transport。 |
-| 7. 回應規劃 | 策略使用每個上游回應前，都會嚴格核對其與查詢是否匹配。回應規則執行 accept、reject 或經命名上游重新查詢；遍歷無迴圈且最多包含三個上游。 |
+| 6. 交換 | 請求 scope 選擇攔截所得目的位址、單一 `UpstreamPool` transport，或對 `DnsUpstreamGroup` 中未造訪的實體成員發起並行競速（首個有效的非截斷 `NOERROR`/`NXDOMAIN` 應答獲勝並立即取消其餘分支，`TC=1` `NOERROR`/`NXDOMAIN`、`SERVFAIL` 及其他錯誤 RCODE 僅作為有序回退；每個分支獨立計入 `DnsSocketBudget`，並在單次邏輯查詢內共享同一個 `RaceScoreContext` 業務延續）。 |
+| 7. 回應規劃 | 策略使用每個上游回應前，都會嚴格核對其與查詢是否匹配。回應 `upstream(...)` 同時匹配實際應答的實體上游與所屬競速群組名；回應規則執行 accept、reject 或經命名上游/競速群組重新查詢，遍歷無迴圈且最多包含三次交換。 |
 | 8. 發布與渲染 | 只有嚴格驗證後的最終 wire 回應才能進入快取或發布給 singleflight waiter。偏好位址族壓制在儲存已驗證、可重用的應答後，才套用於呼叫方渲染。 |
 | 9. 結果與投影 | forwarder 傳回型別化結果。`DnsController` 使用固定 generation 的投影快照提交該結果，隨後入口 adapter 寫應答。 |
 

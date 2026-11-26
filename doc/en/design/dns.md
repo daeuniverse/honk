@@ -30,12 +30,13 @@ Non-`must` transparent DNS and the standalone ingress adapter use the same `DnsC
 The standalone UDP listener runs `min(runtime workers, 4)` receive supervisors on one socket. Each receives up to eight datagrams per batch, retaining each datagram's destination metadata and admission separately, and reuses its own 512 KiB of payload buffers, up to 2 MiB per listener. The socket requests a 4 MiB kernel receive buffer; Linux silently caps it at `net.core.rmem_max`. Each supervisor polls a query once before spawning it, so ready cache answers need no task. Unfinished queries remain owned and joined through stop/drain, and a query panic fails teardown. Batching does not bypass capacity or generation checks. Receive-error warnings are per supervisor, so one socket fault can warn up to four times.
 
 - [`src/dns.rs`](../../../crates/honk-config/src/dns.rs) holds `DnsConfig`
-  (`bind`, `upstream`, `routing`, `strategy`, `cache`, `fixed_domain_ttl`).
+  (`bind`, `upstream`, `upstream_groups`, `routing`, `strategy`, `cache`, `fixed_domain_ttl`).
   `DnsBindEndpoint` / `DnsBindTransport` / `DnsBindError` parse current-dae
   listeners with semantic equality, and `DnsConfig::bind_endpoint` maps empty to
   disabled. Bind syntax: [Configuration](../configuration.md). `DnsUpstream`
   carries name, address, `protocol: DnsProtocol`, `tls_server_name` and the
-  `outbound: Option<String>` dial-path proxy tag. Dae routing is first-match
+  `outbound: Option<String>` dial-path proxy tag; `DnsUpstreamGroup` carries a
+  race group name and 2–8 ordered physical member names (`name: race(u1, u2, ...)`). Dae routing is first-match
   `DnsRequestRule`/`DnsResponseRule` over AND-ed, negatable `DnsCond`s. Request
   conditions are Qname, Qtype and Sip; response conditions are Qname, Qtype,
   Upstream and Ip. `Sip` accepts mixed host/CIDR arguments and never response
@@ -126,8 +127,8 @@ The production path is ordered as follows:
 | 3. Family gate and hosts | `ipv4only`/`ipv6only` reject the other address family with NODATA before hosts or upstream work. Otherwise the immutable hosts snapshot runs before request routing, cache, and upstream exchange. |
 | 4. Request planning | Source-ordered request rules choose reject, `asis`, or a named upstream from the routing domain, QTYPE, and logical client source. First match wins. |
 | 5. Reuse | Eligible requests look up the exact-identity positive/negative cache, then share one singleflight exchange on a miss. Ineligible requests bypass both. |
-| 6. Exchange | The request scope selects the intercepted destination or an `UpstreamPool` transport. |
-| 7. Response planning | Every upstream response is strictly matched to the query before policy uses it. Response rules accept, reject, or re-query through a named upstream; traversal is acyclic and contains at most three upstreams. |
+| 6. Exchange | The request scope selects the intercepted destination, one `UpstreamPool` transport, or a concurrent race across a `DnsUpstreamGroup`'s unvisited physical members (first valid non-truncated `NOERROR`/`NXDOMAIN` reply wins and cancels remaining leg futures, keeping `TC=1` `NOERROR`/`NXDOMAIN`, `SERVFAIL`, and other error RCODEs as ordered fallbacks; each leg charges `DnsSocketBudget` independently and shares one `RaceScoreContext` business continuation). |
+| 7. Response planning | Every upstream response is strictly matched to the query before policy uses it. Response `upstream(...)` matches both the physical responder and any raced group name; rules accept, reject, or re-query through a named upstream or race group, and traversal is acyclic with at most three exchanges. |
 | 8. Publication and rendering | Only a strictly validated final wire response can enter the cache or be published to singleflight waiters. Prefer-family suppression is applied to caller rendering after the validated reusable answer is stored. |
 | 9. Outcome and projection | The forwarder returns a typed outcome. `DnsController` submits that outcome with the pinned generation's projection snapshot, then the ingress adapter writes the reply. |
 

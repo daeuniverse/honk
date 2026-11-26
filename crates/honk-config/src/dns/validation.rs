@@ -1,10 +1,146 @@
 use super::{
-    DnsCond, DnsConfig, DnsRequestAction, DnsResponseAction, DnsTagMatcher, RequestSource,
+    DnsCond, DnsConfig, DnsRequestAction, DnsResponseAction, DnsTagMatcher, MAX_DNS_RACE_UPSTREAMS,
+    RequestSource,
 };
 use crate::diagnostic::{SettingPath, SourceRef};
 use crate::error::{DetailedConfigError, ErrorCategory};
 
 impl DnsConfig {
+    fn validate_upstream_groups_detailed(
+        &self,
+        source: &SourceRef,
+    ) -> Result<(), DetailedConfigError> {
+        let group_error =
+            |ordinal: usize, setting: SettingPath, code: &'static str, message: &'static str| {
+                let mut error = DetailedConfigError::new(
+                    ErrorCategory::Validation,
+                    code,
+                    source.clone(),
+                    setting,
+                    message,
+                );
+                error.diagnostic.entry_index = Some(ordinal);
+                error
+            };
+
+        for (index, group) in self.upstream_groups.iter().enumerate() {
+            let ordinal = index + 1;
+            let name_path = || {
+                SettingPath::new("dns")
+                    .field("upstream_groups")
+                    .index(ordinal)
+                    .field("name")
+            };
+            if group.name.is_empty() {
+                return Err(group_error(
+                    ordinal,
+                    name_path(),
+                    "invalid-dns-race",
+                    "DNS race group name must not be empty",
+                ));
+            }
+            if self
+                .upstream
+                .iter()
+                .any(|upstream| upstream.name == group.name)
+            {
+                return Err(group_error(
+                    ordinal,
+                    name_path(),
+                    "conflicting-dns-upstream-name",
+                    "DNS race group name conflicts with a declared upstream",
+                ));
+            }
+            if self.upstream_groups[..index]
+                .iter()
+                .any(|prior| prior.name == group.name)
+            {
+                return Err(group_error(
+                    ordinal,
+                    name_path(),
+                    "conflicting-dns-upstream-name",
+                    "duplicate DNS race group name",
+                ));
+            }
+            if !(2..=MAX_DNS_RACE_UPSTREAMS).contains(&group.upstreams.len()) {
+                return Err(group_error(
+                    ordinal,
+                    SettingPath::new("dns")
+                        .field("upstream_groups")
+                        .index(ordinal)
+                        .field("upstreams"),
+                    "invalid-dns-race",
+                    "DNS race group requires between 2 and 8 upstreams",
+                ));
+            }
+        }
+
+        for (index, group) in self.upstream_groups.iter().enumerate() {
+            let ordinal = index + 1;
+            for (member_index, member) in group.upstreams.iter().enumerate() {
+                let member_path = || {
+                    SettingPath::new("dns")
+                        .field("upstream_groups")
+                        .index(ordinal)
+                        .field("upstreams")
+                        .index(member_index + 1)
+                };
+                if member.is_empty() {
+                    return Err(group_error(
+                        ordinal,
+                        member_path(),
+                        "invalid-dns-race",
+                        "DNS race group member name must not be empty",
+                    ));
+                }
+                if member == &group.name {
+                    return Err(group_error(
+                        ordinal,
+                        member_path(),
+                        "invalid-dns-race",
+                        "DNS race group cannot reference itself",
+                    ));
+                }
+                if group.upstreams[..member_index]
+                    .iter()
+                    .any(|prior| prior == member)
+                {
+                    return Err(group_error(
+                        ordinal,
+                        member_path(),
+                        "invalid-dns-race",
+                        "DNS race group cannot list the same upstream twice",
+                    ));
+                }
+                if self
+                    .upstream_groups
+                    .iter()
+                    .any(|other| other.name == *member)
+                {
+                    return Err(group_error(
+                        ordinal,
+                        member_path(),
+                        "nested-dns-upstream-group",
+                        "DNS race group members must be physical upstreams, not another race group",
+                    ));
+                }
+                if !self
+                    .upstream
+                    .iter()
+                    .any(|upstream| upstream.name == *member)
+                {
+                    return Err(group_error(
+                        ordinal,
+                        member_path(),
+                        "unknown-dns-upstream",
+                        "DNS race group references an undeclared upstream",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn check_upstream_reference(
         &self,
         target: &str,
@@ -12,7 +148,12 @@ impl DnsConfig {
         index: Option<usize>,
         setting: impl FnOnce() -> SettingPath,
     ) -> Result<(), DetailedConfigError> {
-        if self.upstream.iter().any(|upstream| upstream.name == target) {
+        if self.upstream.iter().any(|upstream| upstream.name == target)
+            || self
+                .upstream_groups
+                .iter()
+                .any(|group| group.name == target)
+        {
             return Ok(());
         }
         let mut error = DetailedConfigError::new(
@@ -30,6 +171,7 @@ impl DnsConfig {
         &self,
         source: &SourceRef,
     ) -> Result<(), DetailedConfigError> {
+        self.validate_upstream_groups_detailed(source)?;
         let routing = &self.routing;
         match routing.request_source() {
             RequestSource::Current => {
@@ -145,19 +287,28 @@ impl DnsConfig {
                 match &rule.action {
                     // Every declaration counts: the runtime keeps the last one.
                     DnsRequestAction::Upstream(name) => {
-                        self.upstream
-                            .iter()
-                            .any(|upstream| {
-                                upstream.name == *name
+                        let non_direct = |target: &str| {
+                            self.upstream.iter().any(|upstream| {
+                                upstream.name == target
                                     && !upstream.outbound.as_deref().is_some_and(|outbound| {
                                         outbound.eq_ignore_ascii_case("direct")
                                     })
                             })
-                            .then_some((
-                                "subtag-dns-upstream-route",
-                                "action",
-                                "a subtag() DNS rule's upstream must be declared `-> direct`",
-                            ))
+                        };
+                        let rejected = if let Some(group) = self
+                            .upstream_groups
+                            .iter()
+                            .find(|group| group.name == *name)
+                        {
+                            group.upstreams.iter().any(|member| non_direct(member))
+                        } else {
+                            non_direct(name)
+                        };
+                        rejected.then_some((
+                            "subtag-dns-upstream-route",
+                            "action",
+                            "a subtag() DNS rule's upstream must be declared `-> direct`",
+                        ))
                     }
                     DnsRequestAction::AsIs | DnsRequestAction::Reject => Some((
                         "subtag-dns-action",

@@ -269,6 +269,15 @@ where
     Ok(sources)
 }
 
+pub const MAX_DNS_RACE_UPSTREAMS: usize = 8;
+
+/// Concurrent DNS upstream race group (`name: race(u1, u2, ...)`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsUpstreamGroup {
+    pub name: String,
+    pub upstreams: Vec<String>,
+}
+
 /// DNS configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsConfig {
@@ -290,6 +299,8 @@ pub struct DnsConfig {
     pub resolved_client_subnet: Option<Ipv4Net>,
     #[serde(default)]
     pub upstream: Vec<DnsUpstream>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream_groups: Vec<DnsUpstreamGroup>,
     #[serde(default)]
     pub routing: DnsRouting,
     /// DNS request strategy
@@ -834,6 +845,7 @@ impl Default for DnsConfig {
                 tls_server_name: None,
                 outbound: None,
             }],
+            upstream_groups: Vec::new(),
             routing: DnsRouting::default(),
             strategy: DnsStrategy::Both,
             cache: DnsCacheConfig {
@@ -1202,5 +1214,22 @@ mod tests {
         let cfg: DnsConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.fixed_domain_ttl.get("a.test"), Some(&0u32));
         assert_eq!(cfg.fixed_domain_ttl.get("b.test"), Some(&300u32));
+    }
+
+    #[test]
+    fn dns_upstream_groups_serde_roundtrip_and_default_omission() {
+        let default = DnsConfig::default();
+        assert!(default.upstream_groups.is_empty());
+        let default_json = serde_json::to_value(&default).unwrap();
+        assert!(default_json.get("upstream_groups").is_none());
+
+        let mut with_race = DnsConfig::default();
+        with_race.upstream_groups.push(DnsUpstreamGroup {
+            name: "fast".into(),
+            upstreams: vec!["default".into(), "backup".into()],
+        });
+        let encoded = serde_json::to_string(&with_race).unwrap();
+        let decoded: DnsConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.upstream_groups, with_race.upstream_groups);
     }
 }

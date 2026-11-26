@@ -3,33 +3,39 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use bytes::Bytes;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use tracing::{debug, trace};
 
 use crate::dns::cache::{CacheKey, PublicationEpoch};
 use crate::dns::engine::{DnsEngine, ParsedQuery, PreparedQuery};
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeParts, OutcomeStatus, Provenance};
-use crate::dns::planner::RequestScope;
+use crate::dns::planner::{RequestScope, ResponseTraversal, UpstreamTag};
 use crate::dns::query::{DnsRequestMeta, IngressProfile, QueryContext};
-use crate::dns::response::ResponseTemplate;
+use crate::dns::response::{ResponseTemplate, checked_response_rcode, is_truncated};
 use crate::dns::singleflight::FlightKey;
 
 use super::message::{build_dns_query, new_asis_socket_with_mark};
 use super::ttl::{patch_txid, rewrite_answer_ttls};
-use super::{CacheAccess, DnsForwardError, DnsForwarder, ResolveMode, ResolveOptions};
+use super::{
+    CacheAccess, DnsForwardError, DnsForwarder, RaceScoreContext, ResolveMode, ResolveOptions,
+};
 
 impl DnsForwarder {
     pub(crate) async fn exchange(
         &self,
         scope: &RequestScope,
         raw_query: &[u8],
-        ingress: IngressProfile,
-    ) -> anyhow::Result<Vec<u8>> {
+        query: &QueryContext,
+        score: &RaceScoreContext,
+    ) -> anyhow::Result<(Vec<u8>, UpstreamTag)> {
         match scope {
             RequestScope::Upstream(upstream) => {
-                self.upstream_pool.query(upstream.as_str(), raw_query).await
+                self.exchange_upstream(upstream, raw_query, query, None, score)
+                    .await
             }
             RequestScope::AsIs(destination) => {
-                let query = self.query_asis(raw_query, *destination, ingress);
+                let wire = self.query_asis(raw_query, *destination, query.ingress());
                 let observation = crate::observe::flows::dns::outbound_evidence(
                     "direct",
                     crate::observe::vocab::RoutingSource::Builtin,
@@ -38,13 +44,123 @@ impl DnsForwarder {
                     *destination,
                     Default::default(),
                 );
-                crate::observe::scope_pin!(query);
-                let query = crate::observe::flows::dns::outbound_scope(observation.as_ref(), query);
-                crate::observe::scope_pin!(query);
-                let query = crate::observe::flows::dns::exchange_scope(raw_query, "asis", query);
-                query.await
+                crate::observe::scope_pin!(wire);
+                let wire = crate::observe::flows::dns::outbound_scope(observation.as_ref(), wire);
+                crate::observe::scope_pin!(wire);
+                let wire = crate::observe::flows::dns::exchange_scope(raw_query, "asis", wire);
+                let response = wire.await?;
+                Ok((
+                    response,
+                    UpstreamTag::new("asis").expect("static asis tag is valid"),
+                ))
             }
         }
+    }
+
+    pub(crate) async fn exchange_upstream(
+        &self,
+        target: &UpstreamTag,
+        raw_query: &[u8],
+        query: &QueryContext,
+        skip_visited: Option<&ResponseTraversal>,
+        score: &RaceScoreContext,
+    ) -> anyhow::Result<(Vec<u8>, UpstreamTag)> {
+        let Some(members) = self.upstream_groups.get(target) else {
+            let wire = if !self.upstream_groups.is_empty() {
+                self.upstream_pool
+                    .query_race_leg(target.as_str(), raw_query, score)
+                    .await?
+            } else {
+                self.upstream_pool.query(target.as_str(), raw_query).await?
+            };
+            return Ok((wire, target.clone()));
+        };
+
+        let eligible: Vec<&UpstreamTag> = members
+            .iter()
+            .filter(|member| skip_visited.is_none_or(|traversal| !traversal.has_visited(member)))
+            .collect();
+        if eligible.is_empty() {
+            anyhow::bail!(
+                "DNS race group '{}' has no unvisited upstreams",
+                target.as_str()
+            );
+        }
+        if eligible.len() == 1 {
+            let sole = eligible[0];
+            let wire = self
+                .upstream_pool
+                .query_race_leg(sole.as_str(), raw_query, score)
+                .await?;
+            return Ok((wire, sole.clone()));
+        }
+
+        let mut in_flight: FuturesUnordered<_> = eligible
+            .into_iter()
+            .map(|member| async move {
+                let result = self
+                    .upstream_pool
+                    .query_race_leg(member.as_str(), raw_query, score)
+                    .await;
+                (member, result)
+            })
+            .collect();
+
+        let mut best_truncated: Option<(Vec<u8>, UpstreamTag)> = None;
+        let mut best_servfail: Option<(Vec<u8>, UpstreamTag)> = None;
+        let mut best_error_rcode: Option<(Vec<u8>, UpstreamTag)> = None;
+        let mut best_invalid: Option<(Vec<u8>, UpstreamTag)> = None;
+        let mut first_rejection: Option<anyhow::Error> = None;
+        let mut last_error: Option<anyhow::Error> = None;
+
+        while let Some((member, result)) = in_flight.next().await {
+            match result {
+                Ok(wire) => match checked_response_rcode(Some(query), &wire) {
+                    Ok(0 | 3) => {
+                        if !is_truncated(&wire) {
+                            return Ok((wire, member.clone()));
+                        }
+                        best_truncated.get_or_insert_with(|| (wire, member.clone()));
+                    }
+                    Ok(2) => {
+                        best_servfail.get_or_insert_with(|| (wire, member.clone()));
+                    }
+                    Ok(_) => {
+                        best_error_rcode.get_or_insert_with(|| (wire, member.clone()));
+                    }
+                    Err(_) => {
+                        best_invalid.get_or_insert_with(|| (wire, member.clone()));
+                    }
+                },
+                Err(error) => {
+                    if honk_outbound::proxy::is_packet_rejection(&error) {
+                        first_rejection.get_or_insert(error);
+                    } else {
+                        last_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        if let Some(winner) = best_truncated {
+            return Ok(winner);
+        }
+        if let Some(winner) = best_servfail {
+            return Ok(winner);
+        }
+        if let Some(winner) = best_error_rcode {
+            return Ok(winner);
+        }
+        if let Some(rejection) = first_rejection {
+            return Err(rejection);
+        }
+        if let Some(error) = last_error {
+            return Err(error);
+        }
+        if let Some(invalid) = best_invalid {
+            return Ok(invalid);
+        }
+        anyhow::bail!("DNS race group '{}' produced no result", target.as_str())
     }
 
     #[allow(clippy::too_many_arguments)]

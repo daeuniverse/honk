@@ -230,6 +230,22 @@ upstream {
 
 带 [`exit`](./groups.md#出口) 的组通过路由的 TCP 流传输 TCP、DoT、DoH 和经代理的 UDP 上游。DoQ 和 DoH3 在组选路前排除由组出口组成的多跳路由。支持 UDP 且符合条件的节点可以承载这两种上游，包括支持 UDP 的配置链和折叠为一个合格节点的路由。选中的 `block` 仍是终止动作。
 
+### 并发竞速组
+
+`name: race(u1, u2, ...)` 声明一个命名的并发竞速上游组，同时查询 2 到 8 个已声明的物理上游并取最快的有效应答：
+
+```dae
+upstream {
+    alidns: 'udp://223.5.5.5:53'
+    dnspod: 'https://doh.pub/dns-query'
+    domestic: race(alidns, dnspod)
+}
+```
+
+- `race(...)` 接受 2 到 8 个用逗号分隔的裸写或加引号物理上游名。每个成员保留各自的协议、TLS 设置和 `->` 出站路由；`race(...)` 声明本身不接受 `->` 或 `outbound:` 后缀。
+- 完整配置校验会拒绝少于 2 个或多于 8 个成员、空名称、自引用、同一 `race(...)` 内重复成员、与物理上游重名或结构化配置中重复的竞速组名、嵌套竞速组以及未声明的成员名（`invalid-dns-race`、`conflicting-dns-upstream-name`、`nested-dns-upstream-group`、`unknown-dns-upstream`）。在 `.dae` 语法中重复声明同名竞速组会替换先前的成员列表。
+- 缓存未命中时，honk 并发查询所有未访问过的成员，返回首个有效的非截断（`TC=0`）`NOERROR` 或 `NXDOMAIN` 应答，并立即取消其余在途分支。较早分支返回的错误、超时、截断应答（`TC=1`）、`SERVFAIL` 或其他错误 RCODE（如 `REFUSED`、`NOTIMP`、`FORMERR`、EDNS `BADVERS`）不会中止其余存活分支；仅当没有任何非截断 `NOERROR`/`NXDOMAIN` 分支成功时，才依次回退使用有效的 `TC=1` `NOERROR`/`NXDOMAIN`、`SERVFAIL` 或其他错误 RCODE 应答，全部分支均失败时保留类型化的本地数据包拒绝错误。
+
 ## DNS 路由
 
 `routing` 里是排好序的 `request` 和 `response` 规则，第一条匹配的生效。同一个条件里的参数按 OR 组合；用 `&&` 连起来的条件按 AND 组合。条件前加 `!` 表示取反。
@@ -252,7 +268,7 @@ upstream {
 | `qtype(a, aaaa, ...)` | Request 与 response | 匹配 QTYPE 名称或数字 `u16`。可识别名称为 `A`、`AAAA`、`CNAME`、`MX`、`TXT`、`NS`、`PTR`、`SOA`、`SRV`、`HTTPS`、`SVCB`、`ANY` 和 `*`。`*` 是 `ANY` 的别名，不是通配符。 |
 | `sip(192.168.50.1, 100.64.0.0/10, 2001:db8::/32)` | 仅 request | 把逻辑客户端来源和列出的任一个 IP 主机地址或 CIDR 匹配。 |
 | `subtag(MyAirport, keyword: Air, regex: ^Paid)` | 仅 request | 匹配[节点服务器域名](#节点服务器域名)查询所属订阅的 tag：精确值、`keyword:` 或 `regex:`，区分大小写。 |
-| `upstream(name, ...)` | 仅 response | 匹配生成当前应答的上游。名称精确比较，且不像动作目标那样转为小写。 |
+| `upstream(name, ...)` | 仅 response | 匹配生成当前应答的上游（对于竞速交换，同时匹配实际获胜的物理上游名与所属竞速组名）。名称精确比较，且不像动作目标那样转为小写。 |
 | `ip(192.0.2.0/24, geoip: private, ...)` | 仅 response | 任一应答 IP 属于所列 CIDR 或 GeoIP 集时匹配。 |
 
 `qname` 用去掉末尾点的小写查询名称匹配。`full:` 和 `suffix:` 的模式会转成小写，但模式里的末尾点会保留，所以带末尾点的模式永远匹配不上。`keyword:` 和 `regex:` 模式区分大小写；应写小写，或者加 `(?i)`。
@@ -304,7 +320,7 @@ dns {
 - 被接管的查询只发往选中的上游，遵守 `strategy` 和 `use_host`，不走缓存和 response 规则，也不回退：查询失败就表示物理节点连接或探测连接失败。
 - 接管按域名生效，不是端到端的下载目标解析策略。下载时为选路而预先解析 URL 域名，只是尽力而为；代理下载的 URL 域名仍由代理解析，而承载代理自身的节点服务器解析遵守这条规则。显式使用 bootstrap 解析器的下载绕过这个 hook。
 - tag 属于主机名，不属于节点：不同订阅里共用同一主机名的节点，各自的 tag 会合并，所以第一条匹配的规则就为这个主机名选定一个上游。
-- 这条规则只能和 `qname()` 组合，而且所选上游的每条声明都必须是 `-> direct`，否则校验报错：`subtag-dns-condition`、`subtag-dns-action` 或 `subtag-dns-upstream-route`。
+- 这条规则只能和 `qname()` 组合，而且所选上游的每条声明都必须是 `-> direct`（若指向竞速组，则每个物理成员上游的每条声明都必须是 `-> direct`），否则校验报错：`subtag-dns-condition`、`subtag-dns-action` 或 `subtag-dns-upstream-route`。
 - 上游自身的域名、ECH 发现和离线 `delay` 子命令仍使用 bootstrap 解析器。
 - 域名匹配到 `use_host` 中的[别名](#hosts-快照use_host)时，honk 改为解析别名目标。别名链停在地址条目上，就直接用这些地址；否则把目标域名当作节点域名解析，也就是交给接管该目标的 `subtag()` 规则，没有接管就走 bootstrap。直接匹配原始域名的地址条目不会经这个 hook 接管；honk 用的是别名链终点的地址条目。所有被接管的查询，包括本地地址结果和 bootstrap 目标，都遵守 DNS 运行时 admission 与取消机制。目标或 subtag 路径一旦选定，该路径失败就是最终结果。查询执行前 reload 删掉了这个别名时，原域名按没有别名的情况解析。
 - 别名匹配所有交给 bootstrap 解析器的域名，不限于节点服务器域名：没有指定显式 bootstrap 解析器的订阅、Geo 数据和外部 UI 下载的 URL 域名，SOCKS5 节点的 UDP 中继域名，以及健康检查、延迟测试、连通性探测和内部解析回退到 bootstrap 时的域名。DNS 上游自身的域名和 ECH 发现不走这个 hook。
@@ -336,7 +352,7 @@ dns {
 
 `NXDOMAIN` 和 `SERVFAIL` 跳过应答规则和回退动作。对可缓存的查询，如果上游交换失败或返回 `SERVFAIL`，而[过期应答](#缓存与固定-ttl)还在，honk 就改为返回它；本地数据包拒绝不会触发这一行为。
 
-一次 response 遍历最多查三个上游，初始上游也算在内；第四次交换 honk 会拒绝。重新查询形成环路时，honk 同样拒绝。
+一次 response 遍历最多查三个上游，初始上游也算在内；第四次交换 honk 会拒绝。重新查询形成环路（包括再次查询已使用过的竞速组或获胜物理上游）时，honk 同样拒绝；重新查询另一个竞速组时，会自动跳过同一遍历中已经应答过的物理成员。
 
 ## 地址族策略
 

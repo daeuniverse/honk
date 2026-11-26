@@ -107,6 +107,7 @@ use crate::routing::parse_ip_net_str;
 
 const FORMAT_VERSION: u8 = 2;
 const ECS_FORMAT_VERSION: u8 = 3;
+const RACE_FORMAT_VERSION: u8 = 4;
 // Retention remains fixed; the reply TTL keeps its existing identity slot.
 const STALE_RETENTION_SECS: u64 = 3600;
 
@@ -114,8 +115,11 @@ pub(super) fn encode(config: &DnsConfig) -> Result<Vec<u8>, PolicyError> {
     let client_subnet = config
         .effective_client_subnet()
         .map_err(|source| PolicyError::InvalidClientSubnet { source })?;
+    let has_groups = !config.upstream_groups.is_empty();
     let mut writer = Writer::new();
-    writer.byte(if client_subnet.is_some() {
+    writer.byte(if has_groups {
+        RACE_FORMAT_VERSION
+    } else if client_subnet.is_some() {
         ECS_FORMAT_VERSION
     } else {
         FORMAT_VERSION
@@ -178,10 +182,23 @@ pub(super) fn encode(config: &DnsConfig) -> Result<Vec<u8>, PolicyError> {
     writer.u64(u64::try_from(config.cache.max_size).map_err(|_| PolicyError::FieldTooLarge)?);
     writer.u64(STALE_RETENTION_SECS);
     writer.u32(config.cache.stale_reply_ttl);
+    if has_groups {
+        writer.byte(u8::from(client_subnet.is_some()));
+    }
     if let Some(network) = client_subnet {
         writer.byte(network.prefix_len());
         for octet in network.network().octets() {
             writer.byte(octet);
+        }
+    }
+    if has_groups {
+        writer.len(config.upstream_groups.len())?;
+        for group in &config.upstream_groups {
+            writer.string(&exact(&group.name, "upstream group name")?)?;
+            writer.len(group.upstreams.len())?;
+            for member in &group.upstreams {
+                writer.string(&exact(member, "upstream group member")?)?;
+            }
         }
     }
     Ok(writer.finish())

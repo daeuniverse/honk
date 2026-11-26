@@ -15,6 +15,17 @@ use crate::dns::transport::{IdlePressureRelease, RouteFailures, UdpPool, UdpPool
 
 struct UdpRetirementDrain<'a>(&'a UpstreamPool);
 
+#[derive(Default)]
+struct RouteAttemptState {
+    original_business: Option<honk_outbound::group::ScoreContinuation>,
+    route_failures: RouteFailures,
+}
+
+struct ScoredRoute {
+    route: DnsDialRoute,
+    pre_admitted: Option<honk_outbound::group::ScoreBusinessGuard>,
+}
+
 impl Drop for UdpRetirementDrain<'_> {
     fn drop(&mut self) {
         self.0.drain_retired_transports(false);
@@ -393,35 +404,104 @@ impl UpstreamPool {
         .await
     }
 
+    async fn resolve_route_with_score(
+        &self,
+        entry: &UpstreamEntry,
+        target: SocketAddr,
+        state: &mut RouteAttemptState,
+        race_score: Option<&crate::dns::forwarder::RaceScoreContext>,
+    ) -> anyhow::Result<ScoredRoute> {
+        let Some(ctx) = race_score else {
+            let route = self
+                .resolve_dial_route_for_address(entry, target, state.original_business.as_ref())
+                .await?;
+            return Ok(ScoredRoute {
+                route,
+                pre_admitted: None,
+            });
+        };
+        if let Some(shared) = ctx.current() {
+            if state.original_business.is_none() {
+                state.original_business = Some(shared.clone());
+            }
+            let route = self
+                .resolve_dial_route_for_address(entry, target, state.original_business.as_ref())
+                .await?;
+            let pre_admitted =
+                admit_score_attempt(route.feedback.as_ref(), &mut state.original_business)?;
+            return Ok(ScoredRoute {
+                route,
+                pre_admitted,
+            });
+        }
+        let _guard = ctx.lock_first_admission().await;
+        if let Some(shared) = ctx.current()
+            && state.original_business.is_none()
+        {
+            state.original_business = Some(shared.clone());
+        }
+        let route = self
+            .resolve_dial_route_for_address(entry, target, state.original_business.as_ref())
+            .await?;
+        let pre_admitted =
+            admit_score_attempt(route.feedback.as_ref(), &mut state.original_business)?;
+        if let Some(cont) = state.original_business.as_ref() {
+            ctx.record(cont);
+        }
+        Ok(ScoredRoute {
+            route,
+            pre_admitted,
+        })
+    }
+
     async fn query_udp_via_proxy(
         &self,
         upstream_name: &str,
         entry: &UpstreamEntry,
-        route: &DnsDialRoute,
+        scored: ScoredRoute,
         raw_query: &[u8],
-        original: &mut Option<honk_outbound::group::ScoreContinuation>,
-        route_failures: &mut RouteFailures,
+        state: &mut RouteAttemptState,
     ) -> anyhow::Result<Vec<u8>> {
+        let ScoredRoute {
+            route,
+            pre_admitted,
+        } = scored;
         let exchange = async {
             let node = route
                 .node
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("proxied DNS route has no node"))?;
             let _admission = self.admit_query().await?;
-            let business = admit_score_attempt(route.feedback.as_ref(), original)?;
+            let business = match pre_admitted {
+                Some(business) => Some(business),
+                None => admit_score_attempt(route.feedback.as_ref(), &mut state.original_business)?,
+            };
             let response = self
-                .exchange_routed(entry, route, raw_query, business, route_failures)
+                .exchange_routed(
+                    entry,
+                    &route,
+                    raw_query,
+                    business,
+                    &mut state.route_failures,
+                )
                 .await?;
             let response = if crate::dns::response::is_truncated(&response) {
                 crate::observe::flows::dns::tcp_fallback();
-                let tcp_feedback = self.tcp_feedback_for_route(entry, route)?;
-                let business = admit_score_attempt(tcp_feedback.as_ref(), original)?;
+                let tcp_feedback = self.tcp_feedback_for_route(entry, &route)?;
+                let business =
+                    admit_score_attempt(tcp_feedback.as_ref(), &mut state.original_business)?;
                 debug!(
                     "DNS upstream '{}' proxied UDP answer has TC set — retrying over proxied TCP",
                     upstream_name
                 );
-                self.exchange_routed(entry, route, raw_query, business, route_failures)
-                    .await?
+                self.exchange_routed(
+                    entry,
+                    &route,
+                    raw_query,
+                    business,
+                    &mut state.route_failures,
+                )
+                .await?
             } else {
                 response
             };
@@ -489,13 +569,17 @@ impl UpstreamPool {
         upstream_name: &str,
         entry: &UpstreamEntry,
         raw_query: &[u8],
+        race_score: Option<&crate::dns::forwarder::RaceScoreContext>,
     ) -> anyhow::Result<Vec<u8>> {
-        let mut original_business = None;
-        let mut route_failures = RouteFailures::default();
+        let mut state = RouteAttemptState::default();
         let current = { entry.udp.lock().current_address() };
         let has_traffic_router =
             self.traffic_router_snapshot.read().is_some() || self.traffic_router.read().is_some();
-        let initial_route = if current.is_none() && entry.outbound.is_none() && has_traffic_router {
+        let initial_route = if race_score.is_none()
+            && current.is_none()
+            && entry.outbound.is_none()
+            && has_traffic_router
+        {
             let (targets, witness) = self.resolve_observed_addrs(entry).await;
             let target = targets?
                 .into_iter()
@@ -505,26 +589,23 @@ impl UpstreamPool {
                 witness.selected_ip(target.ip());
             }
             Some(
-                self.resolve_dial_route_for_address(entry, target, original_business.as_ref())
-                    .await?,
+                self.resolve_dial_route_for_address(
+                    entry,
+                    target,
+                    state.original_business.as_ref(),
+                )
+                .await?,
             )
         } else {
             None
         };
         let failed = if let Some(address) = current {
-            let route = self
-                .resolve_dial_route_for_address(entry, address, original_business.as_ref())
+            let scored = self
+                .resolve_route_with_score(entry, address, &mut state, race_score)
                 .await?;
-            if route.node.is_some() {
+            if scored.route.node.is_some() {
                 match self
-                    .query_udp_via_proxy(
-                        upstream_name,
-                        entry,
-                        &route,
-                        raw_query,
-                        &mut original_business,
-                        &mut route_failures,
-                    )
+                    .query_udp_via_proxy(upstream_name, entry, scored, raw_query, &mut state)
                     .await
                 {
                     Ok(response) => return Ok(response),
@@ -533,7 +614,7 @@ impl UpstreamPool {
             } else {
                 let admission = self.admit_query().await?;
                 match self
-                    .exchange_direct_udp(entry, &route, raw_query, admission)
+                    .exchange_direct_udp(entry, &scored.route, raw_query, admission)
                     .await
                 {
                     Ok(exchange) => {
@@ -541,7 +622,7 @@ impl UpstreamPool {
                             .finish_direct_udp_query(
                                 upstream_name,
                                 entry,
-                                &route,
+                                &scored.route,
                                 raw_query,
                                 exchange,
                             )
@@ -571,23 +652,19 @@ impl UpstreamPool {
             if let Some(witness) = &witness {
                 witness.selected_ip(first.ip());
             }
-            let route = match initial_route {
-                Some(route) if route.target == first => route,
+            let scored = match initial_route {
+                Some(route) if route.target == first => ScoredRoute {
+                    route,
+                    pre_admitted: None,
+                },
                 _ => {
-                    self.resolve_dial_route_for_address(entry, first, original_business.as_ref())
+                    self.resolve_route_with_score(entry, first, &mut state, race_score)
                         .await?
                 }
             };
-            if route.node.is_some() {
+            if scored.route.node.is_some() {
                 match self
-                    .query_udp_via_proxy(
-                        upstream_name,
-                        entry,
-                        &route,
-                        raw_query,
-                        &mut original_business,
-                        &mut route_failures,
-                    )
+                    .query_udp_via_proxy(upstream_name, entry, scored, raw_query, &mut state)
                     .await
                 {
                     Ok(response) => return Ok(response),
@@ -596,7 +673,7 @@ impl UpstreamPool {
             } else {
                 let attempt = async {
                     let admission = self.admit_query().await?;
-                    self.exchange_direct_udp(entry, &route, raw_query, admission)
+                    self.exchange_direct_udp(entry, &scored.route, raw_query, admission)
                         .await
                 }
                 .await;
@@ -606,7 +683,7 @@ impl UpstreamPool {
                             .finish_direct_udp_query(
                                 upstream_name,
                                 entry,
-                                &route,
+                                &scored.route,
                                 raw_query,
                                 exchange,
                             )
@@ -626,19 +703,12 @@ impl UpstreamPool {
         if let Some(witness) = &witness {
             witness.selected_ip(retry.ip());
         }
-        let route = self
-            .resolve_dial_route_for_address(entry, retry, original_business.as_ref())
+        let scored = self
+            .resolve_route_with_score(entry, retry, &mut state, race_score)
             .await?;
-        if route.node.is_some() {
+        if scored.route.node.is_some() {
             return self
-                .query_udp_via_proxy(
-                    upstream_name,
-                    entry,
-                    &route,
-                    raw_query,
-                    &mut original_business,
-                    &mut route_failures,
-                )
+                .query_udp_via_proxy(upstream_name, entry, scored, raw_query, &mut state)
                 .await
                 .with_context(|| {
                     format!("UDP DNS failed via {retry} (first {first}: {first_error})")
@@ -646,14 +716,20 @@ impl UpstreamPool {
         }
         let attempt = async {
             let admission = self.admit_query().await?;
-            self.exchange_direct_udp(entry, &route, raw_query, admission)
+            self.exchange_direct_udp(entry, &scored.route, raw_query, admission)
                 .await
         }
         .await;
         match attempt {
             Ok(exchange) => {
-                self.finish_direct_udp_query(upstream_name, entry, &route, raw_query, exchange)
-                    .await
+                self.finish_direct_udp_query(
+                    upstream_name,
+                    entry,
+                    &scored.route,
+                    raw_query,
+                    exchange,
+                )
+                .await
             }
             Err(error) => Err(error).with_context(|| {
                 format!("UDP DNS failed via {retry} (first {first}: {first_error})")
@@ -663,7 +739,12 @@ impl UpstreamPool {
 }
 
 impl UpstreamPool {
-    async fn query_inner(&self, upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn query_inner(
+        &self,
+        upstream_name: &str,
+        raw_query: &[u8],
+        race_score: Option<&crate::dns::forwarder::RaceScoreContext>,
+    ) -> anyhow::Result<Vec<u8>> {
         debug!(
             "UpstreamPool::query called for '{}' ({} bytes)",
             upstream_name,
@@ -674,21 +755,29 @@ impl UpstreamPool {
             .get(upstream_name)
             .ok_or_else(|| anyhow::anyhow!("unknown upstream: {upstream_name}"))?;
         if entry.protocol == DnsProtocol::Udp {
-            return self.query_datagram(upstream_name, entry, raw_query).await;
+            return self
+                .query_datagram(upstream_name, entry, raw_query, race_score)
+                .await;
         }
 
         let (targets, witness) = self.resolve_observed_addrs(entry).await;
         let targets = targets?;
         let mut last_error = None;
         let mut first_error = None;
-        let mut original_business = None;
-        let mut route_failures = RouteFailures::default();
+        let mut state = RouteAttemptState::default();
         for target in targets {
-            let route = self
-                .resolve_dial_route_for_address(entry, target, original_business.as_ref())
+            let scored = self
+                .resolve_route_with_score(entry, target, &mut state, race_score)
                 .await?;
+            let ScoredRoute {
+                route,
+                pre_admitted,
+            } = scored;
             let _admission = self.admit_query().await?;
-            let business = admit_score_attempt(route.feedback.as_ref(), &mut original_business)?;
+            let business = match pre_admitted {
+                Some(business) => Some(business),
+                None => admit_score_attempt(route.feedback.as_ref(), &mut state.original_business)?,
+            };
             if let Some(witness) = &witness {
                 witness.selected_ip(route.target.ip());
             }
@@ -710,7 +799,7 @@ impl UpstreamPool {
                     &route,
                     effective_query,
                     business,
-                    &mut route_failures,
+                    &mut state.route_failures,
                 );
                 crate::observe::scope_pin!(exchange);
                 let exchange = crate::observe::flows::dns::outbound_scope(
@@ -771,7 +860,19 @@ impl UpstreamPool {
 #[async_trait::async_trait]
 impl DnsUpstreamPool for UpstreamPool {
     async fn query(&self, upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let query = self.query_inner(upstream_name, raw_query);
+        let query = self.query_inner(upstream_name, raw_query, None);
+        crate::observe::scope_pin!(query);
+        let query = crate::observe::flows::dns::exchange_scope(raw_query, upstream_name, query);
+        query.await
+    }
+
+    async fn query_race_leg(
+        &self,
+        upstream_name: &str,
+        raw_query: &[u8],
+        score: &crate::dns::forwarder::RaceScoreContext,
+    ) -> anyhow::Result<Vec<u8>> {
+        let query = self.query_inner(upstream_name, raw_query, Some(score));
         crate::observe::scope_pin!(query);
         let query = crate::observe::flows::dns::exchange_scope(raw_query, upstream_name, query);
         query.await
