@@ -169,6 +169,29 @@ pub(super) fn selected(candidate: Option<&Candidate<'_>>, reason: &'static str) 
     chosen(candidate);
 }
 
+pub(super) fn committed_subgroup(
+    subgroup: &Group,
+    leaf: Option<&honk_config::node::Node>,
+    ineligible_reason: Option<&'static str>,
+) {
+    #[cfg(feature = "flow-observation")]
+    captured::update(|state, index| {
+        for row in &mut state.decisions[index].candidates {
+            if row.eligible == Some(true)
+                && captured::matches(&row.member, GroupMember::Group(subgroup))
+            {
+                row.leaf_node_id = leaf.map(|node| node.id);
+                row.leaf_node_name = leaf.and_then(|node| captured::name(&node.name));
+                if let Some(reason) = ineligible_reason {
+                    row.eligible = Some(false);
+                    row.reason = reason;
+                }
+            }
+        }
+    });
+    let _ = (subgroup, leaf, ineligible_reason);
+}
+
 pub(super) fn chosen(candidate: Option<&Candidate<'_>>) {
     #[cfg(feature = "flow-observation")]
     captured::update(|state, index| {
@@ -198,6 +221,13 @@ pub(super) fn previous(member: GroupMember<'_>) {
         state.decisions[index].previous_member = member;
     });
     let _ = member;
+}
+
+pub(super) fn clear_previous() {
+    #[cfg(feature = "flow-observation")]
+    captured::update(|state, index| {
+        state.decisions[index].previous_member = None;
+    });
 }
 
 pub(super) fn previous_tag(manager: &super::GroupManager, group: &Group, tag: &str) {

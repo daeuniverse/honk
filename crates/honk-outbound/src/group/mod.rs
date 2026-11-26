@@ -128,41 +128,99 @@ pub struct ScoreSelectionPlan<'a> {
     pub observation: Option<Arc<observation::SelectionObservation>>,
 }
 
-/// Whether resolving a selection may update group state or must only observe
-/// it. Peek is deliberately threaded through nested policies so warm-up
-/// discovery shares production semantics without advancing selection state.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SelectionEffects {
+enum EffectMode {
     Apply,
-    Peek,
-    ApplyWithHealthFallback,
-    PeekWithHealthFallback,
-    /// Internal full-view preflight; derive Score membership without committing it.
     Preview,
+    Peek,
 }
 
+/// Whether resolving a selection may update group state or must only observe
+/// it. `PartialEq` is intentionally omitted so callers query explicit capability
+/// predicates rather than matching a single mode variant.
+#[derive(Clone, Copy)]
+struct SelectionEffects {
+    mode: EffectMode,
+    health_fallback: bool,
+    wake_idle: bool,
+}
+
+#[allow(non_upper_case_globals)]
 impl SelectionEffects {
+    const Apply: Self = Self {
+        mode: EffectMode::Apply,
+        health_fallback: false,
+        wake_idle: true,
+    };
+
+    const ApplyWithHealthFallback: Self = Self {
+        mode: EffectMode::Apply,
+        health_fallback: true,
+        wake_idle: true,
+    };
+
+    const Peek: Self = Self {
+        mode: EffectMode::Peek,
+        health_fallback: false,
+        wake_idle: false,
+    };
+
+    const Preview: Self = Self {
+        mode: EffectMode::Preview,
+        health_fallback: false,
+        wake_idle: false,
+    };
+
     fn applies(self) -> bool {
-        matches!(self, Self::Apply | Self::ApplyWithHealthFallback)
+        self.mode == EffectMode::Apply
+    }
+
+    fn is_preview(self) -> bool {
+        self.mode == EffectMode::Preview
     }
 
     fn prepares_score(self) -> bool {
-        self.applies() || self == Self::Preview
+        matches!(self.mode, EffectMode::Apply | EffectMode::Preview)
+    }
+
+    fn wakes_idle(self) -> bool {
+        self.wake_idle
+    }
+
+    fn preview(self) -> Self {
+        Self {
+            mode: if self.prepares_score() {
+                EffectMode::Preview
+            } else {
+                EffectMode::Peek
+            },
+            health_fallback: self.health_fallback,
+            wake_idle: self.wake_idle && self.prepares_score(),
+        }
     }
 
     fn peek(self) -> Self {
-        match self {
-            Self::Preview => Self::Preview,
-            _ if self.health_fallback() => Self::PeekWithHealthFallback,
-            _ => Self::Peek,
+        Self {
+            mode: if self.mode == EffectMode::Preview {
+                EffectMode::Preview
+            } else {
+                EffectMode::Peek
+            },
+            health_fallback: self.health_fallback,
+            wake_idle: false,
+        }
+    }
+
+    fn unchosen_selector(self) -> Self {
+        Self {
+            mode: EffectMode::Peek,
+            health_fallback: self.health_fallback,
+            wake_idle: false,
         }
     }
 
     fn health_fallback(self) -> bool {
-        matches!(
-            self,
-            Self::ApplyWithHealthFallback | Self::PeekWithHealthFallback
-        )
+        self.health_fallback
     }
 }
 

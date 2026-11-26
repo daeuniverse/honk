@@ -738,6 +738,27 @@ impl ScorePolicyState {
         *counter = counter.saturating_add(removed);
     }
 
+    pub(in crate::group) fn admits_candidate(
+        &self,
+        network: SelectionNetwork,
+        node_id: Uuid,
+        attributions: &[&str],
+        mut pool_bound: u8,
+    ) -> bool {
+        if pool_bound == 0 {
+            return true;
+        }
+        let inner = self.inner.lock();
+        !attributions.iter().any(|group| {
+            let bound = pool_bound & 1 != 0;
+            pool_bound >>= 1;
+            bound
+                && !inner
+                    .evaluation(group, network)
+                    .is_some_and(|set| set.initialized() && set.evaluates(node_id))
+        })
+    }
+
     #[cfg(test)]
     fn selection_reason_counts(
         &self,

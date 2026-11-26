@@ -272,8 +272,8 @@ impl super::GroupManager {
         })
     }
     /// Return the latency-ordered URLTest alternatives for one target without
-    /// changing selection state. Each entry keeps the same Honk attribution
-    /// and selection chain as an ordinary target-aware plan.
+    /// changing the parent URLTest selection, committing nested subgroups only
+    /// when needed to admit their candidate.
     pub fn urltest_retry_plan_for_target(
         &self,
         group_name: &str,
@@ -328,19 +328,20 @@ impl super::GroupManager {
                 context.health_family,
                 super::SelectionEffects::Peek,
                 || {
+                    let retry_rules = ScoreSelectionRules {
+                        allow_trials: false,
+                        routes: entry.routes,
+                        selector,
+                        ..Default::default()
+                    };
                     let mut visited = Vec::new();
                     let (candidates, _) = self.flatten_candidates_for_target(
                         group,
                         context,
                         &mut visited,
                         0,
-                        super::SelectionEffects::Peek,
-                        ScoreSelectionRules {
-                            allow_trials: false,
-                            routes: entry.routes,
-                            selector,
-                            ..Default::default()
-                        },
+                        super::SelectionEffects::Preview,
+                        retry_rules,
                     );
                     let candidates = self.filter_alive_candidates(
                         candidates,
@@ -362,12 +363,48 @@ impl super::GroupManager {
                         group.check_url.as_deref(),
                     );
                     let root_has_exit = group.exit.is_some();
+                    let preview_key = |candidate: &super::Candidate<'_>| {
+                        if !entry.routes {
+                            return Some(DialKey::Node(candidate.node.id));
+                        }
+                        let mut preview = candidate.clone();
+                        if root_has_exit {
+                            preview.selection_chain.insert(0, group.name.as_str());
+                            preview.exit_on_path = true;
+                        }
+                        let (node, route) =
+                            self.compose_candidate_route(&preview, context.network)?;
+                        Some(DialKey::of(node, route.as_ref()))
+                    };
                     let mut keys = [DialKey::Node(Uuid::nil()); 3];
                     let limit = keys.len();
                     let mut accepted = 0;
                     let targets = candidates
                         .into_iter()
                         .filter_map(|mut candidate| {
+                            if let Some(subgroup) = candidate.via
+                                && !self.score_state.admits_candidate(
+                                    context.network,
+                                    candidate.node.id,
+                                    &candidate.attribution,
+                                    candidate.pool_bound,
+                                )
+                            {
+                                let key = preview_key(&candidate)?;
+                                if keys[..accepted].contains(&key) {
+                                    return None;
+                                }
+                                let mut commit_visited = Vec::new();
+                                candidate = self.commit_subgroup_candidate(
+                                    group,
+                                    subgroup,
+                                    context,
+                                    &mut commit_visited,
+                                    0,
+                                    super::SelectionEffects::Apply,
+                                    retry_rules,
+                                )?;
+                            }
                             if root_has_exit {
                                 candidate.selection_chain.insert(0, group.name.as_str());
                                 candidate.exit_on_path = true;
@@ -821,7 +858,7 @@ impl super::GroupManager {
         } else {
             group.policy
         };
-        if effects.applies() && policy != honk_config::group::GroupPolicy::Selector {
+        if effects.wakes_idle() && policy != honk_config::group::GroupPolicy::Selector {
             self.mark_used(&group.name, idle_activity);
         }
         let ordinary_score = policy == honk_config::group::GroupPolicy::Score;
@@ -912,7 +949,7 @@ impl super::GroupManager {
                     self.pick_score(
                         ScoreView {
                             origins: &[candidate],
-                            preview: effects == super::SelectionEffects::Preview,
+                            preview: effects.is_preview(),
                             ..Default::default()
                         },
                         group,
@@ -942,31 +979,6 @@ impl super::GroupManager {
             );
             return (mode, candidate.into_iter().collect(), ordinary_score);
         }
-        if rules.cold_urltest
-            && policy == honk_config::group::GroupPolicy::URLTest
-            && !candidates.iter().any(|candidate| {
-                self.node_latency(
-                    candidate.node,
-                    context.network,
-                    context.health_family,
-                    group.check_url.as_deref(),
-                    candidate.tag(),
-                ) != Duration::MAX
-            })
-        {
-            observation::metric("sorting_latency", None);
-            observation::reason("cold_candidates_pending");
-            return (
-                super::SelectionPlanMode::ColdUrlTest,
-                self.order_by_latency(
-                    candidates,
-                    context.network,
-                    context.health_family,
-                    group.check_url.as_deref(),
-                ),
-                false,
-            );
-        }
         let pin_effects = if rules.node_targets_only {
             effects.peek()
         } else {
@@ -977,21 +989,96 @@ impl super::GroupManager {
                 observation::reason("selector_choice");
                 selected_member.and_then(|member| Self::pick_selector(&candidates, member))
             }
-            honk_config::group::GroupPolicy::URLTest => Some(self.pick_urltest(
-                &candidates,
-                group,
-                context.network,
-                context.health_family,
-                pin_effects,
-            )),
+            honk_config::group::GroupPolicy::URLTest => loop {
+                if candidates.is_empty() {
+                    break None;
+                }
+                observation::clear_previous();
+                if rules.cold_urltest
+                    && !candidates.iter().any(|candidate| {
+                        self.node_latency(
+                            candidate.node,
+                            context.network,
+                            context.health_family,
+                            group.check_url.as_deref(),
+                            candidate.tag(),
+                        ) != Duration::MAX
+                    })
+                {
+                    observation::metric("sorting_latency", None);
+                    observation::reason("cold_candidates_pending");
+                    let ordered = self.order_by_latency(
+                        candidates,
+                        context.network,
+                        context.health_family,
+                        group.check_url.as_deref(),
+                    );
+                    let ordered = if effects.applies() {
+                        ordered
+                            .into_iter()
+                            .filter_map(|candidate| match candidate.via {
+                                Some(subgroup) => self.commit_subgroup_candidate(
+                                    group, subgroup, context, visited, depth, effects, rules,
+                                ),
+                                None => Some(candidate),
+                            })
+                            .collect()
+                    } else {
+                        ordered
+                    };
+                    if ordered.is_empty() {
+                        observation::selected(None, "no_eligible_candidate");
+                        return (super::SelectionPlanMode::Authoritative, Vec::new(), false);
+                    }
+                    return (super::SelectionPlanMode::ColdUrlTest, ordered, false);
+                }
+                let (index, latency) =
+                    self.pick_urltest(&candidates, group, context.network, context.health_family);
+                let picked = candidates.remove(index);
+                let committed = match picked.via.filter(|_| effects.applies()) {
+                    Some(subgroup) => self.commit_subgroup_candidate(
+                        group, subgroup, context, visited, depth, effects, rules,
+                    ),
+                    None => Some(picked),
+                };
+                if let Some(committed) = committed {
+                    self.commit_urltest_selection(
+                        group,
+                        context.network,
+                        &committed,
+                        latency,
+                        pin_effects,
+                    );
+                    break Some(committed);
+                }
+            },
             honk_config::group::GroupPolicy::LoadBalance => {
                 let index = self.pick_load_balance(&candidates, group, context.network, effects);
                 Some(candidates.swap_remove(index))
             }
-            honk_config::group::GroupPolicy::Fallback => {
-                let index = self.pick_fallback(&candidates, group, context.network, pin_effects);
-                Some(candidates.swap_remove(index))
-            }
+            honk_config::group::GroupPolicy::Fallback => loop {
+                if candidates.is_empty() {
+                    break None;
+                }
+                let (index, should_pin) = self.pick_fallback(&candidates, group, context.network);
+                let picked = candidates.remove(index);
+                let committed = match picked.via.filter(|_| effects.applies()) {
+                    Some(subgroup) => self.commit_subgroup_candidate(
+                        group, subgroup, context, visited, depth, effects, rules,
+                    ),
+                    None => Some(picked),
+                };
+                if let Some(committed) = committed {
+                    self.commit_fallback_selection(
+                        group,
+                        context.network,
+                        &committed,
+                        should_pin,
+                        pin_effects,
+                    );
+                    break Some(committed);
+                }
+            },
             honk_config::group::GroupPolicy::Score if rules.node_targets_only => {
                 let cold = !self
                     .score_state
@@ -1005,7 +1092,7 @@ impl super::GroupManager {
                     origins: &candidates,
                     health_filtered: health_filtered.as_ref(),
                     withdrawn: &withdrawn,
-                    preview: effects == super::SelectionEffects::Preview,
+                    preview: effects.is_preview(),
                 },
                 group,
                 context,
@@ -1022,6 +1109,48 @@ impl super::GroupManager {
             candidate.into_iter().collect(),
             ordinary_score,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_subgroup_candidate<'a>(
+        &'a self,
+        group: &'a honk_config::group::Group,
+        subgroup: &'a honk_config::group::Group,
+        context: &ScoreSelectionContext,
+        visited: &mut Vec<&'a str>,
+        depth: usize,
+        effects: super::SelectionEffects,
+        rules: ScoreSelectionRules<'_>,
+    ) -> Option<super::Candidate<'a>> {
+        let sub_entry = self.groups.get(subgroup.name.as_str())?;
+        visited.push(group.name.as_str());
+        let committed = self.pick_candidate_for_entry(
+            &sub_entry.group,
+            Some(&sub_entry.idle_activity),
+            context,
+            visited,
+            depth + 1,
+            effects,
+            rules,
+        );
+        visited.pop();
+        let Some(mut committed) = committed else {
+            observation::committed_subgroup(subgroup, None, Some("selected_member_unavailable"));
+            return None;
+        };
+        committed.via = Some(&sub_entry.group);
+        if let Err(reason) = self.subgroup_candidate_eligible(
+            &committed,
+            context.probe_domain,
+            context.health_family,
+            group,
+            rules,
+        ) {
+            observation::committed_subgroup(subgroup, Some(committed.node), Some(reason));
+            return None;
+        }
+        observation::committed_subgroup(subgroup, Some(committed.node), None);
+        Some(committed)
     }
 
     fn packet_score_bootstrap<'a>(
@@ -1193,15 +1322,22 @@ impl super::GroupManager {
             return (Vec::new(), Vec::new());
         }
         visited.push(group.name.as_str());
-        // Only the serving Selector or pinned member may advance nested policy
-        // state.
-        let sub_effects = if effects.applies()
-            && (group.policy == honk_config::group::GroupPolicy::Selector
-                || self
-                    .plan_selector_member(group, context.network, rules.selector)
-                    .is_some())
+        // Selector and pinned groups isolate unchosen siblings; URLTest and
+        // Fallback preview candidates here and commit only the chosen subgroup.
+        let sub_effects = if group.policy == honk_config::group::GroupPolicy::Selector
+            || self
+                .plan_selector_member(group, context.network, rules.selector)
+                .is_some()
         {
-            effects.peek()
+            effects.unchosen_selector()
+        } else if effects.applies()
+            && matches!(
+                group.policy,
+                honk_config::group::GroupPolicy::URLTest
+                    | honk_config::group::GroupPolicy::Fallback
+            )
+        {
+            effects.preview()
         } else {
             effects
         };

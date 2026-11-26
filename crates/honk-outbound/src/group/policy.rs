@@ -240,14 +240,13 @@ impl GroupManager {
     /// candidate ranks by its representative leaf's latency, and selection
     /// identity is the member tag (so a sub-group's internal leaf change
     /// does not by itself switch the parent's selection).
-    pub(super) fn pick_urltest<'a>(
+    pub(super) fn pick_urltest(
         &self,
-        candidates: &[Candidate<'a>],
+        candidates: &[Candidate<'_>],
         group: &Group,
         network: SelectionNetwork,
         ipver: IpVersion,
-        effects: SelectionEffects,
-    ) -> Candidate<'a> {
+    ) -> (usize, Option<Duration>) {
         let tolerance = Duration::from_millis(group.tolerance.max(1));
         observation::metric("sorting_latency", Some(tolerance.as_secs_f64() * 1000.0));
         observation::reason("lowest_latency");
@@ -271,23 +270,19 @@ impl GroupManager {
                 cache.get(&group.name).and_then(|sel| sel.tcp.clone())
             };
             if let Some(entry) = tcp_entry
-                && let Some(c) = candidates.iter().find(|c| c.tag() == entry.tag)
+                && let Some(index) = candidates.iter().position(|c| c.tag() == entry.tag)
             {
                 observation::reason("udp_tcp_mirror");
                 observation::metric("tcp_selection", None);
                 observation::previous_tag(self, group, &entry.tag);
-                if effects.applies()
-                    && self.cache_urltest_selection(group, network, c, entry.latency)
-                {
-                    self.maybe_interrupt(&group.name, network);
-                }
-                return c.clone();
+                return (index, Some(entry.latency));
             }
             // No usable TCP selection yet — fall through to the normal
             // evaluation (which ranks by the latency fallback chain).
         }
 
-        let best = self.pick_best_by_latency(candidates, group, network, ipver);
+        let best_index = self.pick_best_index_by_latency(candidates, group, network, ipver);
+        let best = &candidates[best_index];
 
         {
             let cache = self.urltest_cache.read();
@@ -328,7 +323,7 @@ impl GroupManager {
                     && best_latency.saturating_add(tolerance) >= current_latency
                 {
                     observation::reason("tolerance_held");
-                    return candidates[pos].clone();
+                    return (pos, None);
                 }
             }
         }
@@ -340,11 +335,23 @@ impl GroupManager {
             group.check_url.as_deref(),
             best.tag(),
         );
-        if effects.applies() && self.cache_urltest_selection(group, network, &best, latency) {
+        (best_index, Some(latency))
+    }
+
+    pub(super) fn commit_urltest_selection(
+        &self,
+        group: &Group,
+        network: SelectionNetwork,
+        candidate: &Candidate<'_>,
+        latency: Option<Duration>,
+        effects: SelectionEffects,
+    ) {
+        if let Some(latency) = latency
+            && effects.applies()
+            && self.cache_urltest_selection(group, network, candidate, latency)
+        {
             self.maybe_interrupt(&group.name, network);
         }
-
-        best
     }
 
     /// LoadBalance policy: round-robin over the alive candidates in member
@@ -394,8 +401,7 @@ impl GroupManager {
         candidates: &[Candidate<'_>],
         group: &Group,
         network: SelectionNetwork,
-        effects: SelectionEffects,
-    ) -> usize {
+    ) -> (usize, bool) {
         observation::reason("first_alive");
         {
             let cache = self.fallback_cache.read();
@@ -406,13 +412,26 @@ impl GroupManager {
                 && let Some(index) = candidates.iter().position(|c| c.tag() == pinned)
             {
                 observation::reason("pinned_alive");
-                return index;
+                return (index, false);
             }
         }
-        if effects.applies() && self.cache_fallback_selection(group, network, &candidates[0]) {
+        (0, true)
+    }
+
+    pub(super) fn commit_fallback_selection(
+        &self,
+        group: &Group,
+        network: SelectionNetwork,
+        candidate: &Candidate<'_>,
+        should_pin: bool,
+        effects: SelectionEffects,
+    ) {
+        if should_pin
+            && effects.applies()
+            && self.cache_fallback_selection(group, network, candidate)
+        {
             self.maybe_interrupt(&group.name, network);
         }
-        0
     }
 
     /// Pick the candidate with the lowest probe latency from alive_set.
@@ -421,16 +440,17 @@ impl GroupManager {
     /// strikes not yet cleared by consecutive real successes) ranks below
     /// every non-demoted candidate; within a tier the (real-only) moving
     /// average decides.
-    pub(super) fn pick_best_by_latency<'a>(
+    pub(super) fn pick_best_index_by_latency(
         &self,
-        candidates: &[Candidate<'a>],
+        candidates: &[Candidate<'_>],
         group: &Group,
         network: SelectionNetwork,
         ipver: IpVersion,
-    ) -> Candidate<'a> {
+    ) -> usize {
         candidates
             .iter()
-            .min_by_key(|c| {
+            .enumerate()
+            .min_by_key(|(_, c)| {
                 let demoted =
                     self.failure_demoted(c.node, network, ipver, group.check_url.as_deref());
                 observation::latency_tier(c, demoted);
@@ -439,8 +459,8 @@ impl GroupManager {
                     self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag()),
                 )
             })
-            .cloned()
-            .unwrap_or_else(|| candidates[0].clone())
+            .map(|(index, _)| index)
+            .unwrap_or(0)
     }
 
     /// Whether the node carries pending failure strikes. UDP checks both

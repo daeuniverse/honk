@@ -160,4 +160,30 @@ impl GroupManager {
             })
             .collect()
     }
+
+    pub(super) fn subgroup_candidate_eligible(
+        &self,
+        candidate: &Candidate<'_>,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        group: &Group,
+        rules: score::selection::ScoreSelectionRules<'_>,
+    ) -> Result<(), &'static str> {
+        if rules.routes && self.has_exits() && domain != ProbeDomain::Tcp {
+            return Ok(());
+        }
+        if domain == ProbeDomain::Tcp
+            && let Some(url) = group.check_url.as_deref()
+            && let Some(alive) = &self.alive_set
+        {
+            return (candidate.node.protocol() == honk_config::types::NodeProtocol::Block
+                || alive.is_alive_for_url(candidate.tag(), url))
+            .then_some(())
+            .ok_or("custom_url_unavailable");
+        }
+        (candidate.node.protocol() == honk_config::types::NodeProtocol::Block
+            || self.is_node_selectable_for_domain(candidate.node.id, domain, ipver))
+        .then_some(())
+        .ok_or("capability_or_health_unavailable")
+    }
 }

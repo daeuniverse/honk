@@ -1515,11 +1515,11 @@ fn test_urltest_parent_with_urltest_subgroup() {
         Duration::from_millis(5),
     );
 
-    // The direct member is fastest → picked under its own node name.
+    // The direct member is fastest → picked under its own node name; the
+    // unchosen sub-group only previews and does not cache a selection yet.
     assert_eq!(m.select_node("parent").unwrap().name, "d");
     assert_eq!(m.get_urltest_selection("parent"), Some("d".into()));
-    // Flattening formed the sub-group's own selection as a side effect.
-    assert_eq!(m.get_urltest_selection("sub"), Some("l1".into()));
+    assert_eq!(m.get_urltest_selection("sub"), None);
     assert_eq!(m.selection_chain("parent"), vec!["parent", "d"]);
 
     // Kill the direct member → the sub-group's representative leaf wins.
@@ -1527,6 +1527,7 @@ fn test_urltest_parent_with_urltest_subgroup() {
     assert_eq!(m.select_node("parent").unwrap().name, "l1");
     // `now` displays the sub-group tag, the chain resolves to the leaf.
     assert_eq!(m.get_urltest_selection("parent"), Some("sub".into()));
+    assert_eq!(m.get_urltest_selection("sub"), Some("l1".into()));
     assert_eq!(m.selection_chain("parent"), vec!["parent", "sub", "l1"]);
 
     // Cold start with no data anywhere: every flattened leaf races.
