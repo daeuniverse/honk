@@ -50,7 +50,7 @@ listener 預設關閉，需要在設定裡明確啟用 [`experimental.native_api
 | POST | `/api/v1/dns/query` | 明確的 DNS 診斷。 |
 | GET | `/api/v1/dns/cache`、`/api/v1/dns/log` | 精確快取快照與用戶端查詢歷史。 |
 | DELETE | `/api/v1/dns/cache/{entry_id}`、`/api/v1/dns/cache` | 刪除單一精確的快取 incarnation，或依完整名稱與可選 type 刪除。 |
-| POST | `/api/v1/dns/cache/flush` | 等待記憶體快取與已啟用的持久化快取確認失效；不清空網域名稱路由事實。 |
+| POST | `/api/v1/dns/cache/flush` | 等待記憶體快取與已啟用的持久化快取確認失效，並將網域上游 bootstrap 快取標為待重新整理；不清空網域名稱路由事實。 |
 | POST | `/api/v1/routing/trace` | 固定目前 generation 的離線路由模擬，只支援 `resolve=none`。 |
 | GET | `/api/v1/rules` | 回傳目前 generation 的完整規則字典、fallback 與可用的來源位置。 |
 | GET | `/api/v1/dns/rules` | 回傳目前 generation 的 DNS 請求規則與回應規則，每個清單以 fallback 結尾。 |
@@ -931,7 +931,7 @@ DNS 查詢、快取回應與 DNS 日誌分頁都會遮蔽用於顯示的 listene
 
 超出這份預算時回傳 `503 snapshot_unavailable`。游標無法識別時回傳 `410 snapshot_expired`；可識別但過濾器或 `limit` 不同的游標回傳 `400 invalid_request`。`entry_id` 標示精確的 incarnation，用舊 ID 刪不掉替代它的記錄。
 
-依 name 刪除可以跨精確 key 的各種變體，並用 type 限定範圍。刪除與 flush 與入庫發布序列化，會等已啟用的持久化確認失效；確認之後，舊的 foreground 或 refresh 不能把已刪的快取復活。flush 不清空 DNS 路由投影。
+依 name 刪除可以跨精確 key 的各種變體，並用 type 限定範圍。刪除與 flush 與入庫發布序列化，會等已啟用的持久化確認失效；確認之後，舊的 foreground 或 refresh 不能把已刪的快取復活。flush 還會將網域上游 bootstrap 快取標為待重新整理（保留 stale 回退），不清空 DNS 路由投影。
 
 DNS 查詢、快取與日誌的完整 JSON 回應上限都是 262144 位元組。快取與日誌分頁如果下一筆會超出上限，就提前結束並回傳 `next_cursor`，因此 `limit` 只是上限，不保證筆數。單筆記錄本身就超限時，會獨佔一頁完整回傳，不受這個上限約束。
 
@@ -1440,7 +1440,7 @@ Clash listener 允許任意 CORS 來源，沒有原生 API 那樣的 Host 與 Or
 | GET | `/logs` | 透過 WebSocket 或分塊 JSON 列推送 tracing 事件；所有訂閱者共用一個 256 槽位的廣播佇列，`?level=` 預設為 `info`。 |
 | GET | `/dns/query` | 經 honk DNS 解析 `?name=` 並回傳 DoH 風格 JSON；`?type=` 預設為 `A`。 |
 | POST | `/cache/fakeip/flush` | 相容性 no-op，回傳 204；沒有持久化 FakeIP 對映可清除。 |
-| POST | `/cache/dns/flush` | 清除存活 DNS 快取及其持久化 DNS 狀態。 |
+| POST | `/cache/dns/flush` | 清除存活 DNS 快取及其持久化 DNS 狀態，並將網域上游 bootstrap 快取標為待重新整理。 |
 | GET | `/providers/proxies` | 將非空群組暴露為 Clash proxy provider。每個 provider 是一個代理群組，不是訂閱；訂閱狀態見 [Provider 觀測與重新整理](#provider-觀測與重新整理)。 |
 | GET | `/providers/rules` | 回傳目前空樁文件 `{"providers":[]}`。 |
 | GET | `/ui`, `/ui/*` | 將 `/ui` 重新導向到 `/ui/`，並提供已設定的外部 UI 目錄。 |
@@ -1675,7 +1675,7 @@ B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
 
 | 欄位 | 說明 |
 | --- | --- |
-| `socketAdmission.refused` | Endpoint 網路 bootstrap 需要兩個額度，而整個 DNS socket 分割區不足兩個時被拒絕的次數。 |
+| `socketAdmission.refused` | Endpoint 網路 bootstrap 所需額度（單族策略 1 個，雙棧策略 2 個）超過整個 DNS socket 分割區上限時被拒絕的次數。 |
 | `socketAdmission.timeouts` | 因 admission 期限耗盡而回傳的必要實體 socket admission 呼叫。 |
 | `proxyAdmission.timeouts` | 因 admission 期限耗盡而回傳的必要代理 stream 或非原始 packet 準備 admission 呼叫。 |
 | `pressure.retiredUdpPools` | 因壓力而選中退役的空閒 UDP socket pool，每個被摘除的 pool 只計一次。 |

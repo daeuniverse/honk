@@ -365,7 +365,7 @@ dns {
 
 ### bootstrap 撥號順序
 
-同一策略也決定上游主機名經 bootstrap 解析後的撥號順序。`both` 和 `preferipv4` 先撥 IPv4，`preferipv6` 先撥 IPv6。TCP、DoT、DoH、DoQ、DoH3 以及經代理承載的 DNS，在撥號失敗後會繼續試後面的位址。直連 UDP 把那唯一一次重試優先給另一個位址族，再考慮同族的其他位址，並重用連線成功的 socket。`ipv4only` 和 `ipv6only` 只在相容格式裡可用，會把上游撥號候選限制在對應位址族。
+同一策略也控制上游主機名的 bootstrap 查詢與撥號順序。網域上游的 bootstrap 解析結果依 DNS generation 快取（TTL 限制在 30–300 秒，帶 stale 回退，並在網路變化或全量 DNS 快取清除時標記待重新整理；見[上游 bootstrap 解析與快取](../design/dns.md#上游-bootstrap-解析與快取)）。`both` 和 `preferipv4` 先撥 IPv4，`preferipv6` 先撥 IPv6；在各自位址族內，honk 會把最近一次成功的位址提前，但不會覆蓋偏好位址族。TCP、DoT、DoH、DoQ、DoH3 以及經代理承載的 DNS，在撥號失敗後會繼續試後面的位址。直連 UDP 把那唯一一次重試優先給另一個位址族，再考慮同族的其他位址，並重用連線成功的 socket。`ipv4only` 和 `ipv6only` 只在相容格式裡可用，對上游主機名只查詢並撥號對應位址族。
 
 ## 快取與固定 TTL
 

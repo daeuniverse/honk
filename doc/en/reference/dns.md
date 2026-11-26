@@ -365,7 +365,7 @@ In a preference mode, both families remain queryable. For a non-preferred A/AAAA
 
 ### Bootstrap dial order
 
-The same strategy orders bootstrap-resolved addresses for an upstream hostname. `both` and `preferipv4` dial IPv4 first; `preferipv6` dials IPv6 first. TCP, DoT, DoH, DoQ, DoH3, and proxied DNS try subsequent addresses after a failed dial. Direct UDP uses its one retry for the other family before another address in the same family, then reuses the successful socket. The compatibility-only `ipv4only` and `ipv6only` strategies filter upstream dial candidates to that family.
+The same strategy controls upstream bootstrap queries and dial order for an upstream hostname. Domain-upstream bootstrap addresses are cached per DNS generation (TTL clamped to 30–300 seconds, with stale fallback and invalidation on network changes or full DNS cache flush; see [upstream bootstrap resolution and caching](../design/dns.md#upstream-bootstrap-resolution-and-caching)). `both` and `preferipv4` dial IPv4 first; `preferipv6` dials IPv6 first. Within each family, honk promotes the most recently succeeded address without overriding the preferred family. TCP, DoT, DoH, DoQ, DoH3, and proxied DNS try subsequent addresses after a failed dial. Direct UDP uses its one retry for the other family before another address in the same family, then reuses the successful socket. The compatibility-only `ipv4only` and `ipv6only` strategies query and dial only that family for upstream hostnames.
 
 ## Cache and fixed TTL
 

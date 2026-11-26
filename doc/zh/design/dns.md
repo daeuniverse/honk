@@ -133,9 +133,9 @@ Honk 的独立 bind 可以是 `:53530`、其他空闲端口，或者关闭；它
 
 每个 generation 有两个互相独立的 2,048 上限：controller 查询的生命周期，以及活跃的 singleflight key。UDP 客户端 admission 和普通 UDP 初始化是分开的，启动时封顶为 `min(1536, MemTotal / 4 / 256 KiB)`。`DnsController` 持有这份进程级 UDP 预算，活跃和退役的 generation 共用；reload 不补发额度，permit 保留到应答完成。每查询 256 KiB 是容量估算，不是强制的 RSS 上限；共享的 2,048 查询上限也不是给 TCP 专用预留的。每个 flight 最多接受 256 个 follower。flight 饱和时直接拒绝，不会开启无限上游交换；controller 把这个过载渲染成 `REFUSED`。发布结果时，删除 flight 和向已加入的 follower 广播结果是原子完成的，之后的缓存未命中请求可以开新 flight。已完成的失败保留原始原因，但不进入缓存，所以已加入的 follower 不会各自重复那次失败的交换。leader 丢弃未发布的结果时会删除 flight 并唤醒 follower 重新竞争所有权；取消属于这种情况，缺少已验证的 response template、只被 compatibility mode 接受的成功结果也一样。
 
-DNS 自己的 socket 用一份独立扣减的进程级描述符分区，活跃和退役的 generation 共用。额度跟着实际 socket、空闲 stream、endpoint poller 或 packet-adapter worker 走，保留到 teardown。Endpoint 的网络 bootstrap 会为并发的 A/AAAA 一次预留两个额度。Literal IP 和 pinned 地址绕过这个 admission；`/etc/hosts` 只有在没有先查询配置的 resolver 时才不需要网络额度。配置 resolver 的 admission 放在 hosts 回退之前，被拒就立即返回。
+DNS 自己的 socket 用一份独立扣减的进程级描述符分区，活跃和退役的 generation 共用。额度跟着实际 socket、空闲 stream、endpoint poller 或 packet-adapter worker 走，保留到 teardown。Endpoint 的网络 bootstrap 按查询的地址族原子预留额度：单族策略（`ipv4only`、`ipv6only`）预留 1 个额度，双栈策略（`both`、`preferipv4`、`preferipv6`）预留 2 个额度；当预算上限低于所需额度时，admission 立即按 `Capacity` 拒绝。Literal IP、pinned 地址以及命中的域名上游 bootstrap 缓存（含合并等待的 singleflight waiter）绕过这个 admission；`/etc/hosts` 只有在没有先查询配置的 resolver 时才不需要网络额度。配置 resolver 的 admission 放在 hosts 回退之前，被拒就立即返回。
 
-代理 TCP stream 和非原始 UDP 的 packet 准备，共用一份保守的逻辑 lease 上限，大小不超过 DNS socket 分区，并在代理节点 bootstrap 之前取得 lease。Direct、Shadowsocks、SOCKS5 的原始 UDP 使用物理额度；SOCKS5 的控制 TCP 和其他代理 carrier 保留原有的 outbound 所有权。两额度预留只覆盖 DNS 上游的 endpoint 名称。解析原始 Shadowsocks/SOCKS5 代理节点或 SOCKS5 relay 名称时，准备过程只持有一个额度，却可能为并发的 A/AAAA 短暂打开两个没有计入的 resolver socket。Shadowsocks 会在打开 UDP socket 之前把它们关掉；SOCKS5 解析 relay 时可能和控制 TCP 重叠。这不等于所有代理 carrier 或代理准备阶段 resolver socket 的总 FD 上限。
+代理 TCP stream 和非原始 UDP 的 packet 准备，共用一份保守的逻辑 lease 上限，大小不超过 DNS socket 分区，并在代理节点 bootstrap 之前取得 lease。Direct、Shadowsocks、SOCKS5 的原始 UDP 使用物理额度；SOCKS5 的控制 TCP 和其他代理 carrier 保留原有的 outbound 所有权。这套按地址族预留（1 或 2 个额度）的规则只覆盖 DNS 上游的 endpoint 名称。解析原始 Shadowsocks/SOCKS5 代理节点或 SOCKS5 relay 名称时，准备过程只持有一个额度，却可能为并发的 A/AAAA 短暂打开两个没有计入的 resolver socket。Shadowsocks 会在打开 UDP socket 之前把它们关掉；SOCKS5 解析 relay 时可能和控制 TCP 重叠。这不等于所有代理 carrier 或代理准备阶段 resolver socket 的总 FD 上限。
 
 必要的 admission 阻塞时，按 generation 注册的弱 owner 通过保留的 close/join 路径，回收没有被借用的缓存 UDP socket 以及空闲的 TCP/TLS/H2/QUIC 资源。完成和取消在释放借用后会重新检查压力，其他等待中的上游不必依赖维护定时器；已经开始交换的不会被淘汰。Socket admission 失败时，重试和 resolver hook 里保留类型化的 `Capacity`，可能渲染成 `SERVFAIL`，这不同于 singleflight 的 `REFUSED`。入口饱和时，独立 listener 仍返回拒绝，透明 UDP 仍丢弃，行为和原来一样。
 
@@ -166,7 +166,7 @@ Bootstrap hook 通过别名或选中的 `subtag()` 规则接管原始域名。�
 
 偏好地址族的 sibling 查询只改第一个问题的 QTYPE。事务 ID、flags、QCLASS、EDNS 数据、入口 profile、逻辑客户端来源、原始目的地址，以及其余 wire profile 都不变。Sibling 普通失败或返回 NODATA，不会压制可用的非偏好响应；typed local packet refusal 则用原始原因结束调用方的解析。内部和应用主机名解析时，bootstrap fallback 只在所有符合资格的地址族都不可用时运行一次，之后用同一套地址族资格过滤 fallback 地址。
 
-这个策略也决定 bootstrap 解析出的上游拨号目标顺序。`both` 用 IPv4 优先的兼容顺序；偏好模式把对应地址族放前面，同时保留另一个地址族。stream 和 QUIC transport 会依次尝试候选地址。直连 UDP 保持现有的两次尝试上限：首个候选失败后，唯一的一次重试先换另一个地址族，再考虑同族其他地址，并缓存成功的 socket。
+这个策略也控制上游 bootstrap 查询与拨号顺序：单族模式只查询对应地址族，双栈模式保持偏好地址族在前且只在同族内提升最近一次成功的地址（见[上游 bootstrap 解析与缓存](#上游-bootstrap-解析与缓存)）。stream 和 QUIC transport 会依次尝试候选地址。直连 UDP 保持现有的两次尝试上限：首个候选失败后，唯一的一次重试先换另一个地址族，再考虑同族其他地址，并缓存成功的 socket。
 
 包括 capacity 在内的类型化 local packet refusal 不算 availability failure。
 DoH3/DoQ 和代理 reusable-session 初始化，给 builder 和每个 waiter 保留同一个
@@ -261,7 +261,13 @@ DNS client task owner 和捕获的 runtime owner 保留同一份 packet-adapter 
 
 直连上游 socket 带 bypass mark，流量不会重新进入透明拦截。主机名 endpoint 通过 generation 捕获的 bootstrap resolver 解析；拨号从不依赖 honk 被拦截的 resolver 路径。
 
-拨号、TLS、QUIC、HTTP session 建立用 dial/handshake timeout，请求和响应交换用独立的 query timeout。一次查询尝试只有一个绝对的交换 deadline。每个 transport 失败后最多重试一次，需要时重置无效的可复用 session，所以总查询工作有界。Transport slot 对并发初始化做 singleflight，每个正在关闭的资源保留唯一的 teardown future。池关闭先停止 admission，等已通过 admission 的交换结束，再关闭空闲资源，并显式 join 每个 receive 或协议 driver task。
+拨号、TLS、QUIC、HTTP session 建立用 dial/handshake timeout，请求和响应交换用独立的 query timeout。一次查询尝试只有一个绝对的交换 deadline。每个 transport 失败后最多重试一次，需要时重置无效的可复用 session，所以总查询工作有界。Transport slot 对并发初始化做 singleflight，每个正在关闭的资源保留唯一的 teardown future。池关闭先停止 admission，等已通过 admission 的查询结束（包括在途的上游 bootstrap 解析及其 socket 额度释放），再关闭空闲资源，并显式 join 每个 receive 或协议 driver task。
+
+### 上游 bootstrap 解析与缓存
+
+带 bypass mark 的 bootstrap 不设全局缓存。UDP 查询复用单个已连接 socket，在 `400 ms` 与 `1,200 ms` 单调重传（最多 3 次）：不匹配报文不会重置或饿死计时，硬错误快速失败，`TC=1` 的 TCP 回退仅保留剩余预算。双栈 A/AAAA 并发执行，在 deadline 到期或另一族出错时绝不丢弃非空地址族，并在 deadline 内将另一族上限收紧为 `500 ms`（偏好族优先）或 `1,000 ms`（非偏好族优先）；空结果或错误不收紧。单族模式只查询该地址族并按同族过滤 `/etc/hosts`。RCODE `0` 每族最多提取 32 个去重地址与最小 RR TTL（含跟踪到的 CNAME 跳），`3` 返回空成功以保留回退，其余码失败。`/etc/resolv.conf` 异步读取（含受查询超时约束的 ECH 发现）；查完 `/etc/hosts` 或 `/etc/resolv.conf` 后若 deadline 已过期，则在系统 resolver admission 之前直接返回 `TimedOut`，不误报 `Capacity`。
+
+域名上游按 generation 缓存最多 32 个去重 `SocketAddr`（保留次族回退配额）；字面量 IP 与预解析 endpoint 绕过缓存。新鲜期将最小 RR TTL 钳制在 `30–300 秒`（缺省 `60 秒`），附带 `10 分钟` stale 窗口、`5 秒` 重试冷却与节流 stale 回退告警；`PacketRejection`（含 `Capacity`）经 `SharedError` 透传，不回退 stale 也不进入冷却。未命中采用纯内联 singleflight，无后台任务或后台刷新：命中与冷却期 stale 命中零 I/O、零额度；waiter 遵守各自 deadline 并在池关闭开始后直接中止；取消 leader 会先同步释放额度再唤醒 waiter。交换成功后仅在同族内提前胜出地址，保持 `TransportKey` 复用且不覆盖 `preferipv6`/`preferipv4`。普通错误耗尽尝试（stream/QUIC 全部候选或直连 UDP 两次尝试）且在同 generation 满 `5 秒` 冷却后仅标脏缓存，保留 stale 并清除热 UDP 亲和。网络变化与全量 flush 将全部域名上游标脏、清除热 UDP 亲和而不关闭活跃分片，并阻止失效前发起的刷新与迟到的 UDP 应答写入新鲜 TTL、stale 冷却或热 UDP 亲和。只有实际执行 bootstrap I/O 的 leader 发出原生流观测；命中、stale 回退与 waiter 均不发出。
 
 DoH 和 DoH3 在分配或读取响应体之前先判断 HTTP 状态。以下情况不会重置或重试
 session：2xx/5xx 之外的状态、长度不足 DNS 头的响应体，以及超过 DNS 大小上限的响
@@ -362,7 +368,7 @@ DNS 诊断用一组互相独立、单调递增的 atomic counter。覆盖的类�
 
 `/api/v1/dns/query` 把 cache access 和可选的强制配置 upstream 作为同一个请求的局部 options，贯穿 planning、preferred-family sibling 和 exchange；一次请求固定同一个 DNS generation。强制 upstream 会替换普通请求路由，但保留 hosts/strategy 和响应侧 requery，hosts 命中时也不会虚构一次 upstream exchange。`bypass` 不读正、负、stale 答案，不写缓存，不加入普通 singleflight/refresh，也不启动后台 refresher；普通生产请求不带 override 时语义不变。最多 8 个不同 type，共享 10 秒请求期限、262144 字节的完整 JSON 预算，以及每分钟 30 次的 principal/global 限额。
 
-Cache list 的 opaque ID 对应 exact-key 的一个 incarnation，检查它不会触发 LRU promotion，也不计入 hit 统计；`persistent:false` 明确表示只覆盖运行时记录。分页固定 filters 和 instance，最多 8 个 snapshot、30 秒、合计 8 MiB；底层淘汰不会释放仍由 snapshot 持有的预算。按 ID 删除只影响那个 incarnation；按完整 name/type 删除可以覆盖不同的 exact 变体。原生和 Clash 的失效共用 DNS/cache owner 的 publication→shard 顺序，并等待持久化删除以及此前 queued put 的确认；旧的 foreground/refresh 复活不了已经确认失效的记录。Flush 只清答案缓存，不清域名路由投影；持久化失败不能假报成功。
+Cache list 的 opaque ID 对应 exact-key 的一个 incarnation，检查它不会触发 LRU promotion，也不计入 hit 统计；`persistent:false` 明确表示只覆盖运行时记录。分页固定 filters 和 instance，最多 8 个 snapshot、30 秒、合计 8 MiB；底层淘汰不会释放仍由 snapshot 持有的预算。按 ID 删除只影响那个 incarnation；按完整 name/type 删除可以覆盖不同的 exact 变体。原生和 Clash 的失效共用 DNS/cache owner 的 publication→shard 顺序，并等待持久化删除以及此前 queued put 的确认；旧的 foreground/refresh 复活不了已经确认失效的记录。Flush 只清答案缓存并将域名上游的 bootstrap 缓存标为待刷新（保留 stale 回退），不清域名路由投影；持久化失败不能假报成功。
 
 `record_dns_log` 默认为 `true`。当独立的 DNS 日志需求有效，或运行时显式设置 `record_dns_log: "on"` 时，才会记录；实际记录停止时会释放历史并让游标失效。进程级环形缓冲区在客户端请求真正完成时捕获普通 DNS 查询结果，以及来源已知的客户端解析结果；原生和 Clash 的诊断调用、后台刷新产生的重复记录都会排除。它保留实际的 `SocketAddr`、问题、最终状态、缓存/上游/路由和时间，最多 512 条、8 MiB，原始报文和元数据一起计入预算；不截断 RRset，超限就淘汰整条旧记录。列表最新优先，支持 `name`、`type`、`src` 过滤、每页最多 500 条，以及和过滤器绑定的游标；淘汰会让旧游标失效。查询、缓存和日志的响应投影装不进 262144 字节时返回 503 和 `Retry-After`，不会返回截断后仍标为完整的答案。缓存和日志分页在会超限的记录之前结束，并返回 `next_cursor`；单条记录本身超限时独占一页完整返回，因为原始报文最多 65535 字节，展开后大小有界，分页遍历不会因此中断。配置里禁用记录器需要重启；运行时的 `"off"` 可以强制关掉配置已允许的记录器。运行时设置由同一个 owner 原子发布；临时缩容在显式配置激活时重置，provider 刷新或网络刷新时保留。
 

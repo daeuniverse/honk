@@ -52,7 +52,7 @@ Source administration needs a captured `.dae` startup. Writes also need `config_
 | POST | `/api/v1/dns/query` | Live diagnostic query. |
 | GET | `/api/v1/dns/cache`, `/api/v1/dns/log` | Exact cache inspection and retained client outcomes. |
 | DELETE | `/api/v1/dns/cache/{entry_id}`, `/api/v1/dns/cache` | Invalidate one exact incarnation, or a name and optional types. |
-| POST | `/api/v1/dns/cache/flush` | Invalidate the DNS cache with acknowledged persistence fencing. |
+| POST | `/api/v1/dns/cache/flush` | Invalidate the DNS cache and domain-upstream bootstrap caches with acknowledged persistence fencing. |
 | POST | `/api/v1/routing/trace` | Generation-pinned simulation with `resolve: "none"`. |
 | GET | `/api/v1/rules` | Complete generation-scoped rule dictionary including fallback. |
 | GET | `/api/v1/dns/rules` | Running generation's DNS request and response rules, each list ending with its fallback. |
@@ -1007,7 +1007,7 @@ Eviction is per shard and also bounded by cached answer bytes, so a shard can ev
 
 The common cache owner fences old foreground and refresh publications and queued persistent puts, then waits for persistence deletion acknowledgement. Old work cannot resurrect invalidated entries after success. Persistence errors propagate instead of reporting a successful flush.
 
-Routing and domain maps are not cleared.
+A full flush also marks domain-upstream bootstrap caches dirty (retaining stale fallback). Routing and domain maps are not cleared.
 
 `GET /dns/log` records each completed ordinary client DNS outcome once. It includes a known client socket and ingress, plus parseable refusals and errors. Native and Clash diagnostics and background refresh duplicates are excluded. `record_dns_log` defaults true and permits recording while its independent DNS-log demand is active, retaining at most 512 records and 8 MiB.
 
@@ -1541,7 +1541,7 @@ The table follows the router in `crates/honk-core/src/clash_api.rs`.
 | GET | `/logs` | Stream tracing events over WebSocket or chunked JSON lines from one shared 256-slot broadcast queue; `?level=` defaults to `info`. |
 | GET | `/dns/query` | Resolve `?name=` through honk DNS and return DoH-style JSON; `?type=` defaults to `A`. |
 | POST | `/cache/fakeip/flush` | Compatibility no-op returning 204; no FakeIP mappings are persisted to flush. |
-| POST | `/cache/dns/flush` | Flush the live DNS cache and its persisted DNS state. |
+| POST | `/cache/dns/flush` | Flush the live DNS cache, its persisted DNS state, and domain-upstream bootstrap caches. |
 | GET | `/providers/proxies` | Expose non-empty groups as Clash proxy providers. Each provider is a group, not a subscription; subscription state is under [Provider observations and refresh](#provider-observations-and-refresh). |
 | GET | `/providers/rules` | Return the current stub document `{"providers":[]}`. |
 | GET | `/ui`, `/ui/*` | Redirect `/ui` to `/ui/` and serve the configured external UI directory. |
@@ -1787,7 +1787,7 @@ All `dns` fields are process-lifetime `u64` event counters shared across active 
 
 | Field | Meaning |
 | --- | --- |
-| `socketAdmission.refused` | Endpoint network bootstrap refused because the whole DNS socket partition is smaller than the two credits it needs. |
+| `socketAdmission.refused` | Endpoint network bootstrap refused because the whole DNS socket partition is smaller than the credits it needs (one for single-family strategies, two for dual-stack strategies). |
 | `socketAdmission.timeouts` | Mandatory physical socket admission calls that return because their admission deadline expires. |
 | `proxyAdmission.timeouts` | Mandatory proxy stream or non-raw packet preparation admission calls that return because their admission deadline expires. |
 | `pressure.retiredUdpPools` | Idle UDP socket pools selected for pressure retirement, once per detached pool. |

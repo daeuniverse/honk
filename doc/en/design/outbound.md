@@ -446,12 +446,7 @@ routes in the current DNS generation. `resolve_with*` (DNS upstream endpoints)
 skips it, so an upstream's own name cannot recurse. Otherwise `resolve` queries
 the configured bootstrap resolver over bypass-marked UDP/TCP. On failure, it
 falls back to `/etc/hosts` and marked DNS to the first numeric nameserver in
-`/etc/resolv.conf`, without libc NSS or search suffixes. A and AAAA queries run
-concurrently, each within its own 3 s budget. The resolver accepts only
-responses that match the random query ID and exact question, and retries a
-truncated UDP answer over marked TCP. `tls::discover_ech_config` uses
-`query_ech_config` for DNS HTTPS records (`qtype 65`) and extracts the SVCB
-`ech` parameter through the same raw-query path.
+`/etc/resolv.conf` (read asynchronously), without libc NSS or search suffixes. UDP queries reuse one connected marked socket with monotonic retransmits (`400 ms`, `1,200 ms`, up to three sends), accept only responses matching the random query ID and exact question, validate header RCODEs (`0` extracts answers and minimum RR TTL, `3` returns an empty fallback-preserving result, other codes fail), and retry truncated (`TC=1`) answers over marked TCP within the remaining query budget. Dual-stack A/AAAA lookups run concurrently within a 3 s per-family budget using asymmetric completion windows (`500 ms` preferred-first / `1,000 ms` non-preferred-first) without discarding a non-empty family at deadline; single-family modes query only that family. `tls::discover_ech_config` uses `query_ech_config` for DNS HTTPS records (`qtype 65`) within the same 3 s query timeout and extracts the SVCB `ech` parameter through the same raw-query path.
 
 After resolution, `src/address_race.rs` schedules proxy-server TCP
 `connect_marked` and shared QUIC `QuicClient` attempts with stable IPv4/IPv6
