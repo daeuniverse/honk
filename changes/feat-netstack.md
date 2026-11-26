@@ -38,3 +38,4 @@ Added
 - Use 512 AF_XDP RX frames per queue on eligible single-member, single-realm forced-ZeroCopy Endpoint gateways with sufficient capture memory; other devices retain their existing capacities.
 - Charge recorded packet connection and route payloads to the capture budget through queueing, sniff-based rerouting and task completion. Idle observation slots carry no payload allocation.
 - Add per-family checksum completion for single TCP packets emitted by transparent netstack devices.
+- Standalone TUN writes borrowed packet slices directly and commits transmission after the device accepts a complete record.

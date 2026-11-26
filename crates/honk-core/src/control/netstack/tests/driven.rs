@@ -163,6 +163,31 @@ fn unwinding_owner_aborts_an_unfinished_generated_turn() {
 }
 
 #[cfg(target_os = "linux")]
+fn write_tun_datagram(
+    driver: &mut PacketDriver,
+    now: Instant,
+    class: TxClass,
+    writer: &std::os::unix::net::UnixDatagram,
+) -> io::Result<TunOutput> {
+    for _ in 0..crate::tun::BATCH {
+        let result = driver.write_tun(now, class, |header, parts, tx| {
+            let packet: Vec<_> = std::iter::once(header)
+                .chain(parts.iter().copied())
+                .flatten()
+                .copied()
+                .collect();
+            assert_eq!(packet.len(), tx.len);
+            assert_eq!(writer.send(&packet)?, tx.len);
+            Ok(())
+        })?;
+        if result != TunOutput::Progress {
+            return Ok(result);
+        }
+    }
+    panic!("UDP control exhausted the maintenance budget");
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn tun_turn_preserves_expiry_after_the_last_output_pass() {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -189,17 +214,23 @@ async fn tun_turn_preserves_expiry_after_the_last_output_pass() {
             writer.set_nonblocking(true).unwrap();
             reader.set_nonblocking(true).unwrap();
             let mut cx = context();
-            let more = crate::tun::service_turn(std::slice::from_mut(&mut driver), &mut cx, now, |drivers, cx| {
-                let driver = &mut drivers[0];
-                for class in [TxClass::Control, TxClass::Bulk] {
-                    assert!(exported(driver, cx, class).is_none());
-                }
-                assert_eq!(driver.deadline(), Some(due));
-                // Expiry crosses after the last output poll, with no further ingress.
-                std::thread::sleep(due.saturating_duration_since(Instant::now()));
-                assert!(Instant::now() >= due);
-                Ok(false)
-            })
+            let more = crate::tun::service_turn(
+                std::slice::from_mut(&mut driver),
+                &mut cx,
+                now,
+                |drivers, _| {
+                    for class in [TxClass::Control, TxClass::Bulk] {
+                        assert_eq!(
+                            write_tun_datagram(&mut drivers[0], now, class, &writer)?,
+                            TunOutput::Idle
+                        );
+                    }
+                    // Expiry crosses after the last output poll, with no further ingress.
+                    std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                    assert!(Instant::now() >= due);
+                    Ok(false)
+                },
+            )
             .unwrap();
             assert!(!more, "the empty output pass supplied no continuation");
             assert_eq!(scope.0.inner.lock().queued, 0, "finalization must not strand an unexported ICMP packet");
@@ -209,17 +240,19 @@ async fn tun_turn_preserves_expiry_after_the_last_output_pass() {
 
             tokio::time::sleep_until(tokio::time::Instant::from_std(driver.deadline().unwrap())).await;
             let mut emitted = 0;
-            crate::tun::service_turn(std::slice::from_mut(&mut driver), &mut cx, Instant::now(), |drivers, cx| {
-                let driver = &mut drivers[0];
-                for class in [TxClass::Control, TxClass::Bulk] {
-                    if let Some(output) = exported(driver, cx, class) {
-                        assert_eq!(writer.send(output.packet())?, output.packet().len());
-                        output.release();
-                        emitted += 1;
+            let now = Instant::now();
+            crate::tun::service_turn(
+                std::slice::from_mut(&mut driver),
+                &mut cx,
+                now,
+                |drivers, _| {
+                    for class in [TxClass::Control, TxClass::Bulk] {
+                        let result = write_tun_datagram(&mut drivers[0], now, class, &writer)?;
+                        emitted += usize::from(matches!(result, TunOutput::Packet(_)));
                     }
-                }
-                Ok(false)
-            })
+                    Ok(false)
+                },
+            )
             .unwrap();
             assert_eq!(emitted, 1, "the deadline alone must deliver the expired fragment's reply");
             let length = reader.recv(&mut packet).unwrap();
@@ -231,7 +264,10 @@ async fn tun_turn_preserves_expiry_after_the_last_output_pass() {
             assert!(matches!(reader.recv(&mut packet), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
             assert_eq!(driver.deadline(), None);
             scope.shutdown(true);
-            driver.service(&mut cx, Instant::now());
+            crate::tun::service_turn(std::slice::from_mut(&mut driver), &mut cx, now, |_, _| {
+                Ok(false)
+            })
+            .unwrap();
             assert!(owner.reclaim().await);
             owner.run().await;
         }
@@ -281,34 +317,41 @@ async fn tun_dual_turn_services_timers_and_close_while_shared_output_is_blocked(
                 Err(error) => panic!("fill shared output: {error}"),
             }
         }
-        let mut pending = Vec::new();
-        crate::tun::service_turn(&mut drivers, &mut context(), now, |drivers, cx| {
+        crate::tun::service_turn(&mut drivers, &mut context(), now, |drivers, _| {
             for driver in drivers {
-                let output = exported(driver, cx, TxClass::Bulk).unwrap();
                 assert_eq!(
-                    writer.send(output.packet()).unwrap_err().kind(),
+                    write_tun_datagram(driver, now, TxClass::Bulk, &writer)
+                        .unwrap_err()
+                        .kind(),
                     io::ErrorKind::WouldBlock
                 );
-                pending.push(output);
-                assert_eq!(driver.deadline(), Some(due));
             }
             Ok(false)
         })
         .unwrap();
-        crate::tun::service_turn(&mut drivers, &mut context(), due, |drivers, cx| {
+        assert!(drivers.iter().all(|driver| driver.deadline() == Some(due)));
+        crate::tun::service_turn(&mut drivers, &mut context(), due, |drivers, _| {
             for driver in drivers {
-                let output = exported(driver, cx, TxClass::Control)
-                    .expect("each scope must expire its fragment behind blocked bulk output");
                 assert_eq!(
-                    writer.send(output.packet()).unwrap_err().kind(),
-                    io::ErrorKind::WouldBlock
+                    write_tun_datagram(driver, due, TxClass::Control, &writer)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::WouldBlock,
+                    "expiry must reach each control writer despite the blocked bulk group"
                 );
-                pending.push(output);
             }
             Ok(false)
         })
         .unwrap();
-        assert_eq!(pending.len(), 4);
+        let pending: Vec<_> = drivers
+            .iter_mut()
+            .map(|driver| exported(driver, &mut context(), TxClass::Bulk).unwrap())
+            .collect();
+        assert!(
+            pending
+                .iter()
+                .all(|output| output.packet().ends_with(b"pending"))
+        );
         for scope in &scopes {
             scope.shutdown(true);
         }
@@ -332,6 +375,171 @@ async fn tun_dual_turn_services_timers_and_close_while_shared_output_is_blocked(
     })
     .await
     .expect("both original scopes must finish without writable output or fresh ingress");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tun_scatter_close_keeps_original_flow_until_the_reset_write() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let now = Instant::now();
+        let (scope, owner, budget) = runtime(now);
+        let client = "10.0.0.2:40000".parse().unwrap();
+        let (mut flow, server) = handshake(&scope, now, client, 100);
+        let id = flow.flow_id();
+        let destination = flow.local_addr();
+        let retired = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&retired);
+        let retired_scope = scope.clone();
+        flow.set_retirement_callback(move || {
+            assert!(retired_scope.0.inner.try_lock().is_some());
+            observed.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+        assert_eq!(
+            scope.receive(&segment(client, 101, server, tcp::ACK, b"unread"), now),
+            Rx::Consumed
+        );
+        drop(flow);
+        let mut driver = owner.hand_off();
+        // App Drop is processed during the pre-RX phase. Credit refusal may not pull its RST.
+        let credit = scope
+            .0
+            .inner
+            .lock()
+            .ledger
+            .reserve_tx(TxClass::Control)
+            .unwrap();
+        let mut cx = context();
+        crate::tun::service_turn(
+            std::slice::from_mut(&mut driver),
+            &mut cx,
+            now,
+            |drivers, _| {
+                assert_eq!(
+                    drivers[0].write_tun(now, TxClass::Control, |_, _, _| {
+                        panic!("pull without a funded frame and descriptor")
+                    })?,
+                    TunOutput::Idle
+                );
+                Ok(false)
+            },
+        )
+        .unwrap();
+        scope.0.inner.lock().ledger.cancel_tx(credit).unwrap();
+        assert!(scope.retains_tcp(client, destination));
+
+        let committed = scope.stats().unwrap().tx_packets;
+        let mut failed = Vec::new();
+        let mut sink = |header: &[u8], parts: &[&[u8]], tx: Transmit| {
+            assert!(scope.0.inner.try_lock().is_none());
+            assert_eq!(retired.load(Ordering::SeqCst), 0);
+            assert_eq!(tx.flow, Some(id));
+            assert!(parts.is_empty());
+            let (control, payload) = decode_packet(header);
+            assert_eq!(control.flags & tcp::RST, tcp::RST);
+            assert!(payload.is_empty());
+            failed.extend_from_slice(header);
+            Err(io::ErrorKind::WouldBlock.into())
+        };
+        let error = (0..crate::tun::BATCH)
+            .find_map(
+                |_| match driver.write_tun(now, TxClass::Control, &mut sink) {
+                    Ok(TunOutput::Progress) => None,
+                    Err(error) => Some(error),
+                    result => panic!("expected the original flow's RST: {result:?}"),
+                },
+            )
+            .expect("RST must reach the sink within one class turn");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        driver.finish_turn(&mut cx, now);
+        assert!(scope.retains_tcp(client, destination));
+        assert_eq!(scope.stats().unwrap().tx_packets, committed);
+        let tx = driver
+            .write_tun(now, TxClass::Control, |header, parts, tx| {
+                assert_eq!(tx.flow, Some(id));
+                assert!(parts.is_empty());
+                assert_eq!(header, failed);
+                assert_eq!(retired.load(Ordering::SeqCst), 0);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(tx, TunOutput::Packet(failed.len()));
+        driver.finish_turn(&mut cx, now);
+        assert_eq!(retired.load(Ordering::SeqCst), 1);
+        assert!(!scope.retains_tcp(client, destination));
+        assert_eq!(scope.stats().unwrap().tx_packets, committed + 1);
+        scope.shutdown(true);
+        driver.finish_turn(&mut cx, now);
+        assert!(owner.reclaim().await);
+        owner.run().await;
+        drop((driver, scope));
+        assert_eq!(budget.used(), 0);
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tun_scatter_progress_yields_without_an_fd_write() {
+    let now = Instant::now() + Duration::from_secs(10);
+    let budget = MemoryBudget::new(32 << 20);
+    let mut cfg = config();
+    cfg.icmp_limits.burst = 0;
+    let (scope, owner) = PacketScope::new(cfg, Arc::clone(&budget), limits(), now).unwrap();
+    let refusals = (crate::tun::BATCH * 2 + 5) as u16;
+    let ids: Vec<_> = scope.0.with_silent(|inner| {
+        let stack = inner.stack.as_mut().unwrap();
+        (0..refusals)
+            .map(|port| {
+                let client = SocketAddr::from(([192, 0, 2, 5], 40000 + port));
+                assert_eq!(
+                    stack.receive(now, &segment(client, 101, 0, tcp::SYN, &[])),
+                    Rx::Consumed
+                );
+                let id = stack.poll_accept().unwrap().id;
+                stack.tcp_refuse(id, honk_netstack::Refuse::IcmpAdminProhibited);
+                id
+            })
+            .collect()
+    });
+    let remaining = || {
+        scope.0.with_silent(|inner| {
+            let stack = inner.stack.as_ref().unwrap();
+            ids.iter().filter(|&&id| stack.tcp_retained(id)).count()
+        })
+    };
+    assert_eq!(remaining(), usize::from(refusals));
+    let mut driver = owner.hand_off();
+    let mut first = 0;
+    let mut cx = context();
+    let mut maintenance = || {
+        crate::tun::service_turn(
+            std::slice::from_mut(&mut driver),
+            &mut cx,
+            now,
+            |drivers, _| {
+                Ok(crate::tun::write_output_turn(
+                    drivers,
+                    &mut first,
+                    now,
+                    || true,
+                    |_, _, _| panic!("maintenance must never write to the FD"),
+                )?)
+            },
+        )
+        .unwrap()
+    };
+    assert!(maintenance(), "bounded cleanup needs another turn");
+    assert!((5..=6).contains(&remaining()));
+    assert!(!maintenance());
+    assert_eq!(remaining(), 0);
+    scope.shutdown(true);
+    driver.finish_turn(&mut cx, now);
+    assert!(owner.reclaim().await);
+    owner.run().await;
+    drop((driver, scope));
+    assert_eq!(budget.used(), 0);
 }
 
 #[tokio::test]

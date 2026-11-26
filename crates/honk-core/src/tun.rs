@@ -6,7 +6,7 @@ mod source;
 
 use crate::control::{
     ControlPlane,
-    netstack::{CAPTURE_MEMORY, OutputLease, PacketDriver, capture_scope_with_output},
+    netstack::{CAPTURE_MEMORY, OutputLease, PacketDriver, TunOutput, capture_scope_with_output},
     packet_endpoint::{PacketEndpointOwner, PacketEndpoints},
 };
 use anyhow::{Context as _, ensure};
@@ -34,6 +34,7 @@ use tokio::io::unix::AsyncFd;
 
 pub(crate) const BATCH: usize = 32;
 const VNET_BYTES: usize = 10;
+const TUN_IOVECS: usize = 20;
 pub(crate) const MAX_IP_BYTES: usize = 40 + u16::MAX as usize;
 pub(crate) const RX_BYTES: usize = VNET_BYTES + MAX_IP_BYTES + 1;
 pub(crate) const TX_CAPS: TxCaps = TxCaps {
@@ -43,6 +44,11 @@ pub(crate) const TX_CAPS: TxCaps = TxCaps {
     csum6: false,
     uso4: false,
     uso6: false,
+};
+const STANDALONE_TX_CAPS: TxCaps = TxCaps {
+    csum4: true,
+    csum6: true,
+    ..TX_CAPS
 };
 const TURN_BYTES: usize = 1 << 20;
 const TURN_TIME: Duration = Duration::from_millis(1);
@@ -123,7 +129,6 @@ struct Runtime {
     owner: PacketEndpointOwner,
     admission: Arc<AtomicBool>,
     rx: Box<[u8]>,
-    pending: [[[Option<OutputLease>; BATCH]; 2]; 2],
     first_group: usize,
     closing: bool,
     malformed_records: u64,
@@ -154,7 +159,6 @@ impl Runtime {
             .close_capture(self.io.as_ref().expect("live TUN FD").get_ref());
         self.closing = true;
         self.endpoints.close();
-        self.dispose_pending();
         #[cfg(feature = "ebpf")]
         if let Err(error) = source_close {
             return match result {
@@ -163,16 +167,6 @@ impl Runtime {
             };
         }
         result
-    }
-
-    fn dispose_pending(&mut self) {
-        for scope in &mut self.pending {
-            for class in scope {
-                for output in class {
-                    drop(output.take());
-                }
-            }
-        }
     }
 
     fn poll_startup(
@@ -230,22 +224,29 @@ impl Runtime {
         let now = Instant::now();
         let mut drivers = std::mem::take(&mut self.drivers);
         let serviced = service_turn(&mut drivers, cx, now, |drivers, cx| {
-            let mut more = false;
-            if active && !self.closing {
-                more |= self.read_batch(cx, now)?;
+            if !active || self.closing {
+                return Ok(false);
             }
+            let read_more = self.read_batch(cx, now)?;
+            let tx_now = Instant::now();
             for driver in drivers.iter_mut() {
-                more |= driver.service(cx, Instant::now());
+                driver.begin_turn(tx_now);
             }
-            if active || self.closing {
-                more |= self.outputs(drivers, cx)?;
-            }
-            Ok(more)
+            let write_more = poll_outputs(
+                self.io.as_ref().expect("live TUN FD"),
+                drivers,
+                &mut self.first_group,
+                cx,
+                tx_now,
+                || self.admission.load(Ordering::Acquire) && !self.endpoints.is_closing(),
+            )?;
+            Ok(read_more || write_more)
         });
         self.drivers = drivers;
         let more = serviced? || topology_more;
         let deadline = self.drivers.iter().filter_map(PacketDriver::deadline).min();
-        if more || poll_deadline(timer.as_mut(), deadline, cx).is_ready() {
+        let deadline_ready = poll_deadline(timer.as_mut(), deadline, cx).is_ready();
+        if more || deadline_ready {
             Poll::Ready(Ok(()))
         } else {
             Poll::Pending
@@ -351,62 +352,6 @@ impl Runtime {
         }
         Ok(true)
     }
-
-    fn outputs(
-        &mut self,
-        drivers: &mut [PacketDriver],
-        cx: &mut Context<'_>,
-    ) -> anyhow::Result<bool> {
-        let started = Instant::now();
-        let mut attempts = 0;
-        let mut bytes = 0;
-        let mut more = false;
-        let groups = drivers.len() * 2;
-        let first = self.first_group;
-        self.first_group = (first + 1) % groups;
-        for offset in 0..groups {
-            if !self.closing && turn_limit(attempts, bytes, started, BATCH * 2) {
-                return Ok(true);
-            }
-            let group = (first + offset) % groups;
-            let scope = group / 2;
-            let class = group % 2;
-            let driver = &mut drivers[scope];
-            let pending = &mut self.pending[scope][class];
-            if pending.iter().all(Option::is_none) {
-                match driver.poll_outputs_class(
-                    cx,
-                    [TxClass::Control, TxClass::Bulk][class],
-                    pending,
-                ) {
-                    Poll::Ready(None) if !self.closing && !self.endpoints.is_closing() => {
-                        anyhow::bail!("TUN packet scope ended before endpoint close");
-                    }
-                    Poll::Ready(Some(count)) => more |= count == BATCH,
-                    _ => {}
-                }
-            }
-            if self.closing {
-                for output in pending {
-                    drop(output.take());
-                }
-                continue;
-            }
-            if pending.iter().all(Option::is_none) {
-                continue;
-            }
-            more |= poll_flush(
-                self.io.as_ref().expect("live TUN FD"),
-                cx,
-                pending,
-                &mut attempts,
-                &mut bytes,
-                started,
-                || self.admission.load(Ordering::Acquire) && !self.endpoints.is_closing(),
-            )?;
-        }
-        Ok(more)
-    }
 }
 
 impl Drop for Runtime {
@@ -418,7 +363,6 @@ impl Drop for Runtime {
             let _ = source.close();
         }
         self.endpoints.close();
-        self.dispose_pending();
         self.drivers.clear();
         drop(self.io.take());
     }
@@ -478,25 +422,120 @@ pub(crate) fn service_turn(
     now: Instant,
     io: impl FnOnce(&mut [PacketDriver], &mut Context<'_>) -> anyhow::Result<bool>,
 ) -> anyhow::Result<bool> {
-    let mut more = false;
     for driver in drivers.iter_mut() {
-        more |= driver.service(cx, now);
+        driver.begin_turn(now);
     }
     let result = io(drivers, cx);
     // No materialization after the output pass: overdue work retains its next-turn deadline.
     for driver in drivers {
         driver.finish_turn(cx, Instant::now());
     }
-    result.map(|progress| more || progress)
+    result
+}
+
+fn poll_outputs<T: AsRawFd>(
+    io: &AsyncFd<T>,
+    drivers: &mut [PacketDriver],
+    first_group: &mut usize,
+    cx: &mut Context<'_>,
+    now: Instant,
+    open: impl Fn() -> bool,
+) -> io::Result<bool> {
+    let mut ready = None;
+    let result = write_output_turn(drivers, first_group, now, &open, |header, parts, tx| {
+        if ready.is_none() {
+            // Probe writability only when the scope actually has output.
+            ready = match io.poll_write_ready(cx) {
+                Poll::Ready(result) => Some(result?),
+                Poll::Pending => return Err(io::ErrorKind::WouldBlock.into()),
+            };
+        }
+        ready
+            .as_mut()
+            .expect("polled TUN write readiness")
+            .try_io(|inner| write_packet_iov(inner.get_ref().as_raw_fd(), header, parts, tx))
+            .unwrap_or_else(|_| Err(io::ErrorKind::WouldBlock.into()))
+    });
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            if !open() {
+                return Ok(true);
+            }
+            if ready.is_none() {
+                // The probe already registered this task with the reactor.
+                return Ok(false);
+            }
+            // try_io cleared the stale edge on EAGAIN. Register and recheck before parking.
+            match io.poll_write_ready(cx) {
+                Poll::Ready(result) => {
+                    drop(result?);
+                    Ok(true)
+                }
+                Poll::Pending => Ok(false),
+            }
+        }
+        result => result,
+    }
+}
+
+pub(crate) fn write_output_turn(
+    drivers: &mut [PacketDriver],
+    first_group: &mut usize,
+    now: Instant,
+    open: impl Fn() -> bool,
+    mut write: impl FnMut(&[u8], &[&[u8]], Transmit) -> io::Result<()>,
+) -> io::Result<bool> {
+    let mut attempts = 0;
+    let mut bytes = 0;
+    let mut more = false;
+    let groups = drivers.len() * 2;
+    let first = *first_group;
+    *first_group = (first + 1) % groups;
+    'groups: for offset in 0..groups {
+        let group = (first + offset) % groups;
+        let driver = &mut drivers[group / 2];
+        let class = [TxClass::Control, TxClass::Bulk][group % 2];
+        for _ in 0..BATCH {
+            if !open() || turn_limit(attempts, bytes, now, BATCH * 2) {
+                return Ok(true);
+            }
+            // Bound failed syscalls and maintenance even on turns with no accepted bytes.
+            attempts += 1;
+            match driver.write_tun(now, class, |header, parts, tx| {
+                if !open() {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                write(header, parts, tx)
+            }) {
+                Ok(TunOutput::Packet(len)) => bytes += VNET_BYTES + len,
+                Ok(TunOutput::Progress) => {}
+                Ok(TunOutput::Idle) => continue 'groups,
+                Ok(TunOutput::Closed) if !open() => return Ok(true),
+                Ok(TunOutput::Closed) => {
+                    return Err(io::Error::other(
+                        "TUN packet scope ended before endpoint close",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        more = true;
+    }
+    Ok(more)
 }
 
 fn exact_record(packet: &[u8]) -> bool {
+    exact_record_len(packet, packet.len())
+}
+
+fn exact_record_len(packet: &[u8], len: usize) -> bool {
     match packet.first().map(|byte| byte >> 4) {
         Some(4) if packet.len() >= 20 => {
-            usize::from(u16::from_be_bytes([packet[2], packet[3]])) == packet.len()
+            usize::from(u16::from_be_bytes([packet[2], packet[3]])) == len
         }
         Some(6) if packet.len() >= 40 => {
-            usize::from(u16::from_be_bytes([packet[4], packet[5]])) + 40 == packet.len()
+            usize::from(u16::from_be_bytes([packet[4], packet[5]])) + 40 == len
         }
         _ => false,
     }
@@ -593,6 +632,133 @@ fn vnet_header(packet: &[u8], transmit: Transmit) -> io::Result<[u8; VNET_BYTES]
     Ok(header)
 }
 
+fn invalid_transmit() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "invalid TUN transmit metadata")
+}
+
+fn vnet_header_iov(
+    hdr: &[u8],
+    total_len: usize,
+    transmit: Transmit,
+) -> io::Result<[u8; VNET_BYTES]> {
+    if transmit.len != total_len || hdr.len() > total_len || !exact_record_len(hdr, total_len) {
+        return Err(invalid_transmit());
+    }
+    let mut header = [0; VNET_BYTES];
+    let ipv6 = hdr[0] >> 4 == 6;
+    let ip = if ipv6 {
+        wire::ipv6::parse_prefix(hdr, total_len)
+    } else {
+        wire::ipv4::parse_prefix(hdr, total_len)
+    };
+    let ip = match ip {
+        Ok(ip) => ip,
+        Err(wire::ParseError::Fragment)
+            if transmit.csum == TxCsum::Full
+                && transmit.gso.is_none()
+                && valid_fragment(hdr, total_len, ipv6) =>
+        {
+            return Ok(header);
+        }
+        Err(_) => return Err(invalid_transmit()),
+    };
+    let start = ip.payload.start;
+    let l4 = hdr.get(start..).ok_or_else(invalid_transmit)?;
+    let (l4_header_len, checksum_offset) = match ip.proto {
+        wire::PROTO_TCP => {
+            let len = usize::from(*l4.get(12).ok_or_else(invalid_transmit)? >> 4) * 4;
+            if !(20..=l4.len()).contains(&len) {
+                return Err(invalid_transmit());
+            }
+            (len, 16)
+        }
+        wire::PROTO_UDP => {
+            let (_, _, payload) =
+                wire::udp::parse_prefix(l4, ip.payload.len()).map_err(|_| invalid_transmit())?;
+            if payload.end != ip.payload.len() {
+                return Err(invalid_transmit());
+            }
+            (payload.start, 6)
+        }
+        wire::PROTO_ICMP | wire::PROTO_ICMPV6
+            if (ip.proto == wire::PROTO_ICMPV6) == ipv6
+                && l4.len() >= 8
+                && transmit.csum == TxCsum::Full
+                && transmit.gso.is_none() =>
+        {
+            return Ok(header);
+        }
+        _ => return Err(invalid_transmit()),
+    };
+    if let TxCsum::Partial {
+        start: csum_start,
+        offset,
+    } = transmit.csum
+    {
+        if usize::from(csum_start) != start || offset != checksum_offset {
+            return Err(invalid_transmit());
+        }
+        header[0] = 1;
+        header[6..8].copy_from_slice(&csum_start.to_le_bytes());
+        header[8..10].copy_from_slice(&offset.to_le_bytes());
+    }
+    if let Some(gso) = transmit.gso {
+        let header_end = start + l4_header_len;
+        if ip.proto != wire::PROTO_TCP
+            || gso.kind != GsoKind::Tcp
+            || transmit.csum == TxCsum::Full
+            || usize::from(gso.hdr_len) != header_end
+            || gso.size == 0
+            || usize::from(gso.size) >= total_len - header_end
+        {
+            return Err(invalid_transmit());
+        }
+        header[1] = if ipv6 { 4 } else { 1 };
+        header[2..4].copy_from_slice(&gso.hdr_len.to_le_bytes());
+        header[4..6].copy_from_slice(&gso.size.to_le_bytes());
+    }
+    Ok(header)
+}
+
+// The prefix parser verified the network/extension headers up to fragmentation.
+fn valid_fragment(hdr: &[u8], total_len: usize, ipv6: bool) -> bool {
+    let (head, offset, more, max_len) = if ipv6 {
+        let mut next = hdr[6];
+        let mut at = wire::ipv6::HEADER_LEN;
+        while next != 44 {
+            next = hdr[at];
+            at += (usize::from(hdr[at + 1]) + 1) * 8;
+        }
+        let Some(fragment) = hdr.get(at..at + 8) else {
+            return false;
+        };
+        let bits = u16::from_be_bytes([fragment[2], fragment[3]]);
+        if fragment[1] != 0 || bits & 6 != 0 {
+            return false;
+        }
+        (
+            at + 8,
+            usize::from(bits & 0xfff8),
+            bits & 1 != 0,
+            usize::from(u16::MAX) - (at - wire::ipv6::HEADER_LEN),
+        )
+    } else {
+        let ihl = usize::from(hdr[0] & 0x0f) * 4;
+        let bits = u16::from_be_bytes([hdr[6], hdr[7]]);
+        if bits & 0xc000 != 0 {
+            return false;
+        }
+        (
+            ihl,
+            usize::from(bits & 0x1fff) * 8,
+            bits & 0x2000 != 0,
+            usize::from(u16::MAX) - ihl,
+        )
+    };
+    let data_len = total_len - head;
+    data_len != 0 && (!more || data_len.is_multiple_of(8)) && offset + data_len <= max_len
+}
+
 pub(crate) fn read_packet(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
     // SAFETY: buffer is a unique writable slice and fd remains owned across this call.
     let count = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
@@ -604,23 +770,64 @@ pub(crate) fn read_packet(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
 }
 
 fn write_packet(fd: RawFd, header: &[u8; VNET_BYTES], packet: &[u8]) -> io::Result<usize> {
-    let buffers = [
-        libc::iovec {
-            iov_base: header.as_ptr().cast_mut().cast(),
-            iov_len: header.len(),
-        },
-        libc::iovec {
-            iov_base: packet.as_ptr().cast_mut().cast(),
-            iov_len: packet.len(),
-        },
-    ];
-    // SAFETY: both slices remain readable and the unique owner keeps fd live during writev.
+    // SAFETY: both vectors borrow readable slices through this call.
+    unsafe { write_vectors(fd, &[io_vector(header), io_vector(packet)]) }
+}
+
+fn write_packet_iov(
+    fd: RawFd,
+    header: &[u8],
+    parts: &[&[u8]],
+    transmit: Transmit,
+) -> io::Result<()> {
+    if parts.len() > TUN_IOVECS - 2 {
+        return Err(invalid_transmit());
+    }
+    let mut buffers = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; TUN_IOVECS];
+    buffers[1] = io_vector(header);
+    let mut used = 2;
+    let mut len = header.len();
+    for &part in parts.iter().filter(|part| !part.is_empty()) {
+        len = len.checked_add(part.len()).ok_or_else(invalid_transmit)?;
+        buffers[used] = io_vector(part);
+        used += 1;
+    }
+    let vnet = vnet_header_iov(header, len, transmit)?;
+    buffers[0] = io_vector(&vnet);
+    // SAFETY: each populated vector borrows a slice still live across this one call.
+    let count = unsafe { write_vectors(fd, &buffers[..used]) }?;
+    require_complete_write(count, VNET_BYTES + len)
+}
+
+fn io_vector(bytes: &[u8]) -> libc::iovec {
+    libc::iovec {
+        iov_base: bytes.as_ptr().cast_mut().cast(),
+        iov_len: bytes.len(),
+    }
+}
+
+// The vectors must point to readable bytes valid until the syscall returns.
+unsafe fn write_vectors(fd: RawFd, buffers: &[libc::iovec]) -> io::Result<usize> {
+    // SAFETY: the caller guarantees the borrowed byte extents.
     let count = unsafe { libc::writev(fd, buffers.as_ptr(), buffers.len() as libc::c_int) };
     if count < 0 {
         Err(io::Error::last_os_error())
     } else {
         Ok(count as usize)
     }
+}
+
+fn require_complete_write(count: usize, length: usize) -> io::Result<()> {
+    if count == length {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WriteZero,
+        format!("TUN packet boundary violation: accepted {count} of {length} bytes; no replay"),
+    ))
 }
 
 pub(crate) fn poll_flush<T: AsRawFd>(
@@ -685,19 +892,13 @@ fn flush_pending(
             }
             *attempts += 1;
             let length = VNET_BYTES + lease.packet().len();
-            match write(&header, lease.packet()) {
-                Ok(count) if count == length => {
-                    *bytes += count;
+            match write(&header, lease.packet())
+                .and_then(|count| require_complete_write(count, length))
+            {
+                Ok(()) => {
+                    *bytes += length;
                     drop(output.take());
                     break;
-                }
-                Ok(count) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        format!(
-                            "TUN packet boundary violation: accepted {count} of {length} bytes; no replay"
-                        ),
-                    ));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     return Ok((true, false));
@@ -801,7 +1002,7 @@ async fn run_owned(
                         crate::control::netstack::PacketOwner,
                     )>(),
             )
-            .context("TUN receive and pending metadata capacity")?;
+            .context("TUN receive and runtime metadata capacity")?;
         Ok((dns, capacity, memory))
     })();
     let (dns, capacity, memory) = match prepared {
@@ -883,7 +1084,7 @@ async fn run_owned(
             realms,
             128,
             u16::MAX as usize,
-            TX_CAPS,
+            STANDALONE_TX_CAPS,
             &budget,
         )?;
         let plain_scope = pair.0.scope();
@@ -894,7 +1095,7 @@ async fn run_owned(
                 realms,
                 128,
                 u16::MAX as usize,
-                TX_CAPS,
+                STANDALONE_TX_CAPS,
                 &budget,
             )?;
             let scope = pair.0.scope();
@@ -957,7 +1158,6 @@ async fn run_owned(
         owner,
         admission,
         rx: vec![0; RX_BYTES].into_boxed_slice(),
-        pending: std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| None))),
         first_group: 0,
         closing: false,
         malformed_records: 0,
@@ -1071,7 +1271,6 @@ async fn run_owned(
             None
         }
     };
-    runtime.dispose_pending();
     runtime.drivers.clear();
     drop(runtime.io.take());
     #[cfg(feature = "ebpf")]

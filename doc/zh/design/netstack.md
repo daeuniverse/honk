@@ -209,9 +209,9 @@ XDP 在启动时为每个物理 Port 选择容量。`physical_mtu + 22` 不溢�
 
 TUN 选择 bulk 128 和配置的逻辑 MTU（默认 1500）；false 使用一个 realm，true 使用两个。每个 scope 的 160 个 CPU frame 各计费 65,535 字节（总计 10,485,600 字节）；共用 384 MiB 预算和一个 UDP pool，不改变 MSS/PMTU 或普通 UDP MTU。
 
-[TUN owner](./datapath.md#fd-报文管线) 保留 CPU-backed `OutputLease` 及原始 `Transmit`。setup 要求独占、单队列、非 persistent 的 `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR`，设置并回读 10 字节小端 vnet 头，仅启用 `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`；内核不支持时明确拒绝。RX 预留 65,586 字节：10 字节 vnet 头、普通 IPv6 最大 65,575 字节以及一个截断 sentinel。读满 buffer、不完整/带填充 IP record、未知 flag、不支持的 GSO 类型/地址族及非法首部/校验和范围，均在组合 metadata/source/admission 路径之前拒绝。GSO `hdr_len` 是 Linux 线性头部范围提示，可包含载荷，必须覆盖解析后的 TCP 头且不超过 IP record。普通 UDP `CHECKSUM_PARTIAL` 无需 USO 也能接收。在回收唯一 RX buffer 前接纳/复制借用 UDP。
+[TUN owner](./datapath.md#fd-报文管线) 在每个类别内先写出已排队的 CPU 帧，再借用协议栈的头和载荷切片执行一次 `writev`。setup 要求独占、单队列、非 persistent 的 `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR`，设置并回读 10 字节小端 vnet 头，仅启用 `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`；内核不支持时明确拒绝。RX 预留 65,586 字节：10 字节 vnet 头、普通 IPv6 最大 65,575 字节以及一个截断 sentinel。读满 buffer、不完整/带填充 IP record、未知 flag、不支持的 GSO 类型/地址族及非法首部/校验和范围，均在组合 metadata/source/admission 路径之前拒绝。GSO `hdr_len` 是 Linux 线性头部范围提示，可包含载荷，必须覆盖解析后的 TCP 头且不超过 IP record。普通 UDP `CHECKSUM_PARTIAL` 无需 USO 也能接收。在回收唯一 RX buffer 前接纳/复制借用 UDP。
 
-每个 scope/class 最多保留 32 个 pending lease。一次 `writev` 提交不可变 record；EAGAIN/EINTR 保留原 lease，短/零写为终止错误，不重放。就绪和 joined close 期间服务所有 driver。独立 DNS 在 plain scope 学习，透明 DNS 使用各 packet 的 scope，均不借用 HOST 事实。Socket HostFacts 保留原始来源有效期与所有权；plain 不提供进程权威。Direct 新建 dial，不保留原 socket operation 或 pre-NAT/TTL 行为。
+每个 scope/class 每轮最多处理 32 次发送或维护。完整记录写成功才提交协议状态。EAGAIN 保留待发报文并重新注册可写唤醒，EINTR 在本轮预算内重试。短写或零写立即终止该设备。就绪和 joined close 期间服务所有 driver。独立 DNS 在 plain scope 学习，透明 DNS 使用各 packet 的 scope，均不借用 HOST 事实。Socket HostFacts 保留原始来源有效期与所有权；plain 不提供进程权威。Direct 新建 dial，不保留原 socket operation 或 pre-NAT/TTL 行为。
 
 每个 [Host 出口](./datapath.md#host-来源托管) 使用与辅助 LAN 相同的 4 MiB 私有 TUN/Stack 份额，不创建 Copy Port。元数据、设备对象、程序以及重载时两代并存的开销计入同一 384 MiB 根预算。两张 socket storage 的动态元素由内核按活动 socket 分配；它们及未来外部创建的 cgroup 的增量不属于 honk 的内存硬上限。流的 PID 和规范化进程名来自其精确 Endpoint 归属记录，不是最近一个发送者或 TUN HostFacts 收据。
 

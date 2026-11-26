@@ -21,6 +21,8 @@ use std::time::Instant;
 
 use honk_datapath::ScopeId;
 use honk_datapath::buffer::{FrameConfig, FrameLease, FrameLedger, TxClass};
+#[cfg(target_os = "linux")]
+use honk_netstack::IovTransmit;
 use honk_netstack::{
     AcceptOpts, Config, DropReason, FlowId, MemoryBudget, MemoryReservation, Mode, Ready, Rx,
     RxMeta, SourceContext, Stack, StackStats, SynInfo, Transmit, TxCaps, UdpError,
@@ -300,6 +302,7 @@ struct Inner {
     queue: Box<[Option<Queued>]>,
     head: usize,
     queued: usize,
+    exported_cpu: [usize; 2],
     frame_size: usize,
     cpu_tx_caps: TxCaps,
     next_tx: TxClass,
@@ -606,6 +609,7 @@ impl PacketScope {
                 queue: frames.queue,
                 head: 0,
                 queued: 0,
+                exported_cpu: [0; 2],
                 frame_size,
                 cpu_tx_caps: caps,
                 next_tx: TxClass::Control,
@@ -1361,6 +1365,7 @@ impl Inner {
             let bytes = self.frames[index]
                 .take()
                 .expect("queued frame owns storage");
+            self.exported_cpu[usize::from(queued.class == TxClass::Bulk)] += 1;
             *output = Some(OutputLease(OutputOwner {
                 scope: scope.clone(),
                 queued: Some(queued),
@@ -1438,21 +1443,58 @@ impl Inner {
         }
     }
 
-    // ponytail: O(queued) shift, bounded by the scope's TX frames; per-class rings if measured.
-    fn pop(&mut self, class: Option<TxClass>) -> Option<Queued> {
-        let len = self.queue.len();
-        let at = (0..self.queued).find(|&i| {
+    fn queue_offset(&self, class: Option<TxClass>) -> Option<usize> {
+        (0..self.queued).find(|&i| {
             class.is_none_or(|class| {
-                self.queue[(self.head + i) % len].is_some_and(|queued| queued.class == class)
+                self.queue[(self.head + i) % self.queue.len()]
+                    .is_some_and(|queued| queued.class == class)
             })
-        })?;
-        let queued = self.queue[(self.head + at) % len].take();
+        })
+    }
+
+    fn pop(&mut self, class: Option<TxClass>) -> Option<Queued> {
+        let at = self.queue_offset(class)?;
+        Some(self.pop_at(at))
+    }
+
+    // ponytail: O(queued) shift, bounded by the scope's TX frames; per-class rings if measured.
+    fn pop_at(&mut self, at: usize) -> Queued {
+        let len = self.queue.len();
+        let queued = self.queue[(self.head + at) % len]
+            .take()
+            .expect("selected queued output");
         for i in (0..at).rev() {
             self.queue[(self.head + i + 1) % len] = self.queue[(self.head + i) % len].take();
         }
         self.head = (self.head + 1) % len;
         self.queued -= 1;
         queued
+    }
+
+    fn submit_output(
+        &mut self,
+        lease: FrameLease,
+        tx: Transmit,
+        class: TxClass,
+    ) -> io::Result<Queued> {
+        if let Some(context) = tx.source {
+            assert!(
+                self.source_work.facts(context).is_some(),
+                "emitted original Host source"
+            );
+        }
+        self.ledger
+            .submit_tx(lease, tx.len, tx.flow)
+            .map_err(io::Error::other)?;
+        if let Some(context) = tx.source {
+            self.source_work.retain_output(context);
+        }
+        if let Some(id) = tx.flow
+            && let Some(slot) = self.slot(id)
+        {
+            slot.outputs += 1;
+        }
+        Ok(Queued { lease, tx, class })
     }
 
     fn install(
@@ -1466,15 +1508,7 @@ impl Inner {
     ) -> io::Result<Queued> {
         #[cfg(not(target_os = "linux"))]
         let _ = fragment;
-        if let Some(context) = tx.source {
-            assert!(
-                self.source_work.facts(context).is_some(),
-                "emitted original Host source"
-            );
-        }
-        self.ledger
-            .submit_tx(lease, tx.len, tx.flow)
-            .map_err(io::Error::other)?;
+        let queued = self.submit_output(lease, tx, class)?;
         self.output_peers[index] = Some(destination);
         #[cfg(target_os = "linux")]
         if let Some(output) = self.output_peer_holds.get_mut(index) {
@@ -1496,15 +1530,7 @@ impl Inner {
                     .cloned(),
             };
         }
-        if let Some(context) = tx.source {
-            self.source_work.retain_output(context);
-        }
-        if let Some(id) = tx.flow
-            && let Some(slot) = self.slot(id)
-        {
-            slot.outputs += 1;
-        }
-        Ok(Queued { lease, tx, class })
+        Ok(queued)
     }
 
     fn publish(
@@ -1567,6 +1593,7 @@ impl Inner {
     fn release_output(&mut self, queued: Queued, bytes: Option<Box<[u8]>>) {
         let index = self.index(queued.lease);
         if let Some(bytes) = bytes {
+            self.exported_cpu[usize::from(queued.class == TxClass::Bulk)] -= 1;
             assert!(
                 self.frames[index].replace(bytes).is_none(),
                 "exclusive output storage"
@@ -1575,6 +1602,18 @@ impl Inner {
             assert!(self.frames[index].is_some(), "funded direct output storage");
         }
         self.release(queued);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tun_idle(&mut self, class_index: usize) -> TunOutput {
+        if self.pending_closes == 0
+            && !self.closing
+            && let Some(rescan) = &mut self.turn_needs_scan
+        {
+            // Credit returns, external lease releases and new work all wake the driver.
+            rescan[class_index] = false;
+        }
+        TunOutput::Idle
     }
 
     fn pull(&mut self, now: Instant, class: TxClass) -> bool {
@@ -1856,6 +1895,15 @@ impl Drop for PacketOwner {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TunOutput {
+    Idle,
+    Closed,
+    Progress,
+    Packet(usize),
+}
+
 pub(crate) enum MaterializedOutput {
     Idle,
     Closed,
@@ -2127,6 +2175,91 @@ impl PacketDriver {
             #[cfg(all(target_os = "linux", test))]
             destination,
         }))
+    }
+
+    /// Write a single standalone TUN record with the exclusive scope lock held. The sink
+    /// can only do synchronous device I/O and reports success after accepting the whole record.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn write_tun(
+        &mut self,
+        now: Instant,
+        class: TxClass,
+        mut emit: impl FnMut(&[u8], &[&[u8]], Transmit) -> io::Result<()>,
+    ) -> io::Result<TunOutput> {
+        let mut inner = self.scope.0.inner.lock();
+        if inner.rights != Rights::Driven
+            || inner.aborted
+            || inner.finished
+            || inner.stack.is_none()
+        {
+            return Ok(TunOutput::Closed);
+        }
+        debug_assert!(inner.resources.is_none() && self.scope.0.auxiliary.is_none());
+        let class_index = usize::from(class == TxClass::Bulk);
+        if inner.exported_cpu[class_index] != 0 {
+            return Ok(inner.tun_idle(class_index));
+        }
+        if let Some(at) = inner.queue_offset(Some(class)) {
+            let queued =
+                inner.queue[(inner.head + at) % inner.queue.len()].expect("selected queued output");
+            let packet = inner.frames[inner.index(queued.lease)]
+                .as_ref()
+                .expect("queued frame owns storage");
+            emit(&packet[..queued.tx.len], &[], queued.tx)?;
+            let queued = inner.pop_at(at);
+            inner.release(queued);
+            inner.wake_credit_waiters();
+            return Ok(TunOutput::Packet(queued.tx.len));
+        }
+
+        let lease = match inner.ledger.reserve_tx(class) {
+            Ok(lease) => lease,
+            Err(
+                honk_datapath::buffer::LedgerError::NoFrame
+                | honk_datapath::buffer::LedgerError::NoDescriptor,
+            ) => return Ok(inner.tun_idle(class_index)),
+            Err(error) => return Err(io::Error::other(error)),
+        };
+        let mut reservation = OutputReservation {
+            inner: &mut inner,
+            lease: Some(lease),
+        };
+        let state = &mut *reservation.inner;
+        let max_len = state.frame_size;
+        let tx = state
+            .stack
+            .as_mut()
+            .expect("live driven stack")
+            .poll_transmit_iov(
+                now,
+                max_len,
+                state.cpu_tx_caps,
+                class == TxClass::Control,
+                None,
+                |header, parts, tx| {
+                    if tx.len == 0 || tx.len > max_len {
+                        return Err(invalid("invalid scatter output extent"));
+                    }
+                    emit(header, parts, tx)
+                },
+            )?;
+        match tx {
+            IovTransmit::Packet(tx) => {
+                // The protocol owner stayed live under this lock through the write. Record
+                // its exact identity and return the credit before any stream/source reap.
+                let queued = state
+                    .submit_output(lease, tx, class)
+                    .expect("complete reserved TUN output");
+                reservation.lease = None;
+                reservation.inner.release(queued);
+                reservation.inner.wake_credit_waiters();
+                Ok(TunOutput::Packet(tx.len))
+            }
+            IovTransmit::Progress => Ok(TunOutput::Progress),
+            IovTransmit::Idle | IovTransmit::Deferred => Ok(state.tun_idle(class_index)),
+            IovTransmit::BufferTooSmall => Err(invalid("TUN output exceeds funded frame extent")),
+            IovTransmit::NeedsIcmp => unreachable!("standalone TUN owns its ICMP limiter"),
+        }
     }
 
     /// `PacketScope::poll_outputs_class` for the driving device, without `Shared::with`.

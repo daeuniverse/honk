@@ -2,6 +2,8 @@ use super::*;
 use crate::control::netstack::{PacketOwner, PacketScope, RuntimeLimits};
 use std::os::unix::net::UnixDatagram;
 
+mod direct;
+
 #[tokio::test]
 async fn stale_topology_readiness_rearms_before_the_next_notification() {
     let (reader, writer) = UnixDatagram::pair().unwrap();
@@ -48,7 +50,16 @@ async fn stale_topology_readiness_rearms_before_the_next_notification() {
 }
 
 fn scope() -> (PacketScope, PacketOwner, Arc<MemoryBudget>) {
+    scope_with_caps(TX_CAPS)
+}
+
+fn scope_with_caps(caps: TxCaps) -> (PacketScope, PacketOwner, Arc<MemoryBudget>) {
     let budget = MemoryBudget::new(8 << 20);
+    let (scope, owner) = scope_in_budget(caps, &budget);
+    (scope, owner, budget)
+}
+
+fn scope_in_budget(caps: TxCaps, budget: &Arc<MemoryBudget>) -> (PacketScope, PacketOwner) {
     let mut config = honk_netstack::Config::new([19; 32]);
     config.mode = honk_netstack::Mode::Transparent {
         exclude: Default::default(),
@@ -56,9 +67,9 @@ fn scope() -> (PacketScope, PacketOwner, Arc<MemoryBudget>) {
     config.mtu = 1500;
     config.max_flows = 8;
     config.memory_limit = 2 << 20;
-    let (scope, owner) = PacketScope::new_with_output(
+    PacketScope::new_with_output(
         config,
-        Arc::clone(&budget),
+        Arc::clone(budget),
         RuntimeLimits {
             max_slots: 8,
             control_frames: 4,
@@ -66,11 +77,10 @@ fn scope() -> (PacketScope, PacketOwner, Arc<MemoryBudget>) {
             max_waiters: 4,
         },
         Instant::now(),
-        TX_CAPS,
+        caps,
         u16::MAX as usize,
     )
-    .unwrap();
-    (scope, owner, budget)
+    .unwrap()
 }
 
 async fn driven_endpoints() -> (
@@ -80,7 +90,15 @@ async fn driven_endpoints() -> (
     PacketScope,
     Arc<MemoryBudget>,
 ) {
-    let (scope, scope_owner, budget) = scope();
+    let (scope, scope_owner, budget) = scope_with_caps(STANDALONE_TX_CAPS);
+    let (endpoints, owner, mut drivers) =
+        start_driven_scopes(vec![(scope.clone(), scope_owner)]).await;
+    (endpoints, owner, drivers.pop().unwrap(), scope, budget)
+}
+
+async fn start_driven_scopes(
+    scopes: Vec<(PacketScope, PacketOwner)>,
+) -> (PacketEndpoints, PacketEndpointOwner, Vec<PacketDriver>) {
     let mut config = Config::default();
     config.ensure_builtin_nodes();
     config.global.dial_mode = "ip".into();
@@ -89,23 +107,17 @@ async fn driven_endpoints() -> (
     config.global.preconnect_node_count = 0;
     config.global.udp_warm_node_count = 0;
     let plane = crate::control::tests::support::control_plane(config);
-    let (endpoints, mut owner, mut drivers) = PacketEndpoints::start_driven(
-        plane,
-        vec![(scope.clone(), scope_owner)],
-        1,
-        None,
-        ScopeId::HOST,
-    )
-    .await
-    .unwrap();
-    let mut driver = drivers.pop().unwrap();
+    let (endpoints, mut owner, mut drivers) =
+        PacketEndpoints::start_driven(plane, scopes, 1, None, ScopeId::HOST)
+            .await
+            .unwrap();
     poll_fn(|cx| {
-        driver.service(cx, Instant::now());
+        service_turn(&mut drivers, cx, Instant::now(), |_, _| Ok(false)).unwrap();
         owner.poll_ready(cx)
     })
     .await
     .unwrap();
-    (endpoints, owner, driver, scope, budget)
+    (endpoints, owner, drivers)
 }
 
 #[tokio::test]
@@ -179,7 +191,10 @@ async fn close_racing_udp_admission_preserves_the_joined_shutdown_outcome() {
                 }
                 let (plane, result) = poll_fn(|cx| {
                     if let Some(driver) = &mut driver {
-                        driver.service(cx, Instant::now());
+                        service_turn(std::slice::from_mut(driver), cx, Instant::now(), |_, _| {
+                            Ok(false)
+                        })
+                        .unwrap();
                     }
                     owner.poll_join_plane(cx)
                 })
@@ -242,7 +257,13 @@ async fn admission_errors_without_endpoint_close_remain_failures() {
         );
         endpoints.close();
         let (plane, result) = poll_fn(|cx| {
-            driver.service(cx, Instant::now());
+            service_turn(
+                std::slice::from_mut(&mut driver),
+                cx,
+                Instant::now(),
+                |_, _| Ok(false),
+            )
+            .unwrap();
             owner.poll_join_plane(cx)
         })
         .await

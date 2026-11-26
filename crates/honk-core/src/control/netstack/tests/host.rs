@@ -309,6 +309,97 @@ async fn host_cpu_and_generated_udp_fragments_keep_original_source_after_sender_
     driver.finish_turn(&mut context(), now);
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tun_scatter_keeps_udp_source_behind_cpu_prefix_until_the_last_write() {
+    let now = Instant::now();
+    let budget = MemoryBudget::new(32 << 20);
+    let (scope, owner) = PacketScope::new(
+        config(),
+        Arc::clone(&budget),
+        RuntimeLimits {
+            max_slots: 1,
+            bulk_frames: 3,
+            ..limits()
+        },
+        now,
+    )
+    .unwrap();
+    scope.prepare_host().unwrap();
+    let client = "192.0.2.1:40000".parse().unwrap();
+    let destination = "198.51.100.1:443".parse().unwrap();
+    let source = facts(31);
+    let work = scope.hold_host_source(&source).unwrap();
+    let original = work.optional_context().unwrap();
+    let sender = scope.datagram_sender_for(destination, work).unwrap();
+    sender.send_to(b"exported", client).await.unwrap();
+    let exported = output(&scope);
+    sender.send_to(&[17; 3000], client).await.unwrap();
+    drop(sender);
+    let pinned = [32, 33, 34, 35].map(|cookie| scope.hold_host_source(&facts(cookie)).unwrap());
+    let mut driver = owner.hand_off();
+    driver.begin_turn(now);
+    assert_eq!(
+        driver
+            .write_tun(now, TxClass::Bulk, |_, _, _| panic!(
+                "overtook the exported prefix"
+            ))
+            .unwrap(),
+        TunOutput::Idle,
+    );
+    assert_eq!(exported.host_return(), Some(source));
+    assert!(exported.packet().ends_with(b"exported"));
+    exported.release();
+
+    let mut offsets = Vec::new();
+    let mut emit = |header: &[u8], parts: &[&[u8]], tx: Transmit| {
+        assert_eq!(tx.source, Some(original));
+        let offset = u16::from_be_bytes([header[6], header[7]]) & 0x1fff;
+        assert_eq!(
+            parts.is_empty(),
+            offset == 0,
+            "only the app's first packet is a CPU frame"
+        );
+        offsets.push(usize::from(offset) * 8);
+        Ok(())
+    };
+    for _ in 0..2 {
+        assert!(matches!(
+            driver.write_tun(now, TxClass::Bulk, &mut emit).unwrap(),
+            TunOutput::Packet(_)
+        ));
+    }
+    let used = budget.used();
+    let count = scope.stats().unwrap().tx_packets;
+    let error = driver
+        .write_tun(now, TxClass::Bulk, |_, _, tx| {
+            assert_eq!(tx.source, Some(original));
+            Err(io::ErrorKind::WouldBlock.into())
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(budget.used(), used);
+    assert_eq!(scope.stats().unwrap().tx_packets, count);
+    assert_eq!(
+        scope.hold_host_source(&facts(36)).err().unwrap().kind(),
+        io::ErrorKind::OutOfMemory
+    );
+    assert!(matches!(
+        driver.write_tun(now, TxClass::Bulk, emit).unwrap(),
+        TunOutput::Packet(_)
+    ));
+    assert_eq!(offsets, [0, 1256, 2512]);
+    let replaced = scope.hold_host_source(&facts(36)).unwrap();
+    assert_ne!(replaced.optional_context(), Some(original));
+    drop((replaced, pinned));
+    scope.shutdown(true);
+    driver.finish_turn(&mut context(), now);
+    assert!(owner.reclaim().await);
+    owner.run().await;
+    drop((driver, scope));
+    assert_eq!(budget.used(), 0);
+}
+
 #[test]
 fn host_tcp_flow_and_control_hold_original_facts_across_foreign_input() {
     let now = Instant::now();
