@@ -322,6 +322,7 @@ struct Inner {
     pending_routing: usize,
     waiters: Box<[Option<Registration>]>,
     credit_waiters: usize,
+    tx_waiters: usize,
     output_waker: Option<Waker>,
     // While a generated turn owns service, mutations record a rescan instead of waking it.
     turn_needs_scan: Option<[bool; 2]>,
@@ -630,6 +631,7 @@ impl PacketScope {
                 pending_routing: 0,
                 waiters: (0..limits.max_waiters).map(|_| None).collect(),
                 credit_waiters: 0,
+                tx_waiters: 0,
                 output_waker: None,
                 turn_needs_scan: None,
                 abort_wake_end: 0,
@@ -1271,6 +1273,7 @@ impl Shared {
                 .take()
                 .expect("retirement callback owns exact slot");
             assert_eq!(slot.id, id);
+            inner.tx_waiters -= usize::from(slot.tx.is_some());
             inner.closed_apps -= 1;
             let device = inner.device_wake();
             Self::wake_terminal_waiters(&mut inner, WaitFor::Retirement(id), &mut wakes);
@@ -1392,8 +1395,30 @@ impl Inner {
     }
 
     // ponytail: bounded linear owner lookup; use a fixed index if measured flow counts need it.
+    fn slot_index(&self, id: FlowId) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|slot| slot.id == id))
+    }
+
     fn slot(&mut self, id: FlowId) -> Option<&mut FlowSlot> {
-        self.slots.iter_mut().flatten().find(|slot| slot.id == id)
+        let index = self.slot_index(id)?;
+        self.slots[index].as_mut()
+    }
+
+    fn register_tx(&mut self, id: FlowId, waker: &Waker) {
+        if let Some(slot) = self.slot(id) {
+            let new = slot.tx.is_none();
+            register(&mut slot.tx, waker);
+            self.tx_waiters += usize::from(new);
+        }
+    }
+
+    fn take_stream_wakers(&mut self, index: usize, read: bool, write: bool) -> [Option<Waker>; 2] {
+        let slot = self.slots[index].as_mut().expect("retained stream slot");
+        let tx = write.then(|| slot.tx.take()).flatten();
+        self.tx_waiters -= usize::from(tx.is_some());
+        [read.then(|| slot.rx.take()).flatten(), tx]
     }
 
     fn index(&self, lease: FrameLease) -> usize {
@@ -1649,21 +1674,22 @@ impl Inner {
             if let Some(slot) = &mut self.slots[self.abort_wake_end]
                 && (slot.rx.is_some() || slot.tx.is_some())
             {
-                return Some([slot.rx.take(), slot.tx.take()]);
+                return Some(self.take_stream_wakers(self.abort_wake_end, true, true));
             }
         }
         while let Some((id, ready)) = self.stack.as_mut().and_then(Stack::poll_event) {
-            let Some(slot) = self.slot(id) else { continue };
+            let Some(index) = self.slot_index(id) else {
+                continue;
+            };
             let rx = ready.contains(Ready::READABLE)
                 || ready.contains(Ready::READ_CLOSED)
                 || ready.contains(Ready::ERROR);
             let tx = ready.contains(Ready::WRITABLE)
                 || ready.contains(Ready::CONNECTED)
                 || ready.contains(Ready::ERROR);
-            let rx = rx.then(|| slot.rx.take()).flatten();
-            let tx = tx.then(|| slot.tx.take()).flatten();
-            if rx.is_some() || tx.is_some() {
-                return Some([rx, tx]);
+            let wakers = self.take_stream_wakers(index, rx, tx);
+            if wakers.iter().any(Option::is_some) {
+                return Some(wakers);
             }
         }
         None
@@ -1785,9 +1811,7 @@ impl PacketOwner {
                 let more = inner.drive(now);
                 resume_wake_panic(Shared::events(&mut inner, None));
                 let mut deadline = inner.stack.as_ref().and_then(Stack::poll_timeout);
-                if inner.credit_waiters != 0
-                    || inner.slots.iter().flatten().any(|slot| slot.tx.is_some())
-                {
+                if inner.credit_waiters != 0 || inner.tx_waiters != 0 {
                     let readiness = now + READINESS_FALLBACK;
                     deadline = Some(deadline.map_or(readiness, |due| due.min(readiness)));
                 }
@@ -1945,8 +1969,7 @@ impl PacketDriver {
         }
         inner.output_waker = armed;
         register(&mut inner.output_waker, cx.waker());
-        let blocked =
-            inner.credit_waiters != 0 || inner.slots.iter().flatten().any(|slot| slot.tx.is_some());
+        let blocked = inner.credit_waiters != 0 || inner.tx_waiters != 0;
         self.fallback = blocked.then(|| self.fallback.unwrap_or(now + READINESS_FALLBACK));
         self.deadline = [
             inner.stack.as_ref().and_then(Stack::poll_timeout),

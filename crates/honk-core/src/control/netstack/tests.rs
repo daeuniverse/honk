@@ -917,6 +917,42 @@ fn abort_drains_closed_flows_during_reentrant_callback() {
 }
 
 #[test]
+fn repeated_writer_polls_cancel_and_reuse_the_same_slot() {
+    let now = Instant::now();
+    let (scope, _owner, _) = runtime(now);
+    let client = "10.0.0.2:40000".parse().unwrap();
+    let mut old = None;
+    for seq in [100, 200] {
+        scope.receive(&segment(client, seq, 0, tcp::SYN, &[]), now);
+        let (_, mut io) = scope.poll_accept().unwrap();
+        let index = scope.0.inner.lock().slot_index(io.flow_id()).unwrap();
+        if let Some((previous, retired)) = &old {
+            assert_eq!(index, *previous);
+            FlowRetirement::abort(retired);
+        }
+        for _ in 0..2 {
+            assert!(
+                std::pin::Pin::new(&mut io)
+                    .poll_shutdown(&mut context())
+                    .is_pending()
+            );
+            assert_eq!(scope.0.inner.lock().tx_waiters, 1);
+        }
+        let retired = io.retirement();
+        if seq == 100 {
+            retired.abort();
+        }
+        drop(io);
+        assert_eq!(scope.0.inner.lock().tx_waiters, 0);
+        scope.drive(now);
+        while let Poll::Ready(Some(out)) = scope.poll_output(&mut context()) {
+            out.release();
+        }
+        old = Some((index, retired));
+    }
+}
+
+#[test]
 fn abort_wakes_both_directions_of_every_flow_after_a_stream_waker_panics() {
     use std::sync::atomic::AtomicBool;
 
@@ -1019,6 +1055,7 @@ fn abort_wakes_both_directions_of_every_flow_after_a_stream_waker_panics() {
         );
         let panic = catch_unwind(AssertUnwindSafe(|| scope.shutdown(true))).unwrap_err();
         assert_eq!(panic.downcast_ref::<&str>(), Some(&"first terminal wake"));
+        assert_eq!(scope.0.inner.lock().tx_waiters, 0);
         assert!(
             sleepers
                 .iter()

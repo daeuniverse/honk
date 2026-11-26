@@ -163,10 +163,11 @@ impl FlowIo {
         }
         self.open = false;
         let registrations = self.scope.0.with(|inner| {
-            let slot = inner.slot(self.id)?;
+            let index = inner.slot_index(self.id)?;
+            let slot = inner.slots[index].as_mut().unwrap();
             slot.app_open = false;
             slot.close_pending = true;
-            let registrations = [slot.rx.take(), slot.tx.take()];
+            let registrations = inner.take_stream_wakers(index, true, true);
             inner.pending_closes += 1;
             inner.closed_apps += 1;
             inner.reap_pending = true;
@@ -219,9 +220,8 @@ impl FlowRetirement {
             stack.tcp_abort(self.id);
         }
         let wakers = inner
-            .slot(self.id)
-            .filter(|slot| slot.rx.is_some() || slot.tx.is_some())
-            .map(|slot| [slot.rx.take(), slot.tx.take()]);
+            .slot_index(self.id)
+            .map(|index| inner.take_stream_wakers(index, true, true));
         self.scope.0.finish_with_wakers(inner, wakers);
     }
 
@@ -357,9 +357,7 @@ impl AsyncWrite for FlowIo {
             match stack.tcp_write(self.id, data) {
                 Ok(n) => Poll::Ready(Ok(n)),
                 Err(StreamError::WouldBlock) => {
-                    if let Some(slot) = inner.slot(self.id) {
-                        register(&mut slot.tx, cx.waker());
-                    }
+                    inner.register_tx(self.id, cx.waker());
                     Poll::Pending
                 }
                 Err(error) => Poll::Ready(Err(stream_error(error))),
@@ -387,9 +385,7 @@ impl AsyncWrite for FlowIo {
             match stack.tcp_shutdown(self.id) {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(StreamError::WouldBlock) => {
-                    if let Some(slot) = inner.slot(self.id) {
-                        register(&mut slot.tx, cx.waker());
-                    }
+                    inner.register_tx(self.id, cx.waker());
                     Poll::Pending
                 }
                 Err(error) => Poll::Ready(Err(stream_error(error))),
