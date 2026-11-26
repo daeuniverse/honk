@@ -1457,9 +1457,9 @@ Clash listener 允许任意 CORS 来源，没有原生 API 那样的 Host 和 Or
 
 `GET /configs` 还返回固定的兼容字段，它们不配置任何功能：`mode-list: ["Rule","Global","Direct"]`、值为 0 的 `port`、`socks-port` 与 `mixed-port`、为 `false` 的 `allow-lan` 与 `ipv6`、`bind-address: "*"`、配置的 `log-level`，以及 `tun: {"enable":false}`。
 
-`GET /proxies` 返回 `{"proxies":{"<name>":<document>}}`；`GET /proxies/{name}` 返回单个文档。节点文档含 `name`、`type`、`udp: true` 与 `history`。组文档含 `name`、`type`、成员名列表 `all`、TCP 选择 `now` 与 `history`；Score 另含 `scoreVerification`。`GLOBAL` 含 `type: "selector"`、`all` 与 `now`，没有 `history`。
+`GET /proxies` 返回 `{"proxies":{"<name>":<document>}}`；`GET /proxies/{name}` 返回单个文档。节点文档含 `name`、`type`、`udp: true`、`alive` 与 `history`。组文档含 `name`、`type`、成员名列表 `all`、TCP 选择 `now` 与 `history`；Score 另含 `scoreVerification`。`GLOBAL` 含 `type: "selector"`、`all` 与 `now`，没有 `history`。
 
-节点 `type` 为 `Shadowsocks`、`Trojan`、`Vmess`、`Vless`、`Socks5`、`Hysteria2`、`Tuic`、`Juicity`、`AnyTLS`、`Chain`、`Direct` 或 `Reject`，其中 `Reject` 对应 `block`。组 `type` 为 `selector`、`url_test`、`load_balance` 或 `fallback`；Score 报告为 `url_test`。`history` 条目为 `{time,delay}`，取最近一次真实 TCP IPv4 测量。
+节点 `type` 为 `Shadowsocks`、`Trojan`、`Vmess`、`Vless`、`Socks5`、`Hysteria2`、`Tuic`、`Juicity`、`AnyTLS`、`Chain`、`Direct` 或 `Reject`，其中 `Reject` 对应 `block`。组 `type` 为 `selector`、`url_test`、`load_balance` 或 `fallback`；Score 报告为 `url_test`。`history` 条目为 `{time,delay}`，取最近一次真实 TCP IPv4 测量。节点 `alive` 表示已有合格健康检查或真实流量结果的地址族的 TCP 健康状态：其中任一地址族存活、或尚无任何结果时为 `true`，全部失效时为 `false`；`history` 保留最近一次成功样本，所以 `alive: false` 的节点仍可能显示延迟。
 
 `GET /rules` 返回 `{"rules":[{"type","payload","proxy"}]}`，由配置的路由规则生成，不含原生规则 ID，也没有 fallback 行。
 
