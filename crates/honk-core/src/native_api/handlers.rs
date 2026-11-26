@@ -19,6 +19,7 @@ type App = State<Arc<NativeState>>;
 type Id = Extension<RequestId>;
 
 pub(super) fn routes() -> Router<Arc<NativeState>> {
+    let geodata_query_rate = Arc::new(security::RequestRate::new());
     Router::new()
         .route("/api", resource(get(discovery), &["GET"]))
         .route(
@@ -357,6 +358,19 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
                     },
                 ),
                 &["POST"],
+            ),
+        )
+        .route(
+            "/api/v1/x-honk/geodata/query",
+            resource(
+                get({
+                    let rate = Arc::clone(&geodata_query_rate);
+                    move |State(state): App, Extension(id): Id, uri: Uri| {
+                        let rate = Arc::clone(&rate);
+                        async move { respond(geodata::query(&state, &rate, &uri, &id).await, id) }
+                    }
+                }),
+                &["GET"],
             ),
         )
         .route(

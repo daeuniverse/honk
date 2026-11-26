@@ -1286,6 +1286,31 @@ geodata owner 存在時，`GET /geodata` 還會報告下面這些欄位：
 
 成功後恢復正常排程。
 
+#### Geodata 內容查詢
+
+`GET /api/v1/x-honk/geodata/query` 唯讀檢查流量或 DNS 路由已載入的 `geosite.dat` 與 `geoip.dat` 快照。已放行的發現介面在 `links["x-honk"].geodata_query` 暴露該路徑；至少有一個保留資產帶檔案路徑時，capabilities 在 `resources["x-honk"].geodata_query` 中回報 `available`、`assets`、`actions`、`max_page_size`、`max_response_bytes`、`per_principal_requests_per_minute` 與 `global_requests_per_minute`。
+
+| 參數 | 要求或預設值 | 說明 |
+| --- | --- | --- |
+| `kind` | `geosite`（預設）或 `geoip` | 要查詢的已載入資產類型。 |
+| `action` | 必填：`list`、`show` 或 `find` | 列出分類、分頁讀取單一分類項目，或反查網域名稱與 IP。 |
+| `filter` | 僅 `list` 可選 | 1–256 位元組非空分類名稱子字串過濾，不區分大小寫。 |
+| `code` | 僅 `show` 必填 | 1–256 位元組非空分類名稱，不含 `@`，不區分大小寫。 |
+| `attr` | 僅 `geosite` 的 `show` 可選 | 1–256 位元組非空 `@attr` 屬性名稱，不區分大小寫（`!name` 匹配否定屬性）。 |
+| `value` | 僅 `find` 必填 | `geosite` 為網域名稱（1–253 位元組，可帶末尾點）；`geoip` 為 IP 字面量（IPv4 對映的 IPv6 會正規化為 IPv4）。 |
+| `limit` | `500`（1–5000） | 單頁最多回傳的 `items` 筆數。 |
+| `offset` | `0` | 從 `0` 開始的匹配結果位移量。 |
+
+回應回傳 `{observed_at,kind,action,asset_sha256,total,offset,limit,truncated,next_offset,items}`，`list` 另含 `filter`，`show` 另含 `code` 與 `attr`，`find` 另含 `query`。回應中的分類名稱統一轉為小寫，顯示字串在計入位元組預算前先遮蔽 listener secret 值。
+
+- `list` 的項目為依 `code` 排序的 `{code,count}`。
+- `show` 在 `geosite` 下回傳 `{type,value,attrs}`（`type` 為 `domain`、`full`、`keyword` 或 `regexp`），在 `geoip` 下回傳 `{cidr}`。
+- `find` 在 `geosite` 下回傳依 `code` 排序的 `{code,type,value,attrs}`，在 `geoip` 下回傳最長前綴匹配的 `{code,cidr}`（依 `code` 與 `cidr` 排序）。
+
+序列化後的 JSON 回應嚴格不超過 `262144` 位元組（256 KiB）。繼續加入項目會超過 `limit` 或 256 KiB 上限時，目前頁提前結束並回傳 `truncated: true` 與 `next_offset: offset + items.len()`；否則 `truncated` 為 `false`、`next_offset` 為 `null`。
+
+參數驗證與保留快照可用性檢查先於每分鐘 30 次的掃描速率配額執行，`400 invalid_request` 與 `404 capability_not_supported` 不消耗配額。`show` 指定的分類不存在時回傳 `404 resource_not_found`，超過每分鐘 30 次掃描回傳帶 `Retry-After` 的 `429 rate_limited`，磁碟檔案不可讀、內容已變更或解析失敗時回傳帶 `Retry-After: 1` 的 `503 temporarily_unavailable`。
+
 ### 內嵌 doona 來源
 
 預設關閉的 `native-ui` 隱含啟用 `native-api`。建置時內嵌以下兩個版本：

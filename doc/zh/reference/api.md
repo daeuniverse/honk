@@ -1286,6 +1286,31 @@ geodata owner 存在时，`GET /geodata` 还会报告下面这些字段：
 
 成功后恢复正常计划。
 
+#### Geodata 内容查询
+
+`GET /api/v1/x-honk/geodata/query` 只读检查流量或 DNS 路由已加载的 `geosite.dat` 与 `geoip.dat` 快照。已放行的发现接口在 `links["x-honk"].geodata_query` 暴露该路径；至少有一个保留资产带文件路径时，capabilities 在 `resources["x-honk"].geodata_query` 中报告 `available`、`assets`、`actions`、`max_page_size`、`max_response_bytes`、`per_principal_requests_per_minute` 和 `global_requests_per_minute`。
+
+| 参数 | 要求或默认值 | 含义 |
+| --- | --- | --- |
+| `kind` | `geosite`（默认）或 `geoip` | 要查询的已加载资产类型。 |
+| `action` | 必填：`list`、`show` 或 `find` | 列出分类、分页读取单个分类条目，或反查域名与 IP。 |
+| `filter` | 仅 `list` 可选 | 1–256 字节非空分类名子串过滤，不区分大小写。 |
+| `code` | 仅 `show` 必填 | 1–256 字节非空分类名，不含 `@`，不区分大小写。 |
+| `attr` | 仅 `geosite` 的 `show` 可选 | 1–256 字节非空 `@attr` 属性名，不区分大小写（`!name` 匹配否定属性）。 |
+| `value` | 仅 `find` 必填 | `geosite` 为域名（1–253 字节，可带末尾点）；`geoip` 为 IP 字面量（IPv4 映射的 IPv6 会规范化为 IPv4）。 |
+| `limit` | `500`（1–5000） | 单页最多返回的 `items` 条数。 |
+| `offset` | `0` | 从 `0` 开始的匹配结果偏移量。 |
+
+响应返回 `{observed_at,kind,action,asset_sha256,total,offset,limit,truncated,next_offset,items}`，`list` 另含 `filter`，`show` 另含 `code` 与 `attr`，`find` 另含 `query`。响应中的分类名统一转为小写，显示字符串在计入字节预算前先遮蔽 listener secret 值。
+
+- `list` 的条目为按 `code` 排序的 `{code,count}`。
+- `show` 在 `geosite` 下返回 `{type,value,attrs}`（`type` 为 `domain`、`full`、`keyword` 或 `regexp`），在 `geoip` 下返回 `{cidr}`。
+- `find` 在 `geosite` 下返回按 `code` 排序的 `{code,type,value,attrs}`，在 `geoip` 下返回最长前缀匹配的 `{code,cidr}`（按 `code` 与 `cidr` 排序）。
+
+序列化后的 JSON 响应严格不超过 `262144` 字节（256 KiB）。继续加入条目会超过 `limit` 或 256 KiB 上限时，当前页提前结束并返回 `truncated: true` 与 `next_offset: offset + items.len()`；否则 `truncated` 为 `false`、`next_offset` 为 `null`。
+
+参数校验与保留快照可用性检查先于每分钟 30 次的扫描速率配额执行，`400 invalid_request` 和 `404 capability_not_supported` 不消耗配额。`show` 指定的分类不存在时返回 `404 resource_not_found`，超过每分钟 30 次扫描返回带 `Retry-After` 的 `429 rate_limited`，磁盘文件不可读、内容已变更或解析失败时返回带 `Retry-After: 1` 的 `503 temporarily_unavailable`。
+
 ### 内嵌 doona 来源
 
 默认关闭的 `native-ui` 隐含启用 `native-api`。构建时内嵌以下两个版本：

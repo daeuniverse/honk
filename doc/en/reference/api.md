@@ -1350,6 +1350,31 @@ Automatic updates queue the same `geodata_update` operation. A manual update whi
 
 A success restores the schedule.
 
+#### Geodata content query
+
+`GET /api/v1/x-honk/geodata/query` inspects the `geosite.dat` and `geoip.dat` snapshots that traffic or DNS routing loaded. Admitted discovery links it at `links["x-honk"].geodata_query`, and capabilities report `resources["x-honk"].geodata_query` with `available`, `assets`, `actions`, `max_page_size`, `max_response_bytes`, `per_principal_requests_per_minute` and `global_requests_per_minute` when at least one retained asset has a file path.
+
+| Parameter | Requirement or default | Meaning |
+| --- | --- | --- |
+| `kind` | `geosite` (default) or `geoip` | Loaded asset kind to inspect. |
+| `action` | Required: `list`, `show` or `find` | List categories, page one category's entries, or reverse-match a domain or IP. |
+| `filter` | Optional on `list` only | Nonempty 1–256 byte case-insensitive substring filter on category codes. |
+| `code` | Required on `show` only | Nonempty 1–256 byte category name without `@`, matched case-insensitively. |
+| `attr` | Optional on `geosite` `show` only | Nonempty 1–256 byte `@attr` key, matched case-insensitively (`!name` matches negative attributes). |
+| `value` | Required on `find` only | Domain (1–253 bytes, optional trailing dot) for `geosite`, or IP literal (`IpAddr`, IPv4-mapped IPv6 canonicalized) for `geoip`. |
+| `limit` | `500` (1–5000) | Maximum rows to return in `items`. |
+| `offset` | `0` | Zero-based starting index into matching rows. |
+
+Each response returns `{observed_at,kind,action,asset_sha256,total,offset,limit,truncated,next_offset,items}` plus `filter` on `list`, `code` and `attr` on `show`, or `query` on `find`. Category codes in responses are lowercase, and display strings mask listener-secret values before byte accounting.
+
+- `list` items are `{code,count}`, sorted by `code`.
+- `show` items are `{type,value,attrs}` (`type` is `domain`, `full`, `keyword` or `regexp`) for `geosite`, or `{cidr}` for `geoip`.
+- `find` items are `{code,type,value,attrs}` sorted by `code` for `geosite`, or longest-prefix `{code,cidr}` matches sorted by `code` and `cidr` for `geoip`.
+
+Serialized JSON responses never exceed `262144` bytes (256 KiB). If adding another item would exceed `limit` or the 256 KiB response cap, the page stops early with `truncated: true` and `next_offset` set to `offset + items.len()`; otherwise `truncated` is `false` and `next_offset` is `null`.
+
+Parameter validation and retained-snapshot availability run before the 30-requests-per-minute scan rate budget, so `400 invalid_request` and `404 capability_not_supported` consume no scan quota. An unknown category on `show` returns `404 resource_not_found`, exceeding 30 scans per minute returns `429 rate_limited` with `Retry-After`, and unreadable, modified or unparseable asset files return `503 temporarily_unavailable` with `Retry-After: 1`.
+
 ### Embedded doona provenance
 
 Default-off `native-ui` implies `native-api`. The build embeds both editions:

@@ -16,10 +16,12 @@ use crate::download_route::{self, Detour, Failed, Outbounds};
 use crate::marked_http::Deadline;
 use crate::routing::{GeoAssetSnapshot, GeoRequirements};
 
+mod query;
 mod sources;
 #[cfg(test)]
 mod tests;
 
+pub(super) use query::serve as query;
 pub(crate) use sources::{Error as SourcesError, Fetched, Patch as SourcesPatch, Route, Sources};
 
 /// How long a file download may wait for any progress: the setup up to the
@@ -316,9 +318,10 @@ fn updatable(state: &NativeState, settings: &NativeApiConfig, assets: &[GeoAsset
         })
 }
 
-pub(super) async fn capability(state: &NativeState) -> Value {
+pub(super) async fn capabilities(state: &NativeState) -> (Value, Value) {
     match capture(state).await {
         Ok((assets, active)) => {
+            let query_cap = query::capability_from_assets(Some(&assets));
             let can_update = updatable(state, &active.experimental.native_api, &assets);
             let mut value = json!({"available": true, "can_update": can_update,
                 "assets": assets.iter().map(|asset| asset.kind).collect::<Vec<_>>(),
@@ -332,9 +335,12 @@ pub(super) async fn capability(state: &NativeState) -> Value {
                 // The file is read at startup only; patches live in the state db.
                 value["lifecycle"] = json!({"file_values": "start", "overrides_persist": true});
             }
-            value
+            (value, query_cap)
         }
-        Err(_) => json!({"available": false}),
+        Err(_) => (
+            json!({"available": false}),
+            query::capability_from_assets(None),
+        ),
     }
 }
 

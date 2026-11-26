@@ -445,6 +445,7 @@ pub(super) fn discovery(auth: AuthDiscovery, admitted: bool) -> Value {
                 "config_export": "/api/v1/x-honk/config/export",
                 "config_import": "/api/v1/x-honk/config/import",
                 "config_revisions": "/api/v1/x-honk/config/revisions",
+                "geodata_query": "/api/v1/x-honk/geodata/query",
             },
         },
         "auth": {
@@ -475,7 +476,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
         .capability(&state.config.read().await.assets);
     providers["can_manage"] = json!(config.can_manage());
     providers["create_unfetched"] = json!(true);
-    let geodata = super::geodata::capability(state).await;
+    let (geodata, geodata_query) = super::geodata::capabilities(state).await;
     let (routing_trace, rules) = {
         let router = state.traffic_router.read().await;
         (
@@ -498,6 +499,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
                 "config_export": {"available":config.sources.available()},
                 "config_import": config.import_capability(),
                 "config_revisions": config.revisions_capability(),
+                "geodata_query": geodata_query,
                 "runtime_mode": {"available":false},
             },
             "config_validate": {"available":config.running(),"modes":["syntax","full"],"max_bytes":crate::configuration::MAX_SOURCE_BYTES,"max_sources":crate::configuration::MAX_SOURCES},

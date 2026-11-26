@@ -16,6 +16,7 @@ async fn authentication_precedes_capability_and_query_validation() {
         (Method::GET, "/api/v1/missing"),
         (Method::GET, "/api/v1/runtime?unknown=x"),
         (Method::GET, "/api/v1/x-honk/runtime/mode?unknown=x"),
+        (Method::GET, "/api/v1/x-honk/geodata/query?action=list"),
         (Method::POST, "/api/v1/runtime"),
     ] {
         error_response(
@@ -100,6 +101,7 @@ async fn discovery_withholds_detail_from_callers_without_a_credential() {
             "config_export": "/api/v1/x-honk/config/export",
             "config_import": "/api/v1/x-honk/config/import",
             "config_revisions": "/api/v1/x-honk/config/revisions",
+            "geodata_query": "/api/v1/x-honk/geodata/query",
         })
     );
     assert!(full["links"].get("config_export").is_none());
@@ -110,11 +112,22 @@ async fn discovery_withholds_detail_from_callers_without_a_credential() {
         "config_export",
         "config_import",
         "config_revisions",
+        "geodata_query",
         "runtime_mode",
     ] {
         assert!(resources.get(key).is_none(), "{key}");
         assert!(resources["x-honk"][key]["available"].is_boolean(), "{key}");
     }
+    assert_eq!(resources["x-honk"]["geodata_query"]["available"], false);
+    error_response(
+        app.get("/api/v1/x-honk/geodata/query?action=list")
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::NOT_FOUND,
+        "capability_not_supported",
+    )
+    .await;
     assert!(resources["config"].get("store").is_none());
     assert_eq!(resources["config"]["x-honk"]["store"], "file");
     let version = response_json(app.get("/api/v1/version").send().await.unwrap()).await;
@@ -366,6 +379,7 @@ async fn preflight_uses_route_methods_but_never_grants_authorization() {
         ("/api/v1/connections", "DELETE"),
         ("/api/v1/providers/raw%2Fid/refresh", "POST"),
         ("/api/v1/dns/cache/flush", "POST"),
+        ("/api/v1/x-honk/geodata/query", "GET"),
         ("/api/v1/x-honk/runtime/mode", "PUT"),
     ] {
         let response = preflight(path, method).send().await.unwrap();

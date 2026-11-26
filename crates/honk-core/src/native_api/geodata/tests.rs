@@ -571,3 +571,5 @@ fn a_display_url_keeps_nothing_that_may_hold_a_credential() {
         assert_eq!(display_url(url, |_| false).as_deref(), shown, "{url}");
     }
 }
+
+mod query;
