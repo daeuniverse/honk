@@ -241,3 +241,81 @@ fn waiter_limit_rejects_the_257th_follower_without_opening_an_exchange() {
     );
     drop(waiters);
 }
+
+#[test]
+fn refresh_flight_limit_reserves_foreground_resolve_capacity() {
+    let before = crate::stats::dns_snapshot();
+    let flights = Singleflight::default();
+    let refresh_limit = u16::try_from(MAX_REFRESH_FLIGHTS).expect("refresh limit");
+    let mut refresh_leaders: Vec<_> = (0..refresh_limit)
+        .map(|index| {
+            let refresh = cache_key(index).with_operation(OperationKind::Refresh);
+            match flights.acquire(FlightKey::Refresh(refresh)) {
+                FlightRole::Leader(leader) => leader,
+                _ => panic!("refresh leader {index}"),
+            }
+        })
+        .collect();
+
+    assert_eq!(flights.active_len(), MAX_REFRESH_FLIGHTS);
+    assert!(matches!(
+        flights.acquire(FlightKey::Refresh(
+            cache_key(0).with_operation(OperationKind::Refresh)
+        )),
+        FlightRole::Waiter(_)
+    ));
+    assert!(matches!(
+        flights.acquire(FlightKey::Refresh(
+            cache_key(refresh_limit).with_operation(OperationKind::Refresh)
+        )),
+        FlightRole::Rejected
+    ));
+    assert!(matches!(
+        flights.acquire_with_origin(key(refresh_limit + 1), true),
+        FlightRole::Rejected
+    ));
+    assert_eq!(flights.counters().rejections, 2);
+    assert!(
+        crate::stats::dns_snapshot()
+            .delta(before)
+            .singleflight_rejected
+            >= 2
+    );
+
+    let resolve_leaders: Vec<_> = (0..(MAX_ACTIVE_FLIGHTS - MAX_REFRESH_FLIGHTS))
+        .map(|offset| {
+            let index = u16::try_from(2000 + offset).expect("resolve index");
+            match flights.acquire(key(index)) {
+                FlightRole::Leader(leader) => leader,
+                _ => panic!("foreground resolve leader {offset}"),
+            }
+        })
+        .collect();
+    assert_eq!(flights.active_len(), MAX_ACTIVE_FLIGHTS);
+    assert!(matches!(flights.acquire(key(4000)), FlightRole::Rejected));
+
+    let released = refresh_leaders.pop().expect("refresh leader");
+    released.publish(|| Ok(template(0)));
+    let FlightRole::Leader(background_sibling) =
+        flights.acquire_with_origin(key(refresh_limit + 1), true)
+    else {
+        panic!("background sibling leader after refresh release");
+    };
+    assert!(matches!(
+        flights.acquire(FlightKey::Refresh(
+            cache_key(refresh_limit).with_operation(OperationKind::Refresh)
+        )),
+        FlightRole::Rejected
+    ));
+    drop(background_sibling);
+    assert!(matches!(
+        flights.acquire(FlightKey::Refresh(
+            cache_key(refresh_limit).with_operation(OperationKind::Refresh)
+        )),
+        FlightRole::Leader(_)
+    ));
+
+    drop(resolve_leaders);
+    drop(refresh_leaders);
+    assert_eq!(flights.active_len(), 0);
+}

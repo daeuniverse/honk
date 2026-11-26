@@ -764,3 +764,215 @@ async fn refresh_servfail_keeps_the_stale_positive() {
         &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]
     );
 }
+
+#[tokio::test]
+async fn background_refresh_storm_leaves_foreground_singleflight_capacity() {
+    struct HeldRefreshUpstream {
+        primed: usize,
+        calls: AtomicUsize,
+        release_refresh: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl DnsUpstreamPool for HeldRefreshUpstream {
+        async fn query(&self, _: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let (domain, _) =
+                parse_dns_question(raw_query).ok_or_else(|| anyhow::anyhow!("question"))?;
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if domain.starts_with("prime-") && call >= self.primed {
+                self.release_refresh.notified().await;
+            }
+            let mut response = make_a_response([192, 0, 2, 77], 1);
+            let parsed = QueryContext::parse(raw_query).expect("query");
+            let end = parsed.question_offsets().expect("offsets").end();
+            let mut out = raw_query[..end].to_vec();
+            out[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+            out[6..8].copy_from_slice(&1_u16.to_be_bytes());
+            out.extend_from_slice(&response.split_off(response.len() - 16));
+            Ok(out)
+        }
+    }
+
+    const PRIMED: usize = 2048;
+    let upstream = Arc::new(HeldRefreshUpstream {
+        primed: PRIMED,
+        calls: AtomicUsize::new(0),
+        release_refresh: tokio::sync::Notify::new(),
+    });
+    let cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(8192)));
+    let forwarder = DnsForwarder::new(upstream.clone(), cache, test_router());
+
+    let queries: Vec<_> = (0..PRIMED)
+        .map(|index| build_dns_query(&format!("prime-{index}.example"), 1))
+        .collect();
+    for query in &queries {
+        forwarder.resolve_outcome(query).await.expect("prime");
+    }
+    for query in &queries {
+        let hit = forwarder
+            .resolve_outcome(query)
+            .await
+            .expect("near-expiry cache hit");
+        assert_eq!(hit.provenance(), Provenance::Cache);
+    }
+
+    assert!(
+        forwarder.active_flights() <= crate::dns::singleflight::MAX_REFRESH_FLIGHTS,
+        "refresh storm occupied {} active flights",
+        forwarder.active_flights()
+    );
+    let cold = build_dns_query("cold-foreground.example", 1);
+    let foreground = forwarder
+        .resolve_outcome(&cold)
+        .await
+        .expect("foreground resolve must retain reserved singleflight capacity");
+    assert_eq!(foreground.provenance(), Provenance::Upstream);
+
+    upstream.release_refresh.notify_waiters();
+    forwarder.shutdown_background_tasks().await;
+}
+
+#[tokio::test]
+async fn background_refresh_preferred_siblings_respect_foreground_singleflight_reserve() {
+    struct SiblingStormUpstream {
+        aaaa_entered: AtomicUsize,
+        aaaa_ready: tokio::sync::Notify,
+        release_aaaa: tokio::sync::Notify,
+        a_entered: AtomicUsize,
+        a_progress: tokio::sync::Notify,
+        release_a: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl DnsUpstreamPool for SiblingStormUpstream {
+        async fn query(&self, _: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let (domain, qtype) =
+                parse_dns_question(raw_query).ok_or_else(|| anyhow::anyhow!("question"))?;
+            if domain.starts_with("prefer-") {
+                if qtype == 28 {
+                    let entered = self.aaaa_entered.fetch_add(1, Ordering::SeqCst) + 1;
+                    if entered == 1024 {
+                        self.aaaa_ready.notify_one();
+                    }
+                    self.release_aaaa.notified().await;
+                    let mut response = make_aaaa_response(TEST_V6, 300);
+                    let parsed = QueryContext::parse(raw_query).expect("query");
+                    let end = parsed.question_offsets().expect("offsets").end();
+                    let mut out = raw_query[..end].to_vec();
+                    out[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+                    out[6..8].copy_from_slice(&1_u16.to_be_bytes());
+                    out.extend_from_slice(&response.split_off(response.len() - 28));
+                    return Ok(out);
+                }
+                if qtype == 1 {
+                    self.a_entered.fetch_add(1, Ordering::SeqCst);
+                    self.a_progress.notify_waiters();
+                    self.release_a.notified().await;
+                }
+            }
+            let mut response = make_a_response([192, 0, 2, 88], 300);
+            let parsed = QueryContext::parse(raw_query).expect("query");
+            let end = parsed.question_offsets().expect("offsets").end();
+            let mut out = raw_query[..end].to_vec();
+            out[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+            out[6..8].copy_from_slice(&1_u16.to_be_bytes());
+            out.extend_from_slice(&response.split_off(response.len() - 16));
+            Ok(out)
+        }
+    }
+
+    const COUNT: usize = 1024;
+    let upstream = Arc::new(SiblingStormUpstream {
+        aaaa_entered: AtomicUsize::new(0),
+        aaaa_ready: tokio::sync::Notify::new(),
+        release_aaaa: tokio::sync::Notify::new(),
+        a_entered: AtomicUsize::new(0),
+        a_progress: tokio::sync::Notify::new(),
+        release_a: tokio::sync::Notify::new(),
+    });
+    let cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(8192)));
+    let forwarder = DnsForwarder::new(upstream.clone(), cache, test_router())
+        .with_strategy(DnsStrategy::PreferIpv4);
+    let service = forwarder.cache_service().await;
+
+    let mut aaaa_queries = Vec::with_capacity(COUNT);
+    let mut a_keys = Vec::with_capacity(COUNT);
+    for index in 0..COUNT {
+        let domain = format!("prefer-{index}.example");
+        let aaaa_query = build_dns_query(&domain, 28);
+        let a_query = build_dns_query(&domain, 1);
+        let mut aaaa_wire = make_aaaa_response(TEST_V6, 1);
+        let aaaa_end = QueryContext::parse(&aaaa_query)
+            .expect("aaaa query")
+            .question_offsets()
+            .expect("offsets")
+            .end();
+        let mut aaaa_cached = aaaa_query[..aaaa_end].to_vec();
+        aaaa_cached[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        aaaa_cached[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        aaaa_cached.extend_from_slice(&aaaa_wire.split_off(aaaa_wire.len() - 28));
+        service.put_exact(resolve_cache_key(&aaaa_query), aaaa_cached, 1, None);
+
+        let mut a_wire = make_a_response([192, 0, 2, 1], 300);
+        let a_end = QueryContext::parse(&a_query)
+            .expect("a query")
+            .question_offsets()
+            .expect("offsets")
+            .end();
+        let mut a_cached = a_query[..a_end].to_vec();
+        a_cached[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        a_cached[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        a_cached.extend_from_slice(&a_wire.split_off(a_wire.len() - 16));
+        let a_key = resolve_cache_key(&a_query);
+        service.put_exact(a_key.clone(), a_cached, 300, None);
+        aaaa_queries.push(aaaa_query);
+        a_keys.push(a_key);
+    }
+
+    for query in &aaaa_queries {
+        let hit = forwarder
+            .resolve_outcome(query)
+            .await
+            .expect("near-expiry AAAA cache hit");
+        assert_eq!(hit.provenance(), Provenance::Cache);
+    }
+    tokio::time::timeout(Duration::from_secs(5), upstream.aaaa_ready.notified())
+        .await
+        .expect("all 1024 AAAA refreshes entered");
+
+    for a_key in &a_keys {
+        service.expire_positive_exact_for_test(a_key);
+    }
+    upstream.release_aaaa.notify_waiters();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let a_entered = upstream.a_entered.load(Ordering::SeqCst);
+            let active_tasks = forwarder.refresh_task_count();
+            if a_entered >= 512 && (a_entered == COUNT || active_tasks <= a_entered) {
+                break;
+            }
+            tokio::select! {
+                _ = upstream.a_progress.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
+    })
+    .await
+    .expect("refresh sibling storm settled");
+
+    assert!(
+        forwarder.active_flights() <= crate::dns::singleflight::MAX_REFRESH_FLIGHTS,
+        "refresh + preferred sibling storm occupied {} active flights",
+        forwarder.active_flights()
+    );
+    let cold = build_dns_query("cold-foreground-prefer.example", 1);
+    let foreground = forwarder
+        .resolve_outcome(&cold)
+        .await
+        .expect("foreground resolve must retain reserved singleflight capacity");
+    assert_eq!(foreground.provenance(), Provenance::Upstream);
+
+    upstream.release_a.notify_waiters();
+    forwarder.shutdown_background_tasks().await;
+}

@@ -106,6 +106,7 @@ pub(crate) enum CacheAccess {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ResolveOptions {
     pub(crate) cache: CacheAccess,
+    pub(crate) background_refresh: bool,
     pub(crate) forced_upstream: Option<super::planner::UpstreamTag>,
     /// A node server host lookup on the dial path. It skips response rules,
     /// which may requery through a proxy whose own dial would need this very
@@ -114,6 +115,10 @@ pub(crate) struct ResolveOptions {
 }
 
 impl ResolveOptions {
+    pub(crate) const fn is_background_refresh(&self) -> bool {
+        self.background_refresh || matches!(self.cache, CacheAccess::Refresh)
+    }
+
     fn sibling(&self) -> Self {
         Self {
             cache: if self.cache == CacheAccess::Refresh {
@@ -121,6 +126,7 @@ impl ResolveOptions {
             } else {
                 self.cache
             },
+            background_refresh: self.is_background_refresh(),
             forced_upstream: self.forced_upstream.clone(),
             node_host: self.node_host,
         }

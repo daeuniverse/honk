@@ -6,13 +6,14 @@ use honk_config::dns::DnsStrategy;
 
 use tokio::sync::broadcast;
 
-use super::cache::{CacheKey, OperationKind};
+use super::cache::CacheKey;
 use super::forwarder::{DnsForwardError, ResolveMode};
 use super::outcome::Provenance;
 use super::query::DnsRequestMeta;
 use super::response::ResponseTemplate;
 
 pub(crate) const MAX_ACTIVE_FLIGHTS: usize = 2048;
+pub(crate) const MAX_REFRESH_FLIGHTS: usize = 1536;
 pub(crate) const MAX_WAITERS_PER_FLIGHT: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -48,10 +49,8 @@ impl FlightKey {
         }
     }
 
-    fn operation(&self) -> OperationKind {
-        match self {
-            Self::Resolve { cache_key, .. } | Self::Refresh(cache_key) => cache_key.operation(),
-        }
+    fn is_refresh(&self) -> bool {
+        matches!(self, Self::Refresh(_))
     }
 }
 
@@ -87,9 +86,15 @@ pub(crate) struct FlightAnswer {
 
 pub(crate) type FlightResult = Result<Arc<FlightAnswer>, Arc<DnsForwardError>>;
 
+#[derive(Default)]
+struct FlightTable {
+    entries: HashMap<FlightKey, broadcast::Sender<FlightResult>>,
+    active_refreshes: usize,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct Singleflight {
-    entries: Arc<Mutex<HashMap<FlightKey, broadcast::Sender<FlightResult>>>>,
+    table: Arc<Mutex<FlightTable>>,
     counters: Arc<CounterSet>,
 }
 
@@ -106,14 +111,23 @@ pub(crate) struct FlightWaiter {
 
 pub(crate) struct FlightLeader {
     key: Option<FlightKey>,
-    entries: Arc<Mutex<HashMap<FlightKey, broadcast::Sender<FlightResult>>>>,
+    counts_as_refresh: bool,
+    table: Arc<Mutex<FlightTable>>,
     counters: Arc<CounterSet>,
 }
 
 impl Singleflight {
     pub(crate) fn acquire(&self, key: FlightKey) -> FlightRole {
-        let mut entries = lock(&self.entries);
-        if let Some(sender) = entries.get(&key) {
+        self.acquire_with_origin(key, false)
+    }
+
+    pub(crate) fn acquire_with_origin(
+        &self,
+        key: FlightKey,
+        background_refresh: bool,
+    ) -> FlightRole {
+        let mut table = lock(&self.table);
+        if let Some(sender) = table.entries.get(&key) {
             if sender.receiver_count() >= MAX_WAITERS_PER_FLIGHT {
                 self.counters.rejections.fetch_add(1, Ordering::Relaxed);
                 crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightRejected);
@@ -136,7 +150,7 @@ impl Singleflight {
                 counters: Arc::clone(&self.counters),
             });
         }
-        if entries.len() >= MAX_ACTIVE_FLIGHTS {
+        if table.entries.len() >= MAX_ACTIVE_FLIGHTS {
             self.counters.rejections.fetch_add(1, Ordering::Relaxed);
             crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightRejected);
             crate::logging::warn_throttled!(
@@ -146,15 +160,31 @@ impl Singleflight {
             );
             return FlightRole::Rejected;
         }
+        let is_refresh = key.is_refresh();
+        let counts_as_refresh = is_refresh || background_refresh;
+        if counts_as_refresh && table.active_refreshes >= MAX_REFRESH_FLIGHTS {
+            self.counters.rejections.fetch_add(1, Ordering::Relaxed);
+            crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightRejected);
+            crate::logging::warn_throttled!(
+                saturation = "refresh_keys",
+                action = "reject",
+                "DNS singleflight saturated"
+            );
+            return FlightRole::Rejected;
+        }
         let (sender, _) = broadcast::channel(1);
-        entries.insert(key.clone(), sender);
+        table.entries.insert(key.clone(), sender);
         self.counters.leaders.fetch_add(1, Ordering::Relaxed);
-        if matches!(key.operation(), OperationKind::Refresh) {
+        if counts_as_refresh {
+            table.active_refreshes += 1;
+        }
+        if is_refresh {
             self.counters.refreshes.fetch_add(1, Ordering::Relaxed);
         }
         FlightRole::Leader(FlightLeader {
             key: Some(key),
-            entries: Arc::clone(&self.entries),
+            counts_as_refresh,
+            table: Arc::clone(&self.table),
             counters: Arc::clone(&self.counters),
         })
     }
@@ -172,7 +202,7 @@ impl Singleflight {
     }
 
     pub(crate) fn active_len(&self) -> usize {
-        lock(&self.entries).len()
+        lock(&self.table).entries.len()
     }
 }
 
@@ -196,11 +226,14 @@ impl FlightLeader {
         let Some(key) = self.key.take() else {
             return;
         };
-        let mut entries = lock(&self.entries);
-        let Some(sender) = entries.remove(&key) else {
+        let mut table = lock(&self.table);
+        let Some(sender) = table.entries.remove(&key) else {
             return;
         };
-        // Sending while `entries` is locked is completion's linearization point:
+        if self.counts_as_refresh {
+            table.active_refreshes = table.active_refreshes.saturating_sub(1);
+        }
+        // Sending while `table` is locked is completion's linearization point:
         // attached waiters are notified before a successor can be acquired.
         if sender.receiver_count() > 0 {
             let _ = sender.send(result());
@@ -219,7 +252,14 @@ impl Drop for FlightLeader {
         let Some(key) = self.key.take() else {
             return;
         };
-        let aborted = lock(&self.entries).remove(&key).is_some();
+        let aborted = {
+            let mut table = lock(&self.table);
+            let removed = table.entries.remove(&key).is_some();
+            if removed && self.counts_as_refresh {
+                table.active_refreshes = table.active_refreshes.saturating_sub(1);
+            }
+            removed
+        };
         if aborted {
             self.counters.aborts.fetch_add(1, Ordering::Relaxed);
             crate::stats::record_dns_event(crate::stats::DnsStatEvent::SingleflightCancel);

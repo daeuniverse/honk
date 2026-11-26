@@ -212,6 +212,7 @@ impl DnsForwarder {
         let query = raw_query.to_vec();
         let options = ResolveOptions {
             cache: CacheAccess::Refresh,
+            background_refresh: true,
             forced_upstream: options.forced_upstream.clone(),
             node_host: options.node_host,
         };

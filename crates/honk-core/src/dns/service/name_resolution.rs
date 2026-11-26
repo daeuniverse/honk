@@ -546,6 +546,7 @@ async fn resolve_claimed(
         cache: CacheAccess::Bypass,
         forced_upstream: Some(UpstreamTag::new(upstream)?),
         node_host: true,
+        ..Default::default()
     };
     let mut responses = exchange_families(service, forwarder, domain, None, &options)
         .await

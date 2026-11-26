@@ -293,7 +293,7 @@ pub(crate) async fn resolve_with_owner(
     };
     let flights = forwarder.singleflight();
     loop {
-        match flights.acquire(flight_key.clone()) {
+        match flights.acquire_with_origin(flight_key.clone(), options.is_background_refresh()) {
             FlightRole::Rejected => return Err(DnsForwardError::Overloaded),
             FlightRole::Waiter(waiter) => {
                 crate::observe::flows::dns::source("coalesced", None);
