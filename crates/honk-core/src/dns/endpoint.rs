@@ -17,6 +17,12 @@ use super::transport::DnsSocketBudget;
 
 /// Default DoH / DoH3 request path (RFC 8484).
 pub const DEFAULT_DOH_PATH: &str = "/dns-query";
+const MAX_RESOLVED_UPSTREAM_ADDRS: usize = 32;
+
+pub(in crate::dns) struct ResolvedEndpointAddrs {
+    pub(in crate::dns) addresses: Vec<SocketAddr>,
+    pub(in crate::dns) min_ttl: Option<u32>,
+}
 
 /// Parsed upstream endpoint used by the encrypted DNS transports.
 #[derive(Debug, Clone)]
@@ -27,6 +33,7 @@ pub struct DnsEndpoint {
     pub path: String,
     /// TLS/QUIC server name (SNI). Falls back to `host` when host is not an IP.
     pub sni: String,
+    literal_ip: Option<IpAddr>,
     bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
     resolved_addr: Option<SocketAddr>,
     strategy: DnsStrategy,
@@ -72,20 +79,18 @@ impl DnsEndpoint {
             _ => String::new(),
         };
 
-        let sni = if let Some(sni) = tls_server_name.map(str::trim).filter(|s| !s.is_empty()) {
-            sni.to_string()
-        } else if host.parse::<IpAddr>().is_ok() {
-            // IP literal — SNI still required by rustls; use the IP string.
-            host.clone()
-        } else {
-            host.clone()
-        };
+        let literal_ip = host.parse::<IpAddr>().ok();
+        let sni = tls_server_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| host.clone(), ToString::to_string);
 
         Ok(Self {
             host,
             port,
             path,
             sni,
+            literal_ip,
             bootstrap_resolver,
             resolved_addr: None,
             strategy,
@@ -94,6 +99,31 @@ impl DnsEndpoint {
     pub(crate) fn with_resolved_addr(mut self, address: SocketAddr) -> Self {
         self.resolved_addr = Some(address);
         self
+    }
+
+    pub(in crate::dns) fn is_domain(&self) -> bool {
+        self.resolved_addr.is_none() && self.literal_ip.is_none()
+    }
+
+    pub(in crate::dns) fn try_resolve_static(&self) -> Option<anyhow::Result<SocketAddr>> {
+        if let Some(address) = self.resolved_addr {
+            return Some(Ok(address));
+        }
+        let ip = self.literal_ip?;
+        let allowed = match self.strategy {
+            DnsStrategy::Ipv4Only => ip.is_ipv4(),
+            DnsStrategy::Ipv6Only => ip.is_ipv6(),
+            DnsStrategy::PreferIpv4 | DnsStrategy::PreferIpv6 | DnsStrategy::Both => true,
+        };
+        if allowed {
+            Some(Ok(SocketAddr::new(ip, self.port)))
+        } else {
+            Some(Err(anyhow::anyhow!(
+                "bootstrap resolve '{}' returned no addresses allowed by {:?}",
+                self.host,
+                self.strategy
+            )))
+        }
     }
 
     /// Resolve host to every allowed candidate, preferred family first.
@@ -113,47 +143,81 @@ impl DnsEndpoint {
         budget: &DnsSocketBudget,
         deadline: Instant,
     ) -> anyhow::Result<Vec<SocketAddr>> {
-        if let Some(address) = self.resolved_addr {
-            return Ok(vec![address]);
-        }
-        let ips = if let Ok(ip) = self.host.parse::<IpAddr>() {
-            vec![ip]
-        } else {
-            let ips = honk_outbound::bootstrap::resolve_with_admission(
-                self.bootstrap_resolver,
-                &self.host,
-                deadline,
-                || async {
-                    budget
-                        .acquire_bootstrap_until(deadline)
-                        .await
-                        .map_err(|error| std::io::Error::other(error.into_boxed_dyn_error()))
-                },
-            )
+        self.resolve_records_budgeted(budget, deadline)
             .await
-            .map_err(|error| {
-                anyhow::Error::new(error).context(format!("bootstrap resolve '{}'", self.host))
-            })?;
-            if ips.is_empty() {
-                anyhow::bail!("bootstrap resolve '{}' returned no addresses", self.host);
-            }
-            ips
+            .map(|resolved| resolved.addresses)
+    }
+
+    pub(in crate::dns) async fn resolve_records_budgeted(
+        &self,
+        budget: &DnsSocketBudget,
+        deadline: Instant,
+    ) -> anyhow::Result<ResolvedEndpointAddrs> {
+        if let Some(static_result) = self.try_resolve_static() {
+            return static_result.map(|address| ResolvedEndpointAddrs {
+                addresses: vec![address],
+                min_ttl: None,
+            });
+        }
+        let (families, credits) = match self.strategy {
+            DnsStrategy::Ipv4Only => (honk_outbound::bootstrap::QueryFamilies::Ipv4Only, 1),
+            DnsStrategy::Ipv6Only => (honk_outbound::bootstrap::QueryFamilies::Ipv6Only, 1),
+            DnsStrategy::PreferIpv6 => (
+                honk_outbound::bootstrap::QueryFamilies::Both { prefer_v6: true },
+                2,
+            ),
+            DnsStrategy::PreferIpv4 | DnsStrategy::Both => (
+                honk_outbound::bootstrap::QueryFamilies::Both { prefer_v6: false },
+                2,
+            ),
         };
-        let (mut v4, mut v6): (Vec<_>, Vec<_>) = ips
-            .into_iter()
-            .map(|ip| SocketAddr::new(ip, self.port))
-            .partition(SocketAddr::is_ipv4);
-        let addresses = match &self.strategy {
-            DnsStrategy::PreferIpv6 => {
-                v6.extend(v4);
-                v6
+        let resolved = honk_outbound::bootstrap::resolve_records_with_admission(
+            self.bootstrap_resolver,
+            &self.host,
+            families,
+            deadline,
+            || async {
+                budget
+                    .acquire_bootstrap_credits_until(credits, deadline)
+                    .await
+                    .map_err(|error| std::io::Error::other(error.into_boxed_dyn_error()))
+            },
+        )
+        .await
+        .map_err(|error| {
+            anyhow::Error::new(error).context(format!("bootstrap resolve '{}'", self.host))
+        })?;
+        if resolved.ips.is_empty() {
+            anyhow::bail!("bootstrap resolve '{}' returned no addresses", self.host);
+        }
+        let addresses = self.filter_and_cap_ips(resolved.ips)?;
+        Ok(ResolvedEndpointAddrs {
+            addresses,
+            min_ttl: resolved.min_ttl,
+        })
+    }
+
+    fn filter_and_cap_ips(&self, ips: Vec<IpAddr>) -> anyhow::Result<Vec<SocketAddr>> {
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        for ip in ips {
+            let address = SocketAddr::new(ip, self.port);
+            let target = if address.is_ipv4() { &mut v4 } else { &mut v6 };
+            if !target.contains(&address) {
+                target.push(address);
             }
-            DnsStrategy::Ipv4Only => v4,
-            DnsStrategy::Ipv6Only => v6,
-            DnsStrategy::PreferIpv4 | DnsStrategy::Both => {
-                v4.extend(v6);
+        }
+        let addresses = match self.strategy {
+            DnsStrategy::PreferIpv6 => cap_dual_stack(v6, v4),
+            DnsStrategy::Ipv4Only => {
+                v4.truncate(MAX_RESOLVED_UPSTREAM_ADDRS);
                 v4
             }
+            DnsStrategy::Ipv6Only => {
+                v6.truncate(MAX_RESOLVED_UPSTREAM_ADDRS);
+                v6
+            }
+            DnsStrategy::PreferIpv4 | DnsStrategy::Both => cap_dual_stack(v4, v6),
         };
         if addresses.is_empty() {
             anyhow::bail!(
@@ -164,6 +228,22 @@ impl DnsEndpoint {
         }
         Ok(addresses)
     }
+}
+
+/// Cap combined dual-stack candidates while preserving fallback records in the
+/// secondary family when the primary family alone fills the cap.
+fn cap_dual_stack(mut primary: Vec<SocketAddr>, mut secondary: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let secondary_reserve = secondary.len().min(MAX_RESOLVED_UPSTREAM_ADDRS / 2);
+    let primary_keep = primary
+        .len()
+        .min(MAX_RESOLVED_UPSTREAM_ADDRS - secondary_reserve);
+    let secondary_keep = secondary
+        .len()
+        .min(MAX_RESOLVED_UPSTREAM_ADDRS - primary_keep);
+    primary.truncate(primary_keep);
+    secondary.truncate(secondary_keep);
+    primary.extend(secondary);
+    primary
 }
 
 fn default_port(protocol: DnsProtocol) -> u16 {
@@ -328,7 +408,7 @@ mod tests {
         let ipv6 = [
             0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
         ];
-        let server = spawn_bootstrap_server(ipv4, Some(ipv6), 8).await;
+        let server = spawn_bootstrap_server(ipv4, Some(ipv6), 6).await;
         let resolver =
             honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{server}")).unwrap();
 
@@ -549,6 +629,62 @@ mod tests {
                 .is_err(),
             "unadmitted or pre-resolved endpoints sent a bootstrap query"
         );
+    }
+
+    #[tokio::test]
+    async fn single_family_bootstrap_uses_one_credit_and_returns_ttl() {
+        let ipv4 = [192, 0, 2, 10];
+        let ipv6 = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+        ];
+        let server = spawn_bootstrap_server(ipv4, Some(ipv6), 2).await;
+        let resolver =
+            honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{server}")).unwrap();
+        let budget = DnsSocketBudget::new(1);
+        for (strategy, expected) in [
+            (DnsStrategy::Ipv4Only, SocketAddr::from((ipv4, 853))),
+            (DnsStrategy::Ipv6Only, SocketAddr::from((ipv6, 853))),
+        ] {
+            let ep = DnsEndpoint::parse_with_resolver(
+                "single.test:853",
+                DnsProtocol::Tls,
+                None,
+                Some(resolver),
+                strategy,
+            )
+            .unwrap();
+            let res = ep
+                .resolve_records_budgeted(&budget, Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert_eq!((res.addresses, res.min_ttl), (vec![expected], Some(60)));
+            assert_eq!(budget.available_sockets(), 1);
+        }
+    }
+
+    #[test]
+    fn cap_dual_stack_preserves_secondary_fallback_when_primary_exceeds_half_cap() {
+        let v4 = |n| {
+            (1..=n)
+                .map(|i| SocketAddr::from(([192, 0, 2, i], 443)))
+                .collect::<Vec<_>>()
+        };
+        let v6 = |n| {
+            (1..=n)
+                .map(|i| {
+                    SocketAddr::from((
+                        [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i],
+                        443,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        let (p, s) = (v4(28), v6(6));
+        let capped = cap_dual_stack(p.clone(), s.clone());
+        assert_eq!((&capped[..26], &capped[26..]), (&p[..26], &s[..6]));
+        let balanced = cap_dual_stack(p, v6(20));
+        assert_eq!(balanced.iter().filter(|a| a.is_ipv4()).count(), 16);
+        assert_eq!(balanced.iter().filter(|a| a.is_ipv6()).count(), 16);
     }
 
     async fn spawn_bootstrap_server(

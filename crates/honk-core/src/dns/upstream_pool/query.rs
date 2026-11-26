@@ -6,6 +6,7 @@ use honk_config::types::DnsProtocol;
 use tracing::debug;
 
 use super::UpstreamPool;
+use super::addr_cache::{ResolvedAddrs, ResolvedCandidates};
 use super::admission::AdmissionPermit;
 use super::entries::{UdpFamily, UpstreamEntry};
 use super::routing::DnsDialRoute;
@@ -252,11 +253,22 @@ impl UpstreamPool {
         Err(last_capacity.expect("every UDP shard rejected registration"))
     }
 
-    async fn admit_query(&self) -> anyhow::Result<AdmissionPermit<'_>> {
-        let admission = self
-            .admission
+    fn ensure_open(&self) -> anyhow::Result<()> {
+        if self.admission.is_open() {
+            Ok(())
+        } else {
+            Err(super::pool_closed_error().into())
+        }
+    }
+
+    fn admit_pool(&self) -> anyhow::Result<AdmissionPermit<'_>> {
+        self.admission
             .admit()
-            .ok_or_else(|| anyhow::anyhow!("DNS upstream pool is closed"))?;
+            .ok_or_else(|| super::pool_closed_error().into())
+    }
+
+    async fn admit_query(&self) -> anyhow::Result<AdmissionPermit<'_>> {
+        let admission = self.admit_pool()?;
         #[cfg(test)]
         self.pause_after_admission_for_test().await;
         Ok(admission)
@@ -279,6 +291,7 @@ impl UpstreamPool {
         route: &DnsDialRoute,
         raw_query: &[u8],
         admission: AdmissionPermit<'a>,
+        affinity_epoch: u64,
     ) -> anyhow::Result<(Vec<u8>, AdmissionPermit<'a>, Option<EcsQuery>)> {
         let exchange = async {
             let address = route.target;
@@ -295,7 +308,7 @@ impl UpstreamPool {
                     crate::observe::flows::dns::transport_exchange_scope(effective_query, query);
                 query.await?
             };
-            entry.udp.lock().mark_current(address);
+            entry.udp.lock().mark_current(address, affinity_epoch);
             Ok((response, admission, injected))
         };
         crate::observe::scope_pin!(exchange);
@@ -304,36 +317,72 @@ impl UpstreamPool {
         exchange.await
     }
 
-    pub(super) async fn resolve_addrs(
+    /// Fast-paths literal IPs and fresh/cooldown cache hits synchronously without
+    /// acquiring an `AdmissionPermit`. Only the boxed cold/expired miss path holds
+    /// admission across resolution (never across leaf routing) so `close()` waits
+    /// for in-flight bootstrap and its socket credits to drain.
+    pub(super) async fn resolve_observed_addrs_until(
         &self,
         entry: &UpstreamEntry,
-    ) -> anyhow::Result<Vec<SocketAddr>> {
-        entry.check_explicit_block()?;
-        entry
-            .endpoint
-            .resolve_addrs_budgeted(
-                &self.socket_budget,
-                tokio::time::Instant::now() + self.dns_dial_timeout,
-            )
-            .await
+        deadline: tokio::time::Instant,
+    ) -> (
+        anyhow::Result<ResolvedCandidates>,
+        Option<honk_outbound::runtime::flow_observation::LookupSelection>,
+    ) {
+        if let Err(error) = self.ensure_open() {
+            return (Err(error), None);
+        }
+        if let Err(error) = entry.check_explicit_block() {
+            return (Err(error), None);
+        }
+        if let Some(static_result) = entry.endpoint.try_resolve_static() {
+            return (
+                static_result.map(|address| ResolvedCandidates {
+                    addresses: ResolvedAddrs::Single(address),
+                    cache_generation: None,
+                    invalidation_epoch: 0,
+                }),
+                None,
+            );
+        }
+        if let Some(hit) = entry.try_hit_addr(tokio::time::Instant::now()) {
+            return (Ok(hit), None);
+        }
+        Box::pin(async {
+            let _admission = match self.admit_pool() {
+                Ok(admission) => admission,
+                Err(error) => return (Err(error), None),
+            };
+            entry
+                .resolve_or_wait_addr(
+                    deadline,
+                    || self.admission.is_open(),
+                    |deadline| async move {
+                        let resolve = honk_outbound::runtime::flow_observation::observe_resolution(
+                            entry
+                                .endpoint
+                                .resolve_records_budgeted(&self.socket_budget, deadline),
+                        );
+                        crate::observe::scope_pin!(resolve);
+                        crate::observe::flows::dns::scope_purpose("proxy_server", resolve).await
+                    },
+                )
+                .await
+        })
+        .await
     }
 
-    /// Boxed so a direct UDP query, which normally reuses its current
-    /// address, does not reserve the resolver's state in its future.
     async fn resolve_observed_addrs(
         &self,
         entry: &UpstreamEntry,
     ) -> (
-        anyhow::Result<Vec<SocketAddr>>,
+        anyhow::Result<ResolvedCandidates>,
         Option<honk_outbound::runtime::flow_observation::LookupSelection>,
     ) {
-        Box::pin(async {
-            let resolve = honk_outbound::runtime::flow_observation::observe_resolution(
-                self.resolve_addrs(entry),
-            );
-            crate::observe::scope_pin!(resolve);
-            crate::observe::flows::dns::scope_purpose("proxy_server", resolve).await
-        })
+        self.resolve_observed_addrs_until(
+            entry,
+            tokio::time::Instant::now() + self.dns_dial_timeout,
+        )
         .await
     }
 
@@ -342,10 +391,12 @@ impl UpstreamPool {
         &self,
         entry: &UpstreamEntry,
     ) -> anyhow::Result<SocketAddr> {
-        self.resolve_addrs(entry)
-            .await?
-            .into_iter()
-            .next()
+        self.resolve_observed_addrs(entry)
+            .await
+            .0?
+            .addresses
+            .first()
+            .copied()
             .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))
     }
 
@@ -395,7 +446,6 @@ impl UpstreamPool {
 
     async fn query_udp_via_proxy(
         &self,
-        upstream_name: &str,
         entry: &UpstreamEntry,
         route: &DnsDialRoute,
         raw_query: &[u8],
@@ -418,7 +468,7 @@ impl UpstreamPool {
                 let business = admit_score_attempt(tcp_feedback.as_ref(), original)?;
                 debug!(
                     "DNS upstream '{}' proxied UDP answer has TC set — retrying over proxied TCP",
-                    upstream_name
+                    entry.name
                 );
                 self.exchange_routed(entry, route, raw_query, business, route_failures)
                     .await?
@@ -427,10 +477,11 @@ impl UpstreamPool {
             };
             debug!(
                 "DNS upstream '{}' (udp via proxy {}) returned {} bytes",
-                upstream_name,
+                entry.name,
                 node.node.name,
                 response.len()
             );
+            entry.record_preferred(route.target);
             Ok(response)
         };
         crate::observe::scope_pin!(exchange);
@@ -441,7 +492,6 @@ impl UpstreamPool {
 
     async fn finish_direct_udp_query(
         &self,
-        upstream_name: &str,
         entry: &UpstreamEntry,
         route: &DnsDialRoute,
         raw_query: &[u8],
@@ -452,7 +502,7 @@ impl UpstreamPool {
         let response = if crate::dns::response::is_truncated(&response) {
             debug!(
                 "DNS upstream '{}' UDP answer has TC set — retrying over TCP",
-                upstream_name
+                entry.name
             );
             let exchange = async {
                 crate::observe::flows::dns::tcp_fallback();
@@ -472,93 +522,80 @@ impl UpstreamPool {
         } else {
             debug!(
                 "DNS upstream '{}' (udp) returned {} bytes",
-                upstream_name,
+                entry.name,
                 response.len()
             );
             response
         };
-        match injected {
+        let response = match injected {
             Some(injected) => injected
                 .restore_response(response)
-                .context("invalid ECS response from DNS upstream"),
-            None => Ok(response),
+                .context("invalid ECS response from DNS upstream")?,
+            None => response,
+        };
+        entry.record_preferred(route.target);
+        Ok(response)
+    }
+
+    async fn exchange_udp_attempt(
+        &self,
+        entry: &UpstreamEntry,
+        route: &DnsDialRoute,
+        raw_query: &[u8],
+        affinity_epoch: u64,
+        original: &mut Option<honk_outbound::group::ScoreContinuation>,
+        route_failures: &mut RouteFailures,
+    ) -> anyhow::Result<Vec<u8>> {
+        if route.node.is_some() {
+            self.query_udp_via_proxy(entry, route, raw_query, original, route_failures)
+                .await
+        } else {
+            let admission = self.admit_query().await?;
+            let exchange = self
+                .exchange_direct_udp(entry, route, raw_query, admission, affinity_epoch)
+                .await?;
+            self.finish_direct_udp_query(entry, route, raw_query, exchange)
+                .await
         }
     }
+
     async fn query_datagram(
         &self,
-        upstream_name: &str,
         entry: &UpstreamEntry,
         raw_query: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
+        self.ensure_open()?;
         let mut original_business = None;
         let mut route_failures = RouteFailures::default();
         let current = { entry.udp.lock().current_address() };
-        let has_traffic_router =
-            self.traffic_router_snapshot.read().is_some() || self.traffic_router.read().is_some();
-        let initial_route = if current.is_none() && entry.outbound.is_none() && has_traffic_router {
-            let (targets, witness) = self.resolve_observed_addrs(entry).await;
-            let target = targets?
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))?;
-            if let Some(witness) = witness {
-                witness.selected_ip(target.ip());
-            }
-            Some(
-                self.resolve_dial_route_for_address(entry, target, original_business.as_ref())
-                    .await?,
-            )
-        } else {
-            None
-        };
-        let failed = if let Some(address) = current {
+        let failed = if let Some((address, affinity_epoch)) = current {
             let route = self
                 .resolve_dial_route_for_address(entry, address, original_business.as_ref())
                 .await?;
-            if route.node.is_some() {
-                match self
-                    .query_udp_via_proxy(
-                        upstream_name,
-                        entry,
-                        &route,
-                        raw_query,
-                        &mut original_business,
-                        &mut route_failures,
-                    )
-                    .await
-                {
-                    Ok(response) => return Ok(response),
-                    Err(error) => Some((address, retryable_error(error)?)),
-                }
-            } else {
-                let admission = self.admit_query().await?;
-                match self
-                    .exchange_direct_udp(entry, &route, raw_query, admission)
-                    .await
-                {
-                    Ok(exchange) => {
-                        return self
-                            .finish_direct_udp_query(
-                                upstream_name,
-                                entry,
-                                &route,
-                                raw_query,
-                                exchange,
-                            )
-                            .await;
-                    }
-                    Err(error) => Some((address, retryable_error(error)?)),
-                }
+            match self
+                .exchange_udp_attempt(
+                    entry,
+                    &route,
+                    raw_query,
+                    affinity_epoch,
+                    &mut original_business,
+                    &mut route_failures,
+                )
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error) => Some((address, retryable_error(error)?)),
             }
         } else {
             None
         };
 
-        let (addresses, witness) = self.resolve_observed_addrs(entry).await;
-        let addresses = addresses?;
+        let (resolved, witness) = self.resolve_observed_addrs(entry).await;
+        let resolved = resolved?;
         let (first, first_error, retry) = if let Some((failed_address, first_error)) = failed {
-            let [first, retry] = udp_attempt_addresses(&addresses, Some(failed_address))
-                .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))?;
+            let [first, retry] =
+                udp_attempt_addresses(&resolved.addresses, Some(failed_address))
+                    .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))?;
             let retry = if first == failed_address {
                 retry
             } else {
@@ -566,54 +603,27 @@ impl UpstreamPool {
             };
             (failed_address, first_error, retry)
         } else {
-            let [first, retry] = udp_attempt_addresses(&addresses, None)
+            let [first, retry] = udp_attempt_addresses(&resolved.addresses, None)
                 .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))?;
             if let Some(witness) = &witness {
                 witness.selected_ip(first.ip());
             }
-            let route = match initial_route {
-                Some(route) if route.target == first => route,
-                _ => {
-                    self.resolve_dial_route_for_address(entry, first, original_business.as_ref())
-                        .await?
-                }
-            };
-            if route.node.is_some() {
-                match self
-                    .query_udp_via_proxy(
-                        upstream_name,
-                        entry,
-                        &route,
-                        raw_query,
-                        &mut original_business,
-                        &mut route_failures,
-                    )
-                    .await
-                {
-                    Ok(response) => return Ok(response),
-                    Err(first_error) => (first, retryable_error(first_error)?, retry),
-                }
-            } else {
-                let attempt = async {
-                    let admission = self.admit_query().await?;
-                    self.exchange_direct_udp(entry, &route, raw_query, admission)
-                        .await
-                }
-                .await;
-                match attempt {
-                    Ok(exchange) => {
-                        return self
-                            .finish_direct_udp_query(
-                                upstream_name,
-                                entry,
-                                &route,
-                                raw_query,
-                                exchange,
-                            )
-                            .await;
-                    }
-                    Err(first_error) => (first, retryable_error(first_error)?, retry),
-                }
+            let route = self
+                .resolve_dial_route_for_address(entry, first, original_business.as_ref())
+                .await?;
+            match self
+                .exchange_udp_attempt(
+                    entry,
+                    &route,
+                    raw_query,
+                    resolved.invalidation_epoch,
+                    &mut original_business,
+                    &mut route_failures,
+                )
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(first_error) => (first, retryable_error(first_error)?, retry),
             }
         };
 
@@ -629,35 +639,35 @@ impl UpstreamPool {
         let route = self
             .resolve_dial_route_for_address(entry, retry, original_business.as_ref())
             .await?;
-        if route.node.is_some() {
-            return self
-                .query_udp_via_proxy(
-                    upstream_name,
-                    entry,
-                    &route,
-                    raw_query,
-                    &mut original_business,
-                    &mut route_failures,
-                )
-                .await
-                .with_context(|| {
+        match self
+            .exchange_udp_attempt(
+                entry,
+                &route,
+                raw_query,
+                resolved.invalidation_epoch,
+                &mut original_business,
+                &mut route_failures,
+            )
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                if !honk_outbound::proxy::is_packet_rejection(&error) {
+                    entry.mark_dirty_on_all_failed(
+                        resolved.cache_generation,
+                        tokio::time::Instant::now(),
+                    );
+                    if entry.endpoint.is_domain() {
+                        let mut udp = entry.udp.lock();
+                        if udp.current == Some(first) || udp.current == Some(retry) {
+                            udp.clear_current();
+                        }
+                    }
+                }
+                Err(error).with_context(|| {
                     format!("UDP DNS failed via {retry} (first {first}: {first_error})")
-                });
-        }
-        let attempt = async {
-            let admission = self.admit_query().await?;
-            self.exchange_direct_udp(entry, &route, raw_query, admission)
-                .await
-        }
-        .await;
-        match attempt {
-            Ok(exchange) => {
-                self.finish_direct_udp_query(upstream_name, entry, &route, raw_query, exchange)
-                    .await
+                })
             }
-            Err(error) => Err(error).with_context(|| {
-                format!("UDP DNS failed via {retry} (first {first}: {first_error})")
-            }),
         }
     }
 }
@@ -674,16 +684,16 @@ impl UpstreamPool {
             .get(upstream_name)
             .ok_or_else(|| anyhow::anyhow!("unknown upstream: {upstream_name}"))?;
         if entry.protocol == DnsProtocol::Udp {
-            return self.query_datagram(upstream_name, entry, raw_query).await;
+            return self.query_datagram(entry, raw_query).await;
         }
 
-        let (targets, witness) = self.resolve_observed_addrs(entry).await;
-        let targets = targets?;
+        let (resolved, witness) = self.resolve_observed_addrs(entry).await;
+        let resolved = resolved?;
         let mut last_error = None;
         let mut first_error = None;
         let mut original_business = None;
         let mut route_failures = RouteFailures::default();
-        for target in targets {
+        for &target in resolved.addresses.iter() {
             let route = self
                 .resolve_dial_route_for_address(entry, target, original_business.as_ref())
                 .await?;
@@ -733,12 +743,14 @@ impl UpstreamPool {
                             .unwrap_or("direct"),
                         response.len()
                     );
-                    return match injected {
+                    let response = match injected {
                         Some(injected) => injected
                             .restore_response(response)
-                            .context("invalid ECS response from DNS upstream"),
-                        None => Ok(response),
+                            .context("invalid ECS response from DNS upstream")?,
+                        None => response,
                     };
+                    entry.record_preferred(route.target);
+                    return Ok(response);
                 }
                 Err(error) => {
                     let error = retryable_error(error)?;
@@ -758,6 +770,7 @@ impl UpstreamPool {
         }
         let (target, error) =
             last_error.ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))?;
+        entry.mark_dirty_on_all_failed(resolved.cache_generation, tokio::time::Instant::now());
         let context = match first_error.filter(|(first, _)| *first != target) {
             Some((first, first_error)) => format!(
                 "DNS upstream '{upstream_name}' failed via {target} (first {first}: {first_error})"

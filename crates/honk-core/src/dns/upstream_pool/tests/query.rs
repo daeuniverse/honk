@@ -291,7 +291,7 @@ async fn udp_cold_retry_rechecks_route_for_alternate_address() {
         stream.write_all(&response).await.unwrap();
         query
     });
-    let (bootstrap_address, bootstrap_task) = spawn_dual_stack_bootstrap(4).await;
+    let (bootstrap_address, bootstrap_task) = spawn_dual_stack_bootstrap(2).await;
     let resolver =
         honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{bootstrap_address}"));
     let node = Node {
