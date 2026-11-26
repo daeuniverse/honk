@@ -10,7 +10,7 @@ use super::worker;
 use super::{ProjectionObservation, QueryScope, RoutingProjection, RoutingProjectionSnapshot};
 use crate::ebpf::maps;
 use crate::ebpf::mock::MockEbpfBackend;
-use crate::ebpf::{PolicyBackend, ProjectionMapOperation};
+use crate::ebpf::{DomainProjectionSink, PolicyBackend, ProjectionMapOperation};
 use crate::routing::Router;
 
 fn host_ip(ip: IpAddr) -> super::state::ProjectionIp {
@@ -955,9 +955,20 @@ async fn held_publication_defers_submission_without_blocking() {
 }
 
 fn projection_for_test(snapshot: Arc<RoutingProjectionSnapshot>) -> TestProjection {
+    let backend = backend_for_test(&snapshot);
+    let (projection, receiver) = unspawned_projection(snapshot);
+    (
+        projection,
+        receiver,
+        Arc::new(tokio::sync::RwLock::new(Box::new(backend))),
+    )
+}
+
+fn unspawned_projection(
+    snapshot: Arc<RoutingProjectionSnapshot>,
+) -> (RoutingProjection, tokio::sync::mpsc::Receiver<()>) {
     let (wake, receiver) = tokio::sync::mpsc::channel(1);
     let counters = Arc::new(super::ProjectionCounters::default());
-    let backend = backend_for_test(&snapshot);
     let state = DesiredState::new(snapshot, 10_000);
     let structure = Arc::clone(&state.structure);
     (
@@ -979,7 +990,6 @@ fn projection_for_test(snapshot: Arc<RoutingProjectionSnapshot>) -> TestProjecti
             publication_released: tokio::sync::Notify::new(),
         },
         receiver,
-        Arc::new(tokio::sync::RwLock::new(Box::new(backend))),
     )
 }
 

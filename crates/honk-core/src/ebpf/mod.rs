@@ -483,9 +483,23 @@ pub(crate) fn record_pname_routing(
     }
 }
 
+/// Writes individual DNS facts into the active routing generation.
+pub trait DomainProjectionSink: Send + Sync {
+    /// Replace one entry in the active generation-owned domain HASH map.
+    /// A present all-zero value is meaningful and must not be removed.
+    fn set_domain_ip_bitmap(
+        &mut self,
+        ip_key: &LpmKey,
+        bitmap: &DomainRouting,
+    ) -> Result<(), DomainRouteWriteError>;
+
+    /// Remove an entry from the active generation-owned domain HASH map.
+    fn remove_domain_ip_bitmap(&mut self, ip_key: &LpmKey) -> Result<(), DomainRouteWriteError>;
+}
+
 /// Policy publication shared by kernel and software execution owners.
 #[async_trait]
-pub trait PolicyBackend: Send + Sync {
+pub trait PolicyBackend: DomainProjectionSink {
     fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)>;
     fn tc_mut(&mut self) -> anyhow::Result<&mut (dyn EbpfBackend + 'static)>;
 
@@ -576,13 +590,6 @@ pub trait PolicyBackend: Send + Sync {
         ip_key: &LpmKey,
         bitmap: &DomainRouting,
     ) -> anyhow::Result<()>;
-    /// Replace one entry in the active generation-owned domain HASH map.
-    /// A present all-zero value is meaningful and must not be removed.
-    fn set_domain_ip_bitmap(
-        &mut self,
-        ip_key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> Result<(), DomainRouteWriteError>;
     fn set_domain_ip_bitmap_batch(
         &mut self,
         entries: &[(LpmKey, DomainRouting)],
@@ -593,8 +600,6 @@ pub trait PolicyBackend: Send + Sync {
         }
         Ok(())
     }
-    /// Remove an entry from the active generation-owned domain HASH map.
-    fn remove_domain_ip_bitmap(&mut self, ip_key: &LpmKey) -> Result<(), DomainRouteWriteError>;
     fn remove_domain_ip_bitmap_batch(
         &mut self,
         keys: &[LpmKey],

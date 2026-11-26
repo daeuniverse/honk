@@ -210,6 +210,19 @@ impl UserspaceBackend {
     }
 }
 
+impl DomainProjectionSink for UserspaceBackend {
+    fn set_domain_ip_bitmap(
+        &mut self,
+        key: &LpmKey,
+        bitmap: &DomainRouting,
+    ) -> Result<(), DomainRouteWriteError> {
+        self.policy.set_domain(key, bitmap)
+    }
+    fn remove_domain_ip_bitmap(&mut self, key: &LpmKey) -> Result<(), DomainRouteWriteError> {
+        self.policy.remove_domain(key)
+    }
+}
+
 #[async_trait]
 impl PolicyBackend for UserspaceBackend {
     fn userspace_mut(&mut self) -> anyhow::Result<&mut UserspaceBackend> {
@@ -288,16 +301,6 @@ impl PolicyBackend for UserspaceBackend {
 
     fn add_domain_ip_bitmap(&mut self, key: &LpmKey, bitmap: &DomainRouting) -> anyhow::Result<()> {
         self.policy.add_domain(key, bitmap)
-    }
-    fn set_domain_ip_bitmap(
-        &mut self,
-        key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> Result<(), DomainRouteWriteError> {
-        self.policy.set_domain(key, bitmap)
-    }
-    fn remove_domain_ip_bitmap(&mut self, key: &LpmKey) -> Result<(), DomainRouteWriteError> {
-        self.policy.remove_domain(key)
     }
     fn set_outbound_alive(
         &mut self,

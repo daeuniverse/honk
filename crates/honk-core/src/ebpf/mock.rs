@@ -16,7 +16,7 @@ use super::retirement::{
 #[cfg(test)]
 use super::{DatapathFlagsWriteOrigin, DatapathFlagsWriteTrace, ProjectionMapOperation};
 use super::{
-    EbpfBackend, PolicyBackend, RoutingPushPhase, UdpDecisionCommitResult,
+    DomainProjectionSink, EbpfBackend, PolicyBackend, RoutingPushPhase, UdpDecisionCommitResult,
     UdpDecisionSequenceStatus, UdpDecisionTransition, validate_udp_decision_transition,
 };
 use super::{

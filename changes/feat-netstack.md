@@ -39,3 +39,4 @@ Added
 - Charge recorded packet connection and route payloads to the capture budget through queueing, sniff-based rerouting and task completion. Idle observation slots carry no payload allocation.
 - Add per-family checksum completion for single TCP packets emitted by transparent netstack devices.
 - Standalone TUN writes borrowed packet slices directly and commits transmission after the device accepts a complete record.
+- Narrow DNS projection and control-plane backend capabilities while retaining generation-fenced publication and TC ownership.

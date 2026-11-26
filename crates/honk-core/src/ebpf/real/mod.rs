@@ -15,10 +15,10 @@ use tracing::{debug, info, warn};
 use super::TcpSocketOwnership;
 use super::retirement::AuxDeleteTally;
 use super::{
-    EbpfBackend, FlowExpiryHint, PolicyBackend, RETIRE_BATCH_CAPACITY, RETIRE_FENCE_MAP,
-    RetireCounts, RetireError, RetireKind, RetireOutcome, RetireRequest, UDP_DECISION_SEQUENCE_MAP,
-    UdpDecisionCommitResult, UdpDecisionSequenceStatus, UdpDecisionTransition,
-    probe::BatchCapability, validate_udp_decision_transition,
+    DomainProjectionSink, EbpfBackend, FlowExpiryHint, PolicyBackend, RETIRE_BATCH_CAPACITY,
+    RETIRE_FENCE_MAP, RetireCounts, RetireError, RetireKind, RetireOutcome, RetireRequest,
+    UDP_DECISION_SEQUENCE_MAP, UdpDecisionCommitResult, UdpDecisionSequenceStatus,
+    UdpDecisionTransition, probe::BatchCapability, validate_udp_decision_transition,
 };
 
 /// Parse the running kernel version from /proc/version.
@@ -538,6 +538,42 @@ impl RealEbpfBackend {
     }
 }
 
+impl DomainProjectionSink for RealEbpfBackend {
+    fn set_domain_ip_bitmap(
+        &mut self,
+        ip_key: &LpmKey,
+        bitmap: &DomainRouting,
+    ) -> Result<(), super::DomainRouteWriteError> {
+        match self.active_domain_mut()?.insert(&ip_key.data, bitmap, 0) {
+            Ok(()) => Ok(()),
+            Err(MapError::SyscallError(error))
+                if matches!(
+                    error.io_error.raw_os_error(),
+                    Some(libc::ENOSPC) | Some(libc::E2BIG)
+                ) =>
+            {
+                Err(super::DomainRouteWriteError::MapFull)
+            }
+            Err(error) => Err(super::DomainRouteWriteError::Other(anyhow::anyhow!(
+                "active domain map insert: {error}"
+            ))),
+        }
+    }
+
+    fn remove_domain_ip_bitmap(
+        &mut self,
+        ip_key: &LpmKey,
+    ) -> Result<(), super::DomainRouteWriteError> {
+        match self.active_domain_mut()?.remove(&ip_key.data) {
+            Ok(()) => Ok(()),
+            Err(error) if Self::map_error_is_missing(&error) => Ok(()),
+            Err(error) => Err(super::DomainRouteWriteError::Other(anyhow::anyhow!(
+                "active domain map delete: {error}"
+            ))),
+        }
+    }
+}
+
 #[async_trait]
 impl PolicyBackend for RealEbpfBackend {
     fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)> {
@@ -604,40 +640,6 @@ impl PolicyBackend for RealEbpfBackend {
         }
         map.insert(&ip_key.data, &value, 0)
             .map_err(|error| anyhow::anyhow!("active domain map insert: {error}"))
-    }
-
-    fn set_domain_ip_bitmap(
-        &mut self,
-        ip_key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> Result<(), super::DomainRouteWriteError> {
-        match self.active_domain_mut()?.insert(&ip_key.data, bitmap, 0) {
-            Ok(()) => Ok(()),
-            Err(MapError::SyscallError(error))
-                if matches!(
-                    error.io_error.raw_os_error(),
-                    Some(libc::ENOSPC) | Some(libc::E2BIG)
-                ) =>
-            {
-                Err(super::DomainRouteWriteError::MapFull)
-            }
-            Err(error) => Err(super::DomainRouteWriteError::Other(anyhow::anyhow!(
-                "active domain map insert: {error}"
-            ))),
-        }
-    }
-
-    fn remove_domain_ip_bitmap(
-        &mut self,
-        ip_key: &LpmKey,
-    ) -> Result<(), super::DomainRouteWriteError> {
-        match self.active_domain_mut()?.remove(&ip_key.data) {
-            Ok(()) => Ok(()),
-            Err(error) if Self::map_error_is_missing(&error) => Ok(()),
-            Err(error) => Err(super::DomainRouteWriteError::Other(anyhow::anyhow!(
-                "active domain map delete: {error}"
-            ))),
-        }
     }
 
     /// Without the cgroup hooks `pname()` never matches and `!pname()`

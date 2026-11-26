@@ -1,6 +1,31 @@
 use super::*;
 use crate::ebpf;
 
+impl DomainProjectionSink for MockEbpfBackend {
+    fn set_domain_ip_bitmap(
+        &mut self,
+        ip_key: &LpmKey,
+        bitmap: &DomainRouting,
+    ) -> Result<(), ebpf::DomainRouteWriteError> {
+        #[cfg(test)]
+        self.take_projection_fault(ProjectionMapOperation::Set)?;
+        self.policy.set_domain(ip_key, bitmap)?;
+        self.count_routing_writes(1);
+        Ok(())
+    }
+
+    fn remove_domain_ip_bitmap(
+        &mut self,
+        ip_key: &LpmKey,
+    ) -> Result<(), ebpf::DomainRouteWriteError> {
+        #[cfg(test)]
+        self.take_projection_fault(ProjectionMapOperation::Remove)?;
+        self.policy.remove_domain(ip_key)?;
+        self.count_routing_writes(1);
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl PolicyBackend for MockEbpfBackend {
     fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)> {
@@ -209,29 +234,6 @@ impl PolicyBackend for MockEbpfBackend {
             anyhow::bail!("injected domain bitmap write failure");
         }
         self.policy.add_domain(ip_key, bitmap)?;
-        self.count_routing_writes(1);
-        Ok(())
-    }
-
-    fn set_domain_ip_bitmap(
-        &mut self,
-        ip_key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> Result<(), ebpf::DomainRouteWriteError> {
-        #[cfg(test)]
-        self.take_projection_fault(ProjectionMapOperation::Set)?;
-        self.policy.set_domain(ip_key, bitmap)?;
-        self.count_routing_writes(1);
-        Ok(())
-    }
-
-    fn remove_domain_ip_bitmap(
-        &mut self,
-        ip_key: &LpmKey,
-    ) -> Result<(), ebpf::DomainRouteWriteError> {
-        #[cfg(test)]
-        self.take_projection_fault(ProjectionMapOperation::Remove)?;
-        self.policy.remove_domain(ip_key)?;
         self.count_routing_writes(1);
         Ok(())
     }

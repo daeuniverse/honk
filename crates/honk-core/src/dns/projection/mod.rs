@@ -9,7 +9,7 @@ use honk_ebpf_common::DomainRouting;
 use honk_outbound::alive::IpVersion;
 
 use crate::dns::outcome::ProjectionSource;
-use crate::ebpf::PolicyBackend;
+use crate::ebpf::DomainProjectionSink;
 use crate::routing::Router;
 
 mod lifecycle {
@@ -361,8 +361,8 @@ impl PreparedProjectionPublication<'_> {
 }
 
 impl RoutingProjection {
-    pub(crate) fn spawn(
-        ebpf: Arc<tokio::sync::RwLock<Box<dyn PolicyBackend>>>,
+    pub(crate) fn spawn<S: DomainProjectionSink + ?Sized + 'static>(
+        ebpf: Arc<tokio::sync::RwLock<Box<S>>>,
         snapshot: Arc<RoutingProjectionSnapshot>,
     ) -> Arc<Self> {
         let (wake, receiver) = tokio::sync::mpsc::channel(1);

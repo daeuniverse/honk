@@ -1,7 +1,7 @@
 use super::{assert_route, decision, input, object, outbound_ids};
 use crate::control::routing_matcher::RoutingPushPlan;
-use crate::ebpf::PolicyBackend;
 use crate::ebpf::real::RealEbpfBackend;
+use crate::ebpf::{DomainProjectionSink, PolicyBackend};
 use crate::routing::golden::parsed;
 use honk_config::types::DialMode;
 use honk_ebpf_common::DaeParam;

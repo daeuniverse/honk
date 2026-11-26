@@ -445,3 +445,74 @@ async fn drop_cancels_projection_worker() {
         assert!(termination.is_terminated());
     }
 }
+
+#[derive(Default)]
+struct OneEntrySink(Option<([u8; 20], honk_ebpf_common::DomainRouting)>);
+
+impl DomainProjectionSink for OneEntrySink {
+    fn set_domain_ip_bitmap(
+        &mut self,
+        key: &maps::LpmKey,
+        bitmap: &honk_ebpf_common::DomainRouting,
+    ) -> Result<(), crate::ebpf::DomainRouteWriteError> {
+        let key = maps::lpm_key_bytes(key);
+        if self.0.as_ref().is_some_and(|(held, _)| *held != key) {
+            return Err(crate::ebpf::DomainRouteWriteError::MapFull);
+        }
+        self.0 = Some((key, *bitmap));
+        Ok(())
+    }
+
+    fn remove_domain_ip_bitmap(
+        &mut self,
+        key: &maps::LpmKey,
+    ) -> Result<(), crate::ebpf::DomainRouteWriteError> {
+        let key = maps::lpm_key_bytes(key);
+        if self.0.as_ref().is_some_and(|(held, _)| *held == key) {
+            self.0 = None;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn projection_sink_fences_stale_writes_and_recovers_map_capacity() {
+    let first = snapshot(1, 1, 2);
+    let next = snapshot(2, 4, 8);
+    let (projection, _wake) = unspawned_projection(Arc::clone(&first));
+    let sink = tokio::sync::RwLock::new(Box::new(OneEntrySink::default()));
+    let a = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 4));
+    let b = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+    let expires = tokio::time::Instant::now() + Duration::from_secs(30);
+    let scope = honk_datapath::ScopeId::HOST;
+    projection.submit(scope, first, positive("a.test", &[a], expires));
+    worker::flush_for_test_after_snapshot(&projection, &sink, || {
+        projection.update_snapshot(Arc::clone(&next))
+    })
+    .await;
+    assert!(sink.read().await.0.is_none());
+    assert_eq!(projection.counters().generation_rebuilds, 1);
+
+    let entry = |ip, bits| {
+        (
+            maps::lpm_key_bytes(&maps::ip_addr_to_lpm_key(ip)),
+            honk_ebpf_common::DomainRouting {
+                bitmap: [bits, 0, 0, 0, 0, 0, 0, 0],
+            },
+        )
+    };
+    worker::flush_for_test(&projection, &sink).await;
+    assert_eq!(sink.read().await.0, Some(entry(a, 4)));
+    projection.submit(scope, Arc::clone(&next), positive("b.test", &[b], expires));
+    worker::flush_for_test(&projection, &sink).await;
+    assert_eq!(projection.counters().map_full, 1);
+    assert_eq!(projection.counters().write_failures, 1);
+    assert_eq!(sink.read().await.0, Some(entry(a, 4)));
+    projection.submit(scope, next, clear_v4("a.test"));
+    worker::flush_for_test(&projection, &sink).await;
+    assert!(sink.read().await.0.is_none());
+    tokio::time::advance(Duration::from_millis(100)).await;
+    worker::flush_for_test(&projection, &sink).await;
+    assert_eq!(sink.read().await.0, Some(entry(b, 8)));
+    assert!(projection.state.lock().dirty_ips.is_empty());
+}
