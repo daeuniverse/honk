@@ -131,7 +131,7 @@ Honk 的独立 bind 可以是 `:53530`、其他空闲端口，或者关闭；它
 | 8. 发布与渲染 | 只有严格校验后的最终 wire 响应才能进入缓存或发布给 singleflight waiter。偏好地址族压制在保存已校验、可复用的应答后，才应用于调用方渲染。 |
 | 9. 结果与投影 | forwarder 返回类型化结果。`DnsController` 使用固定 generation 的投影快照提交该结果，随后入口 adapter 写应答。 |
 
-每个 generation 有两个互相独立的 2,048 上限：controller 查询的生命周期，以及活跃的 singleflight key。UDP 客户端 admission 和普通 UDP 初始化是分开的，启动时封顶为 `min(1536, MemTotal / 4 / 256 KiB)`。`DnsController` 持有这份进程级 UDP 预算，活跃和退役的 generation 共用；reload 不补发额度，permit 保留到应答完成。每查询 256 KiB 是容量估算，不是强制的 RSS 上限；共享的 2,048 查询上限也不是给 TCP 专用预留的。每个 flight 最多接受 256 个 follower。flight 饱和时直接拒绝，不会开启无限上游交换；controller 把这个过载渲染成 `REFUSED`。发布结果时，删除 flight 和向已加入的 follower 广播结果是原子完成的，之后的缓存未命中请求可以开新 flight。已完成的失败保留原始原因，但不进入缓存，所以已加入的 follower 不会各自重复那次失败的交换。leader 丢弃未发布的结果时会删除 flight 并唤醒 follower 重新竞争所有权；取消属于这种情况，缺少已验证的 response template、只被 compatibility mode 接受的成功结果也一样。
+每个 generation 有两个互相独立的 2,048 上限：controller 查询的生命周期，以及活跃的 singleflight key。UDP 客户端 admission 和普通 UDP 初始化是分开的，启动时封顶为 `min(1536, MemTotal / 4 / 256 KiB)`。`DnsController` 持有这份进程级 UDP 预算，活跃和退役的 generation 共用；reload 不补发额度，permit 保留到应答完成。每查询 256 KiB 是容量估算，不是强制的 RSS 上限；共享的 2,048 查询上限也不是给 TCP 专用预留的。后台 stale-while-revalidate 刷新最多占用 2,048 个活跃 singleflight key 中的 1,536 个，为前台解析预留 512 个槽位。每个 flight 最多接受 256 个 follower。flight 饱和时直接拒绝，不会开启无限上游交换；controller 把这个过载渲染成 `REFUSED`。发布结果时，删除 flight 和向已加入的 follower 广播结果是原子完成的，之后的缓存未命中请求可以开新 flight。已完成的失败保留原始原因，但不进入缓存，所以已加入的 follower 不会各自重复那次失败的交换。leader 丢弃未发布的结果时会删除 flight 并唤醒 follower 重新竞争所有权；取消属于这种情况，缺少已验证的 response template、只被 compatibility mode 接受的成功结果也一样。
 
 DNS 自己的 socket 用一份独立扣减的进程级描述符分区，活跃和退役的 generation 共用。额度跟着实际 socket、空闲 stream、endpoint poller 或 packet-adapter worker 走，保留到 teardown。Endpoint 的网络 bootstrap 会为并发的 A/AAAA 一次预留两个额度。Literal IP 和 pinned 地址绕过这个 admission；`/etc/hosts` 只有在没有先查询配置的 resolver 时才不需要网络额度。配置 resolver 的 admission 放在 hosts 回退之前，被拒就立即返回。
 
@@ -164,7 +164,7 @@ Bootstrap hook 通过别名或选中的 `subtag()` 规则接管原始域名。�
 | `ipv4only` | 只有 A 符合资格。AAAA 不执行上游 I/O，直接应答 NODATA。 |
 | `ipv6only` | 只有 AAAA 符合资格。A 不执行上游 I/O，直接应答 NODATA。 |
 
-偏好地址族的 sibling 查询只改第一个问题的 QTYPE。事务 ID、flags、QCLASS、EDNS 数据、入口 profile、逻辑客户端来源、原始目的地址，以及其余 wire profile 都不变。Sibling 普通失败或返回 NODATA，不会压制可用的非偏好响应；typed local packet refusal 则用原始原因结束调用方的解析。内部和应用主机名解析时，bootstrap fallback 只在所有符合资格的地址族都不可用时运行一次，之后用同一套地址族资格过滤 fallback 地址。
+偏好地址族的 sibling 查询只改第一个问题的 QTYPE。事务 ID、flags、QCLASS、EDNS 数据、入口 profile、逻辑客户端来源、原始目的地址，以及其余 wire profile 都不变。Sibling 普通失败或返回 NODATA，不会压制可用的非偏好响应；typed local packet refusal 则用原始原因结束调用方的解析。内部和应用主机名解析时，被策略 `reject` 的地址族按 fail-closed 处理并移出 fallback 资格：仅当没有地址族被策略拒绝（或按 QTYPE 仅拒绝单个地址族且另一符合资格的地址族查询失败）且剩余符合资格的地址族均不可用时，bootstrap fallback 才运行一次，并按该资格过滤 fallback 地址。
 
 这个策略也决定 bootstrap 解析出的上游拨号目标顺序。`both` 用 IPv4 优先的兼容顺序；偏好模式把对应地址族放前面，同时保留另一个地址族。stream 和 QUIC transport 会依次尝试候选地址。直连 UDP 保持现有的两次尝试上限：首个候选失败后，唯一的一次重试先换另一个地址族，再考虑同族其他地址，并缓存成功的 socket。
 
@@ -259,9 +259,9 @@ DNS client task owner 和捕获的 runtime owner 保留同一份 packet-adapter 
 
 直连 UDP 查询的 future 只为直连交换保留状态。经路由的 transport 交换，包括 `TC` fallback 和代理 UDP，以及 endpoint 地址解析，只在实际走到时才把状态装箱；否则每次缓存未命中都要为用不到的路径分配并复制几十 KB 状态。
 
-直连上游 socket 带 bypass mark，流量不会重新进入透明拦截。主机名 endpoint 通过 generation 捕获的 bootstrap resolver 解析；拨号从不依赖 honk 被拦截的 resolver 路径。
+直连上游 socket 带 bypass mark，流量不会重新进入透明拦截。主机名 endpoint 通过 generation 捕获的 bootstrap resolver 解析，并在 generation 持有的上游条目内将候选地址缓存 60 秒，带并发合并与 1 秒失败退避（不含 typed local packet refusal）；拨号从不依赖 honk 被拦截的 resolver 路径。
 
-拨号、TLS、QUIC、HTTP session 建立用 dial/handshake timeout，请求和响应交换用独立的 query timeout。一次查询尝试只有一个绝对的交换 deadline。每个 transport 失败后最多重试一次，需要时重置无效的可复用 session，所以总查询工作有界。Transport slot 对并发初始化做 singleflight，每个正在关闭的资源保留唯一的 teardown future。池关闭先停止 admission，等已通过 admission 的交换结束，再关闭空闲资源，并显式 join 每个 receive 或协议 driver task。
+拨号、TLS、QUIC、HTTP session 建立用 dial/handshake timeout，请求和响应交换用独立的 query timeout。每条查询共享一个绝对总 deadline（上游池为 `dial_timeout + 2 * query_timeout`，`asis` 为 `dial_timeout + query_timeout`），统一约束 bootstrap、候选地址重试、UDP `TC` fallback 与响应重新查询。在剩余预算允许时，每个 transport 失败后最多重试一次，并在单次可取消超时之外重置无效的可复用 session，使总查询工作严格有界。Transport slot 对并发初始化做 singleflight，每个正在关闭的资源保留唯一的 teardown future。池关闭先停止 admission，等已通过 admission 的交换结束，再关闭空闲资源，并显式 join 每个 receive 或协议 driver task。
 
 DoH 和 DoH3 在分配或读取响应体之前先判断 HTTP 状态。以下情况不会重置或重试
 session：2xx/5xx 之外的状态、长度不足 DNS 头的响应体，以及超过 DNS 大小上限的响
