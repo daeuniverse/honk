@@ -410,10 +410,6 @@ impl Tcb {
                         .sample(Duration::from_millis(u64::from(delta.max(1))));
                 }
             }
-            if self.write_blocked && self.can_write(pool) {
-                self.write_blocked = false;
-                self.ready |= Ready::WRITABLE;
-            }
         }
         let mss = self.send_mss();
         // Eifel (RFC 3522): an ACK echoing a timestamp older than the first retransmission

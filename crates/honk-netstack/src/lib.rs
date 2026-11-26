@@ -18,6 +18,7 @@
 //!
 //! Pass one ingress timestamp to every packet in a receive batch (at most 64 packets).
 //! Drain [`Stack::poll_transmit`] after the batch; each call emits one complete IP packet.
+//! Accounted shard owners can distinguish a short output frame with [`AccountedTransmit::BufferTooSmall`].
 //! A short output buffer preserves the pending packet. Arm [`Stack::poll_timeout`] and
 //! call [`Stack::handle_timeout`] when it expires; a stale lazy-heap entry can cause an
 //! early wakeup. Drain coalesced [`Ready`] events to wake application streams. After an

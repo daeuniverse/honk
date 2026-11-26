@@ -206,6 +206,11 @@ impl IcmpOut {
             }
         }
         .min(cap);
+        self.global_last = Some(now);
+        self.global = global;
+        if global < MSG {
+            return false;
+        }
         let interval = (l.target_interval.as_micros() as u64).max(1);
         let burst = interval.saturating_mul(u64::from(l.target_burst));
         let slot = self.targets.iter().position(|t| t.ip == target);
@@ -214,14 +219,11 @@ impl IcmpOut {
             let us = now.saturating_duration_since(t.last).as_micros() as u64;
             t.credit.saturating_add(us).min(burst)
         });
-        // The clocks advance even when the message is refused, so credit is never counted twice.
-        self.global_last = Some(now);
-        self.global = global;
         if let Some(i) = slot {
             self.targets[i].credit = credit;
             self.targets[i].last = now;
         }
-        if global < MSG || credit < interval {
+        if credit < interval {
             return false;
         }
         self.global = global - MSG;
@@ -767,6 +769,31 @@ mod tests {
             (40_000, 443, Some(0xDEAD_BEEF))
         );
     }
+    #[test]
+    fn global_refusals_leave_target_recency_and_credit_untouched() {
+        let now = Instant::now();
+        let mut icmp = IcmpOut::new(IcmpLimits {
+            per_sec: 1,
+            burst: 2,
+            max_targets: 2,
+            ..IcmpLimits::default()
+        });
+        let (a, b, c) = (v4(192, 0, 2, 1), v4(192, 0, 2, 2), v4(192, 0, 2, 3));
+        assert!(icmp.allow(now, a));
+        assert!(icmp.allow(now + Duration::from_millis(1), b));
+        let remaining = icmp.targets[0].credit;
+        for ms in 2..1000 {
+            assert!(!icmp.allow(now + Duration::from_millis(ms), a));
+        }
+        assert_eq!(
+            (icmp.targets[0].last, icmp.targets[0].credit),
+            (now, remaining)
+        );
+        assert!(icmp.allow(now + Duration::from_secs(1), c));
+        assert!(icmp.targets.iter().any(|t| t.ip == b));
+        assert!(!icmp.targets.iter().any(|t| t.ip == a));
+    }
+
     #[test]
     fn an_out_of_order_service_time_cannot_reissue_limiter_credit() {
         let now = Instant::now();

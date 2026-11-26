@@ -1,7 +1,7 @@
 //! A byte budget several stacks of one process draw from.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Growth may retain the old backing while allocating a doubled replacement.
 pub(crate) fn collection_peak<T>(len: usize) -> Option<usize> {
@@ -30,6 +30,7 @@ pub(crate) fn map_peak<K, V>(len: usize) -> Option<usize> {
 pub struct MemoryBudget {
     limit: usize,
     used: AtomicUsize,
+    release_epoch: AtomicU64,
     backing: Option<MemoryReservation>,
 }
 
@@ -85,6 +86,7 @@ impl MemoryBudget {
         Arc::new(MemoryBudget {
             limit: limit_bytes,
             used: AtomicUsize::new(0),
+            release_epoch: AtomicU64::new(0),
             backing: None,
         })
     }
@@ -96,6 +98,7 @@ impl MemoryBudget {
         Some(Arc::new(Self {
             limit,
             used: AtomicUsize::new(0),
+            release_epoch: AtomicU64::new(0),
             backing: Some(self.reserve(bytes)?),
         }))
     }
@@ -129,9 +132,17 @@ impl MemoryBudget {
             .is_ok()
     }
 
+    pub(crate) fn release_epoch(&self) -> u64 {
+        self.release_epoch.load(Ordering::Acquire)
+    }
+
     pub(crate) fn refund(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
         let before = self.used.fetch_sub(bytes, Ordering::Relaxed);
         debug_assert!(bytes <= before, "budget refunded more than it holds");
+        self.release_epoch.fetch_add(1, Ordering::Release);
     }
 }
 

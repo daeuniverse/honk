@@ -337,6 +337,8 @@ const CONTROL_LIMIT: usize = 128;
 pub enum AccountedTransmit {
     Packet(Transmit),
     NeedsIcmp,
+    /// Pending output needs a larger frame. No packet was consumed by the short write.
+    BufferTooSmall,
     Idle,
 }
 
@@ -373,10 +375,13 @@ pub struct Stack {
     /// Queue elements `purge_stale` has visited; lets tests assert teardown stays amortized O(1).
     #[cfg(test)]
     purge_visits: usize,
+    #[cfg(test)]
+    writer_visits: usize,
     events: VecDeque<FlowId>,
     ready: VecDeque<FlowId>,
     control_ready: Option<VecDeque<FlowId>>,
     writers: VecDeque<FlowId>,
+    seen_release_epochs: (u64, u64),
     timewait_ready: VecDeque<FlowId>,
     controls: VecDeque<Control>,
     pub(crate) tx_wakeup: bool,
@@ -429,10 +434,13 @@ impl Stack {
             timers: Timers::new(),
             #[cfg(test)]
             purge_visits: 0,
+            #[cfg(test)]
+            writer_visits: 0,
             events: VecDeque::new(),
             ready: VecDeque::new(),
             control_ready: None,
             writers: VecDeque::new(),
+            seen_release_epochs: (0, 0),
             timewait_ready: VecDeque::new(),
             controls: VecDeque::new(),
             tx_wakeup: false,
@@ -1114,7 +1122,9 @@ impl Stack {
     ) -> Option<Transmit> {
         match self.poll_transmit_filtered(now, out, caps, false, None) {
             AccountedTransmit::Packet(tx) => Some(tx),
-            AccountedTransmit::NeedsIcmp | AccountedTransmit::Idle => None,
+            AccountedTransmit::NeedsIcmp
+            | AccountedTransmit::BufferTooSmall
+            | AccountedTransmit::Idle => None,
         }
     }
 
@@ -1124,7 +1134,9 @@ impl Stack {
         self.prepare_control_queue();
         match self.poll_transmit_filtered(now, out, TxCaps::NONE, true, None) {
             AccountedTransmit::Packet(tx) => Some(tx),
-            AccountedTransmit::NeedsIcmp | AccountedTransmit::Idle => None,
+            AccountedTransmit::NeedsIcmp
+            | AccountedTransmit::BufferTooSmall
+            | AccountedTransmit::Idle => None,
         }
     }
 
@@ -1198,6 +1210,7 @@ impl Stack {
         } else {
             self.class
         };
+        let mut saw_too_small = false;
         for step in 0..if icmp_retry { 1 } else { 5 } {
             let class = (first_class + step) % 5;
             let needs_icmp = (class == 0
@@ -1244,11 +1257,25 @@ impl Stack {
                     tx.len = n;
                     return AccountedTransmit::Packet(tx);
                 }
-                Output::Blocked => return AccountedTransmit::Idle,
+                Output::Blocked => {
+                    saw_too_small = true;
+                    // The locked retry may touch only ICMP. Resume the unlocked walk past it.
+                    if icmp_retry {
+                        if control_only {
+                            self.control_class = (class + 1) % 5;
+                        } else {
+                            self.class = (class + 1) % 5;
+                        }
+                    }
+                }
                 Output::Deferred | Output::None => {}
             }
         }
-        AccountedTransmit::Idle
+        if saw_too_small {
+            AccountedTransmit::BufferTooSmall
+        } else {
+            AccountedTransmit::Idle
+        }
     }
 
     fn emit_control(
@@ -1371,6 +1398,7 @@ impl Stack {
         } else {
             self.ready.len()
         };
+        let mut saw_too_small = false;
         for _ in 0..ready {
             let id = if control_only {
                 self.control_ready.as_mut().unwrap().pop_front()
@@ -1427,26 +1455,26 @@ impl Stack {
                     }
                     return Output::Sent(n);
                 }
-                Output::Blocked | Output::Deferred if control_only => {
-                    slot.on_control = true;
-                    self.control_ready.as_mut().unwrap().push_back(id);
-                    self.sync_without_tx(id.idx, now);
-                }
-                Output::Blocked => {
-                    slot.on_tx = true;
-                    self.ready.push_front(id);
-                    return Output::Blocked;
-                }
-                Output::Deferred => {
+                Output::Blocked | Output::Deferred => {
+                    saw_too_small |= matches!(result, Output::Blocked);
                     slot.deficit = deficit;
-                    slot.on_tx = true;
-                    self.ready.push_back(id);
+                    if control_only {
+                        slot.on_control = true;
+                        self.control_ready.as_mut().unwrap().push_back(id);
+                    } else {
+                        slot.on_tx = true;
+                        self.ready.push_back(id);
+                    }
                     self.sync_without_tx(id.idx, now);
                 }
                 Output::None => self.sync_without_tx(id.idx, now),
             }
         }
-        Output::None
+        if saw_too_small {
+            Output::Blocked
+        } else {
+            Output::None
+        }
     }
 
     pub fn poll_timeout(&self) -> Option<Instant> {
@@ -1582,12 +1610,8 @@ impl Stack {
             return Err(StreamError::Stale);
         };
         let result = t.write(&mut self.pool, data);
-        if result == Err(StreamError::WouldBlock)
-            && !t.write_wait_queued
-            && t.tx.tail_room(&self.pool) == 0
-        {
-            t.write_wait_queued = true;
-            self.writers.push_back(id);
+        if result == Err(StreamError::WouldBlock) {
+            self.sync_without_tx(id.idx, self.now);
         }
         if result.as_ref().is_ok_and(|&n| n != 0) {
             self.tx_wakeup = true;
@@ -1845,6 +1869,17 @@ impl Stack {
                 }
             }
             if !remove && compact.is_none() {
+                if t.write_blocked
+                    && let Some(threshold) = t.write_threshold(&self.pool)
+                {
+                    if t.tx.can_append(&self.pool, threshold) {
+                        t.write_blocked = false;
+                        t.ready |= Ready::WRITABLE;
+                    } else if !t.write_wait_queued {
+                        t.write_wait_queued = true;
+                        self.writers.push_back(id);
+                    }
+                }
                 let ready = std::mem::take(&mut t.ready);
                 if t.app_open && !ready.is_empty() {
                     slot.ready |= ready;
@@ -1890,15 +1925,28 @@ impl Stack {
             self.purge_stale();
         }
         self.timers.mark(&mut self.table, index);
-        self.wake_writers();
     }
 
     fn wake_writers(&mut self) {
-        let count = self.writers.len();
-        for _ in 0..count {
+        if self.writers.is_empty() {
+            return;
+        }
+        let epochs = self.pool.release_epochs();
+        if epochs == self.seen_release_epochs || self.pool.shared_free() == 0 {
+            return;
+        }
+        self.seen_release_epochs = epochs;
+        for _ in 0..self.writers.len() {
+            if self.pool.shared_free() == 0 {
+                break;
+            }
             let Some(id) = self.writers.pop_front() else {
                 break;
             };
+            #[cfg(test)]
+            {
+                self.writer_visits += 1;
+            }
             let slot = &mut self.table.slots[id.idx as usize];
             if slot.generation != id.generation {
                 continue;
@@ -1906,9 +1954,10 @@ impl Stack {
             let Some(Flow::Tcp(t)) = slot.flow.as_mut() else {
                 continue;
             };
-            if !t.write_blocked || !t.app_open {
+            let threshold = t.write_threshold(&self.pool);
+            if !t.write_blocked || threshold.is_none() {
                 t.write_wait_queued = false;
-            } else if t.can_write(&self.pool) {
+            } else if threshold.is_some_and(|bytes| t.tx.can_append(&self.pool, bytes)) {
                 t.write_wait_queued = false;
                 t.write_blocked = false;
                 slot.ready |= Ready::WRITABLE;
@@ -2189,6 +2238,7 @@ mod tests {
     mod accounted;
     mod fragments;
     mod retention;
+    mod writers;
 
     #[test]
     fn abandoned_opens_do_not_accumulate_stale_ready_nodes() {

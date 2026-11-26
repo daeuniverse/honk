@@ -93,6 +93,7 @@ pub struct Pool {
     free: Vec<Chunk>,
     shared_limit: usize,
     shared_used: usize,
+    local_release_epoch: u64,
     live: usize,
     metadata: usize,
     total_limit: usize,
@@ -116,6 +117,7 @@ impl Pool {
             free: Vec::new(),
             shared_limit: shared_limit_bytes,
             shared_used: 0,
+            local_release_epoch: 0,
             live: 0,
             metadata: 0,
             total_limit,
@@ -200,7 +202,16 @@ impl Pool {
             debug_assert!(bytes <= self.held);
             b.refund(bytes);
             self.held -= bytes;
+        } else if bytes != 0 {
+            self.local_release_epoch = self.local_release_epoch.wrapping_add(1);
         }
+    }
+
+    pub fn release_epochs(&self) -> (u64, u64) {
+        (
+            self.budget.as_ref().map_or(0, |b| b.release_epoch()),
+            self.local_release_epoch,
+        )
     }
 
     pub fn reserve(&mut self, chunks: usize) -> bool {

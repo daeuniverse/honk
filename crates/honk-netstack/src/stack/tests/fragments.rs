@@ -250,7 +250,7 @@ fn fragment_timeout_output_receipt_keeps_exact_quote_and_resets_on_next_poll() {
         ));
         assert!(matches!(
             owner.poll_transmit_accounted(service, &mut [], true, Some(&mut icmp)),
-            AccountedTransmit::Idle
+            AccountedTransmit::BufferTooSmall
         ));
         assert_eq!(owner.take_fragment_output(), None);
         assert!(owner.retains_fragment(fresh));

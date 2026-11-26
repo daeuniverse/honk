@@ -53,7 +53,7 @@ flowchart LR
 
 仅控制拉取使用独立、惰性分配的 ready 队列和类别游标，不能轮转普通 readiness 或消耗其 DRR credit。适配器还须提供普通拉取，才能推进载荷。显式 core packet runtime 轮换优先输出类别，每次拉取前先预留该类别的 frame 和 descriptor。从不使用仅控制拉取的调用方（包括 WireGuard）不会分配该队列。
 
-RACK 记账扩容无法获得预算时，只延后该流：保留待重传义务和原有 DRR credit，其他已有预算的 TCP 流及排队 UDP 分片仍可发送。输出 buffer 太小仍是独立的 blocked-output 结果。
+RACK 记账扩容无法获得预算时，只延后该流：保留待重传义务和原有 DRR credit，其他已有预算的 TCP 流及排队 UDP 分片仍可发送。输出 buffer 太小仍是独立的 blocked-output 结果。已计费的分片 owner 会尝试能放进当前帧的其他输出，再报告 `BufferTooSmall`。ICMP 重试遇到短帧时保留原始引用包及共享限速额度。被全局限速拒绝的错误不会刷新目标的最近使用时间。
 
 ### 定时器
 

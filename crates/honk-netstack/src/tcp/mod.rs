@@ -396,16 +396,15 @@ impl Tcb {
             .min(self.snd_max)
     }
 
-    pub fn can_write(&self, pool: &Pool) -> bool {
-        let chunk = pool.chunk();
-        let limit = self.send_limit(chunk);
-        let threshold = chunk.min(limit / 2);
-        self.app_open
+    pub fn write_threshold(&self, pool: &Pool) -> Option<usize> {
+        let limit = self.send_limit(pool.chunk());
+        let threshold = pool.chunk().min(limit / 2);
+        (self.app_open
             && self.error.is_none()
             && !self.fin_requested
             && matches!(self.state, TcpState::Established | TcpState::CloseWait)
-            && limit.saturating_sub(self.tx.len()) >= threshold
-            && self.tx.can_append(pool, threshold)
+            && limit.saturating_sub(self.tx.len()) >= threshold)
+            .then_some(threshold)
     }
 
     pub fn read(

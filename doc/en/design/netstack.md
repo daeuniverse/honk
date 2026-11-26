@@ -53,7 +53,7 @@ A flow's reply obligations are bits (`DATA`, `OOO`, `WINDOW_UPDATE`, `PROBE_RESP
 
 Control-only pulls use a separate, lazily allocated ready queue and class cursor; they cannot rotate ordinary readiness or consume its DRR credit. An adapter must also offer ordinary pulls for payload progress. The explicit core packet runtime alternates the first output class while reserving each class's frame and descriptor before pulling. Callers that never use control-only pulls, including WireGuard, allocate no control-only queue.
 
-An unfunded RACK bookkeeping expansion defers only that flow: pending retransmission and its existing DRR credit survive, while other funded TCP flows and queued UDP fragments remain eligible. A too-small output buffer remains a distinct blocked-output result.
+An unfunded RACK bookkeeping expansion defers only that flow: pending retransmission and its existing DRR credit survive, while other funded TCP flows and queued UDP fragments remain eligible. A too-small output buffer remains a distinct blocked-output result. Accounted shard pulls report `BufferTooSmall` after trying other eligible output with the supplied frame. A short ICMP retry keeps the original quote and leaves the shared limiter untouched. Globally rate-limited errors do not refresh per-target recency.
 
 ### Timers
 

@@ -727,6 +727,45 @@ fn assert_output_window(scope: &PacketScope, control: usize, bulk: usize) {
 }
 
 #[tokio::test]
+async fn short_shard_frame_returns_its_lease_and_preserves_the_control_packet() {
+    let now = Instant::now();
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, mut owners) = capture_realm(1280, 1, 16, 1, 1, &budget).unwrap();
+    let scope = realm.owner(0).unwrap();
+    let owner = owners.pop().unwrap();
+    let mut driver = owner.hand_off();
+    let client = "192.0.2.1:41000".parse().unwrap();
+    let full_size = {
+        let mut inner = scope.0.inner.lock();
+        inner
+            .stack
+            .as_mut()
+            .unwrap()
+            .receive(now, &segment(client, 1, 700, tcp::ACK, &[]));
+        // Inject a short device frame after the descriptor has become available.
+        std::mem::replace(&mut inner.frame_size, 39)
+    };
+    let mut frame = vec![0; full_size];
+    let error = driver
+        .materialize_into(now, TxClass::Control, &mut frame)
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    {
+        let mut inner = scope.0.inner.lock();
+        inner.frame_size = full_size;
+        assert_eq!(inner.ledger.outstanding_tx().count(), 0);
+        assert_eq!(inner.queued, 0);
+    }
+    let output = materialized(&mut driver, now, TxClass::Control, &mut frame);
+    assert_eq!(decode_packet(&frame[..output.len()]).0.flags, tcp::RST);
+    drop(output);
+    scope.shutdown(true);
+    drop(driver);
+    owner.shutdown().await;
+}
+
+#[tokio::test]
 async fn sharded_output_window_funds_both_owners_and_refunds_the_overlap() {
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
     let (realm, owners) = capture_realm(1500, 1, 256, 2, 1, &budget).unwrap();

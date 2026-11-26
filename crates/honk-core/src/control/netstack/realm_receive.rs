@@ -646,34 +646,52 @@ impl Inner {
         class: TxClass,
         output: &mut [u8],
         caps: TxCaps,
-    ) -> Option<(Transmit, Option<honk_netstack::FragmentInfo>)> {
+    ) -> Result<Option<(Transmit, Option<honk_netstack::FragmentInfo>)>, io::ErrorKind> {
+        use honk_netstack::AccountedTransmit;
         let Some(resources) = resources else {
-            return match class {
+            return Ok(match class {
                 TxClass::Control => stack.poll_control_transmit(now, output),
                 TxClass::Bulk => stack.poll_transmit_with(now, output, caps),
             }
-            .map(|tx| (tx, None));
+            .map(|tx| (tx, None)));
         };
         let control = class == TxClass::Control;
+        let mut short = false;
         for _ in 0..3 {
             match stack.poll_transmit_accounted(now, output, control, None) {
-                honk_netstack::AccountedTransmit::Packet(tx) => {
-                    return Some((tx, stack.take_fragment_output()));
+                AccountedTransmit::Packet(tx) => {
+                    return Ok(Some((tx, stack.take_fragment_output())));
                 }
-                honk_netstack::AccountedTransmit::Idle => return None,
-                honk_netstack::AccountedTransmit::NeedsIcmp => {
+                AccountedTransmit::Idle => break,
+                AccountedTransmit::BufferTooSmall => {
+                    short = true;
+                    break;
+                }
+                AccountedTransmit::NeedsIcmp => {
                     let mut state = resources.icmp.lock();
                     let service_at = Instant::now().max(state.1);
                     state.1 = service_at;
-                    if let honk_netstack::AccountedTransmit::Packet(tx) = stack
-                        .poll_transmit_accounted(service_at, output, control, Some(&mut state.0))
-                    {
-                        return Some((tx, stack.take_fragment_output()));
+                    match stack.poll_transmit_accounted(
+                        service_at,
+                        output,
+                        control,
+                        Some(&mut state.0),
+                    ) {
+                        AccountedTransmit::Packet(tx) => {
+                            return Ok(Some((tx, stack.take_fragment_output())));
+                        }
+                        AccountedTransmit::BufferTooSmall => short = true,
+                        AccountedTransmit::Idle => {}
+                        AccountedTransmit::NeedsIcmp => unreachable!("ICMP limiter supplied"),
                     }
                 }
             }
         }
-        None
+        if short {
+            Err(io::ErrorKind::InvalidInput)
+        } else {
+            Ok(None)
+        }
     }
 }
 

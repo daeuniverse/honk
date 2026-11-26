@@ -105,13 +105,21 @@ impl Rack {
         else {
             return false;
         };
-        let Some(reservation) = budget.reserve(bytes) else {
+        let old_bytes = q
+            .reservation
+            .as_ref()
+            .map_or(0, crate::MemoryReservation::bytes);
+        let Some(reservation) = budget.reserve(bytes.saturating_sub(old_bytes)) else {
             return false;
         };
         let len = q.len();
         q.reserve_exact(capacity - len);
         assert!(q.capacity() <= capacity, "unfunded RACK FIFO capacity");
-        q.reservation = Some(reservation);
+        if let Some(held) = &mut q.reservation {
+            held.absorb(reservation);
+        } else {
+            q.reservation = Some(reservation);
+        }
         true
     }
 
@@ -493,6 +501,31 @@ mod tests {
             TlpOutcome::Done,
             "new-data probe is never a loss"
         );
+    }
+
+    #[test]
+    fn second_fifo_growth_needs_only_its_incremental_credit() {
+        let unit = FIFO_FLOOR * std::mem::size_of::<Retransmit>() * 3;
+        let budget = crate::MemoryBudget::new(3 * unit);
+        let pool = super::super::ring::Pool::with_limits(0, 0)
+            .with_budget(Some(budget.clone()))
+            .with_index_accounting();
+        let mut rack = Rack::new(0);
+        let now = Instant::now();
+        assert!(rack.ensure_room(&pool, 2 * FIFO_FLOOR));
+        for i in 0..2 * FIFO_FLOOR {
+            rack.on_retransmit(i as u32, now);
+        }
+        let held = budget.reserve(1).unwrap();
+        assert!(!rack.ensure_room(&pool, 1));
+        assert_eq!(rack.pending_retransmits(), 2 * FIFO_FLOOR);
+        assert_eq!(budget.used(), unit + 1);
+        drop(held);
+        assert!(rack.ensure_room(&pool, 1));
+        assert_eq!(budget.used(), 3 * unit);
+        rack.on_retransmit((2 * FIFO_FLOOR) as u32, now);
+        rack.trim((2 * FIFO_FLOOR) as u32);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]

@@ -1565,7 +1565,7 @@ impl Inner {
             .expect("free frame owns storage");
         let tx =
             Self::transmit_accounted(stack, &self.resources, now, class, out, self.cpu_tx_caps);
-        if let Some((tx, fragment)) = tx {
+        if let Ok(Some((tx, fragment))) = tx {
             self.publish(lease, tx, class, fragment);
             true
         } else {
@@ -2052,7 +2052,7 @@ impl PacketDriver {
             TxCaps::NONE,
         );
         state.drain_half_open();
-        let Some((tx, fragment)) = tx else {
+        let Some((tx, fragment)) = tx? else {
             // The CPU prefix and this protocol class were both checked under this lock.
             // Only advance() can service a newly pending close.
             if reservation.inner.pending_closes == 0

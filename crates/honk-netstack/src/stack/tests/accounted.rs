@@ -315,6 +315,49 @@ fn realm_udp_pending_bytes_charge_both_budgets_and_rollback_together() {
 }
 
 #[test]
+fn short_fragment_yields_to_a_smaller_control_and_retries_the_original() {
+    let now = Instant::now();
+    let ([mut s, _], _, _) = shards(now, 4);
+    let tuple = FourTuple {
+        local: "198.51.100.1:443".parse().unwrap(),
+        remote: "192.0.2.1:5000".parse().unwrap(),
+    };
+    let mut full = [0; 2000];
+    let first = s
+        .udp_send_from(tuple.local, tuple.remote, &[5; 3000], &mut full)
+        .unwrap();
+    let next_offset = wire::frag::parse(&full[..first]).unwrap().data.len();
+    s.class = 3;
+    s.queue_control(Control {
+        tuple,
+        seq: 7,
+        ack: 0,
+        flags: wire::tcp::RST,
+        icmp: None,
+        flow: None,
+        source: None,
+    });
+    let mut small = [0; 40];
+    let AccountedTransmit::Packet(tx) = s.poll_transmit_accounted(now, &mut small, false, None)
+    else {
+        panic!("fitting reset starved behind UDP")
+    };
+    assert_eq!(tx.len, 40);
+    assert_eq!(wire::parse_ip(&small).unwrap().proto, wire::PROTO_TCP);
+    assert!(matches!(
+        s.poll_transmit_accounted(now, &mut small, false, None),
+        AccountedTransmit::BufferTooSmall
+    ));
+    assert!(s.poll_transmit(now, &mut small).is_none());
+    let n = s.poll_transmit(now, &mut full).unwrap();
+    assert!(n > small.len());
+    let fragment = wire::frag::parse(&full[..n]).unwrap();
+    assert_eq!(fragment.proto, wire::PROTO_UDP);
+    assert_eq!(fragment.offset, next_offset);
+    assert!(fragment.data.iter().all(|&byte| byte == 5));
+}
+
+#[test]
 fn realm_control_capacity_and_icmp_target_burst_are_not_duplicated() {
     let now = Instant::now();
     let (mut stacks, budget, _) = shards(now, 4);
@@ -350,7 +393,7 @@ fn realm_control_capacity_and_icmp_target_burst_are_not_duplicated() {
         }
         assert!(matches!(
             stack.poll_transmit_accounted(now, &mut [], true, Some(&mut icmp)),
-            AccountedTransmit::Idle
+            AccountedTransmit::BufferTooSmall
         ));
         assert!(matches!(
             stack.poll_transmit_accounted(now, &mut out, true, None),

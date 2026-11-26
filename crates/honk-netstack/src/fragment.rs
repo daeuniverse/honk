@@ -262,6 +262,19 @@ impl Live {
             + self.ranges.capacity() * std::mem::size_of::<(usize, usize)>()
     }
 
+    fn holes_after_insert(
+        &self,
+        count: usize,
+        start: usize,
+        end: usize,
+        total: Option<usize>,
+    ) -> usize {
+        let leading = start != 0 && self.ranges.first().is_none_or(|r| r.0 != 0);
+        let tail = self.ranges.last().map_or(end, |r| r.1.max(end));
+        usize::from(leading) + count - 1 + usize::from(total != Some(tail))
+    }
+
+    #[cfg(any(test, feature = "fuzz-checks"))]
     fn holes(&self) -> usize {
         let mut holes = usize::from(self.ranges.first().is_some_and(|r| r.0 != 0));
         holes += self.ranges.len().saturating_sub(1);
@@ -312,7 +325,7 @@ impl Reassembler {
     }
 
     pub(crate) fn scratch_bound(limits: FragmentLimits) -> Option<usize> {
-        // A dry-run range insertion can double the cloned range backing before validation.
+        // Retain scratch for overlapping old and new range and packet allocations.
         crate::budget::collection_peak::<(usize, usize)>(limits.max_holes.checked_add(2)?)?
             .checked_add(
                 usize::from(u16::MAX)
@@ -599,22 +612,11 @@ impl Reassembler {
             self.kill(idx);
             return Err(());
         }
-        // Dry-run the hole count: the new range may close or open gaps.
-        let mut ranges = live.ranges.clone();
-        let mut total = live.total;
-        insert_range(&mut ranges, at, f.offset, end);
-        if !f.more {
-            total = Some(end);
-        }
-        let holes = Live {
-            data: Vec::new(),
-            ranges,
-            total,
-            head: Vec::new(),
-            max_fragment_size: 0,
-            ecn,
-        };
-        if holes.holes() > self.limits.max_holes {
+        let total = if f.more { live.total } else { Some(end) };
+        let join_left = at > 0 && live.ranges[at - 1].1 == f.offset;
+        let join_right = live.ranges.get(at).is_some_and(|r| r.0 == end);
+        let count = live.ranges.len() + 1 - usize::from(join_left) - usize::from(join_right);
+        if live.holes_after_insert(count, f.offset, end, total) > self.limits.max_holes {
             self.stats.invalid += 1;
             self.kill(idx);
             return Err(());
@@ -624,15 +626,22 @@ impl Reassembler {
         } else {
             live.head.capacity()
         };
-        let charge = ENTRY_OVERHEAD
-            + live.data.capacity().max(end)
-            + head
-            + holes.ranges.capacity() * std::mem::size_of::<(usize, usize)>();
+        let range_capacity = live.ranges.capacity().max(count);
+        let metadata = ENTRY_OVERHEAD + head + range_capacity * size_of::<(usize, usize)>();
+        let ceiling = total.unwrap_or(usize::from(u16::MAX));
+        let exact = live.data.capacity().min(ceiling).max(end);
+        let mut capacity = if end > live.data.capacity() {
+            end.max(4096).next_power_of_two().min(ceiling)
+        } else {
+            exact
+        };
         let old_charge = self.entries[idx].charged;
-        let growth = charge.saturating_sub(old_charge);
         let mut idx = idx;
-        // `grow` charges the shared budget too: a refusal evicts like the local limit does.
-        while !self.grow(growth) {
+        while !self.grow((metadata + capacity).saturating_sub(old_charge)) {
+            if capacity > exact {
+                capacity = exact;
+                continue;
+            }
             let key = self.entries[idx].key;
             if self.entries.len() == 1 {
                 self.stats.invalid += 1;
@@ -646,21 +655,30 @@ impl Reassembler {
                 .position(|e| e.key == key)
                 .expect("kept");
         }
+        let charge = metadata + capacity;
         let entry = &mut self.entries[idx];
         let live = entry.live.as_mut().expect("live entry");
-        if live.data.len() < end {
-            // Reassembly is charged by buffered extent: do not let Vec's geometric growth
-            // retain a second uncharged extent between the received fragments.
-            live.data.reserve_exact(end - live.data.len());
-            live.data.resize(end, 0);
-            if live.data.capacity() != end {
-                // `reserve_exact` permits allocator slack. A boxed slice has exactly the
-                // funded extent; normal global allocators never need this conversion.
-                live.data = std::mem::take(&mut live.data).into_boxed_slice().into_vec();
-            }
+        if capacity > live.data.capacity() {
+            live.data.reserve_exact(capacity - live.data.len());
+        }
+        live.data.resize(live.data.len().max(end), 0);
+        if live.data.capacity() > capacity {
+            // The final extent can retire geometric slack before the completion is funded.
+            let len = live.data.len();
+            live.data.resize(capacity, 0);
+            live.data = std::mem::take(&mut live.data).into_boxed_slice().into_vec();
+            live.data.truncate(len);
         }
         live.data[f.offset..end].copy_from_slice(f.data);
-        live.ranges = holes.ranges;
+        if count > live.ranges.capacity() {
+            live.ranges.reserve_exact(count - live.ranges.len());
+        }
+        insert_range(&mut live.ranges, at, f.offset, end, join_left, join_right);
+        if live.ranges.capacity() > range_capacity {
+            live.ranges = std::mem::take(&mut live.ranges)
+                .into_boxed_slice()
+                .into_vec();
+        }
         live.total = total;
         live.max_fragment_size = live.max_fragment_size.max(f.head.len() + f.data.len());
         live.ecn = ecn;
@@ -988,9 +1006,14 @@ impl Reassembler {
 }
 
 /// Inserts `[start, end)` at position `at`, merging touching neighbours.
-fn insert_range(ranges: &mut Vec<(usize, usize)>, at: usize, start: usize, end: usize) {
-    let join_prev = at > 0 && ranges[at - 1].1 == start;
-    let join_next = ranges.get(at).is_some_and(|r| r.0 == end);
+fn insert_range(
+    ranges: &mut Vec<(usize, usize)>,
+    at: usize,
+    start: usize,
+    end: usize,
+    join_prev: bool,
+    join_next: bool,
+) {
     match (join_prev, join_next) {
         (true, true) => {
             ranges[at - 1].1 = ranges[at].1;
@@ -1295,16 +1318,8 @@ mod tests {
         pending(push(&mut r, t, &f[0]));
         pending(push(&mut r, t, &f[2]));
         let live = r.entries[0].live.as_ref().unwrap();
-        assert_eq!(
-            live.data.capacity(),
-            live.data.len(),
-            "no uncharged geometric capacity"
-        );
-        assert_eq!(
-            budget.used(),
-            ENTRY_OVERHEAD + 3000 + 20 + std::mem::size_of::<(usize, usize)>(),
-            "the coalesced range also holds memory"
-        );
+        assert!(live.data.capacity() >= live.data.len());
+        assert_eq!(budget.used(), live.charge());
         complete(push(&mut r, t, &f[3]));
         assert_eq!(held(&r, 0), 0);
         // A killed datagram keeps only its tombstone, which expiry then refunds.
@@ -1356,6 +1371,64 @@ mod tests {
             r.assert_idle();
             assert_eq!(budget.used(), 0, "no charge for a refused entry");
         }
+    }
+
+    #[test]
+    fn sequential_fragments_bound_growth_and_copy_extent() {
+        let now = Instant::now();
+        let (src, dst) = families()[0];
+        let bytes = datagram(src, dst, 65_507, 9);
+        let parts = split(&bytes, 41, 512);
+        let budget = MemoryBudget::new(140_000);
+        let mut r = Reassembler::default().with_budget(Some(budget.clone()));
+        let (mut capacity, mut extent, mut growths, mut copy_bound) = (0, 0, 0, 0);
+        for packet in &parts[..parts.len() - 1] {
+            pending(push(&mut r, now, packet));
+            let live = r.entries[0].live.as_ref().unwrap();
+            if live.data.capacity() != capacity {
+                growths += 1;
+                copy_bound += extent;
+                capacity = live.data.capacity();
+            }
+            extent = live.data.len();
+            assert_eq!(budget.used(), live.charge());
+        }
+        assert!(
+            growths <= 5 && copy_bound <= 65_536,
+            "{growths} growths, {copy_bound} bytes"
+        );
+        let actual = complete(push(&mut r, now, parts.last().unwrap()));
+        // IPv4 identification changes during fragmentation.
+        assert_eq!(&actual[20..], &bytes[20..]);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn exact_fragment_growth_preserves_other_datagrams_and_funds_completion() {
+        let now = Instant::now();
+        let (src, dst) = families()[0];
+        let bytes = datagram(src, dst, 2000, 7);
+        let first = split(&bytes, 1, 1000);
+        let second = split(&bytes, 2, 1000);
+        let budget = MemoryBudget::new(6200);
+        let mut r = Reassembler::default().with_budget(Some(budget.clone()));
+        pending(push(&mut r, now, &first[0]));
+        let live = r.entries[0].live.as_ref().unwrap();
+        assert!(live.data.capacity() > live.data.len());
+        pending(push(&mut r, now, &second[0]));
+        let live = r.entries[1].live.as_ref().unwrap();
+        assert_eq!(live.data.capacity(), live.data.len());
+        assert_eq!(r.stats.evicted, 0);
+        r.expire(now + Duration::from_secs(31));
+        drop(r);
+        assert_eq!(budget.used(), 0);
+        let budget = MemoryBudget::new(4500);
+        let mut r = Reassembler::default().with_budget(Some(budget.clone()));
+        pending(push(&mut r, now, &first[0]));
+        pending(push(&mut r, now, &first[1]));
+        let actual = complete(push(&mut r, now, &first[2]));
+        assert_eq!(&actual[20..], &bytes[20..]);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
