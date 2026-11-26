@@ -215,6 +215,16 @@ impl TlsConnector {
         self.ech_discovery && ech_discovery_name(domain).is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn context_ptr(&self) -> usize {
+        self.connector.context().as_ptr() as usize
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_chrome(&self) -> bool {
+        self.chrome
+    }
+
     /// TLS client handshake over `stream`, verifying the peer against
     /// `domain` (unless the node skips verification).
     pub async fn connect<S>(&self, domain: &str, stream: S) -> anyhow::Result<TlsStream<S>>
@@ -439,9 +449,33 @@ struct EchCacheEntry {
     expires: std::time::Instant,
 }
 
+const MAX_ECH_CACHE_ENTRIES: usize = 256;
+
 static ECH_DISCOVERY_CACHE: LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, EchCacheEntry>>,
-> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    parking_lot::Mutex<std::collections::HashMap<String, EchCacheEntry>>,
+> = LazyLock::new(Default::default);
+
+fn insert_ech_cache_entry(
+    cache: &mut std::collections::HashMap<String, EchCacheEntry>,
+    key: String,
+    entry: EchCacheEntry,
+    now: std::time::Instant,
+) {
+    if !cache.contains_key(&key) && cache.len() >= MAX_ECH_CACHE_ENTRIES {
+        cache.retain(|_, existing| existing.expires > now);
+        while cache.len() >= MAX_ECH_CACHE_ENTRIES {
+            let Some(evict) = cache
+                .iter()
+                .min_by(|(k1, e1), (k2, e2)| e1.expires.cmp(&e2.expires).then_with(|| k1.cmp(k2)))
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            cache.remove(&evict);
+        }
+    }
+    cache.insert(key, entry);
+}
 
 /// Discover a domain's ECHConfigList via DNS HTTPS records (RFC 9460),
 /// cached per domain (positive: record TTL clamped to 60s..1d; negative:
@@ -449,7 +483,7 @@ static ECH_DISCOVERY_CACHE: LazyLock<
 /// explicit `ech_config` which is fail-closed.
 pub async fn discover_ech_config(domain: &str) -> Option<Vec<u8>> {
     let key = ech_discovery_name(domain)?.to_ascii_lowercase();
-    if let Some(hit) = ECH_DISCOVERY_CACHE.lock().unwrap().get(&key)
+    if let Some(hit) = ECH_DISCOVERY_CACHE.lock().get(&key)
         && hit.expires > std::time::Instant::now()
     {
         return hit.config.clone();
@@ -466,12 +500,15 @@ pub async fn discover_ech_config(domain: &str) -> Option<Vec<u8>> {
     if config.is_some() {
         tracing::debug!(domain = %key, "discovered ECH config via DNS HTTPS RR");
     }
-    ECH_DISCOVERY_CACHE.lock().unwrap().insert(
+    let now = std::time::Instant::now();
+    insert_ech_cache_entry(
+        &mut ECH_DISCOVERY_CACHE.lock(),
         key,
         EchCacheEntry {
             config: config.clone(),
-            expires: std::time::Instant::now() + std::time::Duration::from_secs(ttl as u64),
+            expires: now + std::time::Duration::from_secs(ttl as u64),
         },
+        now,
     );
     config
 }
@@ -670,13 +707,25 @@ pub fn build_dns_connector(
     alpn_wire: &[u8],
 ) -> anyhow::Result<TlsConnector> {
     let chrome = chrome_mode();
-    let mut builder = base_builder(skip_cert_verify)?;
-    if chrome {
-        apply_chrome_ctx(&mut builder)?;
-    }
-    builder.set_alpn_protos(alpn_wire)?;
+    let key = ConnectorKey {
+        reality: false,
+        skip_verify: skip_cert_verify,
+        pin: None,
+        alpn: (!alpn_wire.is_empty()).then(|| alpn_wire.to_vec()),
+        chrome,
+    };
+    let connector = shared_connector(key, || {
+        let mut builder = base_builder(skip_cert_verify)?;
+        if chrome {
+            apply_chrome_ctx(&mut builder)?;
+        }
+        if !alpn_wire.is_empty() {
+            builder.set_alpn_protos(alpn_wire)?;
+        }
+        Ok(builder.build())
+    })?;
     Ok(TlsConnector {
-        connector: builder.build(),
+        connector,
         chrome,
         alps: chrome && alpn_wire.windows(3).any(|proto| proto == b"\x02h2"),
         ech_config_list: None,

@@ -1474,7 +1474,7 @@ jobs:
     needs: [changes]
     if: ${{ !cancelled() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.full) || (github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.full == 'true'))) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Read Rust toolchains
@@ -1486,7 +1486,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ steps.toolchain.outputs.stable }}
-          target: x86_64-unknown-linux-musl
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ steps.toolchain.outputs.ebpf }}
@@ -1505,7 +1504,7 @@ jobs:
           set -euo pipefail
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
           sudo apt-get -o Acquire::Retries=5 update
-          sudo apt-get -o Acquire::Retries=5 install -y cmake libclang-dev clang llvm zstd
+          sudo apt-get -o Acquire::Retries=5 install -y zstd
       - name: Read bpf-linker cache key
         id: linker-pin
         run: |
@@ -1539,24 +1538,17 @@ jobs:
           readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
           # build.rs requires the compiler identity as well as source freshness.
           printf '%s' "$EBPF_TOOLCHAIN" > target/bpfel-unknown-none/release/honk-ebpf.toolchain
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.14.1
-      - name: Build core and toolbox through the release wrappers
+      - name: Build core and toolbox in Alpine 3.24
         run: |
           set -euo pipefail
-          export ZIGCC_TARGET=x86_64-linux-musl
-          export CC_x86_64_unknown_linux_musl="$PWD/ci/zigcc"
-          export CXX_x86_64_unknown_linux_musl="$PWD/ci/zigcxx"
-          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$PWD/ci/zigcc"
-          # Zig supplies the CRT; Rust's self-contained CRT would duplicate _start.
-          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS='-C link-self-contained=no'
-          export BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env "$ZIGCC_TARGET")"
-          cargo build --release -p honk-core --no-default-features --features clash-api,ebpf,rprx,jemalloc --target x86_64-unknown-linux-musl
-          cargo build --release -p honk-tool --target x86_64-unknown-linux-musl
-      - name: Start the musl toolbox
+          ci/build-musl.sh honk-core --no-default-features --features clash-api,ebpf,rprx,jemalloc
+          ci/build-musl.sh honk-tool
+      - name: Start the musl binaries
         working-directory: target/x86_64-unknown-linux-musl/release
-        run: ./honk-tool --version
+        run: |
+          set -euo pipefail
+          ./honk-core --version
+          ./honk-tool --version
       - name: Write musl CI report
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0

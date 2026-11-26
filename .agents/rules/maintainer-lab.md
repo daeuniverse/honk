@@ -5,7 +5,7 @@ Read with: `AGENTS.md` (Technology stack: the patched boring-sys) and `doc/en/de
 The maintainer's own interop setup, kept for reference; contributions need none of it.
 
 Install boring-sys prerequisites (`AGENTS.md`, Technology stack) and its REALITY-hooks checkout
-at pinned `/root/code/boring-rprx/boring-sys`. Cross-build with `ci/zig*`, not containers.
+at pinned `/root/code/boring-rprx/boring-sys`. Build static musl binaries with `just build-musl` (`ci/build-musl.sh`).
 
 REALITY / xtls-rprx-vision interop uses two live servers, not the unprivileged suite:
 - LAN lab host: sing-box 1.12, systemd `sing-box-rprx`, `/etc/sing-box/rprx.json`.

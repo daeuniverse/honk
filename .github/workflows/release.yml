@@ -85,9 +85,69 @@ jobs:
           sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
       - run: cargo test --workspace --no-fail-fast
 
+  build-ebpf:
+    name: build eBPF object
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read eBPF Rust toolchain
+        id: toolchain
+        run: echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - name: Install Rust nightly (for the eBPF object)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.ebpf }}
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ebpf-${{ steps.toolchain.outputs.ebpf }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          workspaces: |
+            crates/honk-ebpf -> target
+      - name: Install zstd
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y zstd
+      - name: Install pinned bpf-linker
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
+            "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          echo "$BPF_LINKER_SHA256  $RUNNER_TEMP/bpf-linker.tar.zst" | sha256sum -c -
+          zstd -dc "$RUNNER_TEMP/bpf-linker.tar.zst" | tar -xf - -C "$CARGO_HOME/bin"
+          bpf-linker --version
+      # The eBPF object is target-independent; build it once on x86_64 so all
+      # downstream matrix jobs (including native arm64) reuse the verified object.
+      - name: Build and verify eBPF object
+        working-directory: crates/honk-ebpf
+        env:
+          EBPF_TOOLCHAIN: ${{ steps.toolchain.outputs.ebpf }}
+        run: |
+          set -euo pipefail
+          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
+          # aya refuses objects without BTF ("no BTF parsed for object") — fail
+          # the build here instead of at runtime on a gateway.
+          readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
+          # build.rs requires the exact compiler channel without a trailing newline.
+          printf '%s' "$EBPF_TOOLCHAIN" > target/bpfel-unknown-none/release/honk-ebpf.toolchain
+      - name: Upload eBPF object
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: honk-ebpf
+          path: |
+            crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf
+            crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf.toolchain
+          retention-days: 1
+          if-no-files-found: error
+
   build:
     name: build ${{ matrix.target }}${{ matrix.suffix }}${{ matrix.name_suffix }}
-    runs-on: ubuntu-24.04
+    needs: [build-ebpf]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -96,24 +156,24 @@ jobs:
           # Full: Clash API + native API + embedded doona UI. Both arches ship
           # two binaries: jemalloc (default, faster QUIC) and stock malloc
           # (lower RSS high-water on small gateways).
-          - {target: x86_64-unknown-linux-gnu, suffix: "", variant: full, name_suffix: "-full"}
-          - {target: x86_64-unknown-linux-gnu, suffix: "-stock", variant: full, name_suffix: "-full"}
-          - {target: x86_64-unknown-linux-musl, suffix: "", variant: full, name_suffix: "-full"}
-          - {target: x86_64-unknown-linux-musl, suffix: "-stock", variant: full, name_suffix: "-full"}
-          - {target: aarch64-unknown-linux-gnu, suffix: "", variant: full, name_suffix: "-full"}
-          - {target: aarch64-unknown-linux-gnu, suffix: "-stock", variant: full, name_suffix: "-full"}
-          - {target: aarch64-unknown-linux-musl, suffix: "", variant: full, name_suffix: "-full"}
-          - {target: aarch64-unknown-linux-musl, suffix: "-stock", variant: full, name_suffix: "-full"}
+          - {target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, suffix: "", variant: full, name_suffix: "-full"}
+          - {target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, suffix: "-stock", variant: full, name_suffix: "-full"}
+          - {target: x86_64-unknown-linux-musl, runner: ubuntu-24.04, suffix: "", variant: full, name_suffix: "-full"}
+          - {target: x86_64-unknown-linux-musl, runner: ubuntu-24.04, suffix: "-stock", variant: full, name_suffix: "-full"}
+          - {target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, suffix: "", variant: full, name_suffix: "-full"}
+          - {target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, suffix: "-stock", variant: full, name_suffix: "-full"}
+          - {target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, suffix: "", variant: full, name_suffix: "-full"}
+          - {target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, suffix: "-stock", variant: full, name_suffix: "-full"}
           # Lean variants apply to the static gateway builds only; the gnu
           # artifacts stay full. Every name carries its variant suffix.
-          - {target: x86_64-unknown-linux-musl, suffix: "", variant: clash-api, name_suffix: "-clash-api"}
-          - {target: x86_64-unknown-linux-musl, suffix: "-stock", variant: clash-api, name_suffix: "-clash-api"}
-          - {target: aarch64-unknown-linux-musl, suffix: "", variant: clash-api, name_suffix: "-clash-api"}
-          - {target: aarch64-unknown-linux-musl, suffix: "-stock", variant: clash-api, name_suffix: "-clash-api"}
-          - {target: x86_64-unknown-linux-musl, suffix: "", variant: native-api, name_suffix: "-native-api"}
-          - {target: x86_64-unknown-linux-musl, suffix: "-stock", variant: native-api, name_suffix: "-native-api"}
-          - {target: aarch64-unknown-linux-musl, suffix: "", variant: native-api, name_suffix: "-native-api"}
-          - {target: aarch64-unknown-linux-musl, suffix: "-stock", variant: native-api, name_suffix: "-native-api"}
+          - {target: x86_64-unknown-linux-musl, runner: ubuntu-24.04, suffix: "", variant: clash-api, name_suffix: "-clash-api"}
+          - {target: x86_64-unknown-linux-musl, runner: ubuntu-24.04, suffix: "-stock", variant: clash-api, name_suffix: "-clash-api"}
+          - {target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, suffix: "", variant: clash-api, name_suffix: "-clash-api"}
+          - {target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, suffix: "-stock", variant: clash-api, name_suffix: "-clash-api"}
+          - {target: x86_64-unknown-linux-musl, runner: ubuntu-24.04, suffix: "", variant: native-api, name_suffix: "-native-api"}
+          - {target: x86_64-unknown-linux-musl, runner: ubuntu-24.04, suffix: "-stock", variant: native-api, name_suffix: "-native-api"}
+          - {target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, suffix: "", variant: native-api, name_suffix: "-native-api"}
+          - {target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, suffix: "-stock", variant: native-api, name_suffix: "-native-api"}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -131,72 +191,44 @@ jobs:
           fi
           echo "ARTIFACT_NAME=honk-core-$prefix-${{ matrix.target }}${{ matrix.suffix }}${{ matrix.name_suffix }}" >> "$GITHUB_ENV"
 
-      - name: Read Rust toolchains
+      - name: Read Rust toolchain
         id: toolchain
-        run: |
-          set -euo pipefail
-          echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
-          echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+        run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
 
-      - name: Install Rust stable (with target)
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ steps.toolchain.outputs.stable }}
-          target: ${{ matrix.target }}
 
-      - name: Install Rust nightly (for the eBPF object)
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: ${{ steps.toolchain.outputs.ebpf }}
-          components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}${{ matrix.suffix }}${{ matrix.name_suffix }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-          workspaces: |
-            . -> target
-            crates/honk-ebpf -> target
 
-      - name: Install system dependencies
+      - name: Download eBPF object
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: honk-ebpf
+          path: crates/honk-ebpf/target/bpfel-unknown-none/release
+
+      - name: Verify and stamp eBPF object
+        run: |
+          set -euo pipefail
+          ebpf=crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf
+          expected=$(grep -oP '^channel\s*=\s*"\K[^"]+' crates/honk-ebpf/rust-toolchain.toml)
+          readelf -S "$ebpf" | grep -q '\.BTF'
+          cmp -s "${ebpf}.toolchain" <(printf '%s' "$expected")
+          # Download preserves no mtime newer than checkout; stamp both so build.rs
+          # embeds this object without invoking nightly cargo.
+          touch "$ebpf" "${ebpf}.toolchain"
+
+      - name: Install boring-sys build deps (gnu)
+        if: endsWith(matrix.target, '-gnu')
         run: |
           set -euo pipefail
           sudo apt-get -o Acquire::Retries=5 update
-          sudo apt-get -o Acquire::Retries=5 install -y clang llvm libbpf-dev pkg-config cmake libclang-dev zstd
-
-      - name: Install pinned bpf-linker
-        run: |
-          set -euo pipefail
-          source .github/ci/pins.env
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
-            "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
-          echo "$BPF_LINKER_SHA256  $RUNNER_TEMP/bpf-linker.tar.zst" | sha256sum -c -
-          zstd -dc "$RUNNER_TEMP/bpf-linker.tar.zst" | tar -xf - -C "$CARGO_HOME/bin"
-          bpf-linker --version
-
-      # The eBPF object is target-independent; build it once on the host so
-      # cross builds just pick it up (build.rs locates it when present).
-      - name: Build eBPF object
-        run: |
-          set -euo pipefail
-          cd crates/honk-ebpf
-          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
-
-      # aya refuses objects without BTF ("no BTF parsed for object") — fail
-      # the build here instead of at runtime on a gateway.
-      - name: Verify eBPF object has BTF
-        run: readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
-
-      # boring-sys (BoringSSL, C++) needs a clang-compatible target toolchain:
-      # under cross compilation CMake injects clang-style --target flags into
-      # boring-sys' ASM rules that real GCC rejects, and zig rejects the Rust
-      # triple spelling — ci/zigcc / ci/zigcxx strip those flags and re-anchor
-      # on the zig-style target in $ZIGCC_TARGET.
-      - name: Install zig (non-native targets)
-        if: matrix.target != 'x86_64-unknown-linux-gnu'
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.14.1
+          sudo apt-get -o Acquire::Retries=5 install -y cmake libclang-dev
 
       - name: Fetch doona for the embedded UI
         if: matrix.variant == 'full'
@@ -224,36 +256,13 @@ jobs:
           fi
           echo "FEATURES=$features" >> "$GITHUB_ENV"
 
-      # The root rust-toolchain.toml selects the host compiler whose cross
-      # targets were installed above; the eBPF crate has its own nightly pin.
       - name: Build honk-core (native gnu)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: endsWith(matrix.target, '-gnu')
         run: cargo build --release -p honk-core --no-default-features --features "$FEATURES" --target ${{ matrix.target }}
 
-      - name: Build honk-core (cross via zig wrappers)
-        if: matrix.target != 'x86_64-unknown-linux-gnu'
-        shell: bash
-        run: |
-          set -euo pipefail
-          T="${{ matrix.target }}"
-          export ZIGCC_TARGET="${T/-unknown/}"
-          # cc crate wants lowercase CC_<target_with_underscores>; cargo
-          # wants uppercase CARGO_TARGET_<TARGET>.
-          L=$(printf '%s' "$T" | tr '-' '_')
-          U=$(printf '%s' "$T" | tr 'a-z-' 'A-Z_')
-          eval "export CC_${L}=\$PWD/ci/zigcc"
-          eval "export CXX_${L}=\$PWD/ci/zigcxx"
-          eval "export CARGO_TARGET_${U}_LINKER=\$PWD/ci/zigcc"
-          # musl: let zig supply the CRT (Rust's self-contained rcrt1.o and
-          # zig's crt1.o both define _start).
-          if [[ "$T" == *-musl ]]; then
-            eval "export CARGO_TARGET_${U}_RUSTFLAGS='-C link-self-contained=no'"
-          fi
-          # boring-sys generates its bindings with bindgen at build time —
-          # point it at zig's target headers, not the host's.
-          BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env "$ZIGCC_TARGET")"
-          export BINDGEN_EXTRA_CLANG_ARGS
-          cargo build --release -p honk-core --no-default-features --features "$FEATURES" --target "$T"
+      - name: Build honk-core (native musl via Alpine 3.24)
+        if: endsWith(matrix.target, '-musl')
+        run: ci/build-musl.sh honk-core --no-default-features --features "$FEATURES"
 
       - name: Package artifact
         run: |
@@ -278,8 +287,7 @@ jobs:
           fi
           tar -czf "$name.tar.gz" -C dist "$name"
 
-      - name: Start the packaged x86_64 artifact
-        if: startsWith(matrix.target, 'x86_64-')
+      - name: Start the packaged artifact
         run: |
           set -euo pipefail
           smoke_dir=$(mktemp -d "$RUNNER_TEMP/release-smoke.XXXXXX")
@@ -308,6 +316,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          pattern: honk-core-*
           path: dist
           merge-multiple: true
 

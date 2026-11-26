@@ -327,20 +327,14 @@ honk 依次检查 `DAE_LOCATION_ASSET`、`global.data_dir`、旧根目录 `/var/
 cargo build --release -p honk-tool
 ```
 
-部署到网关时，用仓库的 Zig 包装器构建静态 musl 目标，再复制单个二进制：
+部署到网关时，构建静态 musl 二进制（需要 Docker 或 Podman）并复制单个文件：
 
 ```bash
-ZIGCC_TARGET=x86_64-linux-musl \
-CC_x86_64_unknown_linux_musl=$PWD/ci/zigcc \
-CXX_x86_64_unknown_linux_musl=$PWD/ci/zigcxx \
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=$PWD/ci/zigcc \
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-self-contained=no" \
-BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env x86_64-linux-musl)" \
-cargo build --release -p honk-tool --target x86_64-unknown-linux-musl
+just build-musl-tool   # 或：ci/build-musl.sh honk-tool
 scp target/x86_64-unknown-linux-musl/release/honk-tool root@GATEWAY:/tmp/
 ```
 
-现在的 `just build-musl` 和 `just deploy-vyos` 只构建和部署 `honk-core`，不含 `honk-tool`。用 GNU 链接器构建的二进制，可能无法在纯 musl 网关上执行。
+`aarch64` 宿主机输出在 `aarch64-unknown-linux-musl` 目录。`just build-musl` 和 `just deploy-vyos` 只处理 `honk-core`；用 GNU 链接器构建的二进制，可能无法在纯 musl 网关上执行。
 
 ### 命令族
 
