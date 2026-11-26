@@ -110,14 +110,22 @@ async fn full_validation_checks_unused_structure_without_applying_unused_setting
 #[tokio::test]
 async fn full_validation_counts_unused_sources_with_every_host_materialization() {
     let fixture = Fixture::new(Access::Admin, false).await;
-    std::fs::write(fixture.path("hosts.rules"), "full:alias.test 192.0.2.1\n").unwrap();
+    let target = fixture.path("hosts.rules");
+    std::fs::write(&target, "full:alias.test 192.0.2.1\n").unwrap();
+    for index in 1..31 {
+        std::os::unix::fs::symlink(&target, fixture.path(&format!("hosts-{index}.rules"))).unwrap();
+    }
     let candidate = |count| {
         let hosts = (0..count)
             .map(|index| {
+                let name = if index == 0 {
+                    "hosts.rules".to_owned()
+                } else {
+                    format!("hosts-{index}.rules")
+                };
                 format!(
-                    " use_host: '{}/{}hosts.rules'\n",
-                    fixture.directory.path().display(),
-                    "./".repeat(index)
+                    " use_host: '{}/{name}'\n",
+                    fixture.directory.path().display()
                 )
             })
             .collect::<String>();

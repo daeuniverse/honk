@@ -2312,6 +2312,48 @@ fn hosts_sources_default_off_and_collect_repeated_values() {
 }
 
 #[test]
+fn hosts_sources_deduplicate_lexically_equivalent_paths() {
+    let config = parse_dae_config(
+        "dns {\n    use_host: true\n    use_host: '/etc/./hosts'\n    use_host: 'rules.txt'\n    use_host: './rules.txt'\n    use_host: 'sub//extra.txt'\n    use_host: './sub/./extra.txt/'\n    use_host: '../outside.txt'\n    use_host: './.'\n}",
+    )
+    .unwrap();
+    assert_eq!(
+        config.dns.hosts,
+        [
+            "/etc/hosts",
+            "rules.txt",
+            "sub/extra.txt",
+            "../outside.txt",
+            ".",
+        ]
+    );
+
+    let json: crate::dns::DnsConfig = serde_json::from_value(serde_json::json!({
+        "use_host": ["./rules.txt", "rules.txt", "/etc//hosts", "true", "sub/./a.txt/"]
+    }))
+    .unwrap();
+    assert_eq!(json.hosts, ["rules.txt", "/etc/hosts", "sub/a.txt"]);
+
+    let literal_bool_file = parse_dae_config(
+        "dns {\n    use_host: './false'\n    use_host: '././false'\n    use_host: './ false'\n    use_host: '././ false'\n    use_host: './ hosts.txt'\n    use_host: '././ hosts.txt'\n}",
+    )
+    .unwrap();
+    assert_eq!(
+        literal_bool_file.dns.hosts,
+        ["./false", "./ false", "./ hosts.txt"]
+    );
+    let json_round_tripped: crate::dns::DnsConfig =
+        serde_json::from_value(serde_json::to_value(&literal_bool_file.dns).unwrap()).unwrap();
+    assert_eq!(json_round_tripped.hosts, literal_bool_file.dns.hosts);
+    let toml_round_tripped: crate::dns::DnsConfig =
+        toml::from_str(&toml::to_string(&literal_bool_file.dns).unwrap()).unwrap();
+    assert_eq!(toml_round_tripped.hosts, literal_bool_file.dns.hosts);
+    let yaml_round_tripped: crate::dns::DnsConfig =
+        serde_yaml::from_str(&serde_yaml::to_string(&literal_bool_file.dns).unwrap()).unwrap();
+    assert_eq!(yaml_round_tripped.hosts, literal_bool_file.dns.hosts);
+}
+
+#[test]
 fn udp_warm_node_count_defaults_to_strictly_disabled() {
     assert_eq!(crate::Config::default().global.udp_warm_node_count, 0);
     assert_eq!(

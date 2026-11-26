@@ -227,7 +227,7 @@ pub(crate) fn push_host_source(sources: &mut Vec<String>, value: &str) {
         .iter()
         .any(|candidate| value.eq_ignore_ascii_case(candidate))
     {
-        SYSTEM_HOSTS_PATH
+        SYSTEM_HOSTS_PATH.to_owned()
     } else if value.is_empty()
         || ["false", "no", "0", "off"]
             .iter()
@@ -235,10 +235,32 @@ pub(crate) fn push_host_source(sources: &mut Vec<String>, value: &str) {
     {
         return;
     } else {
-        value
+        normalize_host_source_path(value)
     };
-    if !sources.iter().any(|source| source == path) {
-        sources.push(path.to_owned());
+    if !sources.iter().any(|source| source == &path) {
+        sources.push(path);
+    }
+}
+
+fn normalize_host_source_path(path: &str) -> String {
+    use std::path::{Component, Path, PathBuf};
+
+    let normalized: PathBuf = Path::new(path)
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .collect();
+    if normalized.as_os_str().is_empty() {
+        return ".".to_owned();
+    }
+    let rendered = normalized.to_string_lossy().into_owned();
+    if rendered.starts_with(char::is_whitespace)
+        || ["true", "yes", "1", "on", "false", "no", "0", "off"]
+            .iter()
+            .any(|candidate| rendered.eq_ignore_ascii_case(candidate))
+    {
+        format!("./{rendered}")
+    } else {
+        rendered
     }
 }
 

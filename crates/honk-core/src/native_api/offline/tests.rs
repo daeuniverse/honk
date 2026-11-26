@@ -126,14 +126,16 @@ fn offline_admission_does_not_create_runtime_state_or_connect() {
 fn hosts_admission_charges_each_materialized_reference() {
     let temp = tempfile::tempdir().unwrap();
     let hosts = temp.path().join("hosts.rules");
+    let alias = temp.path().join("hosts-alias.rules");
     let body = "full:exact.test 192.0.2.1\n";
     fs::write(&hosts, body).unwrap();
+    std::os::unix::fs::symlink(&hosts, &alias).unwrap();
     let loaded = fixture(
         temp.path(),
         &format!(
-            "dns {{ use_host: '{}'\n use_host: '{}/./hosts.rules' }}",
+            "dns {{ use_host: '{}'\n use_host: '{}' }}",
             hosts.display(),
-            temp.path().display()
+            alias.display()
         ),
     );
     let active = loaded.config.clone();
@@ -192,13 +194,16 @@ fn hosts_admission_charges_each_materialized_reference() {
 fn unused_submissions_share_exact_materialization_byte_and_count_limits() {
     let temp = tempfile::tempdir().unwrap();
     let body = "full:exact.test 192.0.2.1\n";
-    fs::write(temp.path().join("hosts.rules"), body).unwrap();
+    let hosts = temp.path().join("hosts.rules");
+    let alias = temp.path().join("hosts-alias.rules");
+    fs::write(&hosts, body).unwrap();
+    std::os::unix::fs::symlink(&hosts, &alias).unwrap();
     let loaded = fixture(
         temp.path(),
         &format!(
-            "dns {{ use_host: '{}/hosts.rules'\n use_host: '{}/./hosts.rules' }}",
-            temp.path().display(),
-            temp.path().display(),
+            "dns {{ use_host: '{}'\n use_host: '{}' }}",
+            hosts.display(),
+            alias.display(),
         ),
     );
     let active = loaded.config.clone();
