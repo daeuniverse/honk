@@ -295,8 +295,26 @@ impl UdpPool {
         query: &[u8],
         reporter: Option<&honk_outbound::group::ScoreReporter>,
     ) -> anyhow::Result<Vec<u8>> {
+        self.exchange_until(query, reporter, None).await
+    }
+
+    pub(crate) async fn exchange_until(
+        &self,
+        query: &[u8],
+        reporter: Option<&honk_outbound::group::ScoreReporter>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<Vec<u8>> {
         if query.len() < 12 {
             anyhow::bail!("malformed DNS query");
+        }
+        let exchange_timeout = match deadline {
+            Some(d) => self
+                .timeout
+                .min(d.saturating_duration_since(tokio::time::Instant::now())),
+            None => self.timeout,
+        };
+        if exchange_timeout.is_zero() {
+            anyhow::bail!("UDP DNS query timed out after {:?}", self.timeout);
         }
         let original_id = [query[0], query[1]];
         let question = query[12..Self::question_end(query)?].to_vec();
@@ -339,7 +357,7 @@ impl UdpPool {
         };
         let mut wire = query.to_vec();
         wire[..2].copy_from_slice(&id.to_be_bytes());
-        tokio::time::timeout(self.timeout, async {
+        tokio::time::timeout(exchange_timeout, async {
             self.socket.send(&wire).await?;
             if let Some(reporter) = reporter {
                 reporter.setup_succeeded();

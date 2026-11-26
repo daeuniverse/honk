@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::dial::CarrierIo;
 use super::idle_pool::IdleStream;
 use super::retry::exchange_with_route_retry;
-use super::{DialContext, IdlePoolState, RouteExchange, close_idle_pool, idle_pool_exchange};
+use super::{DialContext, IdlePoolState, RouteExchange, close_idle_pool, idle_pool_exchange_until};
 use honk_outbound::tls::{TlsConnector, TlsStream};
 use parking_lot::Mutex;
 
@@ -36,26 +36,29 @@ impl DotPool {
         raw_query: &[u8],
         feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
-        self.exchange_routed(raw_query, feedback, None).await
+        self.exchange_routed_until(raw_query, feedback, None, None)
+            .await
     }
 
-    pub(crate) async fn exchange_routed(
+    pub(crate) async fn exchange_routed_until(
         self: &Arc<Self>,
         raw_query: &[u8],
         feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
         route: Option<RouteExchange<'_>>,
+        deadline: Option<tokio::time::Instant>,
     ) -> anyhow::Result<Vec<u8>> {
         let routed = route.is_some();
         exchange_with_route_retry(
             "DoT",
             raw_query,
             |reporter| async move {
-                self.exchange_once(raw_query, reporter.as_ref(), routed)
+                self.exchange_once(raw_query, reporter.as_ref(), routed, deadline)
                     .await
             },
             |_| async {},
             feedback,
             route,
+            deadline,
         )
         .await
     }
@@ -65,24 +68,33 @@ impl DotPool {
         raw_query: &[u8],
         reporter: Option<&honk_outbound::group::ScoreReporter>,
         routed: bool,
+        deadline: Option<tokio::time::Instant>,
     ) -> anyhow::Result<Vec<u8>> {
-        idle_pool_exchange(
+        idle_pool_exchange_until(
             &self.lifecycle,
             &self.idle,
-            || self.dial_tls(routed),
+            || self.dial_tls(routed, deadline),
             raw_query,
             self.dial.query_timeout,
+            deadline,
             reporter,
             routed,
         )
         .await
     }
 
-    async fn dial_tls(&self, routed: bool) -> anyhow::Result<PooledStream> {
+    async fn dial_tls(
+        &self,
+        routed: bool,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<PooledStream> {
         let server_name = self.dial.endpoint.sni.clone();
         let via_proxy = self.dial.proxy.is_some();
-        let deadline = tokio::time::Instant::now() + self.dial.dial_timeout;
-        let tcp = self.dial.dial_tcp_boxed_until(deadline).await?;
+        let dial_deadline = match deadline {
+            Some(d) => (tokio::time::Instant::now() + self.dial.dial_timeout).min(d),
+            None => tokio::time::Instant::now() + self.dial.dial_timeout,
+        };
+        let tcp = self.dial.dial_tcp_boxed_until(dial_deadline).await?;
         let retain = routed
             && self
                 .dial
@@ -90,7 +102,7 @@ impl DotPool {
                 .as_ref()
                 .is_some_and(|proxy| proxy.route.is_none());
         let (tcp, _) = CarrierIo::capture(tcp, retain);
-        tokio::time::timeout_at(deadline, self.connector.connect(&server_name, tcp))
+        tokio::time::timeout_at(dial_deadline, self.connector.connect(&server_name, tcp))
             .await
             .map_err(|_| {
                 anyhow::anyhow!(

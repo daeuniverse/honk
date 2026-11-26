@@ -14,8 +14,7 @@ pub(super) struct IdleStream<S> {
     next_id: u16,
 }
 
-/// Pop an idle stream or dial a fresh one, run one length-prefixed exchange,
-/// and return the stream to the pool on success (DoT / plain-TCP shared shape).
+#[cfg(test)]
 pub(super) async fn idle_pool_exchange<S, Dial, DialFut>(
     lifecycle: &tokio::sync::RwLock<IdlePoolState>,
     idle: &parking_lot::Mutex<Vec<IdleStream<S>>>,
@@ -30,10 +29,44 @@ where
     Dial: FnOnce() -> DialFut,
     DialFut: Future<Output = anyhow::Result<S>>,
 {
+    idle_pool_exchange_until(
+        lifecycle,
+        idle,
+        dial,
+        raw_query,
+        query_timeout,
+        None,
+        reporter,
+        routed,
+    )
+    .await
+}
+
+/// Pop an idle stream or dial a fresh one, run one length-prefixed exchange,
+/// and return the stream to the pool on success (DoT / plain-TCP shared shape).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn idle_pool_exchange_until<S, Dial, DialFut>(
+    lifecycle: &tokio::sync::RwLock<IdlePoolState>,
+    idle: &parking_lot::Mutex<Vec<IdleStream<S>>>,
+    dial: Dial,
+    raw_query: &[u8],
+    query_timeout: Duration,
+    deadline: Option<tokio::time::Instant>,
+    reporter: Option<&honk_outbound::group::ScoreReporter>,
+    routed: bool,
+) -> anyhow::Result<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    Dial: FnOnce() -> DialFut,
+    DialFut: Future<Output = anyhow::Result<S>>,
+{
     let lifecycle = lifecycle.read().await;
     match *lifecycle {
         IdlePoolState::Open => {}
         IdlePoolState::Closed => anyhow::bail!("DNS transport pool is closed"),
+    }
+    if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+        anyhow::bail!("DNS stream exchange timed out after {query_timeout:?}");
     }
     let taken = idle.lock().pop();
     let mut stream = match taken {
@@ -49,10 +82,14 @@ where
     if let Some(reporter) = reporter {
         reporter.setup_succeeded();
     }
+    let effective_timeout = match deadline {
+        Some(d) => query_timeout.min(d.saturating_duration_since(tokio::time::Instant::now())),
+        None => query_timeout,
+    };
     let resp = super::framing::exchange_length_prefixed_reported(
         &mut stream.io,
         raw_query,
-        query_timeout,
+        effective_timeout,
         reporter,
         routed.then_some(stream.next_id),
     )

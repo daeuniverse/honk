@@ -18,18 +18,32 @@ use super::ttl::{patch_txid, rewrite_answer_ttls};
 use super::{CacheAccess, DnsForwardError, DnsForwarder, ResolveMode, ResolveOptions};
 
 impl DnsForwarder {
-    pub(crate) async fn exchange(
+    pub(crate) fn exchange_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now()
+            + self
+                .dial_timeout
+                .saturating_add(self.query_timeout.saturating_mul(2))
+    }
+
+    pub(crate) async fn exchange_until(
         &self,
         scope: &RequestScope,
         raw_query: &[u8],
         ingress: IngressProfile,
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<Vec<u8>> {
         match scope {
             RequestScope::Upstream(upstream) => {
-                self.upstream_pool.query(upstream.as_str(), raw_query).await
+                self.upstream_pool
+                    .query_until(upstream.as_str(), raw_query, deadline)
+                    .await
             }
             RequestScope::AsIs(destination) => {
-                let query = self.query_asis(raw_query, *destination, ingress);
+                let asis_deadline = deadline.min(
+                    tokio::time::Instant::now()
+                        + self.dial_timeout.saturating_add(self.query_timeout),
+                );
+                let query = self.query_asis(raw_query, *destination, ingress, asis_deadline);
                 let observation = crate::observe::flows::dns::outbound_evidence(
                     "direct",
                     crate::observe::vocab::RoutingSource::Builtin,
@@ -250,10 +264,11 @@ impl DnsForwarder {
         raw_query: &[u8],
         destination: SocketAddr,
         ingress: IngressProfile,
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<Vec<u8>> {
         match ingress {
             IngressProfile::Udp { .. } => {
-                let query = self.query_asis_udp(raw_query, destination);
+                let query = self.query_asis_udp(raw_query, destination, deadline);
                 crate::observe::scope_pin!(query);
                 let query = crate::observe::flows::dns::transport_exchange_scope(raw_query, query);
                 let response = query.await?;
@@ -271,7 +286,7 @@ impl DnsForwarder {
                 unreachable!("internal/API asis request escaped planning")
             }
         }
-        let query = self.query_asis_tcp(raw_query, destination);
+        let query = self.query_asis_tcp(raw_query, destination, deadline);
         crate::observe::scope_pin!(query);
         let query = crate::observe::flows::dns::transport_exchange_scope(raw_query, query);
         query.await
@@ -281,13 +296,12 @@ impl DnsForwarder {
         &self,
         raw_query: &[u8],
         destination: SocketAddr,
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<Vec<u8>> {
         debug!(%destination, "DNS forwarder: asis UDP dial");
         crate::observe::flows::dns::transport("udp", "udp");
-        let _permit = self
-            .socket_budget
-            .acquire_until(tokio::time::Instant::now() + self.dial_timeout)
-            .await?;
+        let acquire_deadline = (tokio::time::Instant::now() + self.dial_timeout).min(deadline);
+        let _permit = self.socket_budget.acquire_until(acquire_deadline).await?;
         let mut observation = honk_outbound::runtime::flow_observation::TransportAttempt::start(
             Some(destination),
             honk_outbound::runtime::flow_observation::ResolutionLocation::OriginalIp,
@@ -329,8 +343,14 @@ impl DnsForwarder {
             );
         }
         let socket = socket?;
+        let query_budget = self
+            .query_timeout
+            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        if query_budget.is_zero() {
+            anyhow::bail!("asis UDP query timeout");
+        }
 
-        tokio::time::timeout(self.query_timeout, async {
+        tokio::time::timeout(query_budget, async {
             socket.send(raw_query).await?;
             let mut response = vec![0u8; usize::from(u16::MAX)];
             let received = socket.recv(&mut response).await?;
@@ -346,19 +366,30 @@ impl DnsForwarder {
         &self,
         raw_query: &[u8],
         destination: SocketAddr,
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<Vec<u8>> {
         debug!(%destination, "DNS forwarder: asis TCP dial");
         crate::observe::flows::dns::transport("tcp", "tcp");
-        let deadline = tokio::time::Instant::now() + self.dial_timeout;
-        let _permit = self.socket_budget.acquire_until(deadline).await?;
+        let dial_deadline = (tokio::time::Instant::now() + self.dial_timeout).min(deadline);
+        let _permit = self.socket_budget.acquire_until(dial_deadline).await?;
+        let connect_budget = dial_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if connect_budget.is_zero() {
+            anyhow::bail!("asis TCP connect timed out");
+        }
         let mut stream = honk_outbound::util::connect_marked_addr(
             destination,
             Some(honk_outbound::util::bypass_mark()),
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            connect_budget,
         )
         .await
         .context("asis TCP connect")?;
-        crate::dns::transport::exchange_length_prefixed(&mut stream, raw_query, self.query_timeout)
+        let exchange_budget = self
+            .query_timeout
+            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        if exchange_budget.is_zero() {
+            anyhow::bail!("asis TCP exchange timed out");
+        }
+        crate::dns::transport::exchange_length_prefixed(&mut stream, raw_query, exchange_budget)
             .await
             .context("asis TCP exchange")
     }

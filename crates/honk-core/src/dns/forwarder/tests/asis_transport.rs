@@ -401,3 +401,98 @@ async fn prefer_sibling_changes_only_original_question_qtype() {
     );
     assert_eq!(&recorded[1][qclass_start + 2..], &query[qclass_start + 2..]);
 }
+
+#[tokio::test(start_paused = true)]
+async fn udp_asis_tc_fallback_shares_total_query_deadline() {
+    let (tcp, udp, original_dst) = bind_tcp_udp().await;
+    let udp_responder = tokio::spawn(async move {
+        let mut query = vec![0u8; 512];
+        let (received, peer) = udp.recv_from(&mut query).await.unwrap();
+        query.truncate(received);
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        let mut truncated = query;
+        truncated[2..4].copy_from_slice(&0x8380_u16.to_be_bytes());
+        udp.send_to(&truncated, peer).await.unwrap();
+    });
+    let tcp_responder = tokio::spawn(async move {
+        let (_stream, _) = tcp.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let forwarder =
+        asis_test_forwarder().with_timeouts(Duration::from_millis(200), Duration::from_millis(100));
+    let started = tokio::time::Instant::now();
+    let error = forwarder
+        .resolve_with_context_and_profile(
+            &make_a_query(),
+            DnsRequestMeta::new(None, Some(original_dst)),
+            IngressProfile::Udp {
+                advertised_size: 1232,
+            },
+        )
+        .await
+        .expect_err("stalled TCP fallback after slow UDP TC must time out");
+
+    let detail = format!("{error:#}");
+    assert!(
+        detail.contains("timed out") || detail.contains("timeout"),
+        "{detail}"
+    );
+    assert!(
+        started.elapsed() <= Duration::from_millis(320),
+        "asis UDP + TC TCP fallback took {:?}, exceeding shared 300ms budget",
+        started.elapsed()
+    );
+    udp_responder.abort();
+    tcp_responder.abort();
+
+    struct RequeryBudgetPool;
+    #[async_trait]
+    impl DnsUpstreamPool for RequeryBudgetPool {
+        async fn query(&self, name: &str, query: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.query_until(
+                name,
+                query,
+                tokio::time::Instant::now() + Duration::from_millis(500),
+            )
+            .await
+        }
+
+        async fn query_until(
+            &self,
+            name: &str,
+            _query: &[u8],
+            deadline: tokio::time::Instant,
+        ) -> anyhow::Result<Vec<u8>> {
+            if name == "first" {
+                tokio::time::sleep(Duration::from_millis(450)).await;
+                return Ok(make_a_response([192, 0, 2, 1], 60));
+            }
+            tokio::time::sleep_until(deadline).await;
+            anyhow::bail!("requery deadline elapsed")
+        }
+    }
+
+    let requery_dns = honk_config::parser::parse_dae_config(
+        "dns {\n upstream {\n  first: 'udp://127.0.0.1:53'\n  second: 'udp://127.0.0.1:54'\n }\n routing {\n  request {\n   fallback: first\n  }\n  response {\n   ip(192.0.2.1/32) -> second\n   fallback: accept\n  }\n }\n}\n",
+    )
+    .unwrap()
+    .dns;
+    let requery_forwarder = DnsForwarder::new(
+        Arc::new(RequeryBudgetPool),
+        test_cache(),
+        Arc::new(DnsRouter::new_from_dns_config(&requery_dns).expect("router")),
+    )
+    .with_timeouts(Duration::from_millis(200), Duration::from_millis(100));
+    let started = tokio::time::Instant::now();
+    assert!(
+        requery_forwarder
+            .resolve_outcome(&make_a_query())
+            .await
+            .is_err()
+    );
+    assert!(
+        started.elapsed() <= Duration::from_millis(530),
+        "response requery took {:?}, exceeding shared 500ms budget",
+        started.elapsed()
+    );
+}

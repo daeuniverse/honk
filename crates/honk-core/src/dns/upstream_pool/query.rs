@@ -60,20 +60,42 @@ fn admit_score_attempt(
 }
 
 impl UpstreamPool {
+    pub(super) fn query_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now()
+            + self
+                .dns_dial_timeout
+                .saturating_add(self.dns_query_timeout.saturating_mul(2))
+    }
+
+    #[cfg(test)]
     pub(super) async fn udp_pool(
         &self,
         entry: &UpstreamEntry,
         address: SocketAddr,
     ) -> anyhow::Result<Arc<UdpPool>> {
-        self.select_udp_pool(entry, address, &[], false).await
+        self.select_udp_pool_until(entry, address, &[], false, None)
+            .await
     }
 
+    #[cfg(test)]
     pub(super) async fn select_udp_pool(
         &self,
         entry: &UpstreamEntry,
         address: SocketAddr,
         attempted: &[Option<Arc<UdpPool>>],
         expand: bool,
+    ) -> anyhow::Result<Arc<UdpPool>> {
+        self.select_udp_pool_until(entry, address, attempted, expand, None)
+            .await
+    }
+
+    pub(super) async fn select_udp_pool_until(
+        &self,
+        entry: &UpstreamEntry,
+        address: SocketAddr,
+        attempted: &[Option<Arc<UdpPool>>],
+        expand: bool,
+        query_deadline: Option<tokio::time::Instant>,
     ) -> anyhow::Result<Arc<UdpPool>> {
         let family = usize::from(address.is_ipv6());
         let choose = || {
@@ -121,7 +143,8 @@ impl UpstreamPool {
                     .map(|pool| (pool, true))
                     .ok_or_else(|| anyhow::Error::new(UdpPoolCapacity::SHARDS));
             }
-            let deadline = tokio::time::Instant::now() + self.dns_dial_timeout;
+            let dial_deadline = tokio::time::Instant::now() + self.dns_dial_timeout;
+            let deadline = query_deadline.map_or(dial_deadline, |outer| dial_deadline.min(outer));
             let _creation = tokio::time::timeout_at(deadline, entry.udp_creation[family].lock())
                 .await
                 .map_err(|_| {
@@ -220,6 +243,7 @@ impl UpstreamPool {
         entry: &UpstreamEntry,
         address: SocketAddr,
         query: &[u8],
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<Vec<u8>> {
         // Drop all exchange/attempt pool references before checking retired owners.
         let _retirement = UdpRetirementDrain(self);
@@ -228,10 +252,17 @@ impl UpstreamPool {
         let mut last_capacity = None;
         for attempt in 0..super::MAX_UDP_SHARDS {
             let selected = if attempt == 0 {
-                self.udp_pool(entry, address).await
-            } else {
-                self.select_udp_pool(entry, address, &attempted[..attempt], true)
+                self.select_udp_pool_until(entry, address, &[], false, Some(deadline))
                     .await
+            } else {
+                self.select_udp_pool_until(
+                    entry,
+                    address,
+                    &attempted[..attempt],
+                    true,
+                    Some(deadline),
+                )
+                .await
             };
             let pool = match selected {
                 Ok(pool) => pool,
@@ -240,7 +271,7 @@ impl UpstreamPool {
                 }
                 Err(error) => return Err(error),
             };
-            match pool.exchange(query, None).await {
+            match pool.exchange_until(query, None, Some(deadline)).await {
                 Ok(response) => return Ok(response),
                 Err(error) if error.is::<UdpPoolCapacity>() => {
                     attempted[attempt] = Some(pool);
@@ -279,6 +310,7 @@ impl UpstreamPool {
         route: &DnsDialRoute,
         raw_query: &[u8],
         admission: AdmissionPermit<'a>,
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<(Vec<u8>, AdmissionPermit<'a>, Option<EcsQuery>)> {
         let exchange = async {
             let address = route.target;
@@ -287,7 +319,7 @@ impl UpstreamPool {
             crate::observe::flows::dns::transport("udp", "udp");
             let response = {
                 let query = async {
-                    self.exchange_udp_shards(entry, address, effective_query)
+                    self.exchange_udp_shards(entry, address, effective_query, deadline)
                         .await
                 };
                 crate::observe::scope_pin!(query);
@@ -309,14 +341,20 @@ impl UpstreamPool {
         &self,
         entry: &UpstreamEntry,
     ) -> anyhow::Result<Vec<SocketAddr>> {
-        self.resolve_observed_addrs(entry).await.0
+        self.resolve_observed_addrs_until(
+            entry,
+            tokio::time::Instant::now() + self.dns_dial_timeout,
+        )
+        .await
+        .0
     }
 
     /// Cold hostname resolution is boxed so direct UDP hits and cached hostname
     /// lookups do not reserve the resolver's state in their futures.
-    async fn resolve_observed_addrs(
+    async fn resolve_observed_addrs_until(
         &self,
         entry: &UpstreamEntry,
+        deadline: tokio::time::Instant,
     ) -> (
         anyhow::Result<Vec<SocketAddr>>,
         Option<honk_outbound::runtime::flow_observation::LookupSelection>,
@@ -324,12 +362,11 @@ impl UpstreamPool {
         if let Err(error) = entry.check_explicit_block() {
             return (Err(error), None);
         }
-        let bootstrap_deadline = tokio::time::Instant::now() + self.dns_dial_timeout;
         if entry.endpoint.is_literal_or_pinned() {
             return (
                 entry
                     .endpoint
-                    .resolve_addrs_budgeted(&self.socket_budget, bootstrap_deadline)
+                    .resolve_addrs_budgeted(&self.socket_budget, deadline)
                     .await,
                 None,
             );
@@ -337,6 +374,8 @@ impl UpstreamPool {
         if let Some(cached) = entry.bootstrap.lookup_live() {
             return (cached, None);
         }
+        let bootstrap_deadline =
+            (tokio::time::Instant::now() + self.dns_dial_timeout).min(deadline);
         Box::pin(entry.bootstrap.resolve_or_coalesce(
             &entry.endpoint.host,
             bootstrap_deadline,
@@ -374,11 +413,12 @@ impl UpstreamPool {
         raw_query: &[u8],
         business: Option<honk_outbound::group::ScoreBusinessGuard>,
         route_failures: &mut RouteFailures,
+        deadline: Option<tokio::time::Instant>,
     ) -> anyhow::Result<Vec<u8>> {
         Box::pin(async move {
             let _release = IdlePressureRelease(&self.socket_budget);
             match self
-                .get_transport(entry, route.node.as_ref(), route.target)
+                .get_transport_until(entry, route.node.as_ref(), route.target, deadline)
                 .await
             {
                 Ok(transport) => {
@@ -387,6 +427,7 @@ impl UpstreamPool {
                             raw_query,
                             business,
                             route.route_exchange(entry.protocol, route_failures),
+                            deadline,
                         )
                         .await
                 }
@@ -409,6 +450,7 @@ impl UpstreamPool {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn query_udp_via_proxy(
         &self,
         upstream_name: &str,
@@ -417,6 +459,7 @@ impl UpstreamPool {
         raw_query: &[u8],
         original: &mut Option<honk_outbound::group::ScoreContinuation>,
         route_failures: &mut RouteFailures,
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<Vec<u8>> {
         let exchange = async {
             let node = route
@@ -426,7 +469,14 @@ impl UpstreamPool {
             let _admission = self.admit_query().await?;
             let business = admit_score_attempt(route.feedback.as_ref(), original)?;
             let response = self
-                .exchange_routed(entry, route, raw_query, business, route_failures)
+                .exchange_routed(
+                    entry,
+                    route,
+                    raw_query,
+                    business,
+                    route_failures,
+                    Some(deadline),
+                )
                 .await?;
             let response = if crate::dns::response::is_truncated(&response) {
                 crate::observe::flows::dns::tcp_fallback();
@@ -436,8 +486,15 @@ impl UpstreamPool {
                     "DNS upstream '{}' proxied UDP answer has TC set — retrying over proxied TCP",
                     upstream_name
                 );
-                self.exchange_routed(entry, route, raw_query, business, route_failures)
-                    .await?
+                self.exchange_routed(
+                    entry,
+                    route,
+                    raw_query,
+                    business,
+                    route_failures,
+                    Some(deadline),
+                )
+                .await?
             } else {
                 response
             };
@@ -462,6 +519,7 @@ impl UpstreamPool {
         route: &DnsDialRoute,
         raw_query: &[u8],
         exchange: (Vec<u8>, AdmissionPermit<'_>, Option<EcsQuery>),
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<Vec<u8>> {
         let (response, _admission, injected) = exchange;
         let effective_query = injected.as_ref().map_or(raw_query, EcsQuery::wire);
@@ -478,6 +536,7 @@ impl UpstreamPool {
                     effective_query,
                     None,
                     &mut RouteFailures::default(),
+                    Some(deadline),
                 )
                 .await
             };
@@ -500,11 +559,13 @@ impl UpstreamPool {
             None => Ok(response),
         }
     }
+
     async fn query_datagram(
         &self,
         upstream_name: &str,
         entry: &UpstreamEntry,
         raw_query: &[u8],
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<Vec<u8>> {
         let mut original_business = None;
         let mut route_failures = RouteFailures::default();
@@ -513,7 +574,7 @@ impl UpstreamPool {
             self.traffic_router_snapshot.read().is_some() || self.traffic_router.read().is_some();
         let mut prefetched = None;
         let initial_route = if current.is_none() && entry.outbound.is_none() && has_traffic_router {
-            let (targets, witness) = self.resolve_observed_addrs(entry).await;
+            let (targets, witness) = self.resolve_observed_addrs_until(entry, deadline).await;
             let targets = targets?;
             let target = targets
                 .first()
@@ -543,6 +604,7 @@ impl UpstreamPool {
                         raw_query,
                         &mut original_business,
                         &mut route_failures,
+                        deadline,
                     )
                     .await
                 {
@@ -552,7 +614,7 @@ impl UpstreamPool {
             } else {
                 let admission = self.admit_query().await?;
                 match self
-                    .exchange_direct_udp(entry, &route, raw_query, admission)
+                    .exchange_direct_udp(entry, &route, raw_query, admission, deadline)
                     .await
                 {
                     Ok(exchange) => {
@@ -563,6 +625,7 @@ impl UpstreamPool {
                                 &route,
                                 raw_query,
                                 exchange,
+                                deadline,
                             )
                             .await;
                     }
@@ -576,7 +639,7 @@ impl UpstreamPool {
         let (addresses, witness) = match prefetched {
             Some(resolved) => resolved,
             None => {
-                let (addresses, witness) = self.resolve_observed_addrs(entry).await;
+                let (addresses, witness) = self.resolve_observed_addrs_until(entry, deadline).await;
                 (addresses?, witness)
             }
         };
@@ -613,6 +676,7 @@ impl UpstreamPool {
                         raw_query,
                         &mut original_business,
                         &mut route_failures,
+                        deadline,
                     )
                     .await
                 {
@@ -622,7 +686,7 @@ impl UpstreamPool {
             } else {
                 let attempt = async {
                     let admission = self.admit_query().await?;
-                    self.exchange_direct_udp(entry, &route, raw_query, admission)
+                    self.exchange_direct_udp(entry, &route, raw_query, admission, deadline)
                         .await
                 }
                 .await;
@@ -635,6 +699,7 @@ impl UpstreamPool {
                                 &route,
                                 raw_query,
                                 exchange,
+                                deadline,
                             )
                             .await;
                     }
@@ -642,6 +707,11 @@ impl UpstreamPool {
                 }
             }
         };
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(first_error)
+                .with_context(|| format!("UDP DNS query deadline elapsed after {first}"));
+        }
 
         debug!(
             address = %first,
@@ -664,6 +734,7 @@ impl UpstreamPool {
                     raw_query,
                     &mut original_business,
                     &mut route_failures,
+                    deadline,
                 )
                 .await
                 .with_context(|| {
@@ -672,14 +743,21 @@ impl UpstreamPool {
         }
         let attempt = async {
             let admission = self.admit_query().await?;
-            self.exchange_direct_udp(entry, &route, raw_query, admission)
+            self.exchange_direct_udp(entry, &route, raw_query, admission, deadline)
                 .await
         }
         .await;
         match attempt {
             Ok(exchange) => {
-                self.finish_direct_udp_query(upstream_name, entry, &route, raw_query, exchange)
-                    .await
+                self.finish_direct_udp_query(
+                    upstream_name,
+                    entry,
+                    &route,
+                    raw_query,
+                    exchange,
+                    deadline,
+                )
+                .await
             }
             Err(error) => Err(error).with_context(|| {
                 format!("UDP DNS failed via {retry} (first {first}: {first_error})")
@@ -689,7 +767,12 @@ impl UpstreamPool {
 }
 
 impl UpstreamPool {
-    async fn query_inner(&self, upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn query_inner(
+        &self,
+        upstream_name: &str,
+        raw_query: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<Vec<u8>> {
         debug!(
             "UpstreamPool::query called for '{}' ({} bytes)",
             upstream_name,
@@ -700,16 +783,26 @@ impl UpstreamPool {
             .get(upstream_name)
             .ok_or_else(|| anyhow::anyhow!("unknown upstream: {upstream_name}"))?;
         if entry.protocol == DnsProtocol::Udp {
-            return self.query_datagram(upstream_name, entry, raw_query).await;
+            return self
+                .query_datagram(upstream_name, entry, raw_query, deadline)
+                .await;
         }
 
-        let (targets, witness) = self.resolve_observed_addrs(entry).await;
+        let (targets, witness) = self.resolve_observed_addrs_until(entry, deadline).await;
         let targets = targets?;
+        let candidate_count = targets.len();
         let mut last_error = None;
         let mut first_error = None;
         let mut original_business = None;
         let mut route_failures = RouteFailures::default();
-        for target in targets {
+        for (index, target) in targets.into_iter().enumerate() {
+            let now = tokio::time::Instant::now();
+            if index > 0 && now >= deadline {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let candidates_left = u32::try_from(candidate_count - index).unwrap_or(u32::MAX);
+            let candidate_deadline = now + (remaining / candidates_left);
             let route = self
                 .resolve_dial_route_for_address(entry, target, original_business.as_ref())
                 .await?;
@@ -737,6 +830,7 @@ impl UpstreamPool {
                     effective_query,
                     business,
                     &mut route_failures,
+                    Some(candidate_deadline),
                 );
                 crate::observe::scope_pin!(exchange);
                 let exchange = crate::observe::flows::dns::outbound_scope(
@@ -797,7 +891,18 @@ impl UpstreamPool {
 #[async_trait::async_trait]
 impl DnsUpstreamPool for UpstreamPool {
     async fn query(&self, upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let query = self.query_inner(upstream_name, raw_query);
+        self.query_until(upstream_name, raw_query, self.query_deadline())
+            .await
+    }
+
+    async fn query_until(
+        &self,
+        upstream_name: &str,
+        raw_query: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<Vec<u8>> {
+        let deadline = deadline.min(self.query_deadline());
+        let query = self.query_inner(upstream_name, raw_query, deadline);
         crate::observe::scope_pin!(query);
         let query = crate::observe::flows::dns::exchange_scope(raw_query, upstream_name, query);
         query.await

@@ -186,6 +186,7 @@ impl PooledTransport {
         raw_query: &[u8],
         feedback: Option<ScoreBusinessGuard>,
         route: Option<RouteExchange<'_>>,
+        deadline: Option<tokio::time::Instant>,
     ) -> anyhow::Result<Vec<u8>> {
         let (upstream, carrier) = match self {
             Self::Tcp(_) => ("tcp", "tcp"),
@@ -196,11 +197,31 @@ impl PooledTransport {
         };
         crate::observe::flows::dns::transport(upstream, carrier);
         match self {
-            Self::Tcp(transport) => transport.exchange_routed(raw_query, feedback, route).await,
-            Self::Dot(transport) => transport.exchange_routed(raw_query, feedback, route).await,
-            Self::Doh(transport) => transport.exchange_routed(raw_query, feedback, route).await,
-            Self::Doq(transport) => transport.exchange_routed(raw_query, feedback, route).await,
-            Self::Doh3(transport) => transport.exchange_routed(raw_query, feedback, route).await,
+            Self::Tcp(transport) => {
+                transport
+                    .exchange_routed_until(raw_query, feedback, route, deadline)
+                    .await
+            }
+            Self::Dot(transport) => {
+                transport
+                    .exchange_routed_until(raw_query, feedback, route, deadline)
+                    .await
+            }
+            Self::Doh(transport) => {
+                transport
+                    .exchange_routed_until(raw_query, feedback, route, deadline)
+                    .await
+            }
+            Self::Doq(transport) => {
+                transport
+                    .exchange_routed_until(raw_query, feedback, route, deadline)
+                    .await
+            }
+            Self::Doh3(transport) => {
+                transport
+                    .exchange_routed_until(raw_query, feedback, route, deadline)
+                    .await
+            }
         }
     }
 }
@@ -256,11 +277,23 @@ impl UpstreamPool {
         })
     }
 
+    #[cfg(test)]
     pub(super) async fn get_transport(
         &self,
         entry: &UpstreamEntry,
         proxy_node: Option<&OwnedTarget>,
         target: std::net::SocketAddr,
+    ) -> anyhow::Result<Arc<PooledTransport>> {
+        self.get_transport_until(entry, proxy_node, target, None)
+            .await
+    }
+
+    pub(super) async fn get_transport_until(
+        &self,
+        entry: &UpstreamEntry,
+        proxy_node: Option<&OwnedTarget>,
+        target: std::net::SocketAddr,
+        deadline: Option<tokio::time::Instant>,
     ) -> anyhow::Result<Arc<PooledTransport>> {
         let key = TransportKey {
             dialed: proxy_node.map(OwnedTarget::key),
@@ -276,7 +309,7 @@ impl UpstreamPool {
                     .or_insert_with(|| Arc::new(LifecycleSlot::new())),
             )
         };
-        slot.acquire(|| self.build_transport(entry, proxy_node, target))
+        slot.acquire_until(deadline, || self.build_transport(entry, proxy_node, target))
             .await
             .map(|(value, _)| value)
     }

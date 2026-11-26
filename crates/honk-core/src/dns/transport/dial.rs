@@ -186,7 +186,10 @@ impl DialContext {
             .await
     }
 
-    async fn dial_tcp_until(&self, deadline: tokio::time::Instant) -> anyhow::Result<DnsTcpStream> {
+    pub(super) async fn dial_tcp_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<DnsTcpStream> {
         let addresses = self
             .endpoint
             .resolve_addrs_budgeted(&self.socket_budget, deadline)

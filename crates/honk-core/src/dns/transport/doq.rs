@@ -61,19 +61,24 @@ impl DoqClient {
         raw_query: &[u8],
         feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
-        self.exchange_routed(raw_query, feedback, None).await
+        self.exchange_routed_until(raw_query, feedback, None, None)
+            .await
     }
 
-    pub(crate) async fn exchange_routed(
+    pub(crate) async fn exchange_routed_until(
         self: &Arc<Self>,
         raw_query: &[u8],
         feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
         route: Option<RouteExchange<'_>>,
+        deadline: Option<tokio::time::Instant>,
     ) -> anyhow::Result<Vec<u8>> {
         super::retry::exchange_with_route_retry(
             "DoQ",
             raw_query,
-            |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
+            |reporter| async move {
+                self.exchange_once(raw_query, reporter.as_ref(), deadline)
+                    .await
+            },
             |error| {
                 let connection = SessionFailure::<DoqConnection>::session(error);
                 async move {
@@ -84,6 +89,7 @@ impl DoqClient {
             },
             feedback,
             route,
+            deadline,
         )
         .await
     }
@@ -92,13 +98,24 @@ impl DoqClient {
         &self,
         raw_query: &[u8],
         reporter: Option<&honk_outbound::group::ScoreReporter>,
+        deadline: Option<tokio::time::Instant>,
     ) -> anyhow::Result<Vec<u8>> {
-        let conn = self.get_conn().await?;
+        let conn = self.get_conn(deadline).await?;
         if let Some(reporter) = reporter {
             reporter.setup_succeeded();
         }
+        let exchange_timeout = match deadline {
+            Some(d) => self
+                .dial
+                .query_timeout
+                .min(d.saturating_duration_since(tokio::time::Instant::now())),
+            None => self.dial.query_timeout,
+        };
+        if exchange_timeout.is_zero() {
+            anyhow::bail!("DoQ exchange timed out after {:?}", self.dial.query_timeout);
+        }
         let io_error = |error| with_packet_cause(conn.endpoint.packet(), error);
-        tokio::time::timeout(self.dial.query_timeout, async {
+        tokio::time::timeout(exchange_timeout, async {
             let (mut send, mut recv) = conn.connection.open_bi().await.map_err(|error| {
                 with_packet_cause(conn.endpoint.packet(), error.into()).context("DoQ open_bi")
             })?;
@@ -115,7 +132,7 @@ impl DoqClient {
                 reporter.tx(raw_query.len() as u64);
             }
 
-            let mut resp = read_length_prefixed(&mut recv, self.dial.query_timeout)
+            let mut resp = read_length_prefixed(&mut recv, exchange_timeout)
                 .await
                 .map_err(io_error)?;
             if let Some(reporter) = reporter
@@ -137,10 +154,16 @@ impl DoqClient {
         .map_err(|error| SessionFailure::new(conn, error).into())
     }
 
-    async fn get_conn(&self) -> anyhow::Result<Arc<DoqConnection>> {
+    async fn get_conn(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<Arc<DoqConnection>> {
         let observation = SessionObservation::start();
         let result = async {
-            let (connection, reused) = self.connection.acquire(|| self.dial()).await?;
+            let (connection, reused) = self
+                .connection
+                .acquire_until(deadline, || self.dial_until(deadline))
+                .await?;
             if connection.connection.close_reason().is_some() {
                 observation.record(
                     honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionReadyFailed,
@@ -151,7 +174,10 @@ impl DoqClient {
                 self.retire_connection(&connection).await;
                 // Closed Quinn handles still retain their socket and admission credit.
                 drop(connection);
-                let (connection, reused) = self.connection.acquire(|| self.dial()).await?;
+                let (connection, reused) = self
+                    .connection
+                    .acquire_until(deadline, || self.dial_until(deadline))
+                    .await?;
                 if reused {
                     super::lifecycle::attached();
                 }
@@ -168,13 +194,26 @@ impl DoqClient {
             honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionAcquired,
         )
     }
+
+    #[cfg(test)]
     async fn dial(&self) -> anyhow::Result<DoqConnection> {
+        self.dial_until(None).await
+    }
+
+    async fn dial_until(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<DoqConnection> {
+        let dial_deadline = match deadline {
+            Some(d) => (tokio::time::Instant::now() + self.dial.dial_timeout).min(d),
+            None => tokio::time::Instant::now() + self.dial.dial_timeout,
+        };
         let (connection, endpoint) = quic_connect_endpoint(
             &self.dial,
             &self.quic_ep,
             &self.quic_config,
             &self.dial.endpoint,
-            tokio::time::Instant::now() + self.dial.dial_timeout,
+            dial_deadline,
             "DoQ",
         )
         .await?;

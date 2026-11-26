@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::idle_pool::IdleStream;
 use super::retry::exchange_with_route_retry;
-use super::{DialContext, IdlePoolState, RouteExchange, close_idle_pool, idle_pool_exchange};
+use super::{DialContext, IdlePoolState, RouteExchange, close_idle_pool, idle_pool_exchange_until};
 use parking_lot::Mutex;
 
 /// Direct or proxied pooled TCP stream.
@@ -31,26 +31,29 @@ impl TcpPool {
         raw_query: &[u8],
         feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
-        self.exchange_routed(raw_query, feedback, None).await
+        self.exchange_routed_until(raw_query, feedback, None, None)
+            .await
     }
 
-    pub(crate) async fn exchange_routed(
+    pub(crate) async fn exchange_routed_until(
         self: &Arc<Self>,
         raw_query: &[u8],
         feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
         route: Option<RouteExchange<'_>>,
+        deadline: Option<tokio::time::Instant>,
     ) -> anyhow::Result<Vec<u8>> {
         let routed = route.is_some();
         exchange_with_route_retry(
             "TCP DNS",
             raw_query,
             |reporter| async move {
-                self.exchange_once(raw_query, reporter.as_ref(), routed)
+                self.exchange_once(raw_query, reporter.as_ref(), routed, deadline)
                     .await
             },
             |_| async {},
             feedback,
             route,
+            deadline,
         )
         .await
     }
@@ -60,24 +63,33 @@ impl TcpPool {
         raw_query: &[u8],
         reporter: Option<&honk_outbound::group::ScoreReporter>,
         routed: bool,
+        deadline: Option<tokio::time::Instant>,
     ) -> anyhow::Result<Vec<u8>> {
-        idle_pool_exchange(
+        idle_pool_exchange_until(
             &self.lifecycle,
             &self.idle,
-            || self.dial_new(),
+            || self.dial_new(deadline),
             raw_query,
             self.dial.query_timeout,
+            deadline,
             reporter,
             routed,
         )
         .await
     }
 
-    async fn dial_new(&self) -> anyhow::Result<PooledStream> {
+    async fn dial_new(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<PooledStream> {
+        let dial_deadline = match deadline {
+            Some(d) => (tokio::time::Instant::now() + self.dial.dial_timeout).min(d),
+            None => tokio::time::Instant::now() + self.dial.dial_timeout,
+        };
         if self.dial.proxy.is_some() {
-            self.dial.dial_tcp_boxed().await
+            self.dial.dial_tcp_boxed_until(dial_deadline).await
         } else {
-            Ok(Box::new(self.dial.dial_tcp().await?))
+            Ok(Box::new(self.dial.dial_tcp_until(dial_deadline).await?))
         }
     }
 

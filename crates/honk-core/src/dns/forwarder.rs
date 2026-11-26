@@ -32,6 +32,15 @@ pub trait DnsUpstreamPool: Send + Sync {
     /// Send a raw DNS query to the named upstream and return the
     /// raw wire-format response.
     async fn query(&self, upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>>;
+
+    async fn query_until(
+        &self,
+        upstream_name: &str,
+        raw_query: &[u8],
+        _deadline: tokio::time::Instant,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.query(upstream_name, raw_query).await
+    }
 }
 
 #[derive(Debug, Error)]

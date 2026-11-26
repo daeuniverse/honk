@@ -89,19 +89,24 @@ impl Doh3Client {
         raw_query: &[u8],
         feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
-        self.exchange_routed(raw_query, feedback, None).await
+        self.exchange_routed_until(raw_query, feedback, None, None)
+            .await
     }
 
-    pub(crate) async fn exchange_routed(
+    pub(crate) async fn exchange_routed_until(
         self: &Arc<Self>,
         raw_query: &[u8],
         feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
         route: Option<RouteExchange<'_>>,
+        deadline: Option<tokio::time::Instant>,
     ) -> anyhow::Result<Vec<u8>> {
         super::retry::exchange_with_route_retry(
             "DoH3",
             raw_query,
-            |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
+            |reporter| async move {
+                self.exchange_once_until(raw_query, reporter.as_ref(), deadline)
+                    .await
+            },
             |error| {
                 let session = SessionFailure::<H3Session>::session(error);
                 async move {
@@ -112,21 +117,45 @@ impl Doh3Client {
             },
             feedback,
             route,
+            deadline,
         )
         .await
     }
 
+    #[cfg(test)]
     async fn exchange_once(
         &self,
         raw_query: &[u8],
         reporter: Option<&honk_outbound::group::ScoreReporter>,
     ) -> anyhow::Result<Vec<u8>> {
-        let (session, mut sender) = self.get_sender().await?;
+        self.exchange_once_until(raw_query, reporter, None).await
+    }
+
+    async fn exchange_once_until(
+        &self,
+        raw_query: &[u8],
+        reporter: Option<&honk_outbound::group::ScoreReporter>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let (session, mut sender) = self.get_sender(deadline).await?;
         if let Some(reporter) = reporter {
             reporter.setup_succeeded();
         }
+        let exchange_timeout = match deadline {
+            Some(d) => self
+                .dial
+                .query_timeout
+                .min(d.saturating_duration_since(tokio::time::Instant::now())),
+            None => self.dial.query_timeout,
+        };
+        if exchange_timeout.is_zero() {
+            anyhow::bail!(
+                "DoH3 exchange timed out after {:?}",
+                self.dial.query_timeout
+            );
+        }
 
-        tokio::time::timeout(self.dial.query_timeout, async {
+        tokio::time::timeout(exchange_timeout, async {
             let mut wire = raw_query.to_vec();
             let orig_id = force_dns_id_zero(&mut wire);
 
@@ -186,11 +215,17 @@ impl Doh3Client {
 
     /// A sender on a live QUIC connection; one that closed between queries
     /// is rebuilt before the query goes out rather than failing it.
-    async fn get_sender(&self) -> anyhow::Result<(Arc<H3Session>, H3Sender)> {
+    async fn get_sender(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<(Arc<H3Session>, H3Sender)> {
         let observation = SessionObservation::start();
         let result = async {
             for attempt in 0..2 {
-                let (session, reused) = self.session.acquire(|| self.handshake()).await?;
+                let (session, reused) = self
+                    .session
+                    .acquire_until(deadline, || self.handshake_until(deadline))
+                    .await?;
                 match session.connection.close_reason() {
                     None => {
                         let sender = session.sender.lock().await.clone().ok_or_else(|| {
@@ -226,19 +261,30 @@ impl Doh3Client {
         )
     }
 
+    #[cfg(test)]
     async fn handshake(&self) -> anyhow::Result<H3Session> {
-        let deadline = tokio::time::Instant::now() + self.dial.dial_timeout;
+        self.handshake_until(None).await
+    }
+
+    async fn handshake_until(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<H3Session> {
+        let dial_deadline = match deadline {
+            Some(d) => (tokio::time::Instant::now() + self.dial.dial_timeout).min(d),
+            None => tokio::time::Instant::now() + self.dial.dial_timeout,
+        };
         let (conn, endpoint) = quic_connect_endpoint(
             &self.dial,
             &self.quic_ep,
             &self.quic_config,
             &self.dial.endpoint,
-            deadline,
+            dial_deadline,
             "DoH3 QUIC",
         )
         .await?;
         let quinn_conn = H3QuinnConnection::new(conn.clone());
-        let h3 = tokio::time::timeout_at(deadline, h3::client::new(quinn_conn)).await;
+        let h3 = tokio::time::timeout_at(dial_deadline, h3::client::new(quinn_conn)).await;
         let (mut driver, sender) = match h3 {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => {

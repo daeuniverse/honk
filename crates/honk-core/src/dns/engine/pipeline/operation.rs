@@ -22,12 +22,14 @@ pub(super) async fn run_as_leader(
 }
 
 pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, DnsForwardError> {
+    let deadline = context.forwarder.exchange_deadline();
     let upstream_result = context
         .forwarder
-        .exchange(
+        .exchange_until(
             &context.request_scope,
             context.raw_query,
             context.prepared.query().ingress(),
+            deadline,
         )
         .await;
     let (mut response, mut upstream_name) = match upstream_result {
@@ -101,10 +103,18 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
                 strict_reusable: response_strict_reusable,
             } => {
                 strict_reusable &= response_strict_reusable;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(DnsForwardError::Exchange {
+                        upstream: upstream.as_str().to_owned(),
+                        source: anyhow::anyhow!(
+                            "DNS query deadline elapsed before response requery"
+                        ),
+                    });
+                }
                 response = context
                     .forwarder
                     .upstream_pool
-                    .query(upstream.as_str(), context.raw_query)
+                    .query_until(upstream.as_str(), context.raw_query, deadline)
                     .await
                     .map_err(|source| DnsForwardError::Exchange {
                         upstream: upstream.as_str().to_owned(),

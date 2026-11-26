@@ -80,21 +80,23 @@ impl DohClient {
         raw_query: &[u8],
         feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
-        self.exchange_routed(raw_query, feedback, None).await
+        self.exchange_routed_until(raw_query, feedback, None, None)
+            .await
     }
 
-    pub(crate) async fn exchange_routed(
+    pub(crate) async fn exchange_routed_until(
         self: &Arc<Self>,
         raw_query: &[u8],
         feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
         route: Option<RouteExchange<'_>>,
+        deadline: Option<tokio::time::Instant>,
     ) -> anyhow::Result<Vec<u8>> {
         let routed = route.is_some();
         exchange_with_route_retry(
             "DoH",
             raw_query,
             |reporter| async move {
-                self.exchange_once(raw_query, reporter.as_ref(), routed)
+                self.exchange_once(raw_query, reporter.as_ref(), routed, deadline)
                     .await
             },
             |error| {
@@ -107,6 +109,7 @@ impl DohClient {
             },
             feedback,
             route,
+            deadline,
         )
         .await
     }
@@ -116,13 +119,24 @@ impl DohClient {
         raw_query: &[u8],
         reporter: Option<&honk_outbound::group::ScoreReporter>,
         routed: bool,
+        deadline: Option<tokio::time::Instant>,
     ) -> anyhow::Result<Vec<u8>> {
-        let (session, mut sender) = self.get_sender(routed).await?;
+        let (session, mut sender) = self.get_sender(routed, deadline).await?;
         if let Some(reporter) = reporter {
             reporter.setup_succeeded();
         }
+        let exchange_timeout = match deadline {
+            Some(d) => self
+                .dial
+                .query_timeout
+                .min(d.saturating_duration_since(tokio::time::Instant::now())),
+            None => self.dial.query_timeout,
+        };
+        if exchange_timeout.is_zero() {
+            anyhow::bail!("DoH exchange timed out after {:?}", self.dial.query_timeout);
+        }
 
-        tokio::time::timeout(self.dial.query_timeout, async {
+        tokio::time::timeout(exchange_timeout, async {
             let mut wire = raw_query.to_vec();
             let orig_id = force_dns_id_zero(&mut wire);
 
@@ -185,11 +199,18 @@ impl DohClient {
     /// queries (server GOAWAY, idle close), leaving a sender clone that only
     /// fails; `ready` catches that, and the session is rebuilt once before
     /// the query goes out, instead of the query spending its retry on it.
-    async fn get_sender(&self, routed: bool) -> anyhow::Result<(Arc<H2Session>, H2Sender)> {
+    async fn get_sender(
+        &self,
+        routed: bool,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<(Arc<H2Session>, H2Sender)> {
         let observation = SessionObservation::start();
         let result = async {
             for attempt in 0..2 {
-                let (session, reused) = self.session.acquire(|| self.handshake(routed)).await?;
+                let (session, reused) = self
+                    .session
+                    .acquire_until(deadline, || self.handshake(routed, deadline))
+                    .await?;
                 let sender = session.sender.lock().clone().ok_or_else(|| {
                     SessionFailure::new(
                         Arc::clone(&session),
@@ -202,13 +223,22 @@ impl DohClient {
                 let ready = if stale {
                     Err(anyhow::anyhow!("DoH session is closing"))
                 } else {
-                    sender.ready().await.map_err(|error| {
-                        if reused {
+                    let ready_fut = sender.ready();
+                    let awaited = match deadline {
+                        Some(d) => tokio::time::timeout_at(d, ready_fut)
+                            .await
+                            .map_err(|_| anyhow::anyhow!("DoH session readiness timed out")),
+                        None => Ok(ready_fut.await),
+                    };
+                    match awaited {
+                        Ok(Ok(sender)) => Ok(sender),
+                        Ok(Err(error)) => Err(if reused {
                             anyhow::anyhow!("DoH session unusable: {error}")
                         } else {
                             session.h2_error("DoH session unusable", error)
-                        }
-                    })
+                        }),
+                        Err(timeout_err) => return Err(timeout_err),
+                    }
                 };
                 match ready {
                     Ok(sender) => {
@@ -237,13 +267,20 @@ impl DohClient {
         )
     }
 
-    async fn handshake(&self, routed: bool) -> anyhow::Result<H2Session> {
+    async fn handshake(
+        &self,
+        routed: bool,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<H2Session> {
         let server_name = self.dial.endpoint.sni.clone();
         let via_proxy = self.dial.proxy.is_some();
-        let deadline = tokio::time::Instant::now() + self.dial.dial_timeout;
-        let tcp = self.dial.dial_tcp_boxed_until(deadline).await?;
+        let dial_deadline = match deadline {
+            Some(d) => (tokio::time::Instant::now() + self.dial.dial_timeout).min(d),
+            None => tokio::time::Instant::now() + self.dial.dial_timeout,
+        };
+        let tcp = self.dial.dial_tcp_boxed_until(dial_deadline).await?;
         let (tcp, carrier_failure) = CarrierIo::capture(tcp, routed);
-        tokio::time::timeout_at(deadline, async {
+        tokio::time::timeout_at(dial_deadline, async {
             let tls = self
                 .connector
                 .connect(&server_name, tcp)

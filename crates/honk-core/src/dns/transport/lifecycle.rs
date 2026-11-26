@@ -189,7 +189,20 @@ impl<T> LifecycleSlot<T> {
 
     /// The reuse flag includes callers coalesced behind another caller's build.
     /// Acquiring a pool wrapper is not evidence of a physical connection.
+    #[cfg(test)]
     pub(crate) async fn acquire<F, Fut>(&self, build: F) -> anyhow::Result<(Arc<T>, bool)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<T>>,
+    {
+        self.acquire_until(None, build).await
+    }
+
+    pub(crate) async fn acquire_until<F, Fut>(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+        build: F,
+    ) -> anyhow::Result<(Arc<T>, bool)>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = anyhow::Result<T>>,
@@ -218,6 +231,9 @@ impl<T> LifecycleSlot<T> {
                         None
                     }
                     SlotState::Closed => {
+                        if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+                            return Err(anyhow::anyhow!("DNS transport setup deadline elapsed"));
+                        }
                         inner.generation = inner.generation.wrapping_add(1);
                         let generation = inner.generation;
                         inner.state = SlotState::Building { generation };
@@ -230,12 +246,28 @@ impl<T> LifecycleSlot<T> {
             };
 
             if let Some((value, teardown)) = closing {
-                self.finish_close(value, teardown).await;
+                match deadline {
+                    Some(deadline) => {
+                        tokio::time::timeout_at(deadline, self.finish_close(value, teardown))
+                            .await
+                            .map_err(|_| anyhow::anyhow!("DNS transport teardown timed out"))?;
+                    }
+                    None => self.finish_close(value, teardown).await,
+                }
                 continue;
             }
 
             let Some(generation) = action else {
-                notified.await;
+                match deadline {
+                    Some(deadline) => {
+                        tokio::time::timeout_at(deadline, notified)
+                            .await
+                            .map_err(|_| {
+                                anyhow::anyhow!("DNS transport initialization timed out")
+                            })?;
+                    }
+                    None => notified.await,
+                }
                 continue;
             };
             let guard = BuildGuard::new(self, generation);

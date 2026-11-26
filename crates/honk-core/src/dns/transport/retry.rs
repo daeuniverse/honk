@@ -80,7 +80,7 @@ where
     Reset: FnOnce(&anyhow::Error) -> ResetFut,
     ResetFut: Future<Output = ()>,
 {
-    exchange_with_route_retry(label, raw_query, once, reset, feedback, None).await
+    exchange_with_route_retry(label, raw_query, once, reset, feedback, None, None).await
 }
 
 pub(super) async fn exchange_with_route_retry<Once, Fut, Reset, ResetFut>(
@@ -90,6 +90,7 @@ pub(super) async fn exchange_with_route_retry<Once, Fut, Reset, ResetFut>(
     reset: Reset,
     feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
     route: Option<RouteExchange<'_>>,
+    deadline: Option<tokio::time::Instant>,
 ) -> anyhow::Result<Vec<u8>>
 where
     Once: Fn(Option<honk_outbound::group::ScoreReporter>) -> Fut,
@@ -116,18 +117,22 @@ where
         Err(first) => {
             record_reset(label);
             reset(&first).await;
-            let retry_stamp = route.as_ref().map(|route| route.revision.admit());
-            let exchange = once(reporter.clone());
-            crate::observe::scope_pin!(exchange);
-            let exchange =
-                crate::observe::flows::dns::transport_exchange_scope(raw_query, exchange);
-            let result = exchange.await.map_err(|error| {
-                let detail = error.to_string();
-                error.context(format!(
-                    "{label} failed after retry: {detail} (first: {first})"
-                ))
-            });
-            (result, retry_stamp, first_stamp.map(|stamp| (first, stamp)))
+            if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+                (Err(first), first_stamp, None)
+            } else {
+                let retry_stamp = route.as_ref().map(|route| route.revision.admit());
+                let exchange = once(reporter.clone());
+                crate::observe::scope_pin!(exchange);
+                let exchange =
+                    crate::observe::flows::dns::transport_exchange_scope(raw_query, exchange);
+                let result = exchange.await.map_err(|error| {
+                    let detail = error.to_string();
+                    error.context(format!(
+                        "{label} failed after retry: {detail} (first: {first})"
+                    ))
+                });
+                (result, retry_stamp, first_stamp.map(|stamp| (first, stamp)))
+            }
         }
     };
     let valid = (reporter.is_some() || route.is_some())

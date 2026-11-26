@@ -1203,3 +1203,177 @@ async fn upstream_bootstrap_negative_backoff_and_capacity_exemption() {
     bootstrap_task.abort();
     tcp_task.abort();
 }
+
+#[derive(Debug)]
+struct StallingCandidateTcpHandler;
+
+#[async_trait::async_trait]
+impl TcpOutbound for StallingCandidateTcpHandler {
+    async fn dial(
+        &self,
+        _node: &Node,
+        target: SocketAddr,
+        _target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        if target.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+            tokio::time::sleep(connect_timeout).await;
+            anyhow::bail!("candidate {target} timed out after {connect_timeout:?}");
+        }
+        let (client, mut server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let mut len_buf = [0_u8; 2];
+            if server.read_exact(&mut len_buf).await.is_ok() {
+                let len = usize::from(u16::from_be_bytes(len_buf));
+                let mut req = vec![0_u8; len];
+                if server.read_exact(&mut req).await.is_ok() {
+                    let resp = mock_dns_response(u16::from_be_bytes([req[0], req[1]]));
+                    let _ = server.write_all(&(resp.len() as u16).to_be_bytes()).await;
+                    let _ = server.write_all(&resp).await;
+                }
+            }
+        });
+        Ok(ProxyStream {
+            stream: Box::new(client),
+            target_addr: target,
+            target_domain: None,
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn multi_candidate_stream_and_udp_tc_queries_honor_total_query_budget() {
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (all_stall_boot, _, all_stall_boot_task) = spawn_counting_bootstrap_server(
+        vec![
+            [192, 0, 2, 1],
+            [192, 0, 2, 2],
+            [192, 0, 2, 3],
+            [192, 0, 2, 4],
+            [192, 0, 2, 5],
+            [192, 0, 2, 6],
+        ],
+        Arc::clone(&fail),
+    )
+    .await;
+    let (fourth_ok_boot, _, fourth_ok_boot_task) = spawn_counting_bootstrap_server(
+        vec![
+            [192, 0, 2, 1],
+            [192, 0, 2, 2],
+            [192, 0, 2, 3],
+            [127, 0, 0, 1],
+        ],
+        fail,
+    )
+    .await;
+
+    let proxy_node = Node::from_share_link("socks5://127.0.0.1:1080#stall-proxy").unwrap();
+    let mut registry = crate::proxy::ProxyRegistry::new();
+    registry.register(ProtocolEntry::new(
+        NodeProtocol::Socks5,
+        Arc::new(StallingCandidateTcpHandler),
+    ));
+    let registry = Arc::new(registry);
+
+    let all_stall_pool = UpstreamPool::new_with_proxy_and_bootstrap(
+        &[DnsUpstream {
+            outbound: Some(proxy_node.name.clone()),
+            ..make_upstream("all-stall", "all-stall.test:53", DnsProtocol::Tcp)
+        }],
+        make_router(),
+        Some(Arc::clone(&registry)),
+        vec![proxy_node.clone()],
+        Vec::new(),
+        honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{all_stall_boot}")),
+        DnsStrategy::PreferIpv4,
+    )
+    .unwrap()
+    .with_timeouts(Duration::from_millis(100), Duration::from_millis(200));
+
+    let started = tokio::time::Instant::now();
+    assert!(
+        all_stall_pool
+            .query("all-stall", &mock_dns_query(0x5001))
+            .await
+            .is_err()
+    );
+    assert!(
+        started.elapsed() <= Duration::from_millis(450),
+        "6 stalling candidates took {:?}, exceeding total 400ms query budget",
+        started.elapsed()
+    );
+
+    let fourth_ok_pool = UpstreamPool::new_with_proxy_and_bootstrap(
+        &[DnsUpstream {
+            outbound: Some(proxy_node.name.clone()),
+            ..make_upstream("fourth-ok", "fourth-ok.test:53", DnsProtocol::Tcp)
+        }],
+        make_router(),
+        Some(registry),
+        vec![proxy_node],
+        Vec::new(),
+        honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{fourth_ok_boot}")),
+        DnsStrategy::PreferIpv4,
+    )
+    .unwrap()
+    .with_timeouts(Duration::from_millis(100), Duration::from_millis(200));
+
+    let started = tokio::time::Instant::now();
+    let recovered = fourth_ok_pool
+        .query("fourth-ok", &mock_dns_query(0x5002))
+        .await
+        .expect("healthy 4th candidate should receive a slice of the query budget");
+    assert_eq!(recovered, mock_dns_response(0x5002));
+    assert!(
+        started.elapsed() <= Duration::from_millis(450),
+        "fallback candidate took {:?}",
+        started.elapsed()
+    );
+
+    let (tcp_listener, udp_server, tc_addr) =
+        bind_matching_tcp_udp(Ipv4Addr::LOCALHOST.into(), Ipv4Addr::LOCALHOST.into()).await;
+    let udp_task = tokio::spawn(async move {
+        let mut buf = [0_u8; 512];
+        let (_, peer) = udp_server.recv_from(&mut buf).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut truncated = mock_dns_response(u16::from_be_bytes([buf[0], buf[1]]));
+        truncated[2] |= 0x02;
+        udp_server.send_to(&truncated, peer).await.unwrap();
+    });
+    let tcp_task = tokio::spawn(async move {
+        while let Ok((_stream, _)) = tcp_listener.accept().await {
+            std::future::pending::<()>().await;
+        }
+    });
+    let tc_pool = UpstreamPool::new(
+        &[make_upstream(
+            "tc-stall",
+            &tc_addr.to_string(),
+            DnsProtocol::Udp,
+        )],
+        make_router(),
+    )
+    .unwrap()
+    .with_timeouts(Duration::from_millis(200), Duration::from_millis(100));
+
+    let started = tokio::time::Instant::now();
+    assert!(
+        tc_pool
+            .query("tc-stall", &mock_dns_query(0x5003))
+            .await
+            .is_err()
+    );
+    assert!(
+        started.elapsed() <= Duration::from_millis(520),
+        "UDP TC fallback + stalled TCP took {:?}, exceeding total 500ms query budget",
+        started.elapsed()
+    );
+
+    all_stall_pool.close().await;
+    fourth_ok_pool.close().await;
+    tc_pool.close().await;
+    all_stall_boot_task.abort();
+    fourth_ok_boot_task.abort();
+    udp_task.abort();
+    tcp_task.abort();
+}
