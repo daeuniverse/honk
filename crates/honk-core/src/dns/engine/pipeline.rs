@@ -17,7 +17,7 @@ mod flight {
 
     use super::{CacheAccess, ExecutionContext, cache};
     use crate::dns::forwarder::DnsForwardError;
-    use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus};
+    use crate::dns::outcome::{DnsOutcome, EffectiveExpiry};
     use crate::dns::singleflight::{FlightAnswer, FlightLeader};
 
     pub(super) fn publish_outcome(leader: FlightLeader, outcome: DnsOutcome) -> DnsOutcome {
@@ -25,6 +25,7 @@ mod flight {
             leader.publish(|| {
                 Ok(Arc::new(FlightAnswer {
                     template: template.clone(),
+                    status: outcome.status(),
                     provenance: outcome.provenance(),
                     final_upstream: outcome.final_upstream().map(Into::into),
                 }))
@@ -47,7 +48,7 @@ mod flight {
             context.prepared,
             answer.template.wire(),
             None,
-            OutcomeStatus::Accepted,
+            answer.status,
             answer.provenance,
             EffectiveExpiry::do_not_cache(),
             None,

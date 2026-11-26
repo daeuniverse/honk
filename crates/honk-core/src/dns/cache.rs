@@ -285,6 +285,7 @@ mod storage {
         /// Minimum TTL from the DNS record set, in seconds.
         pub min_ttl: u32,
         pub(crate) strict_reusable: bool,
+        pub(crate) rejected: bool,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

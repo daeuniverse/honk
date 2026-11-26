@@ -181,7 +181,7 @@ impl DnsForwarder {
         cache_key: &CacheKey,
         raw_query: &[u8],
         mode: ResolveMode,
-    ) -> Option<(Vec<u8>, u64)> {
+    ) -> Option<(Vec<u8>, bool, u64)> {
         if !self.cache_enabled {
             return None;
         }
@@ -190,6 +190,7 @@ impl DnsForwarder {
             cache.get_stale_exact(cache_key, matches!(mode, ResolveMode::Strict))?;
         #[cfg(feature = "native-api")]
         crate::observe::flows::dns::cache_state("stale");
+        let rejected = entry.rejected;
         let mut response = entry.response.to_vec();
         if self.stale_reply_ttl != 0 {
             rewrite_answer_ttls(&mut response, self.stale_reply_ttl);
@@ -198,7 +199,7 @@ impl DnsForwarder {
             response[0..2].copy_from_slice(&raw_query[0..2]);
         }
         debug!("DNS forwarder serving stale cache after upstream failure");
-        Some((response, revision))
+        Some((response, rejected, revision))
     }
 
     /// Spawn a deduplicated background refresh for a hot entry nearing

@@ -53,6 +53,7 @@ fn test_stale_retention_exceeded() {
         expires_at: Instant::now() - Duration::from_secs(7200),
         min_ttl: 1,
         strict_reusable: true,
+        rejected: false,
     };
     assert!(entry.is_stale_retention_exceeded());
     let fresh = CachedEntry {
@@ -60,6 +61,7 @@ fn test_stale_retention_exceeded() {
         expires_at: Instant::now() - Duration::from_secs(10),
         min_ttl: 1,
         strict_reusable: true,
+        rejected: false,
     };
     assert!(!fresh.is_stale_retention_exceeded());
 }
@@ -71,6 +73,7 @@ fn test_remaining_ttl() {
         expires_at: Instant::now() + Duration::from_secs(45),
         min_ttl: 45,
         strict_reusable: true,
+        rejected: false,
     };
     let remaining = entry.remaining_ttl_secs();
     assert!(

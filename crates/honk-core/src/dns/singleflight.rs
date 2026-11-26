@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 
 use super::cache::CacheKey;
 use super::forwarder::{DnsForwardError, ResolveMode};
-use super::outcome::Provenance;
+use super::outcome::{OutcomeStatus, Provenance};
 use super::query::DnsRequestMeta;
 use super::response::ResponseTemplate;
 
@@ -80,6 +80,7 @@ struct CounterSet {
 
 pub(crate) struct FlightAnswer {
     pub(crate) template: ResponseTemplate,
+    pub(crate) status: OutcomeStatus,
     pub(crate) provenance: Provenance,
     pub(crate) final_upstream: Option<String>,
 }

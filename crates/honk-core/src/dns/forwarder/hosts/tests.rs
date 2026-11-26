@@ -1016,14 +1016,7 @@ async fn alias_keeps_target_request_and_response_rejections_without_target_ident
                 .resolve_outcome(&build_dns_query("alias.test", 1))
                 .await
                 .unwrap();
-            // Cache hits expose the stored synthetic wire as Accepted; only
-            // the cold response-policy lookup carries its rejection verdict.
-            let expected_status = if response_reject && attempt == 1 {
-                OutcomeStatus::Accepted
-            } else {
-                OutcomeStatus::Rejected
-            };
-            assert_eq!(outcome.status(), expected_status);
+            assert_eq!(outcome.status(), OutcomeStatus::Rejected);
             assert!(outcome.answer_ips().is_empty());
             assert_eq!(outcome.domain(), "alias.test");
             assert_eq!(outcome.qtype(), 1);
@@ -1034,14 +1027,7 @@ async fn alias_keeps_target_request_and_response_rejections_without_target_ident
                 .resolve_outcome(&build_dns_query("upstream.test", 1))
                 .await
                 .unwrap();
-            assert_eq!(
-                target.status(),
-                if response_reject {
-                    OutcomeStatus::Accepted
-                } else {
-                    OutcomeStatus::Rejected
-                }
-            );
+            assert_eq!(target.status(), OutcomeStatus::Rejected);
             assert!(target.answer_ips().is_empty());
             if response_reject {
                 assert_eq!(target.provenance(), Provenance::Cache);

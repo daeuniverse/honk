@@ -112,6 +112,11 @@ pub(super) async fn lookup(
             context.options,
         );
     }
+    let status = if entry.rejected {
+        OutcomeStatus::Rejected
+    } else {
+        OutcomeStatus::Accepted
+    };
     let response = entry.response;
     let response = context
         .forwarder
@@ -132,7 +137,7 @@ pub(super) async fn lookup(
             context.prepared,
             response,
             None,
-            OutcomeStatus::Accepted,
+            status,
             Provenance::Cache,
             // Preferred-family probes must not extend the entry's expiry.
             EffectiveExpiry::cacheable(expires_at.saturating_duration_since(Instant::now())),
@@ -213,11 +218,12 @@ pub(super) async fn store(
                 );
             } else {
                 rewrite_answer_ttls(response, cache_ttl);
-                revision = cache.put_exact_if_current(
+                revision = cache.put_exact_status_if_current(
                     context.publication_epoch,
                     cache_key.clone(),
                     response.to_owned(),
                     cache_ttl,
+                    rejected_wire.is_some(),
                     context.refreshing,
                 );
             }

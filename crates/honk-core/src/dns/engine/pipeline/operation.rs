@@ -193,7 +193,7 @@ async fn stale_outcome(
     final_upstream: &UpstreamTag,
     history: Vec<String>,
 ) -> Result<Option<DnsOutcome>, DnsForwardError> {
-    let Some((stale, _revision)) = context
+    let Some((stale, rejected, _revision)) = context
         .forwarder
         .try_serve_stale(&context.cache_key, context.raw_query, context.mode)
         .await
@@ -236,7 +236,11 @@ async fn stale_outcome(
             context.prepared,
             stale,
             None,
-            OutcomeStatus::Accepted,
+            if rejected {
+                OutcomeStatus::Rejected
+            } else {
+                OutcomeStatus::Accepted
+            },
             Provenance::Stale,
             EffectiveExpiry::cacheable(Duration::from_secs(u64::from(ttl))),
             Some(context.logical_upstream.as_str().to_owned()),

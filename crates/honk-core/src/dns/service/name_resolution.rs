@@ -31,7 +31,7 @@ enum NameResolutionError {
 }
 
 #[derive(Default)]
-struct FamilyResponses<T = Vec<u8>> {
+struct FamilyResponses<T = crate::dns::outcome::DnsOutcome> {
     ipv4: Option<anyhow::Result<T>>,
     ipv6: Option<anyhow::Result<T>>,
     ipv4_eligible: bool,
@@ -345,10 +345,38 @@ impl DnsService {
             )
             .await?
             .fail_on_packet_rejection()?;
-            let ipv4_eligible = responses.ipv4_eligible;
-            let ipv6_eligible = responses.ipv6_eligible;
+            let is_rejected =
+                |response: &Option<anyhow::Result<crate::dns::outcome::DnsOutcome>>| {
+                    matches!(
+                        response,
+                        Some(Ok(outcome))
+                            if outcome.status() == crate::dns::outcome::OutcomeStatus::Rejected
+                    )
+                };
+            let is_failed = |response: &Option<anyhow::Result<crate::dns::outcome::DnsOutcome>>| {
+                matches!(response, Some(Err(_)))
+                    || matches!(
+                        response,
+                        Some(Ok(outcome))
+                            if outcome.response_class()
+                                == crate::dns::outcome::ResponseClass::Servfail
+                    )
+            };
+            let ipv4_rejected = is_rejected(&responses.ipv4);
+            let ipv6_rejected = is_rejected(&responses.ipv6);
+            let ipv4_failed = is_failed(&responses.ipv4);
+            let ipv6_failed = is_failed(&responses.ipv6);
+            let ipv4_eligible = responses.ipv4_eligible && !ipv4_rejected;
+            let ipv6_eligible = responses.ipv6_eligible && !ipv6_rejected;
+            let allow_fallback = (ipv4_eligible || ipv6_eligible)
+                && (!(ipv4_rejected || ipv6_rejected)
+                    || (ipv4_eligible && ipv4_failed)
+                    || (ipv6_eligible && ipv6_failed));
             let mut resolved = resolved_from_responses(responses);
             if resolved.ipv4.is_empty() && resolved.ipv6.is_empty() {
+                if !allow_fallback {
+                    return Err(NameResolutionError::NoAddresses { domain }.into());
+                }
                 let addresses =
                     operation
                         .run(fallback(domain.clone()))
@@ -648,7 +676,7 @@ fn resolve_family<'a>(
     query: &'a [u8],
     metadata: Option<(DnsRequestMeta, SocketAddr)>,
     options: &'a ResolveOptions,
-) -> impl Future<Output = anyhow::Result<Vec<u8>>> + Send + 'a {
+) -> impl Future<Output = anyhow::Result<crate::dns::outcome::DnsOutcome>> + Send + 'a {
     // Family futures otherwise multiply through join and cancellation scopes.
     Box::pin(async move {
         match metadata {
@@ -701,9 +729,7 @@ fn resolve_family<'a>(
                         }
                     }
                 }
-                result
-                    .map(|outcome| outcome.into_rendered())
-                    .map_err(Into::into)
+                result.map_err(Into::into)
             }
             None => forwarder
                 .resolve_inner(
@@ -715,7 +741,6 @@ fn resolve_family<'a>(
                     None,
                 )
                 .await
-                .map(|outcome| outcome.into_rendered())
                 .map_err(Into::into),
         }
     })
@@ -747,15 +772,15 @@ fn resolved_from_responses(responses: FamilyResponses) -> ResolvedAddr {
 }
 
 fn parsed_family(
-    response: Option<anyhow::Result<Vec<u8>>>,
+    response: Option<anyhow::Result<crate::dns::outcome::DnsOutcome>>,
     ipv4: bool,
     label: &str,
 ) -> (Vec<IpAddr>, Option<u32>) {
     let Some(response) = response else {
         return (Vec::new(), None);
     };
-    let response = match response {
-        Ok(response) => response,
+    let outcome = match response {
+        Ok(outcome) => outcome,
         Err(_) => {
             debug!(
                 record_type = label,
@@ -765,7 +790,10 @@ fn parsed_family(
             return (Vec::new(), None);
         }
     };
-    let pairs = crate::dns::wire::extract_ips_with_ttl(&response);
+    if outcome.status() == crate::dns::outcome::OutcomeStatus::Rejected {
+        return (Vec::new(), None);
+    }
+    let pairs = crate::dns::wire::extract_ips_with_ttl(outcome.rendered());
     let addresses = pairs
         .iter()
         .filter(|(ip, _)| ip.is_ipv4() == ipv4)

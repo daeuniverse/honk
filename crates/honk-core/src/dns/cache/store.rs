@@ -168,7 +168,14 @@ impl DnsCacheService {
             return;
         }
         let ttl = min_ttl.max(1);
-        let _ = self.put_slot(CacheSlot::Legacy(key), response.into(), ttl, true, None);
+        let _ = self.put_slot(
+            CacheSlot::Legacy(key),
+            response.into(),
+            ttl,
+            true,
+            false,
+            None,
+        );
     }
 
     #[cfg(test)]
@@ -183,7 +190,7 @@ impl DnsCacheService {
     ) {
         let publication = lock(&self.publication);
         if publication.accepting {
-            let _ = self.publish_exact(key, response, min_ttl, refreshing);
+            let _ = self.publish_exact(key, response, min_ttl, false, refreshing);
         }
     }
 
@@ -192,6 +199,7 @@ impl DnsCacheService {
         key: CacheKey,
         response: Vec<u8>,
         min_ttl: u32,
+        rejected: bool,
         refreshing: Option<u64>,
     ) -> Option<u64> {
         let ttl = min_ttl.max(1);
@@ -201,9 +209,11 @@ impl DnsCacheService {
             response.clone(),
             ttl,
             true,
+            rejected,
             refreshing,
         );
         if retained.is_some()
+            && !rejected
             && let Some(persister) = lock(&self.persister).clone()
         {
             persister.save(
@@ -215,6 +225,7 @@ impl DnsCacheService {
         retained
     }
 
+    #[cfg(test)]
     pub(crate) fn put_exact_if_current(
         &self,
         epoch: PublicationEpoch,
@@ -223,11 +234,23 @@ impl DnsCacheService {
         min_ttl: u32,
         refreshing: Option<u64>,
     ) -> Option<u64> {
+        self.put_exact_status_if_current(epoch, key, response, min_ttl, false, refreshing)
+    }
+
+    pub(crate) fn put_exact_status_if_current(
+        &self,
+        epoch: PublicationEpoch,
+        key: CacheKey,
+        response: Vec<u8>,
+        min_ttl: u32,
+        rejected: bool,
+        refreshing: Option<u64>,
+    ) -> Option<u64> {
         let publication = lock(&self.publication);
         if !publication.accepting || publication.epoch != epoch.0 {
             return None;
         }
-        self.publish_exact(key, response, min_ttl, refreshing)
+        self.publish_exact(key, response, min_ttl, rejected, refreshing)
     }
 
     pub(crate) fn put_restored_exact_if_current(
@@ -241,7 +264,14 @@ impl DnsCacheService {
         publication.accepting
             && publication.epoch == epoch.0
             && self
-                .put_slot(CacheSlot::Exact(key), response.into(), min_ttl, false, None)
+                .put_slot(
+                    CacheSlot::Exact(key),
+                    response.into(),
+                    min_ttl,
+                    false,
+                    false,
+                    None,
+                )
                 .is_some()
     }
 
@@ -251,6 +281,7 @@ impl DnsCacheService {
         response: bytes::Bytes,
         min_ttl: u32,
         strict_reusable: bool,
+        rejected: bool,
         refreshing: Option<u64>,
     ) -> Option<u64> {
         if response.len() > super::service::MAX_ANSWER_BYTES
@@ -264,6 +295,7 @@ impl DnsCacheService {
             expires_at: Instant::now() + Duration::from_secs(u64::from(ttl)),
             min_ttl,
             strict_reusable,
+            rejected,
         };
         let index = self.shard_index(&key);
         let mut shard = lock(&self.shards[index]);
@@ -293,6 +325,7 @@ impl DnsCacheService {
                     expires_at: Instant::now() - Duration::from_secs(1),
                     min_ttl,
                     strict_reusable: true,
+                    rejected: false,
                 },
                 revision,
             ),
@@ -318,6 +351,7 @@ impl DnsCacheService {
                     expires_at: Instant::now() - Duration::from_secs(1),
                     min_ttl,
                     strict_reusable: true,
+                    rejected: false,
                 },
                 revision,
             ),
@@ -369,6 +403,7 @@ impl DnsCacheService {
                         - Duration::from_secs(1),
                     min_ttl,
                     strict_reusable: true,
+                    rejected: false,
                 },
                 revision,
             ),

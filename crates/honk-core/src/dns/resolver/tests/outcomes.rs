@@ -622,3 +622,336 @@ async fn claimed_node_host_keeps_both_families_under_a_prefer_strategy() {
     );
     assert_eq!(pool.counts(), [1, 1]);
 }
+
+#[tokio::test]
+async fn policy_reject_never_falls_back_to_bootstrap() {
+    let fallback_calls = Arc::new(AtomicUsize::new(0));
+
+    let request_reject = honk_config::parser::parse_dae_config(
+        "dns {\n routing {\n  request {\n   qname(blocked.example) -> reject\n   fallback: reject\n  }\n }\n}\n",
+    )
+    .unwrap()
+    .dns;
+    for domain in ["blocked.example", "fallback-rejected.example"] {
+        let pool = ScriptedPool::new(Reply::Address(300), Reply::Address(300));
+        let forwarder = Arc::new(
+            DnsForwarder::new(
+                pool.clone(),
+                Arc::new(Mutex::new(DnsCache::new(32))),
+                Arc::new(DnsRouter::new_from_dns_config(&request_reject).expect("router")),
+            )
+            .with_strategy(DnsStrategy::Both),
+        );
+        let calls = Arc::clone(&fallback_calls);
+        let error = DnsService::with_forwarder(forwarder)
+            .resolve_name_with_fallback(domain, move |_| async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec!["198.51.100.8".parse::<IpAddr>().unwrap()])
+            })
+            .await
+            .expect_err("request reject must fail closed without bootstrap fallback");
+        assert!(error.to_string().contains("no A/AAAA records"), "{error:#}");
+        assert_eq!(pool.counts(), [0, 0]);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    let response_reject = honk_config::parser::parse_dae_config(
+        "dns {\n routing {\n  request {\n   fallback: default\n  }\n  response {\n   ip(192.0.2.10/32, 2001:db8::a/128) -> reject\n   qname(neg-sinkhole.example) -> reject\n   fallback: accept\n  }\n }\n}\n",
+    )
+    .unwrap()
+    .dns;
+    let gated_pool = Arc::new(ScriptedPool {
+        replies: [Reply::Address(0), Reply::Address(0)],
+        calls: [AtomicUsize::new(0), AtomicUsize::new(0)],
+        entered: Notify::new(),
+        release: Some(Semaphore::new(0)),
+    });
+    let both_entered = gated_pool.entered.notified();
+    tokio::pin!(both_entered);
+    both_entered.as_mut().enable();
+    let forwarder = Arc::new(
+        DnsForwarder::new(
+            gated_pool.clone(),
+            Arc::new(Mutex::new(DnsCache::new(32))),
+            Arc::new(DnsRouter::new_from_dns_config(&response_reject).expect("router")),
+        )
+        .with_strategy(DnsStrategy::Both),
+    );
+    let resp_service = DnsService::with_forwarder(Arc::clone(&forwarder));
+    let flights = forwarder.singleflight().clone();
+
+    let leader_service = resp_service.clone();
+    let leader_calls = Arc::clone(&fallback_calls);
+    let leader = tokio::spawn(async move {
+        leader_service
+            .resolve_name_with_fallback("sinkhole.example", move |_| async move {
+                leader_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec!["198.51.100.9".parse::<IpAddr>().unwrap()])
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), &mut both_entered)
+        .await
+        .expect("both family queries entered");
+
+    let waiter_service = resp_service.clone();
+    let waiter_calls = Arc::clone(&fallback_calls);
+    let waiter = tokio::spawn(async move {
+        waiter_service
+            .resolve_name_with_fallback("sinkhole.example", move |_| async move {
+                waiter_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec!["198.51.100.9".parse::<IpAddr>().unwrap()])
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while flights.counters().waiters < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both family queries coalesced");
+    gated_pool.release.as_ref().unwrap().add_permits(2);
+
+    let leader_err = leader
+        .await
+        .expect("leader task")
+        .expect_err("response reject leader must fail closed");
+    let waiter_err = waiter
+        .await
+        .expect("waiter task")
+        .expect_err("coalesced singleflight waiter must preserve response rejection");
+    assert!(leader_err.to_string().contains("no A/AAAA records"));
+    assert!(waiter_err.to_string().contains("no A/AAAA records"));
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(gated_pool.counts(), [1, 1]);
+
+    let cache_pool = ScriptedPool::new(Reply::Address(300), Reply::Address(90));
+    let cache_service = DnsService::with_forwarder(Arc::new(
+        DnsForwarder::new(
+            cache_pool.clone(),
+            Arc::new(Mutex::new(DnsCache::new(32))),
+            Arc::new(DnsRouter::new_from_dns_config(&response_reject).expect("router")),
+        )
+        .with_strategy(DnsStrategy::Both),
+    ));
+    for _ in 0..2 {
+        let cached_calls = Arc::clone(&fallback_calls);
+        let cached_err = cache_service
+            .resolve_name_with_fallback("cached-sinkhole.example", move |_| async move {
+                cached_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec!["198.51.100.9".parse::<IpAddr>().unwrap()])
+            })
+            .await
+            .expect_err("cached response reject must fail closed without bootstrap fallback");
+        assert!(cached_err.to_string().contains("no A/AAAA records"));
+    }
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(cache_pool.counts(), [1, 1]);
+
+    struct SoaNodataPool(AtomicUsize);
+    #[async_trait]
+    impl DnsUpstreamPool for SoaNodataPool {
+        async fn query(&self, _: &str, query: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let mut response = crate::dns::forwarder::make_nxdomain_response(query, 60, 60);
+            response[3] = 0x80;
+            Ok(response)
+        }
+    }
+    let nodata_pool = Arc::new(SoaNodataPool(AtomicUsize::new(0)));
+    let nodata_service = DnsService::with_forwarder(Arc::new(
+        DnsForwarder::new(
+            nodata_pool.clone(),
+            Arc::new(Mutex::new(DnsCache::new(32))),
+            Arc::new(DnsRouter::new_from_dns_config(&response_reject).expect("router")),
+        )
+        .with_strategy(DnsStrategy::Ipv4Only),
+    ));
+    for _ in 0..2 {
+        let nodata_calls = Arc::clone(&fallback_calls);
+        let nodata_err = nodata_service
+            .resolve_name_with_fallback("neg-sinkhole.example", move |_| async move {
+                nodata_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec!["198.51.100.13".parse::<IpAddr>().unwrap()])
+            })
+            .await
+            .expect_err("cached SOA NODATA response reject must fail closed");
+        assert!(nodata_err.to_string().contains("no A/AAAA records"));
+    }
+    assert_eq!(nodata_pool.0.load(Ordering::SeqCst), 1);
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+
+    struct StaleFlipPool(AtomicUsize);
+    #[async_trait]
+    impl DnsUpstreamPool for StaleFlipPool {
+        async fn query(&self, _: &str, query: &[u8]) -> anyhow::Result<Vec<u8>> {
+            match self.0.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(address_response(query, 1, 60)),
+                1 => anyhow::bail!("upstream outage after rejection cached"),
+                _ => {
+                    let mut servfail = query.to_vec();
+                    servfail[2..4].copy_from_slice(&0x8182_u16.to_be_bytes());
+                    Ok(servfail)
+                }
+            }
+        }
+    }
+    let stale_pool = Arc::new(StaleFlipPool(AtomicUsize::new(0)));
+    let stale_forwarder = Arc::new(
+        DnsForwarder::new(
+            stale_pool.clone(),
+            Arc::new(Mutex::new(DnsCache::new(32))),
+            Arc::new(DnsRouter::new_from_dns_config(&response_reject).expect("router")),
+        )
+        .with_strategy(DnsStrategy::Ipv4Only),
+    );
+    let stale_service = DnsService::with_forwarder(Arc::clone(&stale_forwarder));
+    let prime_calls = Arc::clone(&fallback_calls);
+    stale_service
+        .resolve_name_with_fallback("stale-sinkhole.example", move |_| async move {
+            prime_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec!["198.51.100.14".parse::<IpAddr>().unwrap()])
+        })
+        .await
+        .expect_err("initial response reject must fail closed");
+    let stale_query = crate::dns::forwarder::build_dns_query("stale-sinkhole.example", 1);
+    let stale_parsed = crate::dns::query::QueryContext::parse_with_profile(
+        &stale_query,
+        crate::dns::query::IngressProfile::Internal,
+    )
+    .expect("query");
+    let stale_key = crate::dns::cache::CacheKey::new(
+        &stale_parsed,
+        None,
+        crate::dns::planner::RequestScope::Upstream(
+            crate::dns::planner::UpstreamTag::new("default").expect("scope"),
+        ),
+        crate::dns::cache::OperationKind::Resolve,
+    );
+    stale_forwarder
+        .cache_service()
+        .await
+        .expire_positive_exact_for_test(&stale_key);
+    for _ in 0..2 {
+        let outage_calls = Arc::clone(&fallback_calls);
+        let stale_err = stale_service
+            .resolve_name_with_fallback("stale-sinkhole.example", move |_| async move {
+                outage_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec!["198.51.100.14".parse::<IpAddr>().unwrap()])
+            })
+            .await
+            .expect_err("stale response reject must fail closed during upstream outage/servfail");
+        assert!(stale_err.to_string().contains("no A/AAAA records"));
+    }
+    let stale_outcome = stale_forwarder
+        .resolve_inner(
+            &stale_query,
+            crate::dns::query::DnsRequestMeta::EMPTY,
+            crate::dns::query::IngressProfile::Internal,
+            &crate::dns::forwarder::ResolveOptions::default(),
+            crate::dns::forwarder::ResolveMode::Compatibility,
+            None,
+        )
+        .await
+        .expect("stale outcome");
+    assert_eq!(
+        stale_outcome.provenance(),
+        crate::dns::outcome::Provenance::Stale
+    );
+    assert_eq!(
+        stale_outcome.status(),
+        crate::dns::outcome::OutcomeStatus::Rejected
+    );
+    assert_eq!(stale_pool.0.load(Ordering::SeqCst), 4);
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let hosts_path = temp.path().join("hosts.rules");
+    std::fs::write(&hosts_path, "full:alias.example blocked.example\n").expect("write hosts");
+    let alias_config = honk_config::parser::parse_dae_config(&format!(
+        "dns {{\n use_host: '{}'\n routing {{\n  request {{\n   qname(blocked.example) -> reject\n   fallback: default\n  }}\n }}\n}}\n",
+        hosts_path.display()
+    ))
+    .unwrap()
+    .dns;
+    let alias_pool = ScriptedPool::new(Reply::Address(300), Reply::Address(300));
+    let alias_forwarder = Arc::new(
+        DnsForwarder::new(
+            alias_pool.clone(),
+            Arc::new(Mutex::new(DnsCache::new(32))),
+            Arc::new(DnsRouter::new_from_dns_config(&alias_config).expect("router")),
+        )
+        .with_strategy(DnsStrategy::Both)
+        .with_hosts_from_config(&alias_config)
+        .expect("hosts"),
+    );
+    let alias_calls = Arc::clone(&fallback_calls);
+    let alias_err = DnsService::with_forwarder(alias_forwarder)
+        .resolve_name_with_fallback("alias.example", move |_| async move {
+            alias_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec!["198.51.100.10".parse::<IpAddr>().unwrap()])
+        })
+        .await
+        .expect_err("hosts alias targeting a rejected name must fail closed");
+    assert!(alias_err.to_string().contains("no A/AAAA records"));
+    assert_eq!(alias_pool.counts(), [0, 0]);
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+
+    let qtype_reject = honk_config::parser::parse_dae_config(
+        "dns {\n routing {\n  request {\n   qtype(aaaa) -> reject\n   fallback: default\n  }\n }\n}\n",
+    )
+    .unwrap()
+    .dns;
+    let v4_ok_pool = ScriptedPool::new(Reply::Address(300), Reply::Address(90));
+    let v4_ok_forwarder = Arc::new(
+        DnsForwarder::new(
+            v4_ok_pool.clone(),
+            Arc::new(Mutex::new(DnsCache::new(32))),
+            Arc::new(DnsRouter::new_from_dns_config(&qtype_reject).expect("router")),
+        )
+        .with_strategy(DnsStrategy::Both),
+    );
+    let v4_calls = Arc::clone(&fallback_calls);
+    let resolved = DnsService::with_forwarder(v4_ok_forwarder)
+        .resolve_name_with_fallback("v4-allowed.example", move |_| async move {
+            v4_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec!["198.51.100.11".parse::<IpAddr>().unwrap()])
+        })
+        .await
+        .expect("A succeeds when only AAAA is rejected");
+    assert_eq!(resolved.ipv4, ["192.0.2.10".parse::<IpAddr>().unwrap()]);
+    assert!(resolved.ipv6.is_empty());
+    assert_eq!(v4_ok_pool.counts(), [1, 0]);
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+
+    let v4_fail_pool = ScriptedPool::new(Reply::Failure, Reply::Address(90));
+    let v4_fail_forwarder = Arc::new(
+        DnsForwarder::new(
+            v4_fail_pool,
+            Arc::new(Mutex::new(DnsCache::new(32))),
+            Arc::new(DnsRouter::new_from_dns_config(&qtype_reject).expect("router")),
+        )
+        .with_strategy(DnsStrategy::Both),
+    );
+    let partial_calls = Arc::clone(&fallback_calls);
+    let fallback_v4 = DnsService::with_forwarder(v4_fail_forwarder)
+        .resolve_name_with_fallback("v4-fallback.example", move |_| async move {
+            partial_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![
+                "198.51.100.12".parse::<IpAddr>().unwrap(),
+                "2001:db8::12".parse::<IpAddr>().unwrap(),
+            ])
+        })
+        .await
+        .expect("non-rejected family failure may still fall back for that family only");
+    assert_eq!(
+        fallback_v4.ipv4,
+        ["198.51.100.12".parse::<IpAddr>().unwrap()]
+    );
+    assert!(
+        fallback_v4.ipv6.is_empty(),
+        "rejected AAAA family must remain excluded from fallback results"
+    );
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+}
