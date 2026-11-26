@@ -208,25 +208,18 @@ impl UdpEndpointPool {
                 removal.packet_lineage,
             ))
             .and_then(|entry| match entry.value() {
-                EndpointEntry::Retiring { io, .. } if removal.matches(entry.value()) => io.clone(),
+                EndpointEntry::Retiring {
+                    io,
+                    native_terminal,
+                    ..
+                } if removal.matches(entry.value()) => {
+                    if !success && let Some(terminal) = native_terminal.get() {
+                        terminal.cleaned(false);
+                    }
+                    io.clone()
+                }
                 _ => None,
             });
-        #[cfg(feature = "native-api")]
-        if !success
-            && let Some(entry) = self.endpoints.get(&EndpointKey::new(
-                removal.scope,
-                removal.client,
-                removal.dst,
-                removal.packet_lineage,
-            ))
-            && let EndpointEntry::Retiring {
-                native_terminal: Some(terminal),
-                ..
-            } = entry.value()
-            && removal.matches(entry.value())
-        {
-            terminal.cleaned(false);
-        }
         let acknowledged = success
             && self.complete_removal(
                 removal.scope,
@@ -394,9 +387,9 @@ impl UdpEndpointPool {
                     && !matches!(occupied.get(), EndpointEntry::Retiring { .. }) =>
             {
                 if let EndpointEntry::Initializing(initializing) = occupied.get() {
-                    #[cfg(feature = "native-api")]
-                    if !packet_binding_active(initializing.packet_source.as_ref())
-                        && let Some(terminal) = initializing.native_terminal.get()
+                    if let Some(terminal) = initializing
+                        .native_terminal
+                        .get_if(|| !packet_binding_active(initializing.packet_source.as_ref()))
                     {
                         terminal.outcome(UdpTerminal::IntentionalRetirement);
                     }
@@ -407,7 +400,6 @@ impl UdpEndpointPool {
                     EndpointEntry::Ready(ready) => Some(Arc::clone(&ready.endpoint.retirement.0)),
                     _ => None,
                 };
-                #[cfg(feature = "native-api")]
                 let native_terminal = match occupied.get() {
                     EndpointEntry::Initializing(initializing) => {
                         initializing.native_terminal.get().cloned()
@@ -432,8 +424,7 @@ impl UdpEndpointPool {
                     io,
                     _packet_source: packet_source,
                     _memory: memory,
-                    #[cfg(feature = "native-api")]
-                    native_terminal,
+                    native_terminal: observation::TerminalSlot::new(native_terminal),
                 })
             }
             _ => return false,
@@ -478,11 +469,10 @@ impl UdpEndpointPool {
                         if *found == generation && *current == owner
                 ) =>
             {
-                #[cfg(feature = "native-api")]
                 if let EndpointEntry::Retiring {
-                    native_terminal: Some(terminal),
-                    ..
+                    native_terminal, ..
                 } = occupied.get()
+                    && let Some(terminal) = native_terminal.get()
                 {
                     terminal.cleaned(true);
                 }

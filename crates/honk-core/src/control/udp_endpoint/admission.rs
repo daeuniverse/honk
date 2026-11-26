@@ -288,8 +288,7 @@ pub(super) struct InitializingEndpoint {
     selected_node: Mutex<Option<(uuid::Uuid, Option<Arc<UdpTrafficEvidence>>)>>,
     pub(super) cancelled: AtomicBool,
     pub(super) cancel_notify: Notify,
-    #[cfg(feature = "native-api")]
-    pub(super) native_terminal: std::sync::OnceLock<observation::SharedTerminal>,
+    pub(super) native_terminal: observation::InitializerTerminalSlot,
     pub(super) memory: Option<Arc<super::budget::EntryMemory>>,
 }
 
@@ -364,8 +363,7 @@ pub(super) enum EndpointEntry {
         io: Option<Arc<RetirementIo>>,
         _packet_source: Option<SourceWork>,
         _memory: Option<Arc<super::budget::EntryMemory>>,
-        #[cfg(feature = "native-api")]
-        native_terminal: Option<observation::SharedTerminal>,
+        native_terminal: observation::TerminalSlot,
     },
 }
 
@@ -494,11 +492,7 @@ impl UdpInitLease {
         flow: Option<Arc<crate::observe::flows::FlowGuard>>,
     ) -> Option<observation::SharedTerminal> {
         let flow = flow?;
-        let terminal = Arc::clone(
-            self.initializer
-                .native_terminal
-                .get_or_init(|| observation::NativeUdpTerminal::new(Arc::clone(&flow), false)),
-        );
+        let terminal = self.initializer.native_terminal.get_or_init(&flow);
         if !packet_binding_active(self.packet_source()) {
             terminal.outcome(UdpTerminal::IntentionalRetirement);
         }
@@ -512,7 +506,7 @@ impl UdpInitLease {
                 && *generation == self.generation
                 && *owner == self.owner
             {
-                *native_terminal = Some(Arc::clone(&terminal));
+                *native_terminal = observation::TerminalSlot::new(Some(Arc::clone(&terminal)));
             }
         } else {
             flow.mark_gap(honk_outbound::runtime::flow_observation::GapReason::RetirementOwnerLost);
@@ -530,10 +524,7 @@ impl UdpInitLease {
     }
 
     pub(in crate::control) fn native_terminal(&self) -> Option<observation::SharedTerminal> {
-        #[cfg(feature = "native-api")]
-        return self.initializer.native_terminal.get().cloned();
-        #[cfg(not(feature = "native-api"))]
-        None
+        self.initializer.native_terminal.get().cloned()
     }
 
     pub(in crate::control) fn scope(&self) -> ScopeId {
@@ -698,7 +689,6 @@ impl UdpInitLease {
         }
         if !packet_binding_active(self.packet_source()) {
             // The peer's scope can close before its pool retirement reaches this entry.
-            #[cfg(feature = "native-api")]
             if let Some(terminal) = self.initializer.native_terminal.get() {
                 terminal.outcome(UdpTerminal::IntentionalRetirement);
             }
@@ -770,8 +760,9 @@ impl UdpInitLease {
             io: None,
             _packet_source: self.packet_source().cloned(),
             _memory: self.initializer.memory.clone(),
-            #[cfg(feature = "native-api")]
-            native_terminal: self.initializer.native_terminal.get().cloned(),
+            native_terminal: observation::TerminalSlot::new(
+                self.initializer.native_terminal.get().cloned(),
+            ),
         });
         drop(occupied);
         let conn_id = entry.retire(false);
@@ -935,7 +926,7 @@ impl UdpEndpointPool {
         data: DatagramPayload<'_>,
         enqueued_at: u32,
         stats: &StatsManager,
-        #[cfg(feature = "native-api")] native_terminal: Option<&observation::SharedTerminal>,
+        native_terminal: Option<&observation::SharedTerminal>,
     ) -> EndpointReservation {
         let result = (|| {
             if sender.is_closed() {
@@ -968,7 +959,6 @@ impl UdpEndpointPool {
                 }
             }
         })();
-        #[cfg(feature = "native-api")]
         if let Some(terminal) = native_terminal {
             match &result {
                 EndpointReservation::QueueFull => terminal.packet_drop("queue_capacity"),
@@ -1079,8 +1069,7 @@ impl UdpEndpointPool {
             selected_node: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             cancel_notify: Notify::new(),
-            #[cfg(feature = "native-api")]
-            native_terminal: std::sync::OnceLock::new(),
+            native_terminal: observation::InitializerTerminalSlot::new(),
             memory,
         });
         let key = *vacant.key();
@@ -1229,7 +1218,6 @@ impl UdpEndpointPool {
                                 data.clone(),
                                 enqueued_at,
                                 stats,
-                                #[cfg(feature = "native-api")]
                                 initializing.native_terminal.get(),
                             ) {
                                 EndpointReservation::QueueClosed => {
@@ -1254,7 +1242,6 @@ impl UdpEndpointPool {
                                 data.clone(),
                                 enqueued_at,
                                 stats,
-                                #[cfg(feature = "native-api")]
                                 ready.endpoint.native.terminal(),
                             ) {
                                 EndpointReservation::QueueClosed => {
@@ -1360,7 +1347,6 @@ impl UdpEndpointPool {
                         DatagramPayload::Owned(data),
                         enqueued_at,
                         stats,
-                        #[cfg(feature = "native-api")]
                         initializing.native_terminal.get(),
                     ),
                     EndpointEntry::Ready(ready)
@@ -1373,7 +1359,6 @@ impl UdpEndpointPool {
                             DatagramPayload::Owned(data),
                             enqueued_at,
                             stats,
-                            #[cfg(feature = "native-api")]
                             ready.endpoint.native.terminal(),
                         )
                     }
@@ -1463,7 +1448,6 @@ impl UdpEndpointPool {
                     DatagramPayload::Owned(data),
                     enqueued_at,
                     stats,
-                    #[cfg(feature = "native-api")]
                     initializing.native_terminal.get(),
                 ),
             ),
@@ -1480,7 +1464,6 @@ impl UdpEndpointPool {
                         DatagramPayload::Owned(data),
                         enqueued_at,
                         stats,
-                        #[cfg(feature = "native-api")]
                         ready.endpoint.native.terminal(),
                     ),
                 )
@@ -1616,7 +1599,6 @@ impl UdpEndpointPool {
                         data,
                         enqueued_at,
                         stats,
-                        #[cfg(feature = "native-api")]
                         initializing.native_terminal.get(),
                     ),
                     (initializing.owner.token, initializing.generation),
@@ -1636,7 +1618,6 @@ impl UdpEndpointPool {
                         data,
                         enqueued_at,
                         stats,
-                        #[cfg(feature = "native-api")]
                         ready.endpoint.native.terminal(),
                     ),
                     (ready.owner.token, ready.generation),

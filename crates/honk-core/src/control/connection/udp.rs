@@ -1,5 +1,7 @@
 use super::overall_dial_timeout;
 use super::routing::{RoutingDecision, build_connection_info, connection_chains};
+#[cfg(feature = "native-api")]
+use crate::control::udp_endpoint::EndpointObservation;
 use crate::control::udp_endpoint::{
     RawDnsRoute, UdpEndpoint, UdpInitLease, UdpTerminal, UdpTrafficEvidence,
 };
@@ -807,6 +809,12 @@ impl ControlPlaneHandle {
             ));
         }
         let node = &target.node;
+        // A fresh shared source can publish during promotion, before the endpoint exists.
+        #[cfg(feature = "native-api")]
+        let endpoint_observation = EndpointObservation::reserve(
+            &self.udp_pool,
+            observation.flow().is_some() || native_terminal.is_some() || target_observer.is_some(),
+        )?;
         // Final promotion remains pre-publication and inside the unchanged
         // absolute preparation deadline.
         let source_pool = Arc::clone(&self.udp_pool);
@@ -941,13 +949,19 @@ impl ControlPlaneHandle {
         };
         endpoint.bind_packet_source(lease.packet_source().cloned())?;
         endpoint.set_traffic_evidence(evidence.clone());
+        #[cfg(feature = "native-api")]
+        {
+            endpoint.native = endpoint_observation;
+        }
         endpoint.native.set_flow(
             observation.take_flow(),
             &self.udp_pool,
             native_terminal.clone(),
-        );
+        )?;
         #[cfg(feature = "native-api")]
-        endpoint.native.set_observer(target_observer);
+        endpoint
+            .native
+            .set_observer(target_observer, &self.udp_pool)?;
         let endpoint = Arc::new(endpoint);
 
         let queue_rx = match follower_rx {

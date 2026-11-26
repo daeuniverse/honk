@@ -1,6 +1,7 @@
 //! Inert twin of endpoint observation for builds without `native-api`: the
 //! bundle is zero-sized, terminals are uninhabited, and every hook folds away.
 
+use std::io;
 use std::sync::Arc;
 
 use honk_outbound::runtime::flow_observation::FlowObserver;
@@ -21,6 +22,49 @@ impl SharedTerminal {
     pub(in crate::control) fn outcome(&self, _outcome: UdpTerminal) {
         match *self {}
     }
+
+    #[inline]
+    pub(super) fn cleaned(&self, _success: bool) {
+        match *self {}
+    }
+
+    #[inline]
+    pub(super) fn packet_drop(&self, _reason: &'static str) {
+        match *self {}
+    }
+}
+
+pub(super) struct InitializerTerminalSlot;
+
+impl InitializerTerminalSlot {
+    #[inline]
+    pub(super) fn new() -> Self {
+        Self
+    }
+
+    #[inline]
+    pub(super) fn get(&self) -> Option<&SharedTerminal> {
+        None
+    }
+
+    #[inline]
+    pub(super) fn get_if(&self, _condition: impl FnOnce() -> bool) -> Option<&SharedTerminal> {
+        None
+    }
+}
+
+pub(super) struct TerminalSlot;
+
+impl TerminalSlot {
+    #[inline]
+    pub(super) fn new(_terminal: Option<SharedTerminal>) -> Self {
+        Self
+    }
+
+    #[inline]
+    pub(super) fn get(&self) -> Option<&SharedTerminal> {
+        None
+    }
 }
 
 pub(in crate::control) enum NativeInitializerGuard {}
@@ -37,6 +81,8 @@ pub(in crate::control) struct EndpointObservation;
 
 const _: () = assert!(size_of::<EndpointObservation>() == 0);
 const _: () = assert!(size_of::<Option<SharedTerminal>>() == 0);
+const _: () = assert!(size_of::<TerminalSlot>() == 0);
+const _: () = assert!(size_of::<InitializerTerminalSlot>() == 0);
 
 impl EndpointObservation {
     #[inline]
@@ -45,7 +91,8 @@ impl EndpointObservation {
         _flow: Option<Arc<FlowGuard>>,
         _pool: &Arc<UdpEndpointPool>,
         _terminal: Option<SharedTerminal>,
-    ) {
+    ) -> io::Result<()> {
+        Ok(())
     }
 
     #[inline]
@@ -55,6 +102,11 @@ impl EndpointObservation {
 
     #[inline]
     pub(super) fn observer(&self) -> Option<&FlowObserver> {
+        None
+    }
+
+    #[inline]
+    pub(super) fn terminal(&self) -> Option<&SharedTerminal> {
         None
     }
 

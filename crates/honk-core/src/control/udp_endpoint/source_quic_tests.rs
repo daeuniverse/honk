@@ -224,7 +224,11 @@ impl Fixture {
         #[cfg(feature = "native-api")]
         endpoint
             .native
-            .set_observer(honk_outbound::runtime::flow_observation::current());
+            .set_observer(
+                honk_outbound::runtime::flow_observation::current(),
+                &self.pool,
+            )
+            .unwrap();
         let endpoint = Arc::new(endpoint);
         let queue = lease.take_queue_receiver().unwrap();
         let mut driver = self.pool.spawn_driver(

@@ -132,6 +132,7 @@ mod source_shared_tests;
 mod source_tests;
 pub(in crate::control) use evidence::UdpTrafficEvidence;
 use foreign_reply::ForeignReplySockets;
+pub(in crate::control) use observation::EndpointObservation;
 use retirement::{EndpointIoGuard, RetirementIo};
 pub(crate) use retirement::{EndpointRemoval, RemovalReason};
 pub(in crate::control) use source::{SourceAttachment, SourcePath, SourcePreparation};
@@ -236,7 +237,7 @@ pub struct UdpEndpoint {
     #[cfg(test)]
     source_reply_hook: Mutex<Option<Arc<source::ReplyAdmissionHook>>>,
     tracker_id: Mutex<Option<uuid::Uuid>>,
-    pub(in crate::control) native: observation::EndpointObservation,
+    pub(in crate::control) native: EndpointObservation,
     retirement: EndpointIoGuard,
 }
 
