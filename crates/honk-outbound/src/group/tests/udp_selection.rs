@@ -251,7 +251,7 @@ fn score_udp_capability_filters_selection_verification_and_nested_finals() {
     let groups = [score, incapable, terminal, parent];
     let alive = Arc::new(AliveDialerSet::new());
     for node in &nodes {
-        alive.register_node(node.id, node.name.clone(), node.address.clone());
+        alive.register_node(node.id, node.name.clone(), Some(node.address.clone()));
     }
 
     for alive_set in [Some(alive), None] {
@@ -330,7 +330,7 @@ fn selector_udp_capability_keeps_the_pin_and_terminal_members() {
     let parent = make_subgroup("parent", GroupPolicy::Selector, &["selector"]);
     let alive = Arc::new(AliveDialerSet::new());
     for node in &nodes {
-        alive.register_node(node.id, node.name.clone(), node.address.clone());
+        alive.register_node(node.id, node.name.clone(), Some(node.address.clone()));
     }
     for alive_set in [Some(alive), None] {
         let manager =
@@ -873,4 +873,81 @@ fn final_chains_preserve_cold_provenance_and_bound_mixed_cycles() {
     let manager = GroupManager::new(&chain, &[]);
     assert_udp_selection(&manager, "level-0", None);
     assert_udp_selection(&manager, "level-1", Some("direct"));
+}
+
+/// Unbound chain nodes have no UDP terminal to select.
+#[test]
+fn udp_selection_skips_chain_nodes() {
+    let front = make_node(nid("front"), "front");
+    let mut chain = make_node(nid("via"), "via");
+    chain.outbound = Node::chain(&chain.name, vec!["front".into(), "land".into()]).outbound;
+    let nodes = vec![chain.clone(), front.clone()];
+    let m = GroupManager::with_alive_set(
+        &[make_group(
+            "relay",
+            GroupPolicy::Fallback,
+            vec![chain.id, front.id],
+        )],
+        &nodes,
+        None,
+    );
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        assert!(!m.is_node_selectable_for_domain(chain.id, domain, IpVersion::V4));
+        assert!(m.is_node_selectable_for_domain(front.id, domain, IpVersion::V4));
+    }
+    assert!(m.is_node_selectable_for_domain(chain.id, ProbeDomain::Tcp, IpVersion::V4));
+}
+
+/// A configured chain's UDP follows its exit, not the chain descriptor.
+#[test]
+fn a_chain_offers_udp_exactly_when_its_exit_carries_it() {
+    let nodes = honk_config::Config {
+        nodes: vec![
+            Node::from_share_link("socks5://127.0.0.1:1080#front").unwrap(),
+            Node::from_share_link("trojan://secret@127.0.0.1:443#trojan").unwrap(),
+            Node::from_share_link(
+                "vless://30882cf1-11d1-4d34-bdf6-44f694c9c591@127.0.0.1:444?packetEncoding=xudp#xudp",
+            )
+            .unwrap(),
+            Node::chain("via-trojan", vec!["front".into(), "trojan".into()]),
+            Node::chain("via-xudp", vec!["front".into(), "xudp".into()]),
+        ],
+        ..Default::default()
+    }
+    .assemble(|_, _, _| {})
+    .unwrap()
+    .nodes;
+    let id = |name: &str| nodes.iter().find(|node| node.name == name).unwrap().id;
+    let manager = GroupManager::new(
+        &[make_group(
+            "g",
+            GroupPolicy::LoadBalance,
+            vec![id("via-trojan"), id("via-xudp")],
+        )],
+        &nodes,
+    );
+    for (name, carries) in [("via-trojan", true), ("via-xudp", false)] {
+        assert_eq!(
+            manager.is_node_selectable_for_domain(id(name), ProbeDomain::DataUdp, IpVersion::V4),
+            carries,
+            "{name}"
+        );
+    }
+    for _ in 0..2 {
+        let plan = manager.selection_plan_for_domain("g", ProbeDomain::DataUdp, IpVersion::V4);
+        assert_eq!(
+            plan.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+            [id("via-trojan")]
+        );
+        let target = manager.selection_plan_for_target(
+            "g",
+            &ScoreSelectionContext::aggregate(
+                SelectionNetwork::Udp,
+                ProbeDomain::DataUdp,
+                IpVersion::V4,
+            ),
+        );
+        assert_eq!(target.entries[0].node.id, id("via-trojan"));
+        assert!(target.entries[0].route.is_none());
+    }
 }

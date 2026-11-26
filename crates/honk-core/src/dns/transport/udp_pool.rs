@@ -613,7 +613,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn refused_peer_fails_promptly_and_recovers_without_socket_replacement() {
-        for bind in ["127.0.0.1:0", "[::1]:0"] {
+        // The loop frees a port and rebinds it below. IPv4 uses a loopback
+        // address of its own, off the shared 127.0.0.1 port pool; wildcard
+        // binds elsewhere can still take the freed port, so this narrows the
+        // race only.
+        for bind in ["127.0.0.84:0", "[::1]:0"] {
             let closed = UdpSocket::bind(bind).await.unwrap();
             let address = closed.local_addr().unwrap();
             drop(closed);
@@ -661,7 +665,10 @@ mod tests {
     #[tokio::test]
     async fn packet_error_does_not_fail_another_pending_query() {
         tokio::time::timeout(Duration::from_secs(5), async {
-            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            // `server` is dropped and its port rebound below. A loopback address
+            // of its own keeps the port off the shared 127.0.0.1 pool; wildcard
+            // binds can still take it, so this narrows the race only.
+            let server = UdpSocket::bind("127.0.0.83:0").await.unwrap();
             let address = server.local_addr().unwrap();
             let pool = UdpPool::new(address, Duration::from_secs(3)).await.unwrap();
             let first_query = query(0x1234);

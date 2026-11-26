@@ -25,7 +25,6 @@
 use rand::Rng;
 use rand::RngExt;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use tracing::debug;
 
 use super::{AeadCipher, UdpDatagram, increment_nonce};
@@ -290,11 +289,11 @@ impl SlidingWindow {
 /// (salt + validated fixed header) is driven lazily from the read path —
 /// reading it inline would deadlock against servers that only answer after
 /// the first client payload chunk.
-pub(crate) async fn dial_stream(
-    mut server: TcpStream,
+pub(crate) async fn dial_stream<T: super::stream::SsTransport>(
+    mut server: T,
     method: Ss2022Method,
     socks_header: Vec<u8>,
-) -> anyhow::Result<super::stream::SsStream> {
+) -> anyhow::Result<super::stream::SsStream<T>> {
     // Request: salt | EIH* | enc(fixed header) | enc(variable header)
     let mut request_salt = vec![0u8; method.key_len];
     rand::rng().fill_bytes(&mut request_salt);
@@ -342,6 +341,7 @@ pub(crate) async fn dial_stream(
 
     // SIP022 3.1.4: salt + header chunks MUST go out in a single write.
     server.write_all(&request).await?;
+    server.flush().await?;
 
     let prologue = super::stream::Ss2022Prologue {
         method,

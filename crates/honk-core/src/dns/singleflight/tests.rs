@@ -36,6 +36,8 @@ fn template(rcode: u8) -> Arc<FlightAnswer> {
     Arc::new(FlightAnswer {
         template: ResponseTemplate::validate(&query, &response).expect("template"),
         projection_expires_at: None,
+        provenance: Provenance::Upstream,
+        final_upstream: Some("default".into()),
     })
 }
 
@@ -51,7 +53,7 @@ async fn completion_notifies_attached_waiter_and_preserves_fresh_flight() {
     };
 
     let completed = template(0);
-    leader.publish(Ok(Arc::clone(&completed)));
+    leader.publish(|| Ok(Arc::clone(&completed)));
     assert_eq!(flights.active_len(), 0);
 
     let FlightRole::Leader(successor) = flights.acquire(flight_key.clone()) else {
@@ -66,7 +68,7 @@ async fn completion_notifies_attached_waiter_and_preserves_fresh_flight() {
     assert_eq!(received.template.wire(), completed.template.wire());
 
     let fresh = template(3);
-    successor.publish(Ok(Arc::clone(&fresh)));
+    successor.publish(|| Ok(Arc::clone(&fresh)));
     let Some(Ok(received)) = successor_waiter.receive().await else {
         panic!("fresh result");
     };

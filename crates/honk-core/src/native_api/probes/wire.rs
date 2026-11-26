@@ -1,4 +1,5 @@
 use super::*;
+use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub(super) async fn execute(
@@ -14,20 +15,39 @@ pub(super) async fn execute(
             plan.result.results[row].observed_at = timestamp(skipped.observed_at);
         }
     }
-    for attempt in &plan.attempts {
-        let candidate = &attempt.candidate;
-        if *stop.borrow() || Instant::now() >= deadline {
-            for &row in &candidate.rows {
-                plan.result.results[row].error = Some(if *stop.borrow() {
-                    "cancelled"
-                } else {
-                    "deadline"
-                });
-                plan.result.results[row].observed_at = timestamp(SystemTime::now());
-            }
-            continue;
+    let context = &plan.context;
+    let mut pending = plan.attempts.iter();
+    let mut running = futures::stream::FuturesUnordered::new();
+    loop {
+        while running.len() < honk_outbound::urltest::URLTEST_MAX_CONCURRENT
+            && let Some(attempt) = pending.next()
+        {
+            let stop = stop.clone();
+            running.push(async move {
+                if *stop.borrow() {
+                    return (attempt, Err("cancelled"));
+                }
+                if Instant::now() >= deadline {
+                    return (attempt, Err("deadline"));
+                }
+                let outcome = attempt_wire(context, attempt, deadline, stop).await;
+                (attempt, Ok(outcome))
+            });
         }
-        let outcome = attempt_wire(state, &plan.context, attempt, deadline, stop.clone()).await;
+        let Some((attempt, outcome)) = running.next().await else {
+            break;
+        };
+        let candidate = &attempt.candidate;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(reason) => {
+                for &row in &candidate.rows {
+                    plan.result.results[row].error = Some(reason);
+                    plan.result.results[row].observed_at = timestamp(SystemTime::now());
+                }
+                continue;
+            }
+        };
         cleanup = cleanup.and(outcome.cleanup);
         let sample = outcome.sample;
         let completed = outcome.completed;
@@ -156,7 +176,8 @@ impl AttemptOutcome {
                     "cancelled"
                 } else if io == Some(std::io::ErrorKind::TimedOut) && Instant::now() >= deadline {
                     "deadline"
-                } else if honk_outbound::proxy::is_packet_rejection(&error)
+                } else if honk_outbound::proxy::dial_failure_scope(error.as_ref())
+                    == honk_outbound::proxy::DialFailureScope::LocalRejection
                     || io == Some(std::io::ErrorKind::Interrupted)
                 {
                     "local_refusal"
@@ -184,7 +205,6 @@ impl AttemptOutcome {
     }
 }
 async fn attempt_wire(
-    state: &NativeState,
     plan: &Context,
     attempt: &Attempt,
     deadline: Instant,
@@ -214,11 +234,9 @@ async fn attempt_wire(
         .and_then(|result| result);
         return AttemptOutcome::completed(result, deadline, &cancel);
     }
-    let Some(entry) = state.proxy_registry.find(candidate.node.protocol()) else {
+    let Some(entry) = plan.proxy_registry.find(candidate.node.protocol()) else {
         return AttemptOutcome::refused();
     };
-    // Disposable runtime identity remains the canonical node's identity. Only its
-    // inherited dial scope pins the previously validated physical server address.
     let Ok(mut ephemeral) = plan.registry.try_ephemeral_guarded(&candidate.node) else {
         return AttemptOutcome::refused();
     };
@@ -252,10 +270,9 @@ async fn attempt_wire(
                         tcp_dns(&mut proxy.stream).await
                     }
                     Transport::Udp => {
-                        let packet = entry
-                            .packet
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("packet handler unavailable"))?;
+                        let packet = entry.packet.as_ref().ok_or(
+                            honk_outbound::proxy::MissingProtocolHandler(candidate.node.protocol()),
+                        )?;
                         let transport = packet
                             .dial_udp_transport_runtime(
                                 Arc::clone(&runtime),
@@ -271,18 +288,12 @@ async fn attempt_wire(
             .await?
         }
     };
-    let result = if let Some(server) = attempt.server {
-        runtime
-            .scope_tasks(
-                plan.registry
-                    .scope_pinned_dials(candidate.node.host(), server, operation),
-            )
-            .await
-    } else {
-        runtime
-            .scope_tasks(plan.registry.scope_dials(operation))
-            .await
-    };
+    let result = runtime
+        .scope_tasks(
+            plan.registry
+                .scope_server_pins(attempt.servers.clone(), operation),
+        )
+        .await;
     let mut outcome = AttemptOutcome::completed(result, deadline, &cancel);
     drop(runtime);
     // Never cancel this owner boundary: close must drain every factory/driver
@@ -320,6 +331,23 @@ mod tests {
         let outcome = AttemptOutcome::completed(Err(error), Instant::now(), &receiver);
         assert!(outcome.completed);
         assert_eq!(outcome.error, Some("probe_failed"));
+    }
+
+    #[test]
+    fn typed_probe_refusals_are_not_completed_health_samples() {
+        use honk_outbound::proxy::{MissingProtocolHandler, PacketRejection};
+
+        let (_, receiver) = watch::channel(false);
+        for error in [
+            anyhow::Error::new(MissingProtocolHandler(
+                honk_config::types::NodeProtocol::VLess,
+            )),
+            anyhow::Error::new(PacketRejection::Capacity),
+        ] {
+            let outcome = AttemptOutcome::completed(Err(error), Instant::now(), &receiver);
+            assert!(!outcome.completed);
+            assert_eq!(outcome.error, Some("local_refusal"));
+        }
     }
 
     #[tokio::test]

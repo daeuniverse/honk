@@ -14,11 +14,14 @@ use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use honk_config::node::{Node, OutboundConfig, TlsOptions, TrojanConfig};
 use sha2::{Sha256, Sha512};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
+use crate::proxy::ProxyRegistry;
 use crate::proxy::transport::{MaybeTls, maybe_tls_wrap_concrete};
+use crate::runtime::OutboundRuntimeRegistry;
+use crate::test_support::{TCP_TARGET, chain, socks5, socks5_relay};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const CLIENT_DATA: &[u8] = b"authenticated client data";
@@ -183,24 +186,43 @@ fn acceptor(reply: Reply, auth_key: &[u8; 32], alpn: Option<&'static [u8]>) -> S
 }
 
 async fn serve(listener: &TcpListener, reply: Reply, key: &PKey<Private>) -> Captured {
-    let (mut tcp, peer) = listener.accept().await.unwrap();
-    let record = read_hello(&mut tcp).await;
-    let hello = record[5..].to_vec();
+    let (tcp, peer) = listener.accept().await.unwrap();
+    let hello = serve_stream(tcp, reply, key).await;
+    Captured { peer, hello }
+}
+
+async fn accept_hello(
+    stream: impl AsyncRead + AsyncWrite + Unpin + std::fmt::Debug,
+    record: Vec<u8>,
+    reply: Reply,
+    key: &PKey<Private>,
+) -> impl AsyncRead + AsyncWrite + Unpin {
     let auth_key = if matches!(reply, Reply::Authenticated | Reply::InvalidHmac) {
-        authenticate_hello(&hello, key)
+        authenticate_hello(&record[5..], key)
     } else {
         [0; 32]
     };
+    let (read, write) = tokio::io::split(stream);
+    let replay = tokio::io::join(Cursor::new(record).chain(read), write);
+    tokio_boring::accept(&acceptor(reply, &auth_key, None), replay)
+        .await
+        .unwrap()
+}
+
+/// Answer one REALITY handshake on `stream` and return the captured ClientHello.
+async fn serve_stream(
+    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug,
+    reply: Reply,
+    key: &PKey<Private>,
+) -> Vec<u8> {
+    let record = read_hello(&mut stream).await;
+    let hello = record[5..].to_vec();
     if matches!(reply, Reply::TlsAlert) {
-        tcp.write_all(&[21, 3, 3, 0, 2, 2, 80]).await.unwrap();
+        stream.write_all(&[21, 3, 3, 0, 2, 2, 80]).await.unwrap();
         let mut received = Vec::new();
-        tcp.read_to_end(&mut received).await.ok();
+        stream.read_to_end(&mut received).await.ok();
     } else {
-        let (read, write) = tcp.into_split();
-        let replay = tokio::io::join(Cursor::new(record).chain(read), write);
-        let mut tls = tokio_boring::accept(&acceptor(reply, &auth_key, None), replay)
-            .await
-            .unwrap();
+        let mut tls = accept_hello(stream, record, reply, key).await;
         // Send before the client's post-handshake authentication; a failure must
         // never publish this stream or let the client write application bytes.
         tls.write_all(SERVER_DATA).await.ok();
@@ -215,7 +237,7 @@ async fn serve(listener: &TcpListener, reply: Reply, key: &PKey<Private>) -> Cap
             );
         }
     }
-    Captured { peer, hello }
+    hello
 }
 
 async fn exchange(node: &Node, tcp: Option<TcpStream>) -> anyhow::Result<Vec<u8>> {
@@ -311,6 +333,194 @@ async fn mask_retries_fresh_classical_and_only_authenticated_stream_carries_data
         assert_fresh_classical_retry(&captured);
     }
     assert_eq!(exercise(&[Reply::Authenticated], false).await.len(), 1);
+}
+
+#[tokio::test]
+async fn refused_reality_replacement_counts_as_a_pinned_proxy_connect() {
+    use crate::group::ScoreOutcome;
+    use crate::proxy::{DialFailureScope, dial_failure_scope};
+    use std::io;
+
+    timeout(Duration::from_secs(10), async {
+        for supplied in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let decoy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let configured = if supplied {
+                decoy.local_addr().unwrap()
+            } else {
+                addr
+            };
+            let key = PKey::generate(Id::X25519).unwrap();
+            let node = node(configured, &key, false);
+            let (registry, _) =
+                OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, false, None)
+                    .unwrap();
+            let scope = registry.dial_scope(|| {});
+            let client = scope.scope(async {
+                let tcp = if supplied {
+                    Some(TcpStream::connect(addr).await.unwrap())
+                } else {
+                    None
+                };
+                exchange(&node, tcp).await
+            });
+            let server = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    registry.acquire_dial_permit().now_or_never().is_some(),
+                    supplied
+                );
+                // The accepted socket can deliver the mask after its listener closes.
+                drop(listener);
+                serve_stream(stream, Reply::Mask, &key).await;
+            };
+            let (result, ()) = tokio::join!(client, server);
+            assert!(decoy.accept().now_or_never().is_none());
+            let error = result.unwrap_err();
+            assert_eq!(dial_failure_scope(error.as_ref()), DialFailureScope::Hop(0));
+            assert_eq!(
+                ScoreOutcome::from_error(&error),
+                ScoreOutcome::Io(io::ErrorKind::ConnectionRefused)
+            );
+            let original = error.root_cause().downcast_ref::<io::Error>().unwrap();
+            assert_eq!(original.raw_os_error(), Some(libc::ECONNREFUSED));
+            assert!(registry.acquire_dial_permit().now_or_never().is_some());
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn chain_reality_mask_retries_through_socks5_at_dial_limit_one() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const TROJAN_REQUEST: &[u8] = b"751843b5d9048eb239d6df153dd1b985b1209d8321522dc0a09b2a90\r\n\
+        \x01\x01\x5d\xb8\xd8\x22\x00\x50\r\n";
+    timeout(Duration::from_secs(10), async {
+        for (routed, second) in [
+            (false, Reply::Authenticated),
+            (false, Reply::Mask),
+            (true, Reply::Authenticated),
+            (true, Reply::Mask),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let key = PKey::generate(Id::X25519).unwrap();
+            let mut exit = node(addr, &key, false);
+            exit.name = "exit".into();
+            exit.trojan_mut().unwrap().password = Some("chain-test-password".into());
+            exit.id = exit.derive_id();
+            let relay = socks5_relay(Vec::new(), false).await;
+            let front = socks5("front", "127.0.0.1", relay.addr.port());
+            let via = chain(&[&front, &exit]);
+            let via_id = via.id;
+            let honk_config::group_graph::Composed::Routed(route) =
+                honk_config::group_graph::compose(front.id, &[front.id], [exit.id])
+            else {
+                panic!("two distinct physical hops")
+            };
+            let (generation, _) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+                &[via, front, exit],
+                1,
+                1,
+                1,
+                false,
+                None,
+            )
+            .unwrap();
+            let generation = Arc::new(generation);
+            let (sibling, _) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+                &[],
+                1,
+                1,
+                1,
+                false,
+                Some(generation.as_ref()),
+            )
+            .unwrap();
+            let starts = Arc::new(AtomicUsize::new(0));
+            let scope = generation.dial_scope({
+                let starts = Arc::clone(&starts);
+                move || {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            let registry = ProxyRegistry::default_resolver().unwrap();
+            let client = scope.scope(async {
+                let mut stream = registry
+                    .dial_ref(
+                        Arc::clone(&generation),
+                        if routed {
+                            crate::proxy::DialRef::Route(&route)
+                        } else {
+                            crate::proxy::DialRef::Node(via_id)
+                        },
+                        TCP_TARGET.parse().unwrap(),
+                        None,
+                        CONNECT_TIMEOUT,
+                    )
+                    .await?
+                    .stream;
+                stream.write_all(CLIENT_DATA).await?;
+                stream.flush().await?;
+                let mut received = [0; SERVER_DATA.len()];
+                stream.read_exact(&mut received).await?;
+                Ok::<_, anyhow::Error>(received)
+            });
+            let server = async {
+                let mut captured = Vec::new();
+                for reply in [Reply::Mask, second] {
+                    let (mut stream, peer) = listener.accept().await.unwrap();
+                    assert!(generation.acquire_dial_permit().now_or_never().is_none());
+                    assert!(sibling.acquire_dial_permit().now_or_never().is_none());
+                    let record = read_hello(&mut stream).await;
+                    captured.push(Captured {
+                        peer,
+                        hello: record[5..].to_vec(),
+                    });
+                    let mut tls = accept_hello(stream, record, reply, &key).await;
+                    if matches!(reply, Reply::Mask) {
+                        let mut received = Vec::new();
+                        let _ = tls.read_to_end(&mut received).await;
+                        assert!(received.is_empty(), "a masked attempt must send no request");
+                    } else {
+                        let mut request = [0; TROJAN_REQUEST.len()];
+                        tls.read_exact(&mut request).await.unwrap();
+                        assert_eq!(request, TROJAN_REQUEST);
+                        let mut received = [0; CLIENT_DATA.len()];
+                        tls.read_exact(&mut received).await.unwrap();
+                        assert_eq!(received, CLIENT_DATA);
+                        tls.write_all(SERVER_DATA).await.unwrap();
+                        tls.flush().await.unwrap();
+                    }
+                }
+                captured
+            };
+            let (result, captured) = tokio::join!(client, server);
+            if matches!(second, Reply::Authenticated) {
+                assert_eq!(result.unwrap(), SERVER_DATA);
+            } else if routed {
+                let error = result.unwrap_err();
+                let stage = crate::proxy::failed_hop(&error).unwrap();
+                assert_eq!(stage.hop, 1);
+                assert!(stage.error.is::<super::RealityMaskCertificate>());
+            } else {
+                assert!(result.unwrap_err().is::<super::RealityMaskCertificate>());
+            }
+            assert_fresh_classical_retry(&captured);
+            assert_eq!(relay.requests(), [addr.to_string(), addr.to_string()]);
+            assert!(listener.accept().now_or_never().is_none());
+            assert_eq!(starts.load(Ordering::SeqCst), 1);
+            assert!(generation.acquire_dial_permit().now_or_never().is_some());
+            assert!(sibling.acquire_dial_permit().now_or_never().is_some());
+            drop(scope);
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -589,4 +799,38 @@ fn repeated_client_hello_is_rejected_without_resealing() {
         0
     );
     assert_eq!(hello, sealed);
+}
+
+#[tokio::test]
+async fn tunneled_handshake_authenticates_and_follows_the_key_share_option() {
+    for (offer_hybrid, groups) in [(true, &[0x11ec, 29][..]), (false, &[29][..])] {
+        let key = PKey::generate(Id::X25519).unwrap();
+        let node = node(SocketAddr::from(([198, 51, 100, 1], 443)), &key, true);
+        let options = crate::proxy::TunnelDialOptions {
+            reality_key_shares: offer_hybrid,
+            ..crate::proxy::TunnelDialOptions::new(CONNECT_TIMEOUT)
+        };
+        let (carrier, server) = tokio::io::duplex(64 * 1024);
+        let client = async {
+            let mut stream =
+                crate::proxy::transport::wrap_tunnel(&node, Box::new(carrier), options).await?;
+            stream.write_all(CLIENT_DATA).await?;
+            let mut received = vec![0; SERVER_DATA.len()];
+            stream.read_exact(&mut received).await?;
+            anyhow::Ok(received)
+        };
+        let (result, hello) = timeout(Duration::from_secs(10), async {
+            tokio::join!(client, serve_stream(server, Reply::Authenticated, &key))
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), SERVER_DATA);
+        assert_eq!(
+            key_shares(&hello)
+                .iter()
+                .map(|(group, _)| *group)
+                .collect::<Vec<_>>(),
+            groups
+        );
+    }
 }

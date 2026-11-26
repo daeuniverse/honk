@@ -2,6 +2,8 @@
 //!
 //! Loading happens while a generation is built, so SIGHUP publishes hosts,
 //! policy, transports, and routing together. Query handling performs no file I/O.
+//! A rule may name one domain instead of addresses (a honk extension): the
+//! name then answers as a CNAME to that domain, which resolves normally.
 
 use anyhow::Context;
 use std::collections::HashMap;
@@ -17,18 +19,46 @@ use sha2::{Digest, Sha256};
 
 use regex::Regex;
 
+use crate::dns::cache::PublicationEpoch;
+use crate::dns::engine::pipeline::{ResolveExecution, resolve_with_owner};
 use crate::dns::engine::{DnsEngine, ParsedQuery};
 use crate::dns::outcome::DnsOutcome;
+use crate::dns::query::{DnsRequestMeta, IngressProfile, QueryContext, parse_name_into};
 
-use super::response::make_address_response;
-use super::{DnsForwardError, DnsForwarder, ResolveMode};
+use super::response::{append_edns, make_address_response, response_prefix};
+use super::{DnsForwardError, DnsForwarder, ResolveMode, ResolveOptions};
 
 const HOSTS_TTL_SECS: u32 = 60;
+/// Maximum followed aliases; loops are rejected separately.
+const MAX_ALIAS_DEPTH: usize = 8;
 
 #[derive(Debug, Default)]
 pub(crate) struct HostsFile {
-    entries: HashMap<String, Vec<IpAddr>>,
+    entries: HashMap<String, HostsTarget>,
     rules: Vec<HostsRule>,
+    /// Lets node-host lookups decline without normalizing the host when no
+    /// rule is an alias.
+    has_aliases: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum HostsTarget {
+    Addresses(Vec<IpAddr>),
+    Alias(String),
+}
+
+/// What a hosts match means for one DNS query.
+#[allow(clippy::large_enum_variant)] // matched at once; boxing would allocate per hosts answer
+pub(crate) enum HostsResolution<'h> {
+    Answered(DnsOutcome),
+    /// The alias targets in chain order; the last one is resolved normally.
+    Alias(Vec<&'h str>),
+}
+
+/// Where a hosts alias sends a node server host.
+pub(crate) enum NodeHostAlias {
+    Addresses(Vec<IpAddr>),
+    Name(String),
 }
 
 #[derive(Clone)]
@@ -120,6 +150,7 @@ impl HostsSourceSet {
             };
             hosts.merge(loaded);
         }
+        hosts.check_alias_chains()?;
         Ok(HostsSnapshot {
             fingerprint: self.fingerprint,
             hosts: (!hosts.entries.is_empty() || !hosts.rules.is_empty()).then(|| Arc::new(hosts)),
@@ -148,7 +179,7 @@ fn digest_file(path: &std::path::Path) -> io::Result<[u8; 32]> {
 #[derive(Debug)]
 struct HostsRule {
     matcher: HostsMatcher,
-    addresses: Vec<IpAddr>,
+    target: HostsTarget,
 }
 
 #[derive(Debug)]
@@ -169,6 +200,24 @@ impl HostsMatcher {
     }
 }
 
+impl std::fmt::Display for HostsMatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Domain(suffix) => write!(f, "domain:{suffix}"),
+            Self::Keyword(keyword) => write!(f, "keyword:{keyword}"),
+            Self::Regexp(pattern, _) => write!(f, "regexp:{pattern}"),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum AliasChainError {
+    #[error("loops")]
+    Loop,
+    #[error("is longer than {} aliases", MAX_ALIAS_DEPTH)]
+    TooLong,
+}
+
 impl HostsSnapshot {
     pub(crate) fn hosts(&self) -> Option<Arc<HostsFile>> {
         self.hosts.clone()
@@ -184,12 +233,47 @@ impl HostsFile {
     pub(super) fn merge(&mut self, other: Self) {
         self.entries.extend(other.entries);
         for rule in other.rules {
-            self.insert_rule(rule.matcher, rule.addresses);
+            self.insert_rule(rule.matcher, rule.target);
         }
+        self.has_aliases = self.contains_alias();
+    }
+
+    fn contains_alias(&self) -> bool {
+        self.entries
+            .values()
+            .chain(self.rules.iter().map(|rule| &rule.target))
+            .any(|target| matches!(target, HostsTarget::Alias(_)))
+    }
+
+    /// Every lookup's chain continues through the chain of some alias target,
+    /// so bounding those here leaves the query-time bound as a defence only.
+    fn check_alias_chains(&self) -> io::Result<()> {
+        if !self.has_aliases {
+            return Ok(());
+        }
+        let invalid = |matcher: &dyn std::fmt::Display, first: &str, error: AliasChainError| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid hosts alias {matcher} -> {first}: the chain {error}"),
+            )
+        };
+        for (name, target) in &self.entries {
+            if let HostsTarget::Alias(first) = target {
+                self.follow_aliases(first)
+                    .map_err(|error| invalid(&format_args!("full:{name}"), first, error))?;
+            }
+        }
+        for rule in &self.rules {
+            if let HostsTarget::Alias(first) = &rule.target {
+                self.follow_aliases(first)
+                    .map_err(|error| invalid(&rule.matcher, first, error))?;
+            }
+        }
+        Ok(())
     }
 
     fn parse(contents: &str) -> Self {
-        let mut entries: HashMap<String, Vec<IpAddr>> = HashMap::new();
+        let mut entries = HashMap::new();
         for line in contents.lines() {
             let fields = line
                 .split_once('#')
@@ -204,8 +288,11 @@ impl HostsFile {
                 if hostname.is_empty() {
                     continue;
                 }
-                let addresses = entries.entry(hostname).or_default();
-                if !addresses.contains(&address) {
+                if let HostsTarget::Addresses(addresses) = entries
+                    .entry(hostname)
+                    .or_insert_with(|| HostsTarget::Addresses(Vec::new()))
+                    && !addresses.contains(&address)
+                {
                     addresses.push(address);
                 }
             }
@@ -213,6 +300,7 @@ impl HostsFile {
         Self {
             entries,
             rules: Vec::new(),
+            has_aliases: false,
         }
     }
 
@@ -230,59 +318,59 @@ impl HostsFile {
             let line_number = index + 1;
             let mut fields = record.split_whitespace();
             let matcher = fields.next().expect("non-empty hosts rule");
-            let mut addresses = Vec::new();
-            for value in fields {
-                let address = value.parse::<IpAddr>().map_err(|error| {
-                    invalid_rule(line_number, format!("invalid IP {value:?}: {error}"))
-                })?;
-                if !addresses.contains(&address) {
-                    addresses.push(address);
-                }
-            }
-            if addresses.is_empty() {
-                return Err(invalid_rule(line_number, "rule contains no IP address"));
-            }
+            let target = parse_target(fields, line_number)?;
 
             if let Some(value) = matcher.strip_prefix("domain:") {
                 hosts.insert_rule(
                     HostsMatcher::Domain(normalize_rule_name(value, line_number)?),
-                    addresses,
+                    target,
                 );
             } else if let Some(value) = matcher.strip_prefix("keyword:") {
                 hosts.insert_rule(
                     HostsMatcher::Keyword(normalize_rule_name(value, line_number)?),
-                    addresses,
+                    target,
                 );
             } else if let Some(value) = matcher.strip_prefix("regexp:") {
                 let regex = Regex::new(value).map_err(|error| {
                     invalid_rule(line_number, format!("invalid regexp {value:?}: {error}"))
                 })?;
-                hosts.insert_rule(HostsMatcher::Regexp(value.to_owned(), regex), addresses);
+                hosts.insert_rule(HostsMatcher::Regexp(value.to_owned(), regex), target);
             } else {
                 let value = matcher.strip_prefix("full:").unwrap_or(matcher);
-                hosts
-                    .entries
-                    .insert(normalize_rule_name(value, line_number)?, addresses);
+                let name = normalize_rule_name(value, line_number)?;
+                if matches!(&target, HostsTarget::Alias(alias) if *alias == name) {
+                    return Err(invalid_rule(line_number, "alias names itself"));
+                }
+                hosts.entries.insert(name, target);
             }
         }
+        hosts.has_aliases = hosts.contains_alias();
         Ok(hosts)
     }
 
-    fn insert_rule(&mut self, matcher: HostsMatcher, addresses: Vec<IpAddr>) {
+    fn insert_rule(&mut self, matcher: HostsMatcher, target: HostsTarget) {
         if let Some(rule) = self
             .rules
             .iter_mut()
             .find(|rule| rule.matcher.same_pattern(&matcher))
         {
-            rule.addresses = addresses;
+            rule.target = target;
         } else {
-            self.rules.push(HostsRule { matcher, addresses });
+            self.rules.push(HostsRule { matcher, target });
         }
     }
 
+    #[cfg(test)]
     fn addresses_for(&self, domain: &str) -> Option<&[IpAddr]> {
-        if let Some(addresses) = self.entries.get(domain) {
-            return Some(addresses);
+        match self.target_for(domain)? {
+            HostsTarget::Addresses(addresses) => Some(addresses),
+            HostsTarget::Alias(_) => None,
+        }
+    }
+
+    fn target_for(&self, domain: &str) -> Option<&HostsTarget> {
+        if let Some(target) = self.entries.get(domain) {
+            return Some(target);
         }
 
         // ponytail: pattern rules stay linear until real hosts files make this visible in profiles.
@@ -300,33 +388,113 @@ impl HostsFile {
                 _ => 0,
             })
         {
-            return Some(&rule.addresses);
+            return Some(&rule.target);
         }
         if let Some(rule) = self.rules.iter().find(|rule| {
             matches!(&rule.matcher, HostsMatcher::Regexp(_, regex) if regex.is_match(domain))
         }) {
-            return Some(&rule.addresses);
+            return Some(&rule.target);
         }
         self.rules.iter().find_map(|rule| match &rule.matcher {
-            HostsMatcher::Keyword(keyword) if domain.contains(keyword) => {
-                Some(rule.addresses.as_slice())
-            }
+            HostsMatcher::Keyword(keyword) if domain.contains(keyword) => Some(&rule.target),
             _ => None,
         })
     }
 
-    fn response(&self, raw_query: &[u8], parsed: &ParsedQuery) -> Option<Vec<u8>> {
+    fn alias_chain<'h>(&'h self, domain: &str, first: &'h str) -> anyhow::Result<Vec<&'h str>> {
+        self.follow_aliases(first)
+            .map_err(|error| anyhow::anyhow!("hosts alias chain from {domain} {error}"))
+    }
+
+    fn follow_aliases<'h>(&'h self, first: &'h str) -> Result<Vec<&'h str>, AliasChainError> {
+        let mut chain = vec![first];
+        while let Some(HostsTarget::Alias(next)) = self.target_for(chain[chain.len() - 1]) {
+            if chain.contains(&next.as_str()) {
+                return Err(AliasChainError::Loop);
+            }
+            if chain.len() == MAX_ALIAS_DEPTH {
+                return Err(AliasChainError::TooLong);
+            }
+            chain.push(next);
+        }
+        Ok(chain)
+    }
+
+    fn resolution<'h>(
+        &'h self,
+        raw_query: &[u8],
+        parsed: &ParsedQuery,
+    ) -> Option<anyhow::Result<HostsAnswer<'h>>> {
         if parsed.query().qclass()?.get() != 1 || !matches!(parsed.qtype(), 1 | 28) {
             return None;
         }
-        let addresses = self.addresses_for(parsed.domain())?;
-        Some(make_address_response(
-            raw_query,
-            parsed.query(),
-            addresses,
-            HOSTS_TTL_SECS,
-        ))
+        Some(match self.target_for(parsed.domain())? {
+            HostsTarget::Addresses(addresses) => Ok(HostsAnswer::Response(make_address_response(
+                raw_query,
+                parsed.query(),
+                addresses,
+                HOSTS_TTL_SECS,
+            ))),
+            HostsTarget::Alias(first) => self
+                .alias_chain(parsed.domain(), first)
+                .map(HostsAnswer::Alias),
+        })
     }
+}
+
+enum HostsAnswer<'h> {
+    Response(Vec<u8>),
+    Alias(Vec<&'h str>),
+}
+
+/// A rule's targets: addresses, or exactly one domain name as an alias.
+fn parse_target<'a>(
+    mut values: impl Iterator<Item = &'a str>,
+    line: usize,
+) -> io::Result<HostsTarget> {
+    let Some(first) = values.next() else {
+        return Err(invalid_rule(line, "rule contains no IP address or alias"));
+    };
+    let Ok(address) = first.parse::<IpAddr>() else {
+        let alias = normalize_hostname(first);
+        if !is_hostname(&alias) {
+            return Err(invalid_rule(line, format!("invalid IP or alias {first:?}")));
+        }
+        if values.next().is_some() {
+            return Err(invalid_rule(
+                line,
+                format!("alias {first:?} must be the only target"),
+            ));
+        }
+        return Ok(HostsTarget::Alias(alias));
+    };
+    let mut addresses = Vec::new();
+    addresses.push(address);
+    for value in values {
+        let address = value
+            .parse::<IpAddr>()
+            .map_err(|error| invalid_rule(line, format!("invalid IP {value:?}: {error}")))?;
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    Ok(HostsTarget::Addresses(addresses))
+}
+
+/// Whether `name` can be an alias target. A last label of digits only is a
+/// mistyped IPv4 address, not a name.
+fn is_hostname(name: &str) -> bool {
+    name.len() <= 253
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        && !name
+            .rsplit('.')
+            .next()
+            .is_some_and(|label| label.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn normalize_rule_name(value: &str, line: usize) -> io::Result<String> {
@@ -365,316 +533,234 @@ impl DnsForwarder {
         parsed: &ParsedQuery,
         raw_query: &[u8],
         mode: ResolveMode,
-    ) -> Result<Option<DnsOutcome>, DnsForwardError> {
-        let Some(response) = self
+    ) -> Result<Option<HostsResolution<'_>>, DnsForwardError> {
+        let Some(answer) = self
             .hosts
             .as_deref()
-            .and_then(|hosts| hosts.response(raw_query, parsed))
+            .and_then(|hosts| hosts.resolution(raw_query, parsed))
         else {
             return Ok(None);
         };
-        self.local_outcome_from_wire(engine, parsed, response, mode)
-            .map(Some)
+        match answer {
+            Ok(HostsAnswer::Response(response)) => self
+                .local_outcome_from_wire(engine, parsed, response, mode)
+                .map(|outcome| Some(HostsResolution::Answered(outcome))),
+            Ok(HostsAnswer::Alias(chain)) => Ok(Some(HostsResolution::Alias(chain))),
+            Err(error) => {
+                crate::logging::warn_throttled!(
+                    error = %format_args!("{error:#}"),
+                    "DNS hosts alias failed"
+                );
+                Err(error.into())
+            }
+        }
     }
+
+    /// Answer an alias with its CNAME chain followed by the answer records of
+    /// the last target, which resolves through the whole pipeline. The
+    /// composed answer is local, so it bypasses the cache like other hosts
+    /// answers; the target lookup keeps the caller's cache policy.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn resolve_hosts_alias(
+        &self,
+        engine: &DnsEngine,
+        parsed: &ParsedQuery,
+        raw_query: &[u8],
+        chain: &[&str],
+        metadata: DnsRequestMeta,
+        ingress: IngressProfile,
+        options: &ResolveOptions,
+        mode: ResolveMode,
+        publication_epoch: PublicationEpoch,
+    ) -> Result<DnsOutcome, DnsForwardError> {
+        let target = chain.last().expect("an alias chain names its target");
+        let target_query = retarget_query(raw_query, parsed.query(), target)?;
+        let target = resolve_with_owner(
+            self,
+            &target_query,
+            metadata,
+            ingress,
+            options,
+            mode,
+            ResolveExecution::foreground(publication_epoch),
+            None,
+        )
+        .await?;
+        let response = alias_response(raw_query, parsed.query(), chain, target.reusable())?;
+        self.local_outcome_from_wire(engine, parsed, response, mode)
+            .map(|outcome| outcome.with_alias_target(target))
+    }
+
+    pub(crate) fn has_hosts_aliases(&self) -> bool {
+        self.hosts.as_deref().is_some_and(|hosts| hosts.has_aliases)
+    }
+
+    pub(crate) fn is_hosts_alias(&self, domain: &str) -> bool {
+        self.hosts.as_deref().is_some_and(|hosts| {
+            hosts.has_aliases && matches!(hosts.target_for(domain), Some(HostsTarget::Alias(_)))
+        })
+    }
+
+    /// Follow a hosts alias for a node server host. Direct address matches
+    /// do not claim the original host; an alias may end at an address entry.
+    pub(crate) fn node_host_alias(&self, host: &str) -> anyhow::Result<Option<NodeHostAlias>> {
+        let Some(hosts) = self.hosts.as_deref().filter(|hosts| hosts.has_aliases) else {
+            return Ok(None);
+        };
+        let Some(HostsTarget::Alias(first)) = hosts.target_for(host) else {
+            return Ok(None);
+        };
+        let target = *hosts
+            .alias_chain(host, first)?
+            .last()
+            .expect("an alias chain names its target");
+        Ok(Some(match hosts.target_for(target) {
+            Some(HostsTarget::Addresses(addresses)) => NodeHostAlias::Addresses(addresses.clone()),
+            _ => NodeHostAlias::Name(target.to_owned()),
+        }))
+    }
+}
+
+fn retarget_query(raw_query: &[u8], query: &QueryContext, target: &str) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        raw_query[4..10] == [0, 1, 0, 0, 0, 0] && matches!(&raw_query[10..12], [0, 0] | [0, 1]),
+        "unsupported hosts alias query sections"
+    );
+    let question_end = query
+        .question_offsets()
+        .context("hosts alias query has no question")?
+        .end();
+    let opt_fields = if raw_query[10..12] == [0, 1] {
+        let mut name = [0; 255];
+        let (length, fields) = parse_name_into(raw_query, question_end, &mut name)?;
+        anyhow::ensure!(
+            name[..length] == [0] && raw_query[fields..fields + 2] == [0, 41],
+            "unsupported hosts alias query additional record"
+        );
+        Some(fields)
+    } else {
+        None
+    };
+    let mut retargeted = Vec::with_capacity(raw_query.len() + target.len() + 2);
+    retargeted.extend_from_slice(&raw_query[..12]);
+    append_name(&mut retargeted, target);
+    retargeted.extend_from_slice(&raw_query[question_end - 4..question_end]);
+    if let Some(fields) = opt_fields {
+        // The old root owner may be compressed into the replaced question.
+        retargeted.push(0);
+        retargeted.extend_from_slice(&raw_query[fields..]);
+    }
+    Ok(retargeted)
+}
+
+/// RFC 6604: the RCODE describes the last name in the chain, so a target
+/// NXDOMAIN still carries the CNAME records of the names that do exist. Any
+/// other failure code is passed through without records.
+fn alias_response(
+    raw_query: &[u8],
+    query: &QueryContext,
+    chain: &[&str],
+    target: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let rcode = crate::dns::response::response_rcode(target)?;
+    let rcode = if rcode > 15 && query.edns().is_none() {
+        2
+    } else {
+        rcode
+    };
+    let (mut response, question_name) = response_prefix(
+        raw_query,
+        query,
+        (rcode & 0x0f) as u8,
+        target.len().saturating_add(chain.len() * 64),
+    );
+    if crate::dns::response::is_truncated(target) {
+        response[2] |= 0x02;
+    }
+    if matches!(rcode, 0 | 3) {
+        let qtype = query.qtype().map_or(0, |qtype| qtype.get());
+        let mut owner = None;
+        for &name in chain {
+            match owner {
+                Some(owner) => append_name(&mut response, owner),
+                None => response.extend_from_slice(&question_name),
+            }
+            response.extend_from_slice(&5u16.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&HOSTS_TTL_SECS.to_be_bytes());
+            response.extend_from_slice(&(name.len() as u16 + 2).to_be_bytes());
+            append_name(&mut response, name);
+            owner = Some(name);
+        }
+        let answers = chain.len() as u16 + copy_answers(&mut response, target, qtype)?;
+        response[6..8].copy_from_slice(&answers.to_be_bytes());
+    }
+    append_edns(&mut response, query, rcode);
+    Ok(response)
+}
+
+/// Append the target's CNAME and `qtype` answer records with every name
+/// expanded, since compression pointers only make sense in their own message.
+fn copy_answers(response: &mut Vec<u8>, target: &[u8], qtype: u16) -> anyhow::Result<u16> {
+    let header = target.get(..12).context("truncated alias target header")?;
+    let questions = u16::from_be_bytes([header[4], header[5]]);
+    let answers = u16::from_be_bytes([header[6], header[7]]);
+    let mut cursor = 12;
+    for _ in 0..questions {
+        anyhow::ensure!(
+            crate::dns::wire::skip_dns_name(target, &mut cursor),
+            "malformed alias target question"
+        );
+        cursor += 4;
+    }
+    let mut copied = 0u16;
+    let mut name = [0; 255];
+    for _ in 0..answers {
+        let (owner_length, fields) = parse_name_into(target, cursor, &mut name)?;
+        let fixed = target
+            .get(fields..fields + 10)
+            .context("truncated alias target record")?;
+        let record_type = u16::from_be_bytes([fixed[0], fixed[1]]);
+        let rdata_start = fields + 10;
+        let rdata_end = rdata_start + usize::from(u16::from_be_bytes([fixed[8], fixed[9]]));
+        let rdata = target
+            .get(rdata_start..rdata_end)
+            .context("truncated alias target RDATA")?;
+        cursor = rdata_end;
+        if record_type == 5 {
+            let mut alias = [0; 255];
+            let (alias_length, encoded_end) = parse_name_into(target, rdata_start, &mut alias)?;
+            anyhow::ensure!(
+                encoded_end == rdata_end,
+                "malformed alias target CNAME RDATA"
+            );
+            response.extend_from_slice(&name[..owner_length]);
+            response.extend_from_slice(&fixed[..8]);
+            response.extend_from_slice(&(alias_length as u16).to_be_bytes());
+            response.extend_from_slice(&alias[..alias_length]);
+        } else if record_type == qtype {
+            response.extend_from_slice(&name[..owner_length]);
+            response.extend_from_slice(fixed);
+            response.extend_from_slice(rdata);
+        } else {
+            continue;
+        }
+        copied += 1;
+        if copied == u16::MAX - MAX_ALIAS_DEPTH as u16 {
+            break;
+        }
+    }
+    Ok(copied)
+}
+
+/// `name` is a validated hostname, so every label fits its length byte.
+fn append_name(wire: &mut Vec<u8>, name: &str) {
+    for label in name.split('.') {
+        wire.push(label.len() as u8);
+        wire.extend_from_slice(label.as_bytes());
+    }
+    wire.push(0);
 }
 
 #[cfg(test)]
-mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use async_trait::async_trait;
-    use honk_config::dns::{
-        DnsCond, DnsConfig, DnsDomainMatcher, DnsRequestAction, DnsRequestRule,
-    };
-    use tempfile::{NamedTempFile, tempdir};
-    use tokio::sync::Mutex;
-
-    use crate::dns::cache::DnsCache;
-    use crate::dns::forwarder::{DnsUpstreamPool, build_dns_query};
-    use crate::dns::outcome::{OutcomeStatus, Provenance, ResponseClass};
-    use crate::dns::query::QueryContext;
-    use crate::dns::routing::DnsRouter;
-
-    use super::super::response::make_empty_response;
-    use super::*;
-
-    #[derive(Default)]
-    struct CountingUpstream {
-        calls: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl DnsUpstreamPool for CountingUpstream {
-        async fn query(&self, _upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let query = QueryContext::parse(raw_query)?;
-            Ok(make_empty_response(raw_query, &query))
-        }
-    }
-
-    fn hosts_file(contents: &str) -> NamedTempFile {
-        let file = NamedTempFile::new().expect("temporary hosts file");
-        std::fs::write(file.path(), contents).expect("write hosts file");
-        file
-    }
-
-    fn test_forwarder(
-        path: &Path,
-        config: &DnsConfig,
-        upstream: Arc<CountingUpstream>,
-    ) -> DnsForwarder {
-        let router = Arc::new(DnsRouter::new_from_dns_config(config).expect("DNS router"));
-        let upstream: Arc<dyn DnsUpstreamPool> = upstream;
-        let mut forwarder =
-            DnsForwarder::new(upstream, Arc::new(Mutex::new(DnsCache::new(100))), router)
-                .with_policy_from_config(config)
-                .expect("DNS policy");
-        forwarder.hosts = Some(Arc::new(HostsFile::load(path).expect("hosts snapshot")));
-        forwarder
-    }
-
-    #[test]
-    fn parser_normalizes_aliases_and_deduplicates_addresses() {
-        let hosts = HostsFile::parse(
-            "127.0.0.1 LOCALHOST localhost. alias # inline comment\n\
-             ::1 localhost\n\
-             invalid ignored\n\
-             192.0.2.1 alias alias\n",
-        );
-
-        assert_eq!(
-            hosts.entries.get("localhost"),
-            Some(&vec![
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                IpAddr::V6(Ipv6Addr::LOCALHOST),
-            ])
-        );
-        assert_eq!(
-            hosts.entries.get("alias"),
-            Some(&vec![
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            ])
-        );
-    }
-
-    #[test]
-    fn oxidns_rules_match_with_oxidns_precedence() {
-        let hosts = HostsFile::parse_rules(
-            "domain:evsm.cc 10.0.0.1\n\
-             domain:sub.evsm.cc 10.0.0.2\n\
-             full:que.evsm.cc 10.0.0.3\n\
-             regexp:^api\\. 10.0.0.4\n\
-             keyword:api 10.0.0.5\n\
-             keyword:cdn 10.0.0.6\n\
-             plain.test 10.0.0.7\n",
-        )
-        .unwrap();
-        let ip = |last| IpAddr::V4(Ipv4Addr::new(10, 0, 0, last));
-
-        assert_eq!(hosts.addresses_for("www.evsm.cc"), Some([ip(1)].as_slice()));
-        assert_eq!(
-            hosts.addresses_for("x.sub.evsm.cc"),
-            Some([ip(2)].as_slice())
-        );
-        assert_eq!(hosts.addresses_for("que.evsm.cc"), Some([ip(3)].as_slice()));
-        assert_eq!(
-            hosts.addresses_for("api.other.test"),
-            Some([ip(4)].as_slice())
-        );
-        assert_eq!(
-            hosts.addresses_for("static.cdn.test"),
-            Some([ip(6)].as_slice())
-        );
-        assert_eq!(hosts.addresses_for("plain.test"), Some([ip(7)].as_slice()));
-        assert_eq!(hosts.addresses_for("not-evsm.cc"), None);
-        assert!(HostsFile::parse_rules("regexp:[ 10.0.0.1").is_err());
-    }
-
-    #[test]
-    fn oxidns_rule_file_supports_matcher_address_and_validation_forms() {
-        let hosts = HostsFile::parse_rules(
-            "# comment\n\
-             full:FULL.TEST. 192.0.2.1 2001:db8::1 192.0.2.1 # trailing comment\n\
-             bare.test 192.0.2.2\n\
-             domain:SUFFIX.TEST. 192.0.2.3\n\
-             regexp:(?i)^api[0-9]+\\.test$ 192.0.2.4\n\
-             keyword:CDN 192.0.2.5\n\
-             full:replace.test 192.0.2.6\n\
-             full:replace.test 192.0.2.7\n",
-        )
-        .unwrap();
-        let v4 = |last| IpAddr::V4(Ipv4Addr::new(192, 0, 2, last));
-
-        assert_eq!(
-            hosts.addresses_for("full.test"),
-            Some([v4(1), IpAddr::V6("2001:db8::1".parse().unwrap())].as_slice())
-        );
-        assert_eq!(hosts.addresses_for("bare.test"), Some([v4(2)].as_slice()));
-        assert_eq!(
-            hosts.addresses_for("x.suffix.test"),
-            Some([v4(3)].as_slice())
-        );
-        assert_eq!(hosts.addresses_for("api12.test"), Some([v4(4)].as_slice()));
-        assert_eq!(
-            hosts.addresses_for("static.cdn.test"),
-            Some([v4(5)].as_slice())
-        );
-        assert_eq!(
-            hosts.addresses_for("replace.test"),
-            Some([v4(7)].as_slice())
-        );
-
-        let raw_regexp = HostsFile::parse_rules("regexp:^API\\.TEST$ 192.0.2.8\n").unwrap();
-        assert_eq!(raw_regexp.addresses_for("api.test"), None);
-        for invalid in [
-            "full:no-address\n",
-            "domain: 192.0.2.1\n",
-            "full:bad-address not-an-ip\n",
-        ] {
-            assert!(
-                HostsFile::parse_rules(invalid).is_err(),
-                "accepted {invalid:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn hosts_answers_a_and_aaaa_before_request_reject() {
-        let file = hosts_file("192.0.2.10 service.test\n2001:db8::10 service.test\n");
-        let upstream = Arc::new(CountingUpstream::default());
-        let mut config = DnsConfig::default();
-        config.routing.request.rules = vec![DnsRequestRule {
-            conditions: vec![DnsCond::Qname {
-                not: false,
-                matchers: vec![DnsDomainMatcher::Full("service.test".into())],
-            }],
-            action: DnsRequestAction::Reject,
-        }];
-        let forwarder = test_forwarder(file.path(), &config, Arc::clone(&upstream));
-
-        let mut a_query = build_dns_query("SERVICE.TEST", 1);
-        a_query[0..2].copy_from_slice(&0x1234u16.to_be_bytes());
-        let a = forwarder
-            .resolve_outcome(&a_query)
-            .await
-            .expect("A outcome");
-        let aaaa = forwarder
-            .resolve_outcome(&build_dns_query("service.test", 28))
-            .await
-            .expect("AAAA outcome");
-
-        assert_eq!(a.status(), OutcomeStatus::Accepted);
-        assert_eq!(a.provenance(), Provenance::Fresh);
-        assert_eq!(a.response_class(), ResponseClass::Positive);
-        assert!(!a.expiry().is_cacheable());
-        assert_eq!(&a.rendered()[0..2], &0x1234u16.to_be_bytes());
-        assert_eq!(a.answer_ips(), &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]);
-        assert_eq!(
-            aaaa.answer_ips(),
-            &[IpAddr::V6("2001:db8::10".parse().unwrap())]
-        );
-        assert_eq!(upstream.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn known_name_family_miss_is_nodata_but_other_queries_use_upstream() {
-        let file = hosts_file("192.0.2.20 ipv4-only.test\n");
-        let upstream = Arc::new(CountingUpstream::default());
-        let config = DnsConfig::default();
-        let forwarder = test_forwarder(file.path(), &config, Arc::clone(&upstream));
-
-        let family_miss = forwarder
-            .resolve_outcome(&build_dns_query("ipv4-only.test", 28))
-            .await
-            .expect("AAAA outcome");
-        assert_eq!(family_miss.status(), OutcomeStatus::Accepted);
-        assert_eq!(family_miss.response_class(), ResponseClass::Nodata);
-        assert_eq!(upstream.calls.load(Ordering::SeqCst), 0);
-
-        forwarder
-            .resolve_outcome(&build_dns_query("ipv4-only.test", 16))
-            .await
-            .expect("TXT outcome");
-        forwarder
-            .resolve_outcome(&build_dns_query("unknown.test", 1))
-            .await
-            .expect("unknown A outcome");
-        assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn rebuilt_forwarder_loads_a_new_snapshot_without_mutating_the_old_one() {
-        let file = hosts_file("192.0.2.30 reload.test\n");
-        let upstream = Arc::new(CountingUpstream::default());
-        let config = DnsConfig::default();
-        let old = test_forwarder(file.path(), &config, Arc::clone(&upstream));
-
-        std::fs::write(file.path(), "192.0.2.31 reload.test\n").expect("replace hosts file");
-        let new = test_forwarder(file.path(), &config, Arc::clone(&upstream));
-
-        let query = build_dns_query("reload.test", 1);
-        let old_outcome = old.resolve_outcome(&query).await.expect("old snapshot");
-        let new_outcome = new.resolve_outcome(&query).await.expect("new snapshot");
-        assert_eq!(
-            old_outcome.answer_ips(),
-            &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 30))]
-        );
-        assert_eq!(
-            new_outcome.answer_ips(),
-            &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 31))]
-        );
-        assert_eq!(upstream.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn configured_sources_merge_in_order() {
-        let first = hosts_file("full:first.test 192.0.2.40\nfull:override.test 192.0.2.41\n");
-        let second = hosts_file("full:second.test 192.0.2.42\nfull:override.test 192.0.2.43\n");
-        let config = DnsConfig {
-            hosts: vec![
-                first.path().to_string_lossy().into_owned(),
-                second.path().to_string_lossy().into_owned(),
-            ],
-            ..Default::default()
-        };
-        let router = Arc::new(DnsRouter::new_from_dns_config(&config).expect("DNS router"));
-        let upstream: Arc<dyn DnsUpstreamPool> = Arc::new(CountingUpstream::default());
-        let forwarder =
-            DnsForwarder::new(upstream, Arc::new(Mutex::new(DnsCache::new(100))), router)
-                .with_hosts_from_config(&config)
-                .expect("merged hosts snapshot");
-
-        for (domain, last) in [
-            ("first.test", 40),
-            ("second.test", 42),
-            ("override.test", 43),
-        ] {
-            let outcome = forwarder
-                .resolve_outcome(&build_dns_query(domain, 1))
-                .await
-                .expect("hosts outcome");
-            assert_eq!(
-                outcome.answer_ips(),
-                &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, last))]
-            );
-        }
-    }
-
-    #[test]
-    fn enabled_hosts_load_failure_is_fatal_but_disabled_hosts_skips_io() {
-        let directory = tempdir().expect("temporary directory");
-        let missing = directory.path().join("missing-hosts");
-        let mut config = DnsConfig::default();
-        let router = Arc::new(DnsRouter::new_from_dns_config(&config).expect("DNS router"));
-        let upstream: Arc<dyn DnsUpstreamPool> = Arc::new(CountingUpstream::default());
-        let forwarder =
-            DnsForwarder::new(upstream, Arc::new(Mutex::new(DnsCache::new(100))), router);
-
-        assert!(forwarder.clone().with_hosts_from_config(&config).is_ok());
-        config.hosts.push(missing.to_string_lossy().into_owned());
-        assert!(forwarder.with_hosts_from_config(&config).is_err());
-    }
-}
+mod tests;

@@ -31,13 +31,24 @@ pub(crate) enum QueueError {
     Io(#[from] io::Error),
     #[error("NFQUEUE 320 is already bound")]
     Busy,
+    #[error("nfnetlink_queue is unavailable; the module may need loading")]
+    Unavailable,
 }
 
 pub(crate) fn preflight() -> Result<(), QueueError> {
     let _socket = netlink::open_socket(false)?;
-    match std::fs::read_to_string("/proc/thread-self/net/netfilter/nfnetlink_queue") {
+    queue_free(std::fs::read_to_string(
+        "/proc/thread-self/net/netfilter/nfnetlink_queue",
+    ))
+}
+
+fn queue_free(contents: io::Result<String>) -> Result<(), QueueError> {
+    match contents {
         Ok(contents) if queue_row(&contents).is_some() => Err(QueueError::Busy),
         Ok(_) => Ok(()),
+        // nfnetlink_queue creates the file when it loads, so no process holds
+        // the queue yet; the bind's first config message autoloads the module.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(QueueError::Io(error)),
     }
 }
@@ -81,7 +92,13 @@ impl QueueSocket {
         Ok(socket)
     }
     fn configure(&self) -> Result<(), QueueError> {
-        self.send_config_command(NFQNL_CFG_CMD_PF_BIND, libc::AF_INET as u16, 0)?;
+        // nfnetlink answers EINVAL when no queue subsystem is registered after
+        // its module autoload attempt.
+        self.send_config_command(NFQNL_CFG_CMD_PF_BIND, libc::AF_INET as u16, 0)
+            .map_err(|error| match error.raw_os_error() {
+                Some(libc::EINVAL) => QueueError::Unavailable,
+                _ => QueueError::Io(error),
+            })?;
         self.send_config_command(NFQNL_CFG_CMD_PF_BIND, libc::AF_INET6 as u16, 0)?;
         self.send_config_command(NFQNL_CFG_CMD_BIND, 0, QUEUE_NUM)
             .map_err(|error| {
@@ -532,6 +549,52 @@ mod tests {
     fn queue_row_finds_owned_queue() {
         let input = "319 10 1 2 65535 3 4 8\n320 20 17 2 65535 5 6 9\n";
         assert_eq!(queue_row(input), Some((17, 5, 6)));
+    }
+
+    #[test]
+    fn queue_free_classifies_proc_reads() {
+        let cases = [
+            (Ok("320 20 17 2 65535 5 6 9\n".to_string()), Some("busy")),
+            (Ok("319 10 1 2 65535 3 4 8\n".to_string()), None),
+            (Err(io::ErrorKind::NotFound.into()), None),
+            (Err(io::ErrorKind::PermissionDenied.into()), Some("io")),
+        ];
+        for (contents, expected) in cases {
+            let actual = match queue_free(contents) {
+                Ok(()) => None,
+                Err(QueueError::Busy) => Some("busy"),
+                Err(QueueError::Io(_)) => Some("io"),
+                Err(QueueError::Unavailable) => Some("unavailable"),
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn configure_reports_missing_queue_subsystem() {
+        let (socket, peer, _fatal) = QueueSocket::for_test();
+        let responder = std::thread::spawn(move || {
+            let request = netlink::recv_datagram(peer.as_raw_fd(), 256).expect("config request");
+            let message = netlink::messages(request)
+                .next()
+                .expect("one config message")
+                .expect("valid config message");
+            let mut acknowledgement = Vec::with_capacity(20);
+            let start = netlink::put_message_header(
+                &mut acknowledgement,
+                netlink::NLMSG_ERROR,
+                0,
+                message.sequence,
+                0,
+                0,
+            );
+            acknowledgement[start + 16..start + 20].copy_from_slice(&(-libc::EINVAL).to_ne_bytes());
+            netlink::seal_message(&mut acknowledgement, start);
+            netlink::send(peer.as_raw_fd(), &acknowledgement).expect("config NACK");
+        });
+
+        assert!(matches!(socket.configure(), Err(QueueError::Unavailable)));
+        responder.join().expect("config responder");
     }
 
     const NFQA_CFG_MASK: u16 = 4;

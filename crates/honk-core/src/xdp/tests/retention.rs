@@ -60,7 +60,7 @@ fn fixture_parts_mtu(
     config.ensure_builtin_nodes();
     config.global.dial_mode = "ip".into();
     config.global.tcp_check_url.clear();
-    config.global.udp_check_dns = vec!["127.0.0.1:9".into()];
+    config.global.udp_check_dns = Some(vec!["127.0.0.1:9".into()]);
     config.global.preconnect_node_count = 0;
     config.global.udp_warm_node_count = 0;
     let plane = crate::control::tests::support::control_plane(config);
@@ -842,7 +842,7 @@ async fn full_live_peer_table_refuses_then_recovers_after_actual_tcp_retirement(
         let mut config = Config::default();
         config.ensure_builtin_nodes();
         config.global.tcp_check_url.clear();
-        config.global.udp_check_dns = vec!["127.0.0.1:9".into()];
+        config.global.udp_check_dns = Some(vec!["127.0.0.1:9".into()]);
         config.global.preconnect_node_count = 0;
         config.global.udp_warm_node_count = 0;
         let plane = crate::control::tests::support::control_plane(config);
@@ -1453,8 +1453,8 @@ async fn generated_tcp_wire_matrix_freezes_qos_and_uses_full_eligible_extent() {
                 assert_eq!(header.seq, syn.seq.wrapping_add(1));
                 let next_seq = header.seq.wrapping_add(payload.len() as u32);
                 scope.receive(&segment(client, server, 101, next_seq, tcp::ACK), now);
-                for tag in 0..usize::from(tags) {
-                    peers[0].path.vlan_tci[tag] ^= 0xf000;
+                for tci in &mut peers[0].path.vlan_tci[..usize::from(tags)] {
+                    *tci ^= 0xf000;
                 }
                 flow.write_all(b"new snapshot").await.unwrap();
                 let later = now + Duration::from_millis(50);

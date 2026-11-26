@@ -202,6 +202,66 @@ async fn native_tcp_success_keeps_decision_path_after_selector_change() -> anyho
 }
 
 #[tokio::test]
+async fn native_tcp_records_collapsed_direct_and_dialed_exit() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let relay = crate::test_support::socks5_relay().await;
+        let exit = canonical_socks5("land", "127.0.0.1", relay.addr.port(), None);
+        let mut fixture = Fixture::with_config("peer", "ip", true, |config| {
+            config.nodes.push(exit.clone());
+            let group = &mut config.groups[1];
+            group.nodes.clear();
+            group.final_outbound = Some("direct".into());
+            group.exit = Some(exit.name.clone());
+        })
+        .await?;
+        let (mut upstream, _) = fixture.listener.accept().await?;
+        fixture.client.write_all(b"x").await?;
+        let mut byte = [0];
+        upstream.read_exact(&mut byte).await?;
+        assert_eq!(byte, *b"x");
+        assert_eq!(&*relay.requests.lock(), &[fixture.listener.local_addr()?]);
+
+        let catalog = fixture.handle.native.as_ref().unwrap().catalog.snapshot();
+        let direct_id = honk_config::config::DIRECT_NODE_ID.to_string();
+        let exit_id = exit.id.to_string();
+        let flow = fixture.flow("active").await?;
+        assert_eq!(
+            flow["chain"],
+            serde_json::json!([catalog.groups["outer"], catalog.groups["inner"], direct_id])
+        );
+        let attempts = leaf_attempts(&flow);
+        assert_eq!(attempts.len(), 2);
+        for attempt in &attempts {
+            let data = &attempt["data"];
+            assert_eq!(data["leaf_node_id"], exit_id);
+            assert_eq!(data["leaf_node_name"], "land");
+            let path = data["selection_path"].as_array().unwrap();
+            assert_eq!(path.len(), 2);
+            assert_eq!(path[0]["group_id"], catalog.groups["outer"]);
+            assert_eq!(path[0]["member_id"], catalog.groups["inner"]);
+            assert_eq!(path[1]["group_id"], catalog.groups["inner"]);
+            assert_eq!(path[1]["member_id"], direct_id);
+            assert_eq!(path[1]["member_name"], "direct");
+            assert_eq!(path[1]["reason"], "final_selected");
+        }
+        let connections = fixture.handle.connection_tracker.snapshot();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].chains, ["land", "direct", "inner", "outer"]);
+
+        fixture.client.shutdown().await?;
+        upstream.shutdown().await?;
+        (&mut fixture.task).await??;
+        let closed = fixture.flow("closed").await?;
+        assert_eq!(closed["chain"], flow["chain"]);
+        assert_eq!(leaf_attempts(&closed), attempts);
+        fixture.finish_removals().await?;
+        fixture.server.shutdown().await;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+
+#[tokio::test]
 async fn native_tcp_lost_leaf_capture_does_not_invent_physical_routing_provenance()
 -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -666,7 +726,9 @@ async fn native_tcp_overall_deadline_retains_cancelled_started_attempt() -> anyh
             &config,
         );
         let generation = fixture.handle.runtime_registry.read().clone();
-        let candidates = [node];
+        let manager = fixture.handle.group_manager.read().clone();
+        let candidate = honk_outbound::group::OwnedTarget::node(node.clone());
+        let candidates = [&candidate];
         let feedback = HashMap::new();
         let chains = HashMap::new();
         let race = fixture.handle.race_candidates(
@@ -679,7 +741,9 @@ async fn native_tcp_overall_deadline_retains_cancelled_started_attempt() -> anyh
             Duration::from_secs(5),
             tokio::time::Instant::now() + Duration::from_millis(100),
             generation,
+            &manager,
             IpVersion::V4,
+            Default::default(),
             &feedback,
             false,
             &chains,
@@ -715,6 +779,90 @@ async fn native_tcp_overall_deadline_retains_cancelled_started_attempt() -> anyh
             step["data"]["milestone"].as_str(),
             Some("target_confirmed" | "first_reply")
         )));
+        observation.finish(
+            crate::observe::vocab::ConnectionState::Failed,
+            "dial_failed",
+        );
+        fixture.finish_removals().await?;
+        fixture.server.shutdown().await;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+
+/// A routed attempt reports the leaf its selection captured, by its own
+/// node ID, and dials as a proxy whatever the leaf's protocol.
+#[tokio::test]
+async fn a_routed_flow_reports_the_captured_leaf() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut fixture = Fixture::new("block", "ip").await?;
+        (&mut fixture.task).await??;
+        let config = fixture.handle.config.read().await.clone();
+        let native = fixture.handle.native.as_ref().unwrap();
+        let peer = config
+            .nodes
+            .iter()
+            .find(|node| node.name == "peer")
+            .unwrap();
+        let direct = honk_config::Config::builtin_direct_node();
+        let absent = uuid::Uuid::from_u128(7);
+        let route = match honk_config::group_graph::compose(direct.id, &[], [peer.id, absent]) {
+            honk_config::group_graph::Composed::Routed(route) => route,
+            other => panic!("expected a route, got {other:?}"),
+        };
+        let candidate = honk_outbound::group::OwnedTarget {
+            node: direct.clone(),
+            route: Some(Box::new(honk_outbound::group::RoutedTarget {
+                route,
+                hop_names: ["peer".to_owned(), "absent".to_owned()].into(),
+            })),
+            collapse: crate::group::ExitCollapse::None,
+        };
+        let target = fixture.listener.local_addr()?;
+        let mut observation = ConnectionObservation::begin(
+            Some(native),
+            crate::observe::vocab::Network::Tcp,
+            fixture.client.local_addr()?,
+            target,
+        );
+        observation.pin_selection(
+            fixture.handle.diagnostics.read().generation,
+            &native.catalog.snapshot(),
+            &config,
+        );
+        let generation = fixture.handle.runtime_registry.read().clone();
+        let manager = fixture.handle.group_manager.read().clone();
+        let result = fixture
+            .handle
+            .race_candidates(
+                &[&candidate],
+                target,
+                Some("example.com".to_owned()),
+                "outer",
+                crate::stats::OutboundKind::Group,
+                None,
+                Duration::from_secs(5),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                generation,
+                &manager,
+                IpVersion::V4,
+                manager.route_health_revision("outer"),
+                &HashMap::new(),
+                false,
+                &HashMap::new(),
+                &observation,
+            )
+            .await;
+        assert!(result?.is_none(), "a route over an absent exit fails");
+        let flow = fixture.flow("observed").await?;
+        let attempts = leaf_attempts(&flow);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[1]["data"]["status"], "failed");
+        for attempt in &attempts {
+            assert_eq!(attempt["data"]["leaf_node_id"], direct.id.to_string());
+            assert_eq!(attempt["data"]["leaf_node_name"], "direct");
+            assert_eq!(attempt["data"]["target_kind"], "domain", "{attempt}");
+        }
         observation.finish(
             crate::observe::vocab::ConnectionState::Failed,
             "dial_failed",

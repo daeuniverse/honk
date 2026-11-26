@@ -27,11 +27,11 @@ pub(crate) type Response = http::Response<ResponseBody>;
 pub(crate) struct Error {
     pub(crate) stage: &'static str,
     #[source]
-    source: Option<anyhow::Error>,
+    pub(crate) source: Option<anyhow::Error>,
 }
 
 impl Error {
-    fn caused(stage: &'static str, source: impl Into<anyhow::Error>) -> Self {
+    pub(crate) fn caused(stage: &'static str, source: impl Into<anyhow::Error>) -> Self {
         Self {
             stage,
             source: Some(source.into()),

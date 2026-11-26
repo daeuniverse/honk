@@ -15,6 +15,7 @@
 //!          (TCP)              (SOCKS5)                  (TCP)
 //! ```
 
+mod drain;
 pub mod splice;
 #[cfg(feature = "rprx")]
 mod vision;
@@ -22,6 +23,8 @@ mod vision;
 #[cfg(test)]
 mod progress_tests;
 
+use self::drain::{CopyProgress, drain_idle};
+use futures::FutureExt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -158,7 +161,7 @@ pub struct RelayProgress {
 
 pub type OptionalRelayProgress = Option<RelayProgress>;
 
-/// Preserve read-based tracker/drain accounting while observing accepted writes.
+/// Preserve read-based live accounting while observing accepted writes.
 pub(crate) struct RelayIo<S> {
     inner: S,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -289,17 +292,62 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for RelayIo<S> {
     }
 }
 
-/// Grace window for the surviving direction after the first EOF, counted
-/// as idle time: any byte of progress resets it. See
+/// Grace window after the first source EOF, counted as idle time. See
 /// [`splice::DRAIN_DEADLINE`] for why the drain must be bounded.
 const DRAIN_DEADLINE: std::time::Duration = splice::DRAIN_DEADLINE;
 
 // A saturated read fits one AnyTLS frame without a one-byte tail.
 const RELAY_BUF_SIZE: usize = u16::MAX as usize;
 // Idle and chatty flows keep this small buffer; one saturated read marks a
-// bulk flow, which uses the full frame size for the rest of its life.
+// bulk flow, which uses the full frame size until an idle check window passes.
 const RELAY_BUF_MIN: usize = 8 * 1024;
 pub(crate) const COPY_BUFFER_MEMORY: usize = 2 * (RELAY_BUF_SIZE + RELAY_BUF_MIN);
+// Both directions are polled by one task. Only one can hold an old and new buffer
+// during replacement, leaving the other small-buffer allowance for both boxed timers.
+const _: () = assert!(2 * size_of::<tokio::time::Sleep>() <= RELAY_BUF_MIN);
+
+// Idle check window before shrinking back to RELAY_BUF_MIN (60-120 s without
+// reads, avoiding churn across 30 s keepalives).
+const RELAY_BUF_IDLE_SHRINK: std::time::Duration = std::time::Duration::from_secs(60);
+
+struct IdleShrink {
+    sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+    armed_read: u64,
+}
+
+fn poll_idle_shrink(
+    idle_shrink: &mut Option<IdleShrink>,
+    buffer: &mut Vec<u8>,
+    read_total: u64,
+    cx: &mut std::task::Context<'_>,
+) {
+    use std::future::Future;
+
+    if buffer.len() <= RELAY_BUF_MIN {
+        return;
+    }
+    let shrink = idle_shrink.get_or_insert_with(|| IdleShrink {
+        sleep: Box::pin(tokio::time::sleep(RELAY_BUF_IDLE_SHRINK)),
+        armed_read: read_total,
+    });
+    let mut should_shrink = false;
+    // Re-poll after reset so the task waker is registered for the new deadline.
+    while shrink.sleep.as_mut().poll(cx).is_ready() {
+        if read_total == shrink.armed_read {
+            should_shrink = true;
+            break;
+        }
+        shrink.armed_read = read_total;
+        shrink
+            .sleep
+            .as_mut()
+            .reset(tokio::time::Instant::now() + RELAY_BUF_IDLE_SHRINK);
+    }
+    if should_shrink {
+        *buffer = vec![0; RELAY_BUF_MIN];
+        *idle_shrink = None;
+    }
+}
 
 /// Stops both copy directions where neither holds unwritten bytes, so the
 /// relay can hand the connection to another engine without cancelling a
@@ -341,16 +389,16 @@ impl Park<'_> {
 }
 
 /// Copy one direction until EOF, then half-close the destination's write
-/// side (same contract as `copy_bidirectional`). Bytes read are counted
-/// into `progress` so the drain supervisor can tell a stalled survivor
-/// from an active one. A taken `park` returns early without closing.
+/// side. The drain starts at source EOF, before a buffered final flush or
+/// shutdown can block. A taken `park` returns without closing either side.
 async fn copy_way<R, W>(
     rd: &mut R,
     wr: &mut W,
-    progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    progress: &CopyProgress,
+    eof: &tokio::sync::Notify,
     upload: bool,
     park: Option<&Park<'_>>,
-) -> Result<u64, RelayError>
+) -> Result<(), RelayError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -360,81 +408,61 @@ where
     // Sniffing or protocol setup may already have buffered bytes before the
     // relay starts, independently of bytes read by this copy loop.
     wr.flush().await.map_err(write_error)?;
-    let mut rd = RelayIo::wrap(rd, progress, None, None, None, false);
-    let mut buffer = vec![0; RELAY_BUF_MIN];
-    let mut n = 0;
-    loop {
-        if park.is_some_and(|park| park.take(upload)) {
-            return Ok(n);
-        }
-        let read = std::future::poll_fn(|cx| {
-            use std::pin::Pin;
-            use std::task::{Poll, ready};
-
-            let mut chunk = tokio::io::ReadBuf::new(&mut buffer);
-            match Pin::new(&mut rd).poll_read(cx, &mut chunk) {
-                Poll::Ready(result) => {
-                    if let Some(park) = park {
-                        park.set_waiting(upload, false);
-                    }
-                    Poll::Ready(result.map(|()| chunk.filled().len()).map_err(read_error))
-                }
-                Poll::Pending => {
-                    // copy_buf waits here without flushing buffered protocol writes.
-                    let flushed = Pin::new(&mut *wr).poll_flush(cx);
-                    if let Some(park) = park {
-                        park.set_waiting(upload, matches!(flushed, Poll::Ready(Ok(()))));
-                    }
-                    ready!(flushed).map_err(write_error)?;
-                    Poll::Pending
-                }
+    {
+        let mut buffer = vec![0; RELAY_BUF_MIN];
+        let mut idle_shrink: Option<IdleShrink> = None;
+        let mut n = 0;
+        loop {
+            if park.is_some_and(|park| park.take(upload)) {
+                return Ok(());
             }
-        })
-        .await?;
-        if read == 0 {
-            break;
-        }
-        wr.write_all(&buffer[..read]).await.map_err(write_error)?;
-        n += read as u64;
-        if read == buffer.len() && read < RELAY_BUF_SIZE {
-            buffer = vec![0; RELAY_BUF_SIZE];
+            let read = std::future::poll_fn(|cx| {
+                use std::pin::Pin;
+                use std::task::{Poll, ready};
+
+                let mut chunk = tokio::io::ReadBuf::new(&mut buffer);
+                match Pin::new(&mut *rd).poll_read(cx, &mut chunk) {
+                    Poll::Ready(result) => {
+                        if let Some(park) = park {
+                            park.set_waiting(upload, false);
+                        }
+                        Poll::Ready(result.map(|()| chunk.filled().len()).map_err(read_error))
+                    }
+                    Poll::Pending => {
+                        // copy_buf waits here without flushing buffered protocol writes.
+                        let flushed = Pin::new(&mut *wr).poll_flush(cx);
+                        if let Some(park) = park {
+                            park.set_waiting(upload, matches!(flushed, Poll::Ready(Ok(()))));
+                        }
+                        ready!(flushed).map_err(write_error)?;
+                        poll_idle_shrink(&mut idle_shrink, &mut buffer, n, cx);
+                        Poll::Pending
+                    }
+                }
+            })
+            .await?;
+            if read == 0 {
+                eof.notify_one();
+                break;
+            }
+            progress.read.store(n + read as u64, Ordering::Relaxed);
+            let mut rest = &buffer[..read];
+            while !rest.is_empty() {
+                let written = wr.write(rest).await.map_err(write_error)?;
+                if written == 0 {
+                    return Err(write_error(std::io::ErrorKind::WriteZero.into()));
+                }
+                rest = &rest[written..];
+                n += written as u64;
+                progress.written.store(n, Ordering::Relaxed);
+            }
+            if read == buffer.len() && read < RELAY_BUF_SIZE {
+                buffer = vec![0; RELAY_BUF_SIZE];
+            }
         }
     }
     wr.flush().await.map_err(write_error)?;
-    wr.shutdown().await.map_err(write_error)?;
-    Ok(n)
-}
-
-/// Wait out the surviving direction after its peer finished. The survivor
-/// is cut only after a full [`DRAIN_DEADLINE`] without any byte progress —
-/// a slow but active download may far exceed the deadline and must not be
-/// interrupted. A cut survivor reports the counter's final value, so the
-/// bytes it did move are not lost from the stats.
-async fn drain_wait(
-    f: &mut (impl Future<Output = Result<u64, RelayError>> + Unpin),
-    progress: &std::sync::atomic::AtomicU64,
-) -> Result<u64, RelayError> {
-    const CHECK: std::time::Duration = std::time::Duration::from_millis(100);
-    let mut last = 0u64;
-    let mut stalled = std::time::Duration::ZERO;
-    loop {
-        tokio::select! {
-            r = &mut *f => return r,
-            _ = tokio::time::sleep(CHECK) => {
-                let now = progress.load(std::sync::atomic::Ordering::Relaxed);
-                if now != last {
-                    last = now;
-                    stalled = std::time::Duration::ZERO;
-                } else {
-                    stalled += CHECK;
-                    if stalled >= DRAIN_DEADLINE {
-                        debug!("relay drain stalled; closing both directions");
-                        return Ok(now);
-                    }
-                }
-            }
-        }
-    }
+    wr.shutdown().await.map_err(write_error)
 }
 
 /// Relay a TCP connection between client and proxy.
@@ -459,8 +487,10 @@ where
     debug!("TCP relay started: {} → {}", client_addr, target_addr);
 
     let result = copy_phase(&mut client, &mut proxy, None).await;
-    let _ = client.shutdown().await;
-    let _ = proxy.shutdown().await;
+    // A borrowed socket may still need a half-close on exit. Poll once to
+    // bound cleanup even when a protocol shutdown is backpressured.
+    let _ = client.shutdown().now_or_never();
+    let _ = proxy.shutdown().now_or_never();
     relay_outcome(result, start, client_addr, target_addr)
 }
 
@@ -477,31 +507,41 @@ where
 {
     let (mut cr, mut cw) = tokio::io::split(client);
     let (mut pr, mut pw) = tokio::io::split(proxy);
-    let c2p_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let p2c_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let c2p = copy_way(&mut cr, &mut pw, c2p_progress.clone(), true, park);
-    let p2c = copy_way(&mut pr, &mut cw, p2c_progress.clone(), false, park);
-    tokio::pin!(c2p);
-    tokio::pin!(p2c);
+    let upload = CopyProgress::default();
+    let download = CopyProgress::default();
+    let eof = tokio::sync::Notify::new();
+    let c2p = copy_way(&mut cr, &mut pw, &upload, &eof, true, park);
+    let p2c = copy_way(&mut pr, &mut cw, &download, &eof, false, park);
+    tokio::pin!(c2p, p2c);
     let parked = || park.is_some_and(Park::taken);
-
-    // The first direction to finish half-closes the other (inside
-    // copy_way); the survivor then drains until its own EOF or until it
-    // stalls for a full DRAIN_DEADLINE. An error in either direction
-    // cancels the whole relay, mirroring `copy_bidirectional`. A parked
-    // direction left the other suspended in a read, so dropping it is safe.
+    let copy = async {
+        tokio::select! {
+            result = &mut c2p => {
+                result?;
+                if !parked() { p2c.await?; }
+            }
+            result = &mut p2c => {
+                result?;
+                if !parked() { c2p.await?; }
+            }
+        }
+        Ok::<(), RelayError>(())
+    };
+    let cutoff = async {
+        // Reset the idle budget only for byte movement at the copy boundary.
+        eof.notified().await;
+        drain::drain_copy_idle(&upload, &download).await;
+    };
+    // A pending codec can exhaust the copy task's budget before the timer is polled.
     tokio::select! {
-        r = &mut c2p => match r {
-            Err(e) => Err(e),
-            Ok(first_n) if parked() => Ok((first_n, p2c_progress.load(Ordering::Relaxed))),
-            Ok(first_n) => drain_wait(&mut p2c, &p2c_progress).await.map(|second_n| (first_n, second_n)),
-        },
-        r = &mut p2c => match r {
-            Err(e) => Err(e),
-            Ok(first_n) if parked() => Ok((c2p_progress.load(Ordering::Relaxed), first_n)),
-            Ok(first_n) => drain_wait(&mut c2p, &c2p_progress).await.map(|second_n| (second_n, first_n)),
-        },
+        biased;
+        result = copy => result?,
+        () = tokio::task::unconstrained(cutoff) => (),
     }
+    Ok((
+        upload.written.load(Ordering::Relaxed),
+        download.written.load(Ordering::Relaxed),
+    ))
 }
 
 fn relay_outcome(
@@ -534,13 +574,16 @@ fn relay_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
     use std::sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     };
+    use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
 
     #[tokio::test]
     async fn saturated_relay_keeps_large_frames_and_partial_write_integrity() {
@@ -592,13 +635,20 @@ mod tests {
                 limit,
                 pending: false,
             };
-            let progress = Arc::new(AtomicU64::new(0));
-            let copied = copy_way(&mut source, &mut writer, Arc::clone(&progress), true, None)
-                .await
-                .unwrap();
+            let progress = CopyProgress::default();
+            copy_way(
+                &mut source,
+                &mut writer,
+                &progress,
+                &tokio::sync::Notify::new(),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
             assert_eq!(writer.bytes, payload);
-            assert_eq!(copied, payload.len() as u64);
-            assert_eq!(progress.load(Ordering::Relaxed), copied);
+            let len = payload.len() as u64;
+            assert_eq!(progress.snapshot(), (len, len));
             if limit == u16::MAX as usize {
                 // One small frame while the flow proves itself bulk, then full ones.
                 let sizes = &writer.sizes;
@@ -645,7 +695,8 @@ mod tests {
         copy_way(
             &mut source,
             &mut tokio::io::sink(),
-            Arc::new(AtomicU64::new(0)),
+            &CopyProgress::default(),
+            &tokio::sync::Notify::new(),
             true,
             None,
         )
@@ -668,6 +719,219 @@ mod tests {
             bulk[1..].iter().all(|&room| room == RELAY_BUF_SIZE),
             "{bulk:?}"
         );
+    }
+
+    const IDLE: Duration = RELAY_BUF_IDLE_SHRINK;
+
+    struct RoomReader(tokio::io::DuplexStream, Arc<AtomicUsize>);
+
+    impl AsyncRead for RoomReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let room = buf.remaining();
+            let before = buf.filled().len();
+            let poll = Pin::new(&mut self.0).poll_read(cx, buf);
+            if matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+                self.1.store(room, Ordering::Relaxed);
+            }
+            poll
+        }
+    }
+
+    struct Feeder {
+        tx: tokio::io::DuplexStream,
+        room: Arc<AtomicUsize>,
+        sent: Vec<u8>,
+    }
+
+    impl Feeder {
+        fn new() -> (Self, RoomReader) {
+            let (tx, rx) = tokio::io::duplex(RELAY_BUF_SIZE);
+            let room = Arc::new(AtomicUsize::new(0));
+            let reader = RoomReader(rx, room.clone());
+            (
+                Self {
+                    tx,
+                    room,
+                    sent: Vec::new(),
+                },
+                reader,
+            )
+        }
+
+        async fn send<T>(&mut self, fut: Pin<&mut impl Future<Output = T>>, len: usize) -> usize {
+            let start = self.sent.len();
+            self.sent.extend((start..start + len).map(|i| i as u8));
+            self.tx.write_all(&self.sent[start..]).await.unwrap();
+            assert!(futures::poll!(fut).is_pending());
+            self.room.swap(0, Ordering::Relaxed)
+        }
+
+        fn eof(self) -> Vec<u8> {
+            self.sent
+        }
+    }
+
+    async fn wait<T>(fut: Pin<&mut impl Future<Output = T>>, duration: Duration) {
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep(duration) => {}
+            _ = fut => panic!("future ended before {duration:?}"),
+        }
+    }
+
+    async fn run_copy_way<W: AsyncWrite + Unpin>(mut rd: RoomReader, mut wr: W) -> W {
+        copy_way(
+            &mut rd,
+            &mut wr,
+            &CopyProgress::default(),
+            &tokio::sync::Notify::new(),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        wr
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expanded_buffer_shrinks_after_idle_window_and_reexpands_on_bulk_read() {
+        // 59 s idle must not shrink prematurely.
+        {
+            let (mut feed, rd) = Feeder::new();
+            let copy = run_copy_way(rd, Vec::new());
+            tokio::pin!(copy);
+
+            assert_eq!(feed.send(copy.as_mut(), RELAY_BUF_MIN).await, RELAY_BUF_MIN);
+            wait(copy.as_mut(), IDLE - Duration::from_secs(1)).await;
+            assert_eq!(feed.send(copy.as_mut(), 16).await, RELAY_BUF_SIZE);
+            let sent = feed.eof();
+            assert_eq!(copy.await, sent);
+        }
+
+        // 60 s idle shrinks in place; a small read stays small; a full read re-expands.
+        {
+            let (mut feed, rd) = Feeder::new();
+            let copy = run_copy_way(rd, Vec::new());
+            tokio::pin!(copy);
+
+            assert_eq!(feed.send(copy.as_mut(), RELAY_BUF_MIN).await, RELAY_BUF_MIN);
+            wait(copy.as_mut(), IDLE + Duration::from_millis(1)).await;
+            assert_eq!(feed.send(copy.as_mut(), 100).await, RELAY_BUF_MIN);
+            assert_eq!(feed.send(copy.as_mut(), RELAY_BUF_MIN).await, RELAY_BUF_MIN);
+            assert_eq!(feed.send(copy.as_mut(), 100).await, RELAY_BUF_SIZE);
+            let sent = feed.eof();
+            assert_eq!(copy.await, sent);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_expanded_flow_keeps_large_buffer_and_rearms_waker_for_later_idle() {
+        let (mut feed, rd) = Feeder::new();
+        let copy = run_copy_way(rd, Vec::new());
+        tokio::pin!(copy);
+
+        assert_eq!(feed.send(copy.as_mut(), RELAY_BUF_MIN).await, RELAY_BUF_MIN);
+        for _ in 0..6 {
+            wait(copy.as_mut(), IDLE / 2 + Duration::from_millis(1)).await;
+            assert_eq!(feed.send(copy.as_mut(), 64).await, RELAY_BUF_SIZE);
+        }
+        wait(copy.as_mut(), IDLE * 2 + Duration::from_millis(10)).await;
+        assert_eq!(feed.send(copy.as_mut(), 16).await, RELAY_BUF_MIN);
+        let sent = feed.eof();
+        assert_eq!(copy.await, sent);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_shrink_respects_pending_flush_vision_park_and_eof_drain() {
+        // Pending flush blocks shrink without losing buffered bytes or the timer wakeup.
+        {
+            let (mut feed, rd) = Feeder::new();
+            let (dst, mut out) = tokio::io::duplex(RELAY_BUF_MIN);
+            let copy = run_copy_way(rd, BufWriter::with_capacity(64, dst));
+            tokio::pin!(copy);
+
+            assert_eq!(feed.send(copy.as_mut(), RELAY_BUF_MIN).await, RELAY_BUF_MIN);
+            assert_eq!(feed.send(copy.as_mut(), 16).await, RELAY_BUF_SIZE);
+            wait(copy.as_mut(), IDLE * 2 + Duration::from_millis(2)).await;
+
+            let mut received = vec![0; RELAY_BUF_MIN];
+            out.read_exact(&mut received).await.unwrap();
+            assert!(out.read_u8().now_or_never().is_none());
+            assert!(futures::poll!(copy.as_mut()).is_pending());
+            let mut held = [0; 16];
+            out.read_exact(&mut held).await.unwrap();
+            received.extend_from_slice(&held);
+
+            assert_eq!(feed.send(copy.as_mut(), 16).await, RELAY_BUF_SIZE);
+            wait(copy.as_mut(), IDLE * 2 + Duration::from_millis(2)).await;
+            assert_eq!(feed.send(copy.as_mut(), 16).await, RELAY_BUF_MIN);
+            let sent = feed.eof();
+            copy.await;
+            out.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, sent);
+        }
+
+        // Vision Park handoff succeeds after in-place shrink with waiting preserved.
+        {
+            let ready = AtomicBool::new(false);
+            let gate = || ready.load(Ordering::Relaxed);
+            let park = Park {
+                gate: &gate,
+                waiting: Default::default(),
+                taken: AtomicBool::new(false),
+            };
+            let (mut feed, rd) = Feeder::new();
+            let (mut app_rx, client_wr) = tokio::io::duplex(64);
+            let (mut proxy, mut peer) = tokio::io::duplex(16 * 1024);
+            let mut client = tokio::io::join(rd, client_wr);
+            let p = copy_phase(&mut client, &mut proxy, Some(&park));
+            tokio::pin!(p);
+
+            assert_eq!(feed.send(p.as_mut(), RELAY_BUF_MIN).await, RELAY_BUF_MIN);
+            wait(p.as_mut(), IDLE + Duration::from_millis(1)).await;
+            assert!(park.waiting[Park::side(true)].load(Ordering::Relaxed) && !park.taken());
+
+            ready.store(true, Ordering::Relaxed);
+            peer.write_all(b"down").await.unwrap();
+            let stats = timeout(Duration::from_secs(1), p).await.unwrap().unwrap();
+            assert_eq!(stats, (RELAY_BUF_MIN as u64, 4));
+            assert!(park.taken());
+            let (mut reply, mut uploaded) = ([0; 4], vec![0; RELAY_BUF_MIN]);
+            app_rx.read_exact(&mut reply).await.unwrap();
+            peer.read_exact(&mut uploaded).await.unwrap();
+            assert_eq!((&reply[..], uploaded), (&b"down"[..], feed.eof()));
+        }
+
+        // EOF after idle shrink still bounds a silent peer via drain_copy_idle.
+        {
+            let (mut feed, rd) = Feeder::new();
+            let (_app_rx, client_wr) = tokio::io::duplex(64);
+            let (mut proxy, mut peer) = tokio::io::duplex(16 * 1024);
+            let mut client = tokio::io::join(rd, client_wr);
+            let p = copy_phase(&mut client, &mut proxy, None);
+            tokio::pin!(p);
+
+            assert_eq!(feed.send(p.as_mut(), RELAY_BUF_MIN).await, RELAY_BUF_MIN);
+            wait(p.as_mut(), IDLE + Duration::from_millis(1)).await;
+            assert_eq!(feed.send(p.as_mut(), 100).await, RELAY_BUF_MIN);
+
+            let eof_at = tokio::time::Instant::now();
+            let sent = feed.eof();
+            let stats = timeout(DRAIN_DEADLINE * 3, p).await.unwrap().unwrap();
+            assert_eq!(stats, (sent.len() as u64, 0));
+            let drained = eof_at.elapsed();
+            assert!(
+                (DRAIN_DEADLINE..DRAIN_DEADLINE * 2).contains(&drained),
+                "{drained:?}"
+            );
+            let mut received = Vec::new();
+            peer.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, sent);
+        }
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ mod compiler {
 
     use honk_config::dns::{
         DnsCond, DnsDomainMatcher, DnsRequestAction, DnsRequestRouting, DnsResponseAction,
-        DnsResponseRouting,
+        DnsResponseRouting, DnsTagMatcher,
     };
 
     use super::matcher::{CompiledCond, CompiledDomainMatcher};
@@ -100,7 +100,10 @@ mod compiler {
                         requirements.add_geoip(code);
                     }
                 }
-                DnsCond::Sip { .. } | DnsCond::Qtype { .. } | DnsCond::Upstream { .. } => {}
+                DnsCond::Sip { .. }
+                | DnsCond::Qtype { .. }
+                | DnsCond::Upstream { .. }
+                | DnsCond::Subtag { .. } => {}
             }
         }
     }
@@ -140,6 +143,15 @@ mod compiler {
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?;
                     Ok(CompiledCond::Sip { not: *not, nets })
+                }
+                DnsCond::Subtag { not, tags } => {
+                    if !allow_sip {
+                        anyhow::bail!("DNS subtag() condition is request-only");
+                    }
+                    Ok(CompiledCond::Subtag {
+                        not: *not,
+                        pattern: compile_tag_matchers(tags)?,
+                    })
                 }
                 DnsCond::Upstream { not, names } => Ok(CompiledCond::Upstream {
                     not: *not,
@@ -185,6 +197,21 @@ mod compiler {
                 CompiledDomainMatcher::Geosite(shared.geosite(code, &domains))
             }
         })
+    }
+
+    /// One alternation with the group filter's `subtag(...)` semantics.
+    fn compile_tag_matchers(tags: &[DnsTagMatcher]) -> anyhow::Result<regex::Regex> {
+        let pattern = tags
+            .iter()
+            .map(|tag| match tag {
+                DnsTagMatcher::Exact(value) => format!("^(?:{})$", regex::escape(value)),
+                DnsTagMatcher::Keyword(value) => regex::escape(value),
+                DnsTagMatcher::Regex(value) => format!("(?:{value})"),
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        regex::Regex::new(&pattern)
+            .map_err(|error| anyhow::anyhow!("Invalid DNS subtag pattern: {error}"))
     }
 }
 mod config {
@@ -257,6 +284,10 @@ mod matcher {
             not: bool,
             names: Vec<String>,
         },
+        Subtag {
+            not: bool,
+            pattern: regex::Regex,
+        },
         Ip {
             not: bool,
             trie: Arc<BinaryLpmTrie>,
@@ -267,6 +298,7 @@ mod matcher {
         domain: &'a str,
         qtype: u16,
         source_ip: Option<IpAddr>,
+        subscriptions: Option<&'a [String]>,
         answer_ips: &'a [IpAddr],
         from_upstream: &'a str,
     }
@@ -282,6 +314,20 @@ mod matcher {
                 domain,
                 qtype,
                 source_ip,
+                subscriptions: None,
+                answer_ips: &[],
+                from_upstream: "",
+            }
+        }
+
+        /// A node server host lookup: the qname and the node's subscription
+        /// tags, without a client or query type.
+        pub(super) fn node_host(domain: &'a str, subscriptions: &'a [String]) -> Self {
+            Self {
+                domain,
+                qtype: 0,
+                source_ip: None,
+                subscriptions: Some(subscriptions),
                 answer_ips: &[],
                 from_upstream: "",
             }
@@ -292,6 +338,7 @@ mod matcher {
                 domain,
                 qtype,
                 source_ip: None,
+                subscriptions: None,
                 answer_ips: context.answer_ips,
                 from_upstream: context.from_upstream,
             }
@@ -320,6 +367,13 @@ mod matcher {
                         return false;
                     };
                     (nets.iter().any(|net| net.contains(&source_ip)), *not)
+                }
+                CompiledCond::Subtag { not, pattern } => {
+                    let Some(subscriptions) = value.subscriptions else {
+                        observe(index, false);
+                        return false;
+                    };
+                    (subscriptions.iter().any(|tag| pattern.is_match(tag)), *not)
                 }
                 CompiledCond::Upstream { not, names } => {
                     (names.iter().any(|name| name == value.from_upstream), *not)
@@ -694,6 +748,34 @@ impl DnsRouter {
 
     pub fn select_upstream(&self, domain: &str) -> &str {
         self.select_upstream_normalized(&domain.to_ascii_lowercase())
+    }
+
+    pub(crate) fn has_node_rules(&self) -> bool {
+        self.request_rules.iter().any(|rule| {
+            rule.conditions
+                .iter()
+                .any(|condition| matches!(condition, matcher::CompiledCond::Subtag { .. }))
+        })
+    }
+
+    /// The upstream of the first `subtag()` request rule matching a node's
+    /// lowercase server host and subscription tags. Rules without `subtag()`
+    /// never claim node hosts: those keep the bootstrap resolver.
+    pub(crate) fn select_node_upstream(
+        &self,
+        domain: &str,
+        subscriptions: &[String],
+    ) -> Option<&str> {
+        let evaluation = Evaluation::node_host(domain, subscriptions);
+        self.request_rules
+            .iter()
+            .filter(|rule| {
+                rule.conditions
+                    .iter()
+                    .any(|condition| matches!(condition, matcher::CompiledCond::Subtag { .. }))
+            })
+            .find(|rule| eval_conditions(&rule.conditions, &evaluation))
+            .and_then(|rule| request_upstream(&rule.action))
     }
 }
 

@@ -1,6 +1,11 @@
-use std::future::Future;
-use std::sync::Arc;
+use std::io;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
+
+use honk_outbound::SharedError;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::super::endpoint::DnsEndpoint;
 use super::budget::DnsSocketBudget;
@@ -27,7 +32,87 @@ pub struct ProxyDial {
     /// Immutable outbound generation captured by the owning DNS runtime.
     /// Legacy unit-test pools may omit it and use the node path directly.
     pub generation: Option<Arc<honk_outbound::runtime::OutboundRuntimeRegistry>>,
+    /// The selected node, or a route's leaf.
     pub node: Node,
+    /// The route through group exits `node` dials as, if any. It runs only on
+    /// a captured generation's hop runtimes, and DNS packet transports
+    /// (DoQ, DoH3) reject it.
+    pub route: Option<honk_config::route::Route>,
+}
+
+// TLS borrows the carrier error and HTTP/2 fans it out. Keep its provenance and
+// episode before either library has to project it.
+pub(super) struct CarrierIo<S> {
+    inner: S,
+    failure: Option<Arc<OnceLock<SharedError>>>,
+}
+
+impl<S> CarrierIo<S> {
+    pub(super) fn capture(inner: S, routed: bool) -> (Self, Option<Arc<OnceLock<SharedError>>>) {
+        let failure = routed.then(|| Arc::new(OnceLock::new()));
+        let stream = Self {
+            inner,
+            failure: failure.clone(),
+        };
+        (stream, failure)
+    }
+}
+
+fn retain_carrier_error(failure: Option<&OnceLock<SharedError>>, error: io::Error) -> io::Error {
+    let Some(failure) = failure else {
+        return error;
+    };
+    let kind = error.kind();
+    let cause = failure.get_or_init(|| SharedError::fanout(error.into()));
+    io::Error::new(kind, cause.clone())
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CarrierIo<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner)
+            .poll_read(cx, buf)
+            .map_err(|error| retain_carrier_error(self.failure.as_deref(), error))
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for CarrierIo<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner)
+            .poll_write(cx, buf)
+            .map_err(|error| retain_carrier_error(self.failure.as_deref(), error))
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner)
+            .poll_write_vectored(cx, bufs)
+            .map_err(|error| retain_carrier_error(self.failure.as_deref(), error))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner)
+            .poll_flush(cx)
+            .map_err(|error| retain_carrier_error(self.failure.as_deref(), error))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 pub(super) enum PacketAdmission<'a> {
@@ -152,16 +237,16 @@ impl DialContext {
                 |address, budget, _| async move {
                     let dial = async {
                         if let Some(generation) = &proxy.generation {
+                            let dial = match &proxy.route {
+                                Some(route) => honk_outbound::proxy::DialRef::Route(route),
+                                None => honk_outbound::proxy::DialRef::Node(proxy.node.id),
+                            };
                             proxy
                                 .registry
-                                .dial_runtime(
-                                    Arc::clone(generation),
-                                    proxy.node.id,
-                                    address,
-                                    None,
-                                    budget,
-                                )
+                                .dial_ref(Arc::clone(generation), dial, address, None, budget)
                                 .await
+                        } else if proxy.route.is_some() {
+                            anyhow::bail!("a route needs a runtime generation")
                         } else {
                             proxy
                                 .registry
@@ -169,7 +254,11 @@ impl DialContext {
                                 .await
                         }
                     };
-                    let dial = crate::observe::flows::dns::outbound_dial_scope(&proxy.node, dial);
+                    let dial = crate::observe::flows::dns::outbound_dial_scope(
+                        &proxy.node,
+                        proxy.route.is_some(),
+                        dial,
+                    );
                     dial.await
                 },
             )
@@ -184,7 +273,10 @@ impl DialContext {
     }
 
     pub(super) fn packet_admission(&self) -> Option<PacketAdmission<'_>> {
-        match self.proxy.as_ref().map(|proxy| proxy.node.protocol()) {
+        match self.proxy.as_ref().map(|proxy| match proxy.route {
+            Some(_) => honk_config::types::NodeProtocol::Chain,
+            None => proxy.node.protocol(),
+        }) {
             None
             | Some(
                 honk_config::types::NodeProtocol::Direct
@@ -205,6 +297,12 @@ impl DialContext {
         let Some(proxy) = &self.proxy else {
             anyhow::bail!("packet transport requested without proxy")
         };
+        if proxy.route.is_some() {
+            return Err(
+                anyhow::Error::new(honk_outbound::proxy::PacketRejection::Policy)
+                    .context("DNS packet transport requires a node target"),
+            );
+        }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             anyhow::bail!("DNS proxy packet setup deadline elapsed")
@@ -240,7 +338,11 @@ impl DialContext {
                 None => transport,
             })
         };
-        let dial = crate::observe::flows::dns::outbound_dial_scope(&proxy.node, dial);
+        let dial = crate::observe::flows::dns::outbound_dial_scope(
+            &proxy.node,
+            proxy.route.is_some(),
+            dial,
+        );
         dial.await
     }
 }
@@ -386,5 +488,57 @@ mod tests {
             assert_eq!(start.elapsed(), Duration::from_millis(1500));
         }
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_packet_transport_refuses_a_route_through_group_exits() {
+        use honk_config::group_graph::{Composed, compose};
+        use honk_config::node::OutboundConfig;
+
+        let socks5 = |name: &str, port: u16| {
+            let mut node = Node {
+                name: name.into(),
+                address: "127.0.0.1".into(),
+                port,
+                outbound: OutboundConfig::Socks5(Default::default()),
+                ..Default::default()
+            };
+            node.id = node.derive_id();
+            node
+        };
+        let (leaf, exit) = (socks5("leaf", 1), socks5("exit", 2));
+        let Composed::Routed(route) = compose(leaf.id, &[leaf.id], [exit.id]) else {
+            panic!("a leaf behind an exit composes a route")
+        };
+        let dial = DialContext {
+            endpoint: crate::dns::endpoint::DnsEndpoint::parse(
+                "192.0.2.1:853",
+                honk_config::types::DnsProtocol::Quic,
+                Some("localhost"),
+            )
+            .unwrap(),
+            query_timeout: Duration::from_secs(1),
+            dial_timeout: Duration::from_secs(1),
+            socket_budget: DnsSocketBudget::new(1),
+            proxy: Some(ProxyDial {
+                registry: Arc::new(ProxyRegistry::new()),
+                generation: None,
+                node: leaf,
+                route: Some(route),
+            }),
+        };
+        let error = dial
+            .dial_packet_transport_until(
+                "192.0.2.1:853".parse().unwrap(),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            honk_outbound::proxy::packet_rejection(&error),
+            Some(honk_outbound::proxy::PacketRejection::Policy),
+        );
     }
 }

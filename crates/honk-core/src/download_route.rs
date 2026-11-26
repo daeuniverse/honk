@@ -11,12 +11,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use honk_config::Config;
-use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
-use honk_outbound::alive::{IpVersion, ProbeDomain};
+use honk_outbound::alive::{IpVersion, ProbeDomain, RouteHealthRevision, RouteHealthStamp};
 use honk_outbound::group::{
-    ScoreAttempt, ScoreBusinessGuard, ScoreContinuation, ScoreOutcome, ScoreSelectionContext,
-    ScoreTarget, SelectionNetwork, SharedGroupManager,
+    GroupManager, OwnedTarget, ScoreAttempt, ScoreBusinessGuard, ScoreContinuation, ScoreOutcome,
+    ScoreSelectionContext, ScoreTarget, SelectionNetwork, SharedGroupManager, Target,
 };
 use honk_outbound::proxy::{AsyncReadWrite, ProxyRegistry, TcpOutbound};
 use honk_outbound::runtime::{
@@ -24,7 +23,7 @@ use honk_outbound::runtime::{
 };
 use tokio::sync::RwLock;
 use tokio::time::{Instant, timeout_at};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::marked_http::{self, Deadline, Reply};
 use crate::routing::{ConnectionInfo, Router};
@@ -76,9 +75,23 @@ pub(crate) enum Route {
     },
     Block,
     Proxy {
-        node: Box<Node>,
+        proxy: Box<DownloadProxy>,
         feedback: Option<ScoreAttempt>,
     },
+}
+
+pub(crate) struct DownloadProxy {
+    pub(crate) target: OwnedTarget,
+    generation: std::sync::Arc<OutboundRuntimeRegistry>,
+    connect_timeout: Duration,
+    health: Option<DownloadHealthRoute>,
+}
+
+struct DownloadHealthRoute {
+    manager: std::sync::Arc<GroupManager>,
+    group: String,
+    family: IpVersion,
+    revision: RouteHealthRevision,
 }
 
 /// A download's `download_detour` setting.
@@ -157,9 +170,11 @@ impl Outbounds<'_> {
             mac: None,
             dscp: None,
         };
+        // Reload publishes router, config, groups and runtimes under these locks, in this order.
+        let router = self.router.read().await;
+        let config = self.config.read().await;
         let (outbound, rule) = match detour {
             None => {
-                let router = self.router.read().await;
                 let (action, matched) = router.route_action(&info);
                 let rule = matched.map(|m| format!("{}:{}", m.rule_type, m.rule_payload));
                 (action.outbound.clone(), rule)
@@ -178,18 +193,8 @@ impl Outbounds<'_> {
                 IpVersion::V4
             }
         });
-        let (node, feedback, group) = {
-            let config = self.config.read().await;
-            let group_manager = self.group_manager.read().clone();
-            // Generic route resolution defaults unknown outputs to direct; an
-            // explicitly configured detour must not bypass that operator error.
-            if detour.is_some()
-                && config.builtin_node(&outbound).is_none()
-                && !config.nodes.iter().any(|node| node.name == outbound)
-                && !config.groups.iter().any(|group| group.name == outbound)
-            {
-                anyhow::bail!("{purpose}: detour outbound '{outbound}' not found");
-            }
+        let group_manager = self.group_manager.read().clone();
+        let (node, feedback, group, health_family, revision) = {
             let group = config
                 .groups
                 .iter()
@@ -207,31 +212,68 @@ impl Outbounds<'_> {
                         SocketAddr::new(dst_ip, port).into()
                     }),
                 };
-                let plan = group_manager
-                    .selection_plan_for_target_with_health_fallback(&outbound, &context, original);
+                let (plan, revision) =
+                    group_manager.dial_plan_for_target(&outbound, &context, original);
+                let health_family = plan.health_family;
                 match plan.entries.into_iter().next() {
-                    Some(entry) => (Some(entry.node.clone()), entry.feedback, group),
-                    None => (None, None, group),
+                    Some(entry) => {
+                        let mut target = group_manager.own_target(Target {
+                            node: entry.node,
+                            route: entry.route,
+                        });
+                        target.collapse = entry.collapse;
+                        (Some(target), entry.feedback, group, health_family, revision)
+                    }
+                    None => (None, None, group, health_family, revision),
                 }
             } else {
-                let nodes = crate::control::reload::resolve_outbound_nodes(
-                    &config,
-                    &group_manager,
-                    &outbound,
-                    ProbeDomain::Tcp,
+                let node = config.builtin_node(&outbound).or_else(|| {
+                    config
+                        .nodes
+                        .iter()
+                        .find(|node| node.name == outbound)
+                        .cloned()
+                });
+                let node = match node {
+                    Some(node) => node,
+                    None if detour.is_some() => {
+                        anyhow::bail!("{purpose}: detour outbound '{outbound}' not found");
+                    }
+                    None => {
+                        warn!("Outbound '{}' not found, falling back to direct", outbound);
+                        Config::builtin_direct_node()
+                    }
+                };
+                (
+                    Some(OwnedTarget::node(node)),
+                    None,
+                    None,
                     target_ipver,
-                );
-                (nodes.into_iter().next(), None, None)
+                    RouteHealthRevision::default(),
+                )
             }
         };
         let Some(node) = node else {
             return Err(anyhow::Error::new(NoUsableNode { outbound }).context(purpose.to_owned()));
         };
-        let route = match node.protocol() {
-            NodeProtocol::Direct => Route::Direct { feedback },
+        let route = match node.node.protocol() {
+            NodeProtocol::Direct if node.route.is_none() => Route::Direct { feedback },
             NodeProtocol::Block => Route::Block,
             _ => Route::Proxy {
-                node: Box::new(node),
+                proxy: Box::new(DownloadProxy {
+                    health: group
+                        .as_ref()
+                        .filter(|_| node.uses_route_evidence())
+                        .map(|group| DownloadHealthRoute {
+                            manager: group_manager,
+                            group: group.clone(),
+                            family: health_family,
+                            revision,
+                        }),
+                    target: node,
+                    generation: self.runtime_registry.read().clone(),
+                    connect_timeout: Duration::from_millis(config.global.connect_timeout_ms),
+                }),
                 feedback,
             },
         };
@@ -241,28 +283,60 @@ impl Outbounds<'_> {
             via = match &route {
                 Route::Direct { .. } => "direct",
                 Route::Block => "block",
-                Route::Proxy { node, .. } => node.name.as_str(),
+                Route::Proxy { proxy, .. } => proxy.target.node.name.as_str(),
             },
             "{purpose} routed"
         );
         Ok(Decision { route, group })
     }
+}
 
-    /// Prepares a tunnel through `node` to `host:port`. Tunnel handlers dial
+impl DownloadProxy {
+    pub(crate) fn admit_route_health(&self) -> Option<RouteHealthStamp> {
+        self.health.as_ref().map(|route| route.revision.admit())
+    }
+
+    pub(crate) fn report_route_outcome(
+        &self,
+        stamp: Option<RouteHealthStamp>,
+        outcome: Result<(), &(dyn std::error::Error + 'static)>,
+    ) {
+        let (Some(route), Some(stamp)) = (&self.health, stamp) else {
+            return;
+        };
+        if self.generation.is_shutdown() {
+            return;
+        }
+        match outcome {
+            Ok(()) => {
+                route.manager.report_route_response(
+                    &route.group,
+                    self.target.key(),
+                    route.family,
+                    stamp,
+                    None,
+                );
+            }
+            Err(error) => {
+                route.manager.report_route_failure(
+                    &route.group,
+                    &self.target,
+                    route.family,
+                    stamp,
+                    error,
+                );
+            }
+        }
+    }
+
+    /// Prepares a tunnel through `target` to `host:port`. Tunnel handlers dial
     /// by domain, so the node's egress resolves it and local DNS poisoning
     /// does not matter; the address is only a fallback for handlers that need one.
-    pub(crate) async fn tunnel(
+    pub(crate) fn tunnel<'a>(
         &self,
-        node: &Node,
+        registry: &'a ProxyRegistry,
         (host, port): (&str, u16),
-    ) -> anyhow::Result<Tunnel> {
-        let protocol = node.protocol();
-        let entry = self
-            .proxy_registry
-            .find(protocol)
-            .ok_or_else(|| anyhow::anyhow!("no handler for protocol {protocol:?}"))?;
-        let connect_timeout =
-            Duration::from_millis(self.config.read().await.global.connect_timeout_ms);
+    ) -> anyhow::Result<Tunnel<'a>> {
         let (domain, addr) = match parse_host_ip(host) {
             Some(ip) => (None, SocketAddr::new(ip, port)),
             None => (
@@ -270,52 +344,101 @@ impl Outbounds<'_> {
                 SocketAddr::from(([0, 0, 0, 0], port)),
             ),
         };
-        let generation = self.runtime_registry.read().clone();
-        let (runtime, guard) = honk_outbound::urltest::try_probe_runtime(
-            &generation,
-            node,
-            honk_outbound::proxy::WarmRequirement::Session,
-        )?;
+        let via = match self.target.route() {
+            Some(route) => TunnelVia::Route {
+                registry,
+                route: *route,
+            },
+            None => {
+                let node = &self.target.node;
+                let protocol = node.protocol();
+                let entry = registry
+                    .find(protocol)
+                    .ok_or(honk_outbound::proxy::MissingProtocolHandler(protocol))?;
+                let (runtime, guard) = honk_outbound::urltest::try_probe_runtime(
+                    &self.generation,
+                    node,
+                    honk_outbound::proxy::WarmRequirement::Session,
+                )?;
+                TunnelVia::Node {
+                    runtime,
+                    guard,
+                    tcp: std::sync::Arc::clone(&entry.tcp),
+                }
+            }
+        };
         Ok(Tunnel {
-            generation,
-            runtime,
-            guard,
-            tcp: std::sync::Arc::clone(&entry.tcp),
-            connect_timeout,
+            generation: self.generation.clone(),
+            via,
+            connect_timeout: self.connect_timeout,
             addr,
             domain,
         })
     }
 }
 
-/// A node's tunnel to one target. The disposable runtime it may own lives
-/// until [`Tunnel::close`], after the stream is done.
-pub(crate) struct Tunnel {
+/// A node's or a route's tunnel to one target. The disposable runtime a
+/// node's tunnel may own lives until [`Tunnel::close`], after the stream is
+/// done.
+pub(crate) struct Tunnel<'a> {
     generation: std::sync::Arc<OutboundRuntimeRegistry>,
-    runtime: std::sync::Arc<NodeRuntime>,
-    guard: Option<EphemeralRuntimeGuard>,
-    tcp: std::sync::Arc<dyn TcpOutbound>,
+    via: TunnelVia<'a>,
     connect_timeout: Duration,
     addr: SocketAddr,
     domain: Option<String>,
 }
 
-impl Tunnel {
+enum TunnelVia<'a> {
+    Node {
+        runtime: std::sync::Arc<NodeRuntime>,
+        guard: Option<EphemeralRuntimeGuard>,
+        tcp: std::sync::Arc<dyn TcpOutbound>,
+    },
+    Route {
+        registry: &'a ProxyRegistry,
+        route: honk_config::route::Route,
+    },
+}
+
+impl Tunnel<'_> {
     pub(crate) async fn dial(&self) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-        let proxy = self
-            .generation
-            .scope_dials(self.tcp.dial_runtime(
-                std::sync::Arc::clone(&self.runtime),
-                self.addr,
-                self.domain.as_deref(),
-                self.connect_timeout,
-            ))
-            .await?;
-        Ok(proxy.stream)
+        let proxy = match &self.via {
+            TunnelVia::Node { runtime, tcp, .. } => {
+                if self.generation.is_shutdown() {
+                    return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
+                }
+                self.generation
+                    .scope_dials(tcp.dial_runtime(
+                        std::sync::Arc::clone(runtime),
+                        self.addr,
+                        self.domain.as_deref(),
+                        self.connect_timeout,
+                    ))
+                    .await
+            }
+            TunnelVia::Route { registry, route } => {
+                registry
+                    .dial_ref(
+                        std::sync::Arc::clone(&self.generation),
+                        honk_outbound::proxy::DialRef::Route(route),
+                        self.addr,
+                        self.domain.as_deref(),
+                        self.connect_timeout,
+                    )
+                    .await
+            }
+        };
+        if self.generation.is_shutdown() {
+            return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
+        }
+        Ok(proxy?.stream)
     }
 
     pub(crate) async fn close(mut self) -> anyhow::Result<()> {
-        if let Some(guard) = self.guard.as_mut() {
+        if let TunnelVia::Node {
+            guard: Some(guard), ..
+        } = &mut self.via
+        {
             guard.close().await?;
         }
         Ok(())
@@ -335,24 +458,52 @@ pub(crate) struct Request<'a> {
     pub(crate) bootstrap: Option<&'a str>,
 }
 
+/// The stage of a download the server answered with `status`: a 404 is told
+/// apart because it is what a removed file or an expired link gives.
+pub(crate) fn status_stage(status: http::StatusCode) -> &'static str {
+    match status {
+        http::StatusCode::NOT_FOUND => "http_not_found",
+        _ => "http_status_rejected",
+    }
+}
+
+/// The outbound a download went through: the node that carried it, and the
+/// group that chose the node when one did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Via {
+    pub(crate) node: String,
+    pub(crate) group: Option<String>,
+}
+
+impl std::fmt::Display for Via {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "node '{}'", self.node)?;
+        match &self.group {
+            Some(group) => write!(f, " of group '{group}'"),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Why a routed download failed.
 pub(crate) enum Failed {
     /// The detour names no outbound, or the chosen one has no usable node.
     Route(anyhow::Error),
-    /// The stage that failed.
-    Stage(&'static str),
+    /// The stage that failed, and the outbound it went through; `None` before
+    /// a node was chosen and for direct downloads.
+    Stage(&'static str, Option<Via>),
 }
 
 impl From<&'static str> for Failed {
     fn from(stage: &'static str) -> Self {
-        Self::Stage(stage)
+        Self::Stage(stage, None)
     }
 }
 
 impl Outbounds<'_> {
     /// Makes `request` through `detour`: straight to its host, or through the
     /// node the detour or the routing rules choose, whose tunnel is closed
-    /// after. Also returns the group the route went through. `setting` and
+    /// after. Also returns the group and the node the route went through. `setting` and
     /// `purpose` are as in [`Self::decide`]. Setup has to finish by the
     /// deadline's `headers`. `original` is the first admitted Score business of
     /// a redirect chain; later hops of the chain continue it instead of
@@ -364,9 +515,9 @@ impl Outbounds<'_> {
         purpose: &str,
         request: &Request<'_>,
         original: &mut Option<ScoreContinuation>,
-    ) -> Result<(Reply, Option<String>), Failed> {
+    ) -> Result<(Reply, Option<String>, Option<Via>), Failed> {
         let (detour, strict_resolver) = match detour {
-            Detour::Direct => return Ok((fetch_direct(request).await?, None)),
+            Detour::Direct => return Ok((fetch_direct(request).await?, None, None)),
             Detour::Routing => (None, None),
             Detour::Group(group) => (Some(group), request.bootstrap),
         };
@@ -390,10 +541,10 @@ impl Outbounds<'_> {
         .await
         .map_err(|_| "download_timeout")?
         .map_err(Failed::Route)?;
-        let (node, feedback) = match decision.route {
+        let (proxy, feedback) = match decision.route {
             Route::Block => return Err("route_blocked".into()),
             Route::Direct { feedback } => (None, feedback),
-            Route::Proxy { node, feedback } => (Some(node), feedback),
+            Route::Proxy { proxy, feedback } => (Some(proxy), feedback),
         };
         let business = admit(
             feedback.as_ref(),
@@ -401,49 +552,89 @@ impl Outbounds<'_> {
             decision.group.as_deref(),
             purpose,
         )?;
-        let reply = match node {
-            None => fetch_direct(request).await,
-            Some(node) => self.fetch_through(&node, purpose, request).await,
+        let via = proxy.as_ref().map(|proxy| Via {
+            node: proxy.target.node.name.clone(),
+            group: decision.group.clone(),
+        });
+        let reply = match proxy {
+            None => {
+                let reply = fetch_direct(request).await;
+                if let Some(business) = business {
+                    business.finish(settlement(&reply));
+                }
+                reply
+            }
+            Some(proxy) => self.fetch_through(&proxy, purpose, request, business).await,
         };
-        if let Some(business) = business {
-            business.finish(settlement(&reply));
-        }
-        let reply = reply?;
-        Ok((reply, decision.group))
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(stage) => return Err(Failed::Stage(stage, via)),
+        };
+        Ok((reply, decision.group, via))
     }
 
     async fn fetch_through(
         &self,
-        node: &Node,
+        proxy: &DownloadProxy,
         purpose: &str,
         request: &Request<'_>,
+        business: Option<ScoreBusinessGuard>,
     ) -> Result<Reply, &'static str> {
-        let host = request.url.host_str().ok_or("invalid_source")?;
-        let port = request
-            .url
-            .port_or_known_default()
-            .ok_or("invalid_source")?;
-        let by = request.deadline.headers;
-        let tunnel = match timeout_at(by, self.tunnel(node, (host, port))).await {
-            Err(_) => return Err("download_timeout"),
-            Ok(Err(error)) => {
-                debug!(%error, node = %node.name, "{purpose} tunnel setup failed");
-                return Err("connection_failed");
+        let mut stamp = None;
+        let reply = async {
+            let host = request.url.host_str().ok_or("invalid_source")?;
+            let port = request
+                .url
+                .port_or_known_default()
+                .ok_or("invalid_source")?;
+            let by = request.deadline.headers;
+            let node = &proxy.target.node;
+            let tunnel = proxy
+                .tunnel(self.proxy_registry, (host, port))
+                .map_err(|error| {
+                    debug!(%error, node = %node.name, "{purpose} tunnel setup failed");
+                    marked_http::Error::caused("connection_failed", error)
+                })?;
+            stamp = proxy.admit_route_health();
+            let reply = match timeout_at(by, tunnel.dial()).await {
+                Err(_) => Err("download_timeout".into()),
+                Ok(Err(error)) => {
+                    debug!(%error, node = %node.name, "{purpose} tunnel dial failed");
+                    Err(marked_http::Error::caused("connection_failed", error))
+                }
+                Ok(Ok(stream)) => get(stream, request).await,
+            };
+            if let Err(error) = tunnel.close().await {
+                debug!(%error, "{purpose} tunnel did not close cleanly");
             }
-            Ok(Ok(tunnel)) => tunnel,
-        };
-        let reply = match timeout_at(by, tunnel.dial()).await {
-            Err(_) => Err("download_timeout"),
-            Ok(Err(error)) => {
-                debug!(%error, node = %node.name, "{purpose} tunnel dial failed");
-                Err("connection_failed")
-            }
-            Ok(Ok(stream)) => get(stream, request).await,
-        };
-        if let Err(error) = tunnel.close().await {
-            debug!(%error, "{purpose} tunnel did not close cleanly");
+            reply
         }
-        reply
+        .await;
+        if let Some(business) = business {
+            let outcome = match &reply {
+                Ok(_) => ScoreOutcome::Success,
+                Err(_) if stamp.is_none() && proxy.target.uses_route_evidence() => {
+                    ScoreOutcome::Rejected
+                }
+                Err(error) if proxy.target.uses_route_evidence() => {
+                    let outcome = error
+                        .source
+                        .as_ref()
+                        .map_or_else(|| failed_settlement(error.stage), ScoreOutcome::from_error);
+                    proxy.target.score_failure(outcome, error)
+                }
+                Err(error) => failed_settlement(error.stage),
+            };
+            business.finish(outcome);
+        }
+        proxy.report_route_outcome(
+            stamp,
+            reply
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| error as &dyn std::error::Error),
+        );
+        reply.map_err(|error| error.stage)
     }
 }
 
@@ -471,14 +662,18 @@ pub(crate) fn admit(
     Ok(business)
 }
 
-/// The Score settlement of a finished download. A download has no client side
-/// to disconnect, so every failure is the carrier's or target's, never a
-/// cancellation, as for the external UI download.
+/// Score settlement for downloads carrying only the public failure stage.
 pub(crate) fn settlement(reply: &Result<Reply, &'static str>) -> ScoreOutcome {
     match reply {
         Ok(_) => ScoreOutcome::Success,
-        Err("download_timeout") => ScoreOutcome::Timeout,
-        Err(_) => ScoreOutcome::Other,
+        Err(stage) => failed_settlement(stage),
+    }
+}
+
+fn failed_settlement(stage: &str) -> ScoreOutcome {
+    match stage {
+        "download_timeout" => ScoreOutcome::Timeout,
+        _ => ScoreOutcome::Other,
     }
 }
 
@@ -516,7 +711,9 @@ pub(crate) async fn fetch_direct(request: &Request<'_>) -> Result<Reply, &'stati
         .map(|ip| SocketAddr::new(ip, port))
         .collect();
     let stream = connect_direct(&addresses, by).await?;
-    get(Box::new(stream), request).await
+    get(Box::new(stream), request)
+        .await
+        .map_err(|error| error.stage)
 }
 
 /// A connection to the first of `addresses` that accepts, racing them like a
@@ -544,7 +741,7 @@ async fn connect_direct(
 async fn get(
     stream: Box<dyn AsyncReadWrite>,
     request: &Request<'_>,
-) -> Result<Reply, &'static str> {
+) -> Result<Reply, marked_http::Error> {
     // Built once, and only for https: plain http must not load the CA store.
     static TLS: std::sync::OnceLock<marked_http::Client> = std::sync::OnceLock::new();
     let plain;
@@ -552,7 +749,8 @@ async fn get(
         match TLS.get() {
             Some(client) => client,
             None => {
-                let client = marked_http::Client::new().map_err(|_| "tls_failed")?;
+                let client = marked_http::Client::new()
+                    .map_err(|error| marked_http::Error::caused("tls_failed", error))?;
                 TLS.get_or_init(|| client)
             }
         }
@@ -567,12 +765,10 @@ async fn get(
             request.headers,
             request.deadline.headers,
         )
-        .await
-        .map_err(|error| error.stage)?;
+        .await?;
     let response = timeout_at(request.deadline.headers, marked_http::send(prepared))
         .await
-        .map_err(|_| "download_timeout")?
-        .map_err(|error| error.stage)?;
+        .map_err(|_| "download_timeout")??;
     marked_http::read(
         response,
         request.wants_body,
@@ -580,7 +776,6 @@ async fn get(
         request.max_bytes,
     )
     .await
-    .map_err(|error| error.stage)
 }
 
 #[cfg(test)]

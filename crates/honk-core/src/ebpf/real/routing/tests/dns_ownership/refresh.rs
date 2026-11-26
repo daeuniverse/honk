@@ -36,7 +36,7 @@ fn client_key(key: &TuplesKey) -> RedirectTuple {
 
 fn client_entry(backend: &RealEbpfBackend, key: &TuplesKey) -> Option<RedirectEntry> {
     HashMap::<_, RedirectTuple, RedirectEntry>::try_from(
-        backend.bpf().unwrap().map("CLIENT_REPLY_TRACK").unwrap(),
+        backend.maps().unwrap().get("CLIENT_REPLY_TRACK").unwrap(),
     )
     .unwrap()
     .get(&client_key(key), 0)
@@ -46,9 +46,9 @@ fn client_entry(backend: &RealEbpfBackend, key: &TuplesKey) -> Option<RedirectEn
 fn evict_client(backend: &mut RealEbpfBackend, key: &TuplesKey) {
     HashMap::<_, RedirectTuple, RedirectEntry>::try_from(
         backend
-            .bpf_mut()
+            .maps_mut()
             .unwrap()
-            .map_mut("CLIENT_REPLY_TRACK")
+            .get_mut("CLIENT_REPLY_TRACK")
             .unwrap(),
     )
     .unwrap()
@@ -58,7 +58,7 @@ fn evict_client(backend: &mut RealEbpfBackend, key: &TuplesKey) {
 
 fn rx_packets(backend: &RealEbpfBackend, outbound: u32) -> u64 {
     PerCpuArray::<_, OutboundStatsCounters>::try_from(
-        backend.bpf().unwrap().map("OUTBOUND_STATS").unwrap(),
+        backend.maps().unwrap().get("OUTBOUND_STATS").unwrap(),
     )
     .unwrap()
     .get(&outbound, 0)

@@ -224,6 +224,18 @@ impl<T: Send + Sync + 'static> quinn::AsyncUdpSocket for NoGsoUdpSocket<T> {
         })
     }
 
+    fn try_send_with_status(&self, transmit: &quinn::udp::Transmit) -> io::Result<bool> {
+        if let Some(stride) = transmit.segment_size
+            && (stride == 0
+                || transmit.contents.len().div_ceil(stride) > self.max_transmit_segments())
+        {
+            return Ok(false);
+        }
+        self.io.try_io(tokio::io::Interest::WRITABLE, || {
+            self.inner.send_with_status((&self.io).into(), transmit)
+        })
+    }
+
     fn poll_recv(
         &self,
         cx: &mut Context<'_>,
@@ -340,5 +352,61 @@ mod tests {
             .unwrap();
         drop(poller);
         assert_eq!(capacity.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn quic_status_respects_honk_socket_boundaries() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            for gso in [false, true] {
+                let io = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let inner = quinn::udp::UdpSocketState::new((&io).into()).unwrap();
+                let socket = NoGsoUdpSocket {
+                    io,
+                    inner,
+                    gso,
+                    _owner: (),
+                };
+                let source = socket.local_addr().unwrap();
+                let cap = socket.max_transmit_segments();
+                let destination = peer.local_addr().unwrap();
+                socket.io.writable().await.unwrap();
+                let submit = |contents: &[u8], segment_size| {
+                    socket
+                        .try_send_with_status(&quinn::udp::Transmit {
+                            destination,
+                            ecn: None,
+                            contents,
+                            segment_size,
+                            src_ip: None,
+                        })
+                        .unwrap()
+                };
+                assert!(!submit(b"invalid", Some(0)));
+                assert!(!submit(&vec![0xee; cap * 64 + 1], Some(64)));
+                #[cfg(target_os = "linux")]
+                assert!(
+                    !submit(&vec![0; 65536], None),
+                    "tolerated EMSGSIZE is not submission"
+                );
+                let payload: Vec<_> = (0..cap * 64 - 1).map(|i| i as u8).collect();
+                for (bytes, stride) in [
+                    (b"plain".as_slice(), None),
+                    (b"equal", Some(5)),
+                    (b"short", Some(9)),
+                    (&payload, Some(64)),
+                ] {
+                    assert!(submit(bytes, stride));
+                    for expected in bytes.chunks(stride.unwrap_or(bytes.len())) {
+                        let mut buf = [0; 128];
+                        let (n, from) = peer.recv_from(&mut buf).await.unwrap();
+                        assert_eq!(from, source);
+                        assert_eq!(&buf[..n], expected);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("native UDP submission or receipt timed out");
     }
 }

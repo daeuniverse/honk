@@ -1,16 +1,55 @@
 //! Generation-local and process-wide physical dial admission.
 
 use std::future::Future;
+use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 use std::task::Poll;
 
 use super::OutboundRuntimeRegistry;
 
+type ServerPin = (Box<str>, IpAddr);
+
+/// Addresses selected by a probe's captured resolver for its physical entry.
+#[derive(Clone, Default)]
+pub struct PinnedServers(Option<Arc<(ServerPin, Option<ServerPin>)>>);
+
+#[cfg(feature = "owned-tasks")]
+impl PinnedServers {
+    pub fn new(primary: (&str, IpAddr), secondary: Option<(&str, IpAddr)>) -> Self {
+        fn pin((host, ip): (&str, IpAddr)) -> Option<ServerPin> {
+            // Literals already resolve to themselves, unless the captured resolver
+            // normalized an IPv4-mapped address.
+            let literal = host.trim_matches(['[', ']']).parse::<IpAddr>();
+            (!literal.is_ok_and(|literal| literal == ip))
+                .then(|| (server_pin_name(host).into(), ip))
+        }
+
+        let primary = pin(primary);
+        // A secondary spelling may still need a pin after eliding a literal primary.
+        let secondary = secondary
+            .filter(|(host, _)| {
+                primary
+                    .as_ref()
+                    .is_none_or(|(name, _)| !name.eq_ignore_ascii_case(server_pin_name(host)))
+            })
+            .and_then(pin);
+        let pins = match primary {
+            Some(primary) => Some((primary, secondary)),
+            None => secondary.map(|only| (only, None)),
+        };
+        Self(pins.map(Arc::new))
+    }
+}
+
+fn server_pin_name(host: &str) -> &str {
+    host.trim_matches(['[', ']']).trim_end_matches('.')
+}
+
 #[derive(Clone)]
 struct DialAdmission {
     generation: Arc<tokio::sync::Semaphore>,
     process: Arc<tokio::sync::Semaphore>,
-    endpoint: Option<Arc<(String, std::net::IpAddr)>>,
+    endpoints: PinnedServers,
 }
 
 impl DialAdmission {
@@ -18,7 +57,7 @@ impl DialAdmission {
         Self {
             generation: Arc::clone(&registry.dial_semaphore),
             process: Arc::clone(&registry.dial_ceiling_semaphore),
-            endpoint: None,
+            endpoints: PinnedServers::default(),
         }
     }
 
@@ -54,7 +93,7 @@ static STANDALONE_DIAL_ADMISSION: LazyLock<DialAdmission> = LazyLock::new(|| Dia
     process: Arc::new(tokio::sync::Semaphore::new(
         tokio::sync::Semaphore::MAX_PERMITS,
     )),
-    endpoint: None,
+    endpoints: PinnedServers::default(),
 });
 
 #[derive(Default)]
@@ -311,15 +350,14 @@ pub(crate) fn capture_dial_admission() -> CapturedDialAdmission {
     try_capture_dial_admission().unwrap_or_else(CapturedDialAdmission::standalone)
 }
 
-pub(crate) fn pinned_server_address(host: &str) -> Option<std::net::IpAddr> {
+pub(crate) fn pinned_server_address(host: &str) -> Option<IpAddr> {
     DIAL_SCOPE
         .try_with(|scope| {
-            scope.admission.endpoint.as_ref().and_then(|endpoint| {
-                endpoint
-                    .0
-                    .eq_ignore_ascii_case(host.trim_matches(['[', ']']))
-                    .then_some(endpoint.1)
-            })
+            let (primary, secondary) = scope.admission.endpoints.0.as_deref()?;
+            let host = server_pin_name(host);
+            std::iter::once(primary)
+                .chain(secondary.as_ref())
+                .find_map(|(name, ip)| name.eq_ignore_ascii_case(host).then_some(*ip))
         })
         .ok()
         .flatten()
@@ -384,20 +422,27 @@ impl OutboundRuntimeRegistry {
         DialAdmission::for_registry(self).acquire().await
     }
 
-    /// Pin the configured server without changing its identity or TLS/transport authority.
-    /// Captured dial scopes carry this pin into autonomous session factories.
+    /// Pin one configured server while keeping its TLS and request authority.
     #[cfg(feature = "owned-tasks")]
-    pub async fn scope_pinned_dials<F>(
-        &self,
-        host: &str,
-        ip: std::net::IpAddr,
-        future: F,
-    ) -> F::Output
+    pub async fn scope_pinned_dials<F>(&self, host: &str, ip: IpAddr, future: F) -> F::Output
     where
         F: Future,
     {
+        self.scope_server_pins(PinnedServers::new((host, ip), None), future)
+            .await
+    }
+
+    /// Bind pre-resolved entry addresses to this operation and its session factories.
+    #[cfg(feature = "owned-tasks")]
+    pub async fn scope_server_pins<F>(&self, pins: PinnedServers, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        if pins.0.is_none() {
+            return self.scope_dials(future).await;
+        }
         let mut admission = DialAdmission::for_registry(self);
-        admission.endpoint = Some(Arc::new((host.trim_matches(['[', ']']).to_owned(), ip)));
+        admission.endpoints = pins;
         DIAL_SCOPE
             .scope(DialScope::new(admission, None), future)
             .await

@@ -113,7 +113,9 @@ impl ControlPlane {
                             network.into(),
                         )
                     {
-                        update.run_callbacks_without_interrupt();
+                        update
+                            .without_probe_wake()
+                            .run_callbacks_without_interrupt();
                     }
                 }
             }

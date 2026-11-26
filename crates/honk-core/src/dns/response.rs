@@ -6,8 +6,8 @@ use thiserror::Error;
 
 use super::query::{IngressProfile, QueryContext, TxId, parse_name_into};
 
-#[cfg(feature = "native-api")]
-pub(crate) mod native;
+#[cfg(any(feature = "native-api", feature = "dns-syslog"))]
+pub(crate) mod presentation;
 
 const HEADER_LEN: usize = 12;
 const QR: u16 = 0x8000;
@@ -20,6 +20,46 @@ pub(crate) fn is_truncated(response: &[u8]) -> bool {
         return false;
     };
     u16::from_be_bytes([flags[0], flags[1]]) & TC != 0
+}
+
+/// Read the full twelve-bit RCODE without allocating a query or record list.
+pub(crate) fn response_rcode(wire: &[u8]) -> Result<u16, ResponseError> {
+    checked_response_rcode(None, wire)
+}
+
+pub(super) fn checked_response_rcode(
+    request: Option<&QueryContext>,
+    wire: &[u8],
+) -> Result<u16, ResponseError> {
+    let mut code = read_u16(wire, 2)? & 0x000f;
+    let mut seen_opt = false;
+    let mut invalid = false;
+    visit_message(request, wire, |record, fields, root_owner| {
+        if read_u16(wire, fields) != Ok(41) {
+            return;
+        }
+        if record.section != Section::Additional || seen_opt || !root_owner {
+            invalid = true;
+            return;
+        }
+        seen_opt = true;
+        code |= u16::from(wire[fields + 4]) << 4;
+        let mut option = fields + 10;
+        while option < record.wire.end {
+            if option + 4 > record.wire.end {
+                invalid = true;
+                break;
+            }
+            option += 4 + usize::from(u16::from_be_bytes([wire[option + 2], wire[option + 3]]));
+            if option > record.wire.end {
+                invalid = true;
+            }
+        }
+    })?;
+    if invalid {
+        return Err(ResponseError::MalformedRecord);
+    }
+    Ok(code)
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -161,15 +201,15 @@ fn validate_layout(
 fn visit_layout(
     request: &QueryContext,
     response: &[u8],
-    visit: impl FnMut(RecordBoundary),
+    mut visit: impl FnMut(RecordBoundary),
 ) -> Result<usize, ResponseError> {
-    visit_message(Some(request), response, visit)
+    visit_message(Some(request), response, |record, _, _| visit(record))
 }
 
 fn visit_message(
     request: Option<&QueryContext>,
     response: &[u8],
-    mut visit: impl FnMut(RecordBoundary),
+    mut visit: impl FnMut(RecordBoundary, usize, bool),
 ) -> Result<usize, ResponseError> {
     if response.len() < HEADER_LEN {
         return Err(ResponseError::HeaderTruncated);
@@ -217,11 +257,16 @@ fn visit_message(
     for (section, count) in sections {
         for _ in 0..count {
             let start = cursor;
-            cursor = record_end(response, cursor)?;
-            visit(RecordBoundary {
-                section,
-                wire: start..cursor,
-            });
+            let (end, fields, root_owner) = record_layout(response, cursor)?;
+            cursor = end;
+            visit(
+                RecordBoundary {
+                    section,
+                    wire: start..cursor,
+                },
+                fields,
+                root_owner,
+            );
         }
     }
     if cursor != response.len() {
@@ -230,15 +275,16 @@ fn visit_message(
     Ok(question_end)
 }
 
-fn record_end(response: &[u8], start: usize) -> Result<usize, ResponseError> {
+fn record_layout(response: &[u8], start: usize) -> Result<(usize, usize, bool), ResponseError> {
     let mut name = [0; 255];
-    let (_, name_end) =
+    let (length, name_end) =
         parse_name_into(response, start, &mut name).map_err(|_| ResponseError::MalformedRecord)?;
     let rdlength = usize::from(read_u16(response, name_end + 8)?);
-    (name_end + 10)
+    let end = (name_end + 10)
         .checked_add(rdlength)
         .filter(|end| *end <= response.len())
-        .ok_or(ResponseError::MalformedRecord)
+        .ok_or(ResponseError::MalformedRecord)?;
+    Ok((end, name_end, name[..length] == [0]))
 }
 
 fn set_txid(response: &mut [u8], txid: TxId) -> Result<(), ResponseError> {

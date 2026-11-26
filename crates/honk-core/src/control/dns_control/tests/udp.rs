@@ -65,10 +65,10 @@ async fn native_log_captures_transparent_udp_completion_with_full_source() {
         .handle_udp_dns_admitted(
             &admission,
             &query,
-            source,
-            "[::1]:53".parse().unwrap(),
+            (source, "[::1]:53".parse().unwrap()),
             crate::dns::query::validate_exact_dns_query(&query).unwrap(),
             crate::control::dns_control::DnsUdpReply::Kernel,
+            None,
         )
         .await;
     let response = api.log_page_for_test();
@@ -79,6 +79,35 @@ async fn native_log_captures_transparent_udp_completion_with_full_source() {
     assert_eq!(log["total"], 1);
     assert_eq!(log["records"][0]["src"], source.to_string());
     assert_eq!(log["records"][0]["answers"][0]["data"], "192.0.2.5");
+}
+
+#[cfg(feature = "dns-syslog")]
+#[tokio::test]
+async fn transparent_udp_completion_is_exported_to_dns_syslog() {
+    let (audit, mut worker, mut receiver) = crate::audit::tests::receiver().await;
+    let query = query_with_txid("example.com", 0x2222);
+    let (controller, _) = test_controller(a_response(&query, [192, 0, 2, 6]), Duration::ZERO);
+    let source: SocketAddr = "192.0.2.9:53001".parse().unwrap();
+    let validated = crate::dns::query::validate_exact_dns_query(&query).unwrap();
+    let pending = audit.begin(&query, validated.ingress(), source);
+    let admission = controller.try_admit_query(true).unwrap();
+    controller
+        .handle_udp_dns_admitted(
+            &admission,
+            &query,
+            (source, "127.0.0.1:53".parse().unwrap()),
+            validated,
+            crate::control::dns_control::DnsUdpReply::Kernel,
+            pending,
+        )
+        .await;
+    let event = crate::audit::tests::receive(&mut receiver).await;
+    assert_eq!(event["result"], "response");
+    assert_eq!(event["client_ip"], "192.0.2.9");
+    assert_eq!(event["client_port"], 53001);
+    assert_eq!(event["transport"], "udp");
+    assert_eq!(event["answers"][0]["data"], "192.0.2.6");
+    worker.shutdown().await;
 }
 
 #[tokio::test]
@@ -125,10 +154,10 @@ async fn admitted_transparent_udp_routes_by_client_source() {
             .handle_udp_dns_admitted(
                 &admission,
                 &query,
-                client_addr.parse().expect("client"),
-                original_dst,
+                (client_addr.parse().expect("client"), original_dst),
                 validated,
                 crate::control::dns_control::DnsUdpReply::Kernel,
+                None,
             )
             .await;
     }
@@ -214,6 +243,100 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
     persister.shutdown().await.expect("persistence shutdown");
     assert!(database.load_dns().expect("persisted rows").is_empty());
     controller.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn alias_failures_preserve_routing_projection() {
+    use honk_config::dns::{DnsConfig, DnsRequestAction, DnsResponseAction};
+
+    let mut request_reject = DnsConfig::default();
+    request_reject.routing.request.fallback = DnsRequestAction::Reject;
+    let mut response_reject = DnsConfig::default();
+    response_reject.routing.response.fallback = DnsResponseAction::Reject;
+    let hosts = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(hosts.path(), "full:example.com target.example\n").unwrap();
+    let v4 = std::net::IpAddr::from([192, 0, 2, 10]);
+    let v6 = std::net::IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10]);
+
+    for (case, rcode, mut config) in [
+        ("BADVERS", 16u16, DnsConfig::default()),
+        ("extended low NXDOMAIN", 19, DnsConfig::default()),
+        ("request rejection", 0, request_reject),
+        ("response rejection", 0, response_reject),
+    ] {
+        config.hosts = vec![hosts.path().to_string_lossy().into_owned()];
+        let mut response = if rcode == 0 {
+            a_response(
+                &query_with_txid("target.example", 0x5151),
+                [198, 51, 100, 20],
+            )
+        } else {
+            response_with_txid("target.example", 0x5151)
+        };
+        response[3] = (response[3] & 0xf0) | (rcode as u8 & 0x0f);
+        response[10..12].copy_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&[0, 0, 41, 4, 208, (rcode >> 4) as u8, 0, 0, 0, 0, 0]);
+        let forwarder = Arc::new(
+            DnsForwarder::new(
+                Arc::new(SlowUpstream {
+                    calls: AtomicUsize::new(0),
+                    delay: Duration::ZERO,
+                    response,
+                }),
+                Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(8))),
+                Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(&config).unwrap()),
+            )
+            .with_policy_from_config(&config)
+            .unwrap()
+            .with_hosts_from_config(&config)
+            .unwrap()
+            .with_cache_enabled(false),
+        );
+        let (controller, _) = projection_controller(forwarder);
+        let runtime = controller.runtime_provider().current();
+        let snapshot = Arc::clone(runtime.routing_projection());
+        for (family, ip) in [
+            (honk_outbound::alive::IpVersion::V4, v4),
+            (honk_outbound::alive::IpVersion::V6, v6),
+        ] {
+            controller.routing_projection.submit(
+                honk_datapath::ScopeId::HOST,
+                Arc::clone(&snapshot),
+                crate::dns::projection::ProjectionObservation::Positive {
+                    domain: "example.com",
+                    family,
+                    ips: &[ip],
+                    expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
+                    source: crate::dns::outcome::ProjectionSource::Fresh,
+                },
+            );
+        }
+        let mut query = query_with_txid("example.com", 0x5151);
+        query[10..12].copy_from_slice(&1u16.to_be_bytes());
+        query.extend_from_slice(&[0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]);
+        let reply = controller
+            .answer_query_for_test(
+                &query,
+                DnsRequestMeta::EMPTY,
+                IngressProfile::Udp {
+                    advertised_size: 1232,
+                },
+            )
+            .await;
+        assert_eq!(&reply[10..12], &1u16.to_be_bytes(), "{case}: OPT response");
+        assert_eq!(
+            (u16::from(reply[reply.len() - 6]) << 4) | u16::from(reply[3] & 0x0f),
+            rcode,
+            "{case}: response code"
+        );
+        let projected = controller
+            .project_routes(&snapshot)
+            .into_iter()
+            .map(|(ip, _)| ip)
+            .collect::<Vec<_>>();
+        assert_eq!(projected, [v4, v6], "{case}: prior routing ownership");
+        controller.shutdown(Duration::from_secs(1)).await;
+    }
 }
 
 #[tokio::test]

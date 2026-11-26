@@ -214,6 +214,7 @@ pub(super) async fn query(
             .map(UpstreamTag::new)
             .transpose()
             .map_err(|_| invalid())?,
+        node_host: false,
     };
     state.require_running().map_err(|_| unavailable(id))?;
     state.observation.dns.rate.admit(id)?;

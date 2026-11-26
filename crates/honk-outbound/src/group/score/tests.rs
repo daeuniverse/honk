@@ -13,6 +13,7 @@ mod comparison;
 mod directional;
 mod evaluation;
 mod evidence;
+mod exit_retry;
 mod live;
 mod performance;
 mod pool_admission;

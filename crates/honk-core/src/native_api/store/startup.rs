@@ -14,7 +14,7 @@ use honk_config::parser::{LoadedConfig, SourceLimits, SourceSnapshot};
 use super::super::secrets::ListenerSecrets;
 use super::db::{DbStore, StoreError, StoredSecrets};
 use crate::configuration::SourceUpdate;
-use crate::state::StateDb;
+use crate::state::{DB_FILE, STATE_DIR, StateDb};
 
 pub(crate) struct DatabaseStartup {
     pub(crate) store: Arc<DbStore>,
@@ -107,11 +107,19 @@ pub(crate) fn stripped_config_matches(original: &Config, stripped: &mut Config) 
 
 impl DatabaseStartup {
     /// `entry` must be absolute and lexically normal; it is read only while the db is empty.
+    /// A db that does not exist yet is created only after the file has passed every check.
     pub(crate) fn open(
         entry: &Path,
         data_dir: &Path,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> anyhow::Result<Self> {
+        let fresh = if db_exists(data_dir) {
+            None
+        } else {
+            let fresh = FreshImport::load(entry, data_dir, diagnostics)?;
+            std::fs::create_dir_all(data_dir)?;
+            Some(fresh)
+        };
         let state = StateDb::open(data_dir).map_err(|error| store_error(error.into()))?;
         let store = Arc::new(DbStore::open(Arc::new(state), entry).map_err(store_error)?);
         if let Some((head, _)) = store.cached_head() {
@@ -131,47 +139,18 @@ impl DatabaseStartup {
                 head: Some(head),
             });
         }
-        let (config, sources) = crate::load_operator_config_captured(store.entry(), diagnostics)
-            .with_context(|| {
-                format!(
-                    "the configuration db is empty and {} cannot be imported",
-                    entry.display()
-                )
-            })?;
-        let originals = sources
-            .ok_or_else(|| anyhow!("--store db imports a dae source tree"))?
-            .sources;
-        let native = &config.experimental.native_api;
-        ensure!(
-            native.enabled && native.config_write && native.credentialed(),
-            "--store db needs experimental.native_api with enabled, config_write and a credential"
-        );
-        no_clash_api(&config)?;
-        same_data_dir(&config, data_dir)?;
-        let (loaded, forbidden) =
-            import_tree(store.entry(), &config, &originals).map_err(|error| match error {
-                ImportError::SecretCopy(path) => anyhow!(
-                    "listener secrets in {} cannot be stripped completely; remove copies of secret values",
-                    path.display()
-                ),
-                ImportError::Load(error) => error.into(),
-                ImportError::Changed => anyhow!(
-                    "{} does not read back the same once listener secrets are stripped",
-                    entry.display()
-                ),
-            })?;
-        let secrets = StoredSecrets {
-            native_api: config.experimental.native_api.secret.clone(),
-            clash_api: config.experimental.clash_api.secret.clone(),
+        let fresh = match fresh {
+            Some(fresh) => fresh,
+            None => FreshImport::load(store.entry(), data_dir, diagnostics)?,
         };
         Ok(Self {
             store,
-            config,
-            sources: update(loaded.sources.clone()),
+            config: fresh.config,
+            sources: update(fresh.stripped.clone()),
             import: Some(Import {
-                stripped: loaded.sources,
-                forbidden,
-                secrets,
+                stripped: fresh.stripped,
+                forbidden: fresh.forbidden,
+                secrets: fresh.secrets,
             }),
             head: None,
         })
@@ -200,6 +179,67 @@ impl DatabaseStartup {
             .map_err(store_error)?;
         Ok(())
     }
+}
+
+/// What `-c` imports as revision 1, with every precondition already checked.
+struct FreshImport {
+    config: Config,
+    stripped: Vec<SourceSnapshot>,
+    forbidden: ListenerSecrets,
+    secrets: StoredSecrets,
+}
+
+impl FreshImport {
+    fn load(
+        entry: &Path,
+        data_dir: &Path,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+    ) -> anyhow::Result<Self> {
+        let (config, sources) = crate::load_operator_config_captured(entry, diagnostics)
+            .with_context(|| {
+                format!(
+                    "the configuration db is empty and {} cannot be imported",
+                    entry.display()
+                )
+            })?;
+        let originals = sources
+            .ok_or_else(|| anyhow!("--store db imports a dae source tree"))?
+            .sources;
+        let native = &config.experimental.native_api;
+        ensure!(
+            native.enabled && native.config_write && native.credentialed(),
+            "--store db needs experimental.native_api with enabled, config_write and a credential"
+        );
+        no_clash_api(&config)?;
+        same_data_dir(&config, data_dir)?;
+        let (loaded, forbidden) =
+            import_tree(entry, &config, &originals).map_err(|error| match error {
+                ImportError::SecretCopy(path) => anyhow!(
+                    "listener secrets in {} cannot be stripped completely; remove copies of secret values",
+                    path.display()
+                ),
+                ImportError::Load(error) => error.into(),
+                ImportError::Changed => anyhow!(
+                    "{} does not read back the same once listener secrets are stripped",
+                    entry.display()
+                ),
+            })?;
+        let secrets = StoredSecrets {
+            native_api: config.experimental.native_api.secret.clone(),
+            clash_api: config.experimental.clash_api.secret.clone(),
+        };
+        Ok(Self {
+            config,
+            stripped: loaded.sources,
+            forbidden,
+            secrets,
+        })
+    }
+}
+
+/// A symlink in its place counts, so that `StateDb::open` reports the refusal.
+fn db_exists(data_dir: &Path) -> bool {
+    std::fs::symlink_metadata(data_dir.join(STATE_DIR).join(DB_FILE)).is_ok()
 }
 
 fn update(sources: Vec<SourceSnapshot>) -> SourceUpdate {

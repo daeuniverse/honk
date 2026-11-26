@@ -77,6 +77,8 @@ fn transport_over<S: AsyncReadWrite + 'static>(
         addr_header: addr::encode_address(target, domain).unwrap(),
         domain: domain.map(Box::from),
         relay_addr: target,
+        exit: None,
+        tls_handoff: Some(false),
     }
 }
 
@@ -252,6 +254,95 @@ async fn unknown_atyp_is_terminal() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 }
 
+#[tokio::test]
+async fn trojan_udp_requires_complete_crlf_delimiter() {
+    use std::io::ErrorKind;
+
+    let target: SocketAddr = "93.184.216.34:53".parse().unwrap();
+    for (delimiter, expected) in [
+        (&b"\r"[..], ErrorKind::UnexpectedEof),
+        (&b"\r!"[..], ErrorKind::InvalidData),
+    ] {
+        let (client, mut server) = tokio::io::duplex(64);
+        let transport = transport_over(client, target, None);
+        let mut wire = wire_addr(target);
+        wire.extend_from_slice(&[0, 0]);
+        wire.extend_from_slice(delimiter);
+        server.write_all(&wire).await.unwrap();
+        drop(server);
+
+        let error = transport.recv_packet(&mut []).await.unwrap_err();
+        assert_eq!(error.kind(), expected);
+        assert_eq!(crate::proxy::error::hop_io_failure(&error), None);
+    }
+}
+
+#[tokio::test]
+async fn checked_first_frame_rechecks_zero_progress_but_finishes_after_custody() {
+    let target = "192.0.2.1:53".parse().unwrap();
+    let sibling = "192.0.2.2:443".parse().unwrap();
+    let payload = b"first";
+    for (security, carrier, free, handed_off) in [
+        ("none", "tcp", 0, false),
+        ("none", "tcp", 1, true),
+        ("tls", "tcp", 0, true),
+        ("reality", "tcp", 0, true),
+        ("tls", "ws", 0, false),
+        ("tls", "grpc", 0, false),
+        ("tls", "grpc", 1, true),
+    ] {
+        let mut node = Node {
+            outbound: honk_config::node::OutboundConfig::Trojan(Default::default()),
+            ..Default::default()
+        };
+        let tls = node.tls_mut().unwrap();
+        tls.enabled = security == "tls";
+        tls.reality_public_key = (security == "reality").then(|| "AAA".into());
+        node.transport_mut().unwrap().transport = carrier.into();
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let prior = vec![0xee; 64 - free];
+        client.write_all(&prior).await.unwrap();
+        let mut transport = transport_over(client, target, None);
+        transport.tls_handoff = crate::proxy::chain::native_udp_writer_handoff(&node);
+        let current = AtomicBool::new(true);
+        let allowed = || current.load(Ordering::Acquire);
+        let admitted = AtomicBool::new(false);
+        let mut send = std::pin::pin!(transport.send_to_checked(
+            target,
+            None,
+            payload,
+            Some(&admitted),
+            &allowed,
+        ));
+        assert!(futures_util::poll!(send.as_mut()).is_pending());
+        assert_eq!(admitted.load(Ordering::Acquire), handed_off);
+        current.store(false, Ordering::Release);
+        let mut drained = vec![0; prior.len()];
+        server.read_exact(&mut drained).await.unwrap();
+        assert_eq!(drained, prior);
+        if handed_off {
+            send.await.unwrap();
+            assert_eq!(read_frame(&mut server).await, (target, payload.to_vec()));
+        } else {
+            let error = send.await.unwrap_err();
+            assert_eq!(
+                crate::proxy::io_packet_rejection(&error),
+                Some(crate::proxy::PacketRejection::Cancelled)
+            );
+            assert!(!admitted.load(Ordering::Acquire));
+        }
+        assert!(!transport.frame_stream_torn());
+        transport
+            .send_to(sibling, None, b"sibling", false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut server).await,
+            (sibling, b"sibling".to_vec())
+        );
+    }
+}
+
 /// Writes that stall mid-frame are never packet-local: the datagram is
 /// admitted before the first byte is written and a deadline is not
 /// congestion.
@@ -384,7 +475,7 @@ async fn plain_tcp_association_serves_every_destination() {
     preparation.commit().unwrap();
     let transport: Arc<dyn MultiTargetTransport> = transport;
     transport
-        .send_to(first, None, b"one", true, None)
+        .send_to_checked(first, None, b"one", None, &|| true)
         .await
         .unwrap();
     transport
@@ -398,4 +489,80 @@ async fn plain_tcp_association_serves_every_destination() {
     assert_eq!((peer, &buf[..n]), (second, &b"re-two"[..]));
     drop(transport);
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn tunneled_associate_carries_every_destination_on_the_carrier() {
+    use crate::proxy::chain::{UDP_EXIT_HOP, UdpExit};
+
+    let first: SocketAddr = "192.0.2.1:53".parse().unwrap();
+    let second: SocketAddr = "192.0.2.2:443".parse().unwrap();
+    let mut node = Node {
+        name: "trojan-exit".into(),
+        host: "must-not-resolve.invalid".into(),
+        port: 443,
+        outbound: honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+            password: Some("tunnel-secret".into()),
+            tls: honk_config::node::TlsOptions {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
+    let (carrier, mut server) = tokio::io::duplex(4096);
+    let handler = TrojanHandler::new();
+    let dial = handler.prepare_shared_source_over(
+        runtime,
+        Box::new(carrier),
+        first,
+        None,
+        TunnelDialOptions::new(std::time::Duration::from_secs(3)),
+    );
+    let transport = UDP_EXIT_HOP
+        .scope(
+            UdpExit {
+                index: 1,
+                tls_handoff: false,
+            },
+            dial,
+        )
+        .await
+        .unwrap();
+
+    // hex(sha224("tunnel-secret")) | CRLF | UDP ASSOCIATE | first | CRLF.
+    let mut expected = b"e18a99df762a533a40db57010c34dde76778a0ca43091577bf581b2b\r\n\x03".to_vec();
+    expected.extend(wire_addr(first));
+    expected.extend_from_slice(b"\r\n");
+    let mut request = vec![0; expected.len()];
+    server.read_exact(&mut request).await.unwrap();
+    assert_eq!(request, expected);
+
+    transport
+        .send_to_checked(first, None, b"one", None, &|| true)
+        .await
+        .unwrap();
+    transport
+        .send_to(second, None, b"two", false, None)
+        .await
+        .unwrap();
+    assert_eq!(read_frame(&mut server).await, (first, b"one".to_vec()));
+    assert_eq!(read_frame(&mut server).await, (second, b"two".to_vec()));
+
+    server
+        .write_all(&frame(wire_addr(second), b"reply"))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 16];
+    let (len, peer) = transport.recv_packet(&mut buf).await.unwrap();
+    assert_eq!((&buf[..len], peer), (&b"reply"[..], second));
+
+    let mut malformed = wire_addr(second);
+    malformed.extend_from_slice(b"\0\0\r!");
+    server.write_all(&malformed).await.unwrap();
+    let error = transport.recv_packet(&mut buf).await.unwrap_err();
+    assert_eq!(crate::proxy::error::hop_io_failure(&error), Some(1));
 }

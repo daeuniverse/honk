@@ -94,7 +94,9 @@ mod wire {
 
 use std::collections::BTreeMap;
 
-use honk_config::dns::{DnsCond, DnsConfig, DnsDomainMatcher, DnsRequestAction, DnsResponseAction};
+use honk_config::dns::{
+    DnsCond, DnsConfig, DnsDomainMatcher, DnsRequestAction, DnsResponseAction, DnsTagMatcher,
+};
 use honk_config::types::DnsProtocol;
 
 use self::normalize::{exact, host, lowercase};
@@ -220,6 +222,28 @@ fn conditions(writer: &mut Writer, values: &[DnsCond]) -> Result<(), PolicyError
                             value: "<redacted>".into(),
                         })?;
                     writer.string(&network.to_string())?;
+                }
+            }
+            DnsCond::Subtag { not, tags } => {
+                writer.byte(5);
+                writer.byte(u8::from(*not));
+                writer.len(tags.len())?;
+                for tag in tags {
+                    let (kind, value) = match tag {
+                        DnsTagMatcher::Exact(value) => (0, value),
+                        DnsTagMatcher::Keyword(value) => (1, value),
+                        DnsTagMatcher::Regex(value) => {
+                            regex::Regex::new(value).map_err(|source| {
+                                PolicyError::InvalidRegex {
+                                    value: value.clone(),
+                                    source,
+                                }
+                            })?;
+                            (2, value)
+                        }
+                    };
+                    writer.byte(kind);
+                    writer.string(value)?;
                 }
             }
             DnsCond::Upstream { not, names } => {

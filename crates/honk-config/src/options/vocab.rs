@@ -141,6 +141,51 @@ pub fn verification_text(value: &str) -> Result<bool, &'static str> {
     Err("invalid certificate verification boolean")
 }
 
+/// Decode nonzero ports and inclusive ranges into sorted, merged disjoint ranges,
+/// rejecting repeated or overlapping ports. Empty comma segments retain the mport
+/// consumer's historical grammar.
+pub fn port_hopping_ranges(spec: &str) -> Option<Vec<(u16, u16)>> {
+    let mut ranges = Vec::new();
+    for part in spec
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let (low, high) = match part.split_once('-') {
+            Some((low, high)) => (
+                low.trim().parse::<u16>().ok()?,
+                high.trim().parse::<u16>().ok()?,
+            ),
+            None => {
+                let port = part.parse::<u16>().ok()?;
+                (port, port)
+            }
+        };
+        if low == 0 || high < low {
+            return None;
+        }
+        ranges.push((low, high));
+    }
+    if ranges.is_empty() {
+        return None;
+    }
+    ranges.sort_unstable_by_key(|&(low, _)| low);
+    let mut canonical: Vec<(u16, u16)> = Vec::with_capacity(ranges.len());
+    for (low, high) in ranges {
+        if let Some(prev) = canonical.last_mut() {
+            if prev.1 >= low {
+                return None;
+            }
+            if prev.1.checked_add(1) == Some(low) {
+                prev.1 = high;
+                continue;
+            }
+        }
+        canonical.push((low, high));
+    }
+    Some(canonical)
+}
+
 /// Decode nonzero ports and inclusive ranges, rejecting repeated ports.
 /// Empty comma segments retain the mport consumer's historical grammar.
 pub fn parse_port_hopping(spec: &str) -> Option<Vec<u16>> {
@@ -175,4 +220,66 @@ pub fn parse_port_hopping(spec: &str) -> Option<Vec<u16>> {
         }
     }
     (!ports.is_empty()).then_some(ports)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::port_hopping_ranges;
+
+    #[test]
+    fn port_hopping_ranges_canonicalizes_single_ports_ranges_and_adjacent_merges() {
+        assert_eq!(port_hopping_ranges("443"), Some(vec![(443, 443)]));
+        assert_eq!(port_hopping_ranges(" 443 , "), Some(vec![(443, 443)]));
+        assert_eq!(
+            port_hopping_ranges("35000-39000"),
+            Some(vec![(35000, 39000)])
+        );
+        assert_eq!(
+            port_hopping_ranges("6000, 4000 - 5000"),
+            port_hopping_ranges("4000-5000,6000")
+        );
+        assert_eq!(
+            port_hopping_ranges("5000-5005,5006-5010"),
+            Some(vec![(5000, 5010)])
+        );
+        assert_eq!(
+            port_hopping_ranges("5006-5010,5000-5005"),
+            Some(vec![(5000, 5010)])
+        );
+        assert_eq!(port_hopping_ranges("102,100,101"), Some(vec![(100, 102)]));
+    }
+
+    #[test]
+    fn port_hopping_ranges_handles_upper_bound_without_overflow() {
+        assert_eq!(port_hopping_ranges("65535"), Some(vec![(65535, 65535)]));
+        assert_eq!(
+            port_hopping_ranges("65534,65535"),
+            Some(vec![(65534, 65535)])
+        );
+        assert_eq!(port_hopping_ranges("1-65535"), Some(vec![(1, 65535)]));
+        assert_eq!(port_hopping_ranges("65535,65535"), None);
+        assert_eq!(port_hopping_ranges("65530-65535,65535"), None);
+    }
+
+    #[test]
+    fn port_hopping_ranges_rejects_empty_zero_reversed_overlapping_and_duplicates() {
+        for invalid in [
+            "",
+            "   ",
+            ",",
+            " , ",
+            "0",
+            "0-10",
+            "9000-8000",
+            "443,443",
+            "100-200,150-250",
+            "100-200,200-250",
+            "35000-39000,35000",
+            "bad",
+            "1-2-3",
+            "65536",
+        ] {
+            assert_eq!(port_hopping_ranges(invalid), None, "{invalid}");
+        }
+    }
 }

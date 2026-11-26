@@ -101,11 +101,12 @@ mod empty_subgroups {
     #[test]
     fn structured_configs_keep_the_assets_block() {
         let config = parse_dae_config_with_detailed_diagnostics(
-            "group {\n proxy { policy: min_moving_avg }\n}\nassets {\n route: proxy\n subscription {\n  ua: 'clash.meta'\n  interval: 3600s\n  cache: false\n }\n}",
+            "group {\n proxy { policy: min_moving_avg }\n}\nassets {\n route: proxy\n geodata {\n  auto_update: true\n  cron: '0 4 * * *'\n  checksum: false\n }\n subscription {\n  ua: 'clash.meta'\n  interval: 3600s\n  cache: false\n }\n}",
             &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(config.assets.route, "proxy");
+        assert!(config.assets.geodata.cron.is_some());
         for restored in [
             serde_json::from_str::<Config>(&serde_json::to_string(&config).unwrap()).unwrap(),
             serde_yaml::from_str::<Config>(&serde_yaml::to_string(&config).unwrap()).unwrap(),
@@ -161,6 +162,37 @@ mod check_targets {
     use honk_config::{Config, parser::parse_dae_config_with_detailed_diagnostics};
 
     #[test]
+    fn route_dns_authority_survives_configuration_round_trips() {
+        let defaults = ["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"];
+        let cases = [
+            ("global { }".to_owned(), serde_json::json!({}), None),
+            (
+                format!("global {{\n udp_check_dns: {}\n}}", defaults.join(", ")),
+                serde_json::json!({"udp_check_dns": defaults}),
+                Some(serde_json::json!(defaults)),
+            ),
+        ];
+        for (dae, structured, expected) in cases {
+            let dae = parse_dae_config_with_detailed_diagnostics(&dae, &mut Vec::new()).unwrap();
+            let structured = serde_json::json!({"global": structured}).to_string();
+            for config in [dae, Config::from_json_str(&structured).unwrap()] {
+                let saved = serde_json::to_value(&config).unwrap();
+                assert_eq!(saved["global"].get("udp_check_dns"), expected.as_ref());
+                assert_eq!(
+                    Config::from_json_str(&saved.to_string()).unwrap().global,
+                    config.global
+                );
+            }
+        }
+        let empty = Config::from_json_str(r#"{"global":{"udp_check_dns":[]}}"#).unwrap();
+        assert_eq!(
+            serde_json::to_value(empty).unwrap()["global"]["udp_check_dns"],
+            serde_json::json!([])
+        );
+        assert!(Config::from_json_str(r#"{"global":{"udp_check_dns":null}}"#).is_err());
+    }
+
+    #[test]
     fn malformed_udp_dns_targets_fail_located_admission() {
         for value in [
             "[::1",
@@ -172,7 +204,7 @@ mod check_targets {
             "resolver.test:",
         ] {
             let mut config = Config::default();
-            config.global.udp_check_dns = vec![value.into()];
+            config.global.udp_check_dns = Some(vec![value.into()]);
             assert!(config.validate().is_err(), "{value}");
             let mut diagnostics = Vec::new();
             let error = parse_dae_config_with_detailed_diagnostics(
@@ -1025,3 +1057,6 @@ fn subscription_entry_route_is_validated_as_download_detour() {
         "subscriptions[1].download_detour"
     );
 }
+
+#[path = "validation/dns_syslog.rs"]
+mod dns_syslog;

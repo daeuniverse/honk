@@ -1936,6 +1936,47 @@ dns {
 }
 
 #[test]
+fn test_parse_dns_request_routing_subtag() {
+    let input = r#"
+dns {
+    routing {
+        request {
+            subtag(MyAirport, keyword: Air, regex: '^Paid') && qname(suffix: private.example) -> providerdoh
+            !subtag(Free, 'keyword: Air') -> providerdoh
+        }
+        response {
+            subtag(MyAirport) -> reject
+        }
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    let rules = &config.dns.routing.request.rules;
+    let subtag = |not, tags| crate::dns::DnsCond::Subtag { not, tags };
+    use crate::dns::DnsTagMatcher::{Exact, Keyword, Regex};
+    assert_eq!(
+        [&rules[0].conditions[0], &rules[1].conditions[0]],
+        [
+            &subtag(
+                false,
+                vec![
+                    Exact("MyAirport".into()),
+                    Keyword("Air".into()),
+                    Regex("^Paid".into())
+                ]
+            ),
+            // Like the group filter, a quoted argument is an exact tag.
+            &subtag(
+                true,
+                vec![Exact("Free".into()), Exact("keyword: Air".into())]
+            ),
+        ]
+    );
+    // subtag() is request-only: the response rule is omitted.
+    assert!(config.dns.routing.response.rules.is_empty());
+}
+
+#[test]
 fn test_parse_dns_request_routing_negation() {
     let input = r#"
 dns {
@@ -3210,6 +3251,73 @@ mod assets_block {
         assert_eq!(defaults.interval, Some(3600));
         assert_eq!(defaults.cache, Some(false));
         config.validate_detailed().unwrap();
+    }
+
+    #[test]
+    fn geodata_schedule_and_checksum_keys_are_kept_in_assets() {
+        let (config, diagnostics) = parse(
+            "assets {\n geodata {\n  auto_update: false\n  cron: '0 4 * * 1'\n  checksum: no\n }\n}",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let geodata = &config.assets.geodata;
+        assert_eq!(geodata.auto_update, Some(false));
+        assert_eq!(
+            geodata.cron.as_ref().map(crate::cron::Cron::as_str),
+            Some("0 4 * * 1")
+        );
+        assert_eq!(geodata.checksum, Some(false));
+        let (config, _) = parse("assets {\n geodata {\n  geosite: 'https://example.test/g'\n }\n}");
+        assert_eq!(
+            config.assets.geodata,
+            crate::assets::GeodataDefaults::default()
+        );
+    }
+
+    #[test]
+    fn an_invalid_geodata_schedule_key_warns_and_stays_unset() {
+        let input = "assets {\n geodata {\n  auto_update: maybe\n  cron: '* 3 * * *'\n  checksum: 2\n  crontab: '0 3 * * *'\n }\n}";
+        let (config, diagnostics) = parse(input);
+        assert_eq!(
+            config.assets.geodata,
+            crate::assets::GeodataDefaults::default()
+        );
+        let warnings = diagnostics
+            .iter()
+            .filter(|d| d.code == "legacy-config-warning")
+            .map(|d| {
+                (
+                    d.setting.to_string(),
+                    d.message,
+                    &input[d.span.clone().unwrap()],
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            warnings,
+            [
+                (
+                    "assets.geodata.auto_update".to_owned(),
+                    "value is not a boolean; ignored",
+                    "maybe"
+                ),
+                (
+                    "assets.geodata.cron".to_owned(),
+                    "value is not a five-field cron expression that fires at most four times a day; ignored",
+                    "'* 3 * * *'"
+                ),
+                (
+                    "assets.geodata.checksum".to_owned(),
+                    "value is not a boolean; ignored",
+                    "2"
+                ),
+            ]
+        );
+        let unknown = diagnostics
+            .iter()
+            .filter(|d| d.code == "unknown-key")
+            .map(|d| d.line)
+            .collect::<Vec<_>>();
+        assert_eq!(unknown, [Some(6)]);
     }
 
     #[test]

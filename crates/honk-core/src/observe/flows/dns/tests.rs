@@ -118,6 +118,157 @@ fn dns_rows(detail: &serde_json::Value) -> Vec<&serde_json::Value> {
 }
 
 #[tokio::test]
+async fn node_subtag_selection_marks_only_executed_predicates_partial() {
+    use crate::dns::runtime::{
+        DnsRuntime, DnsRuntimeParts, DnsServiceProvider, RoutingProjectionSnapshot,
+        RuntimeGeneration,
+    };
+
+    let instance = Uuid::new_v4().to_string();
+    let store = Arc::new(FlowStore::new(
+        instance.clone(),
+        Arc::new(EventHub::new(instance)),
+    ));
+    let config = honk_config::parser::parse_dae_config(
+        "dns {\n routing {\n  request {\n   subtag(MyAirport) && qname(suffix: private.example) -> providerdoh\n  }\n }\n}\n",
+    )
+    .unwrap()
+    .dns;
+    let router = Arc::new(DnsRouter::new_from_dns_config(&config).unwrap());
+    let pool = Arc::new(UpstreamPool::new(&[], router.clone()).unwrap());
+    let (compile_flow, compile_observation) = observer(&store);
+    let forwarder = compile_observation.sync_scope(|| {
+        Arc::new(
+            DnsForwarder::new(
+                pool.clone(),
+                Arc::new(tokio::sync::Mutex::new(DnsCache::new(8))),
+                router,
+            )
+            .with_node_hosts(
+                [
+                    ("node.private.example", "MyAirport"),
+                    ("node.public.example", "MyAirport"),
+                    ("other.private.example", "Other"),
+                ]
+                .map(|(host, tag)| (host.to_owned(), vec![tag.to_owned()]))
+                .into(),
+            ),
+        )
+    });
+    assert_eq!(detail(&store, &compile_flow)["trace_status"], "complete");
+    let runtime = DnsRuntime::new(DnsRuntimeParts {
+        generation: RuntimeGeneration::new(7),
+        forwarder,
+        routing_projection: Arc::new(RoutingProjectionSnapshot::new(
+            7,
+            Arc::new(crate::routing::Router::new(&[], "direct").unwrap()),
+        )),
+        outbound_runtime: None,
+        transport: pool,
+    });
+    let provider = Arc::new(DnsServiceProvider::new(runtime));
+    let service = DnsService::with_provider(provider.clone());
+    let pinned = service.pin_name_resolution(None).unwrap();
+    let hook = crate::dns::node_host::resolver(&service);
+
+    assert!(hook.lookup("node.private.example").is_some());
+    provider.begin_pause();
+    for (host, claimed, evaluated) in [
+        ("node.private.example", true, true),
+        ("node.public.example", false, true),
+        ("other.private.example", false, true),
+        ("unindexed.private.example", false, false),
+    ] {
+        for path in ["preflight", "paused", "pinned"] {
+            let (flow, observation) = observer(&store);
+            assert_eq!(detail(&store, &flow)["trace_status"], "complete");
+            match path {
+                "preflight" => assert_eq!(
+                    observation.sync_scope(|| hook.lookup(host).is_some()),
+                    claimed,
+                ),
+                "paused" => {
+                    let result = observation.scope(service.resolve_node_host(host)).await;
+                    assert_eq!(result.is_err(), claimed);
+                    if !claimed {
+                        assert!(result.unwrap().is_none());
+                    }
+                }
+                "pinned" => {
+                    assert!(
+                        observation
+                            .scope(pinned.resolve_node_server(host))
+                            .await
+                            .is_err()
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let view = detail(&store, &flow);
+            let expected = if evaluated { "partial" } else { "complete" };
+            assert_eq!(view["trace_status"], expected, "{host} {path}: {view:#}");
+            assert_eq!(view["trace"]["status"], expected);
+            assert_eq!(
+                view["trace"]["missing"],
+                if evaluated {
+                    serde_json::json!(["not_instrumented"])
+                } else {
+                    serde_json::json!([])
+                },
+            );
+        }
+    }
+    drop(pinned);
+    provider.finish_pause().await.unwrap();
+}
+
+#[tokio::test]
+async fn node_hosts_without_subtag_rules_keep_complete_evidence() {
+    for rules in ["", "qname(suffix: example) -> ordinary"] {
+        let config = honk_config::parser::parse_dae_config(&format!(
+            "dns {{\n routing {{\n  request {{\n   {rules}\n  }}\n }}\n}}\n"
+        ))
+        .unwrap()
+        .dns;
+        let instance = Uuid::new_v4().to_string();
+        let store = Arc::new(FlowStore::new(
+            instance.clone(),
+            Arc::new(EventHub::new(instance)),
+        ));
+        let (flow, observation) = observer(&store);
+        let service = observation.sync_scope(|| {
+            let router = Arc::new(DnsRouter::new_from_dns_config(&config).unwrap());
+            DnsService::with_forwarder(Arc::new(
+                DnsForwarder::new(
+                    Arc::new(UpstreamPool::new(&[], router.clone()).unwrap()),
+                    Arc::new(tokio::sync::Mutex::new(DnsCache::new(8))),
+                    router,
+                )
+                .with_node_hosts(
+                    [("node.example".to_owned(), vec!["MyAirport".to_owned()])].into(),
+                ),
+            ))
+        });
+        let hook = crate::dns::node_host::resolver(&service);
+        assert!(
+            observation
+                .sync_scope(|| hook.lookup("node.example"))
+                .is_none()
+        );
+        assert!(
+            observation
+                .scope(service.resolve_node_host("node.example"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let view = detail(&store, &flow);
+        assert_eq!(view["trace_status"], "complete");
+        assert_eq!(view["trace"]["missing"], serde_json::json!([]));
+    }
+}
+
+#[tokio::test]
 async fn source_policy_cache_and_verification_ignore_dns_log_toggle() {
     let (service, store, api, gate, mut calls, server) = fixture().await;
     let (flow, observer) = observer(&store);
@@ -443,12 +594,9 @@ async fn selection_evidence_keeps_the_consumed_catalog_after_group_recreation() 
                 let rows = selection_evaluated(plan.observation.as_deref());
                 assert_eq!(rows[0].group_id, consumed.groups["dns-root"]);
                 let picked = plan.entries.first().unwrap();
-                let path = selection_path(
-                    &rows,
-                    &picked.selection_chain,
-                    picked.node,
-                    plan.health_family,
-                );
+                let dialed = honk_outbound::group::OwnedTarget::node(picked.node.clone());
+                let path =
+                    selection_path(&rows, &picked.selection_chain, &dialed, plan.health_family);
                 assert_eq!(
                     path[0].member_id.as_deref(),
                     Some(picked.node.id.to_string().as_str())
@@ -659,7 +807,7 @@ async fn dns_proxy_hostname_and_warm_tcp_keep_query_purpose_and_lineage() {
     use honk_config::types::NodeProtocol;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    for proxied in [false, true] {
+    for (proxied, collapsed) in [(false, false), (true, false), (true, true)] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -694,6 +842,38 @@ async fn dns_proxy_hostname_and_warm_tcp_keep_query_purpose_and_lineage() {
             ..Default::default()
         };
         node.id = node.derive_id();
+        let node_id = node.id.to_string();
+        let group_name = "dns-root";
+        let groups = if collapsed {
+            vec![honk_config::group::Group {
+                name: group_name.into(),
+                final_outbound: Some("direct".into()),
+                exit: Some(node.name.clone()),
+                ..Default::default()
+            }]
+        } else {
+            Vec::new()
+        };
+        let outbound_config = honk_config::Config {
+            groups: groups.clone(),
+            nodes: vec![node.clone()],
+            ..Default::default()
+        };
+        let catalogs = crate::observe::catalog::Catalog::new(&outbound_config);
+        let catalog = catalogs.snapshot();
+        let manager = collapsed.then(|| {
+            let manager = Arc::new(honk_outbound::group::GroupManager::new(
+                &groups,
+                std::slice::from_ref(&node),
+            ));
+            catalogs.install_prepared(catalogs.prepare(&honk_config::Config::default()));
+            catalogs.install_prepared(catalogs.prepare(&outbound_config));
+            assert_ne!(
+                catalog.groups[group_name],
+                catalogs.snapshot().groups[group_name]
+            );
+            manager
+        });
         let mut config = DnsConfig {
             upstream: vec![DnsUpstream {
                 name: "wire".into(),
@@ -704,7 +884,13 @@ async fn dns_proxy_hostname_and_warm_tcp_keep_query_purpose_and_lineage() {
                 },
                 protocol: DnsProtocol::Tcp,
                 tls_server_name: None,
-                outbound: proxied.then(|| node.name.clone()),
+                outbound: proxied.then(|| {
+                    if collapsed {
+                        group_name.to_owned()
+                    } else {
+                        node.name.clone()
+                    }
+                }),
             }],
             ..Default::default()
         };
@@ -718,10 +904,13 @@ async fn dns_proxy_hostname_and_warm_tcp_keep_query_purpose_and_lineage() {
                     crate::proxy::ProxyRegistry::default_resolver().unwrap(),
                 )),
                 vec![node],
-                Vec::new(),
+                groups,
             )
             .unwrap(),
         );
+        if let Some(manager) = manager {
+            pool.set_group_manager_snapshot(manager);
+        }
         let service = DnsService::with_forwarder(Arc::new(DnsForwarder::new(
             pool.clone(),
             Arc::new(tokio::sync::Mutex::new(DnsCache::new(64))),
@@ -740,7 +929,10 @@ async fn dns_proxy_hostname_and_warm_tcp_keep_query_purpose_and_lineage() {
             let query = build_dns_query(name, 1);
             let response = tokio::time::timeout(
                 Duration::from_secs(3),
-                observation.scope(service.resolve(&query, IngressProfile::Internal)),
+                scope_catalog(
+                    Some(catalog.clone()),
+                    observation.scope(service.resolve(&query, IngressProfile::Internal)),
+                ),
             )
             .await
             .unwrap()
@@ -768,6 +960,23 @@ async fn dns_proxy_hostname_and_warm_tcp_keep_query_purpose_and_lineage() {
                         && step["data"]["status"] == "started"
                 })
                 .unwrap();
+            if proxied {
+                assert_eq!(leaf["data"]["leaf_node_id"], node_id);
+                assert_eq!(leaf["data"]["leaf_node_name"], "dns-proxy");
+            }
+            let path = leaf["data"]["selection_path"].as_array().unwrap();
+            if collapsed {
+                assert_eq!(path.len(), 1);
+                assert_eq!(path[0]["group_id"], catalog.groups[group_name]);
+                assert_eq!(
+                    path[0]["member_id"],
+                    honk_config::config::DIRECT_NODE_ID.to_string()
+                );
+                assert_eq!(path[0]["member_name"], "direct");
+                assert_eq!(path[0]["reason"], "final_selected");
+            } else {
+                assert!(path.is_empty());
+            }
             let exchange = rows
                 .iter()
                 .find(|row| {
@@ -977,4 +1186,124 @@ async fn truncated_udp_keeps_both_wire_lookups_and_tcp_fallback_reason() {
         pool.close().await;
         server.await.unwrap();
     }
+}
+
+/// A DNS dial through a group's exit reports the leaf its selection
+/// captured, by its own node ID, and dials a proxy, so it has no server
+/// address of the target's own.
+#[tokio::test]
+async fn a_routed_dns_flow_reports_the_leaf_not_the_route() {
+    use honk_outbound::{
+        alive::{IpVersion, ProbeDomain},
+        group::{GroupManager, ScoreSelectionContext, SelectionNetwork, Target},
+    };
+    let mut config = honk_config::Config::default();
+    config.ensure_builtin_nodes();
+    let socks5 = |name: &str, port: u16| {
+        let mut node = honk_config::node::Node {
+            name: name.into(),
+            outbound: honk_config::node::OutboundConfig::from_protocol(
+                honk_config::types::NodeProtocol::Socks5,
+            ),
+            address: format!("127.0.0.1:{port}"),
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
+    };
+    config
+        .nodes
+        .extend([socks5("inner-exit", 1080), socks5("outer-exit", 1081)]);
+    config.groups.push(honk_config::group::Group {
+        name: "inner".into(),
+        nodes: vec![honk_config::config::DIRECT_NODE_ID],
+        exit: Some("inner-exit".into()),
+        ..Default::default()
+    });
+    config.groups.push(honk_config::group::Group {
+        name: "dns-root".into(),
+        groups: vec!["inner".into()],
+        exit: Some("outer-exit".into()),
+        ..Default::default()
+    });
+    let manager = GroupManager::new(&config.groups, &config.nodes);
+    let instance = Uuid::new_v4().to_string();
+    let store = Arc::new(FlowStore::new(
+        instance.clone(),
+        Arc::new(EventHub::new(instance.clone())),
+    ));
+    let api = recorder(instance, &store);
+    let (_flow, observer) = observer(&store);
+    let target: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let evidence = scope_api(
+        Arc::downgrade(&api),
+        observer.scope(async {
+            let plan = manager.selection_plan_for_target_with_health_fallback(
+                "dns-root",
+                &ScoreSelectionContext {
+                    network: SelectionNetwork::Tcp,
+                    probe_domain: ProbeDomain::Tcp,
+                    target_family: Some(IpVersion::V4),
+                    health_family: IpVersion::V4,
+                    target: None,
+                },
+                None,
+            );
+            let picked = plan.entries.into_iter().next().unwrap();
+            let dialed = manager.own_target(Target {
+                node: picked.node,
+                route: picked.route,
+            });
+            assert!(dialed.route.is_some(), "the leaf dials through the exit");
+            outbound_evidence(
+                "dns-root",
+                crate::observe::vocab::RoutingSource::Forced,
+                None,
+                Some(&dialed),
+                target,
+                Default::default(),
+            )
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        evidence.leaf_node_id.as_deref(),
+        Some(honk_config::config::DIRECT_NODE_ID.to_string().as_str())
+    );
+    assert_eq!(evidence.leaf_node_name.as_deref(), Some("direct"));
+    assert_eq!(evidence.server_addr, None);
+}
+
+/// A route whose leaf is `direct` still dials its exits, so the dial's own
+/// lookups are a proxy server's.
+#[tokio::test]
+async fn a_routed_direct_leaf_dials_as_a_proxy_server() {
+    let mut config = honk_config::Config::default();
+    config.ensure_builtin_nodes();
+    let direct = config
+        .nodes
+        .iter()
+        .find(|node| node.id == honk_config::config::DIRECT_NODE_ID)
+        .unwrap()
+        .clone();
+    let instance = Uuid::new_v4().to_string();
+    let store = Arc::new(FlowStore::new(
+        instance.clone(),
+        Arc::new(EventHub::new(instance)),
+    ));
+    let (_flow, observer) = observer(&store);
+    let purpose = |routed: bool| {
+        let direct = direct.clone();
+        observer.scope(async move {
+            outbound_dial_scope(&direct, routed, async {
+                flow_observation::current().map(|observer| observer.context().dns_purpose)
+            })
+            .await
+        })
+    };
+    assert_eq!(purpose(true).await, Some("proxy_server"));
+    assert_ne!(purpose(false).await, Some("proxy_server"));
 }

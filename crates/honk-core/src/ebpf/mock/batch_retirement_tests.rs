@@ -245,7 +245,8 @@ fn udp_admission_checks_captured_owner_with_model_and_stateless_exemptions() {
         ..Default::default()
     };
     let model = UdpFlowOwner::new(0, None).unwrap();
-    assert!(backend.verify_udp_admission(&key, model).unwrap().is_none());
+    let (entry, cached_group) = backend.verify_udp_admission(&key, model).unwrap();
+    assert!(entry.is_none() && cached_group.is_none());
     assert!(
         backend
             .verify_udp_admission(&key, UdpFlowOwner::new(7, None).unwrap())
@@ -264,7 +265,8 @@ fn udp_admission_checks_captured_owner_with_model_and_stateless_exemptions() {
         let owner = backend
             .udp_flow_owner(7, backend.conn_state_lookup(&key).unwrap())
             .unwrap();
-        assert!(backend.verify_udp_admission(&key, owner).unwrap().is_some());
+        let (entry, cached_group) = backend.verify_udp_admission(&key, owner).unwrap();
+        assert!(entry.is_some() && cached_group.is_none());
         assert!(
             backend
                 .verify_udp_admission(&key, UdpFlowOwner::new(7, Some(42)).unwrap())
@@ -292,12 +294,8 @@ fn udp_admission_checks_captured_owner_with_model_and_stateless_exemptions() {
         dst_port: 53,
         ..key
     };
-    assert!(
-        backend
-            .verify_udp_admission(&stateless, model)
-            .unwrap()
-            .is_none()
-    );
+    let (entry, cached_group) = backend.verify_udp_admission(&stateless, model).unwrap();
+    assert!(entry.is_none() && cached_group.is_none());
     backend.routing_handoffs.get_mut().insert(
         MockEbpfBackend::tuples_key_bytes(&stateless),
         RoutingHandoffEntry {
@@ -316,12 +314,8 @@ fn udp_admission_checks_captured_owner_with_model_and_stateless_exemptions() {
         .unwrap()
         .result
         .decision_token = 0;
-    assert!(
-        backend
-            .verify_udp_admission(&stateless, model)
-            .unwrap()
-            .is_some()
-    );
+    let (entry, cached_group) = backend.verify_udp_admission(&stateless, model).unwrap();
+    assert!(entry.is_some() && cached_group.is_none());
 }
 
 #[test]

@@ -748,6 +748,85 @@ async fn test_tcp_query_pooled() {
 }
 
 #[tokio::test]
+async fn tcp_dns_through_a_chain_or_group_exit_crosses_both_hops_after_traffic_retirement() {
+    use crate::dns::transport::{read_length_prefixed_into, write_length_prefixed};
+    use crate::test_support::{socks5_chain, socks5_relay};
+    use honk_outbound::group::GroupManager;
+    use honk_outbound::runtime::OutboundRuntimeRegistry;
+
+    for (outbound, id) in [("via", 0x4321), ("proxy", 0x4322)] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let front = socks5_relay().await;
+            let land = socks5_relay().await;
+            let [chain, front_node, exit_node] = socks5_chain(&front, &land);
+            let groups = if outbound == "proxy" {
+                vec![Group {
+                    name: outbound.into(),
+                    nodes: vec![front_node.id],
+                    exit: Some(exit_node.name.clone()),
+                    ..Default::default()
+                }]
+            } else {
+                Vec::new()
+            };
+            let mut nodes = vec![front_node, exit_node];
+            if outbound == "via" {
+                nodes.push(chain);
+            }
+            let generation = Arc::new(OutboundRuntimeRegistry::build(&nodes).unwrap());
+            let manager = Arc::new(GroupManager::new(&groups, &nodes));
+            let pool = UpstreamPool::new_with_proxy(
+                &[make_upstream(
+                    "private",
+                    &address.to_string(),
+                    DnsProtocol::Tcp,
+                )],
+                make_router(),
+                Some(Arc::new(
+                    crate::proxy::ProxyRegistry::default_resolver().unwrap(),
+                )),
+                nodes,
+                groups,
+            )
+            .unwrap()
+            .with_group_manager_snapshot(manager)
+            .with_traffic_router_snapshot(Arc::new(Router::new(&[], outbound).unwrap()));
+            pool.set_runtime_generation(Arc::clone(&generation))
+                .unwrap();
+            generation.begin_retirement();
+
+            let query = mock_dns_query(id);
+            let response = mock_dns_response(id);
+            let server = async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut received = Vec::new();
+                read_length_prefixed_into(&mut stream, &mut received, None)
+                    .await
+                    .unwrap();
+                assert_eq!(received[2..], query[2..]);
+                let mut answer = response.clone();
+                answer[..2].copy_from_slice(&received[..2]);
+                write_length_prefixed(&mut stream, &answer).await.unwrap();
+                let mut remaining = [0_u8; 1];
+                assert_eq!(stream.read(&mut remaining).await.unwrap(), 0);
+            };
+            let exchange = async {
+                assert_eq!(pool.query("private", &query).await.unwrap(), response);
+                assert_eq!(*front.requests.lock(), [land.addr]);
+                assert_eq!(*land.requests.lock(), [address]);
+                pool.close().await;
+                assert_eq!(pool.lifecycle_stats().close_count, 1);
+            };
+            tokio::join!(server, exchange);
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{outbound}: DNS exchange or joined close stalled"));
+    }
+}
+
+#[tokio::test]
 async fn test_udp_hedged_retry_on_loss() {
     let response = mock_dns_response(0x1234);
     let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();

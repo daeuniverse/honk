@@ -45,7 +45,7 @@ LLM-generated code is welcome in:
 2. **Disclosed.** The PR description states whether AI was used (see §5). Undisclosed AI use is grounds for closing.
 3. **Tested.** Any LLM-created production-adjacent code (fixtures, mocks that other tests depend on) must itself be exercised by CI. Benchmarks must carry their contract assertions in-tree.
 4. **Human-reviewed.** A human maintainer has read the diff. LLM review never substitutes for human review or self-review.
-5. **Invariants respected.** LLM-created code must obey every contract in `AGENTS.md` (e.g. never call `clear_routes` on the push path; generation-bound ownership; no new lock edges). Reviewers should assume the generator generalized the contract imperfectly and check the seams.
+5. **Invariants respected.** LLM-created code must obey every contract in `AGENTS.md` (e.g. generation-bound ownership; no new lock edges). Reviewers should assume the generator generalized the contract imperfectly and check the seams.
 
 ## 4. Review rules
 

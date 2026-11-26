@@ -268,19 +268,24 @@ pub(crate) fn udp_state_is_staged(state: u8) -> bool {
 }
 
 pub(crate) fn udp_state_is_legacy_userspace_owned(state: &ConnState) -> bool {
+    legacy_udp_userspace_outbound(state).is_some()
+}
+
+fn legacy_udp_userspace_outbound(state: &ConnState) -> Option<u8> {
     if state.decision_token != 0 || state.state != UdpDecisionState::None as u8 {
-        return false;
+        return None;
     }
     let raw = unsafe { state.meta.raw };
     if raw & ROUTING_META_FLAG_PUBLISHED == 0 || raw & ROUTING_META_FLAG_OFFLOAD != 0 {
-        return false;
+        return None;
     }
     let outbound = (raw & 0xff) as u8;
     let must = ((raw >> 40) & 1) != 0;
-    outbound != OutboundIndex::Block as u8
+    (outbound != OutboundIndex::Block as u8
         && (outbound != OutboundIndex::Direct as u8
             || !must
-            || raw & ROUTING_META_FLAG_WAN_USERSPACE != 0)
+            || raw & ROUTING_META_FLAG_WAN_USERSPACE != 0))
+        .then_some(outbound)
 }
 
 #[cfg(test)]
@@ -675,6 +680,21 @@ pub trait EbpfBackend: PolicyBackend {
     #[cfg(feature = "ebpf")]
     fn interface_binding_snapshot(&self) -> anyhow::Result<interface::BindingSnapshot>;
 
+    /// Prepare a blocking verifier job without retaining backend ownership.
+    #[cfg(feature = "ebpf")]
+    fn prepare_tc_programs(
+        &self,
+        _programs: &[interface::TcProgram],
+    ) -> anyhow::Result<Option<real::programs::TcProgramPreparation>> {
+        Ok(None)
+    }
+
+    /// Install the current routing generation before making prepared targets bindable.
+    #[cfg(feature = "ebpf")]
+    fn commit_tc_programs(&mut self, _batch: real::programs::TcProgramBatch) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Apply the commit and return replaced or removed link FDs. The caller
     /// must close them outside any lock: the last close takes the rtnl lock.
     #[cfg(feature = "ebpf")]
@@ -698,18 +718,21 @@ pub trait EbpfBackend: PolicyBackend {
     /// Derive ownership from the coherent snapshot already read at admission.
     fn udp_flow_owner(&self, token: u32, state: Option<ConnState>) -> anyhow::Result<UdpFlowOwner>;
 
+    /// A verified auxiliary handoff or, when it was absent, the cached ordinary group slot.
     fn verify_udp_admission(
         &self,
         tuples: &TuplesKey,
         owner: UdpFlowOwner,
-    ) -> anyhow::Result<Option<RoutingHandoffEntry>> {
+    ) -> anyhow::Result<(Option<RoutingHandoffEntry>, Option<u8>)> {
         anyhow::ensure!(
             owner.has_kernel_capture(),
             "packet-owned UDP has no kernel admission authority"
         );
         let entry = self.routing_handoff_lookup(tuples)?;
+        let mut cached_group = None;
         if !owner.is_stateless(tuples.src_port, tuples.dst_port) {
-            let current = self.udp_flow_owner(owner.token, self.conn_state_lookup(tuples)?)?;
+            let state = self.conn_state_lookup(tuples)?;
+            let current = self.udp_flow_owner(owner.token, state)?;
             if owner.incarnation.is_some() {
                 anyhow::ensure!(
                     owner.incarnation == current.incarnation,
@@ -729,6 +752,15 @@ pub trait EbpfBackend: PolicyBackend {
                 );
             } else {
                 anyhow::ensure!(owner.token == 0, "staged UDP flow has no routing handoff");
+                if owner.incarnation.is_some() {
+                    cached_group = state
+                        .as_ref()
+                        .and_then(legacy_udp_userspace_outbound)
+                        .filter(|outbound| {
+                            (OutboundIndex::UserBase as u8..OutboundIndex::MustRules as u8)
+                                .contains(outbound)
+                        });
+                }
             }
         } else if let Some(entry) = entry {
             anyhow::ensure!(
@@ -736,7 +768,7 @@ pub trait EbpfBackend: PolicyBackend {
                 "raw DNS handoff token mismatch"
             );
         }
-        Ok(entry)
+        Ok((entry, cached_group))
     }
 
     /// Publish one token-bound UDP decision transition. The caller holds the
@@ -823,7 +855,7 @@ pub trait EbpfBackend: PolicyBackend {
     }
 
     #[cfg(all(feature = "ebpf", feature = "native-api"))]
-    fn receive_trace(&mut self) -> Option<std::sync::Arc<real::receive_trace::ReceiveTrace>> {
+    fn prepare_receive_trace(&self) -> Option<real::programs::ReceiveTracePreparation> {
         None
     }
 

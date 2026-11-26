@@ -656,6 +656,26 @@ impl ScoreReporter {
         self.finish_at(outcome, true, Instant::now());
     }
 
+    /// Settle a routed reporter whose captured authority has expired.
+    /// Keep historical trial costs without publishing pending observations.
+    pub fn finish_stale(&self) {
+        self.finish_stale_at(Instant::now());
+    }
+
+    pub(super) fn finish_stale_at(&self, now: Instant) {
+        let mut progress = self.shared.progress.lock();
+        if progress.finished {
+            return;
+        }
+        progress.finished = true;
+        budget::finish(
+            &self.shared.feedback.state,
+            &self.shared.work,
+            ScoreOutcome::Cancelled,
+            now,
+        );
+    }
+
     pub(super) fn finish_at(&self, outcome: ScoreOutcome, count_usefulness: bool, now: Instant) {
         let mut progress = self.shared.progress.lock();
         if progress.finished {
@@ -677,6 +697,7 @@ impl ScoreReporter {
             && !matches!(
                 outcome,
                 ScoreOutcome::Success
+                    | ScoreOutcome::RouteFailure
                     | ScoreOutcome::Rejected
                     | ScoreOutcome::Cancelled
                     | ScoreOutcome::Shutdown

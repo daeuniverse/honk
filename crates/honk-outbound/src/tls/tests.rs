@@ -226,6 +226,59 @@ async fn xhttp_tls_rejects_missing_h2_but_raw_tls_preserves_no_alpn() {
     .unwrap();
 }
 
+/// Like `spawn_server`, but returns the SNI the client offered (`None` if absent).
+fn spawn_sni_server(cert_pem: &str, key_pem: &str) -> (u16, thread::JoinHandle<Option<String>>) {
+    let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+    acceptor
+        .set_certificate(&X509::from_pem(cert_pem.as_bytes()).unwrap())
+        .unwrap();
+    acceptor
+        .set_private_key(&PKey::private_key_from_pem(key_pem.as_bytes()).unwrap())
+        .unwrap();
+    let acceptor = acceptor.build();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let tls = acceptor.accept(stream).ok()?;
+        tls.ssl()
+            .servername(boring::ssl::NameType::HOST_NAME)
+            .map(str::to_owned)
+    });
+    (port, handle)
+}
+
+/// The dial must put the WebSocket `Host` name on the wire as SNI when the
+/// endpoint is an IP literal and no explicit `sni` is set; calling only the
+/// helper would not catch a call site that stops using it.
+#[tokio::test]
+async fn ws_tls_dial_offers_the_host_header_as_sni() {
+    use crate::proxy::transport::maybe_tls_wrap_concrete;
+    use std::time::Duration;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (cert, key) = server_cert();
+        let (port, server) = spawn_sni_server(&cert, &key);
+        let mut node = test_node();
+        node.host = "127.0.0.1".into();
+        node.port = port;
+        node.tls_mut().unwrap().enabled = true;
+        let transport = node.transport_mut().unwrap();
+        transport.transport = "ws".into();
+        transport.ws_host = Some("cdn.example:8443".into());
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let stream = maybe_tls_wrap_concrete(&node, Some(tcp), Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(server.join().unwrap().as_deref(), Some("cdn.example"));
+        drop(stream);
+    })
+    .await
+    .unwrap();
+}
+
 /// Spawn a server holding real ECH keys (boring test fixtures:
 /// public_name ech.com, DHKEM-P256-SHA256).
 fn spawn_ech_server(cert_pem: &str, key_pem: &str) -> (u16, thread::JoinHandle<Vec<u8>>) {
@@ -515,5 +568,132 @@ async fn ech_discovery_end_to_end() {
     stream.write_all(b"ok").await.unwrap();
     stream.shutdown().await.unwrap();
     assert_eq!(server.join().unwrap(), b"ok");
+    crate::bootstrap::set_global(None);
+}
+
+#[test]
+fn dns_connector_shares_context_and_root_store_per_shape() {
+    use foreign_types::{ForeignType, ForeignTypeRef};
+    if crate::bootstrap::run_global_test_in_child(
+        "tls::tests::dns_connector_shares_context_and_root_store_per_shape",
+    ) {
+        return;
+    }
+
+    let shared_store = root_store().unwrap();
+    let dns = |skip, alpn| {
+        let c = build_dns_connector(skip, alpn).unwrap();
+        assert_eq!(
+            c.connector.context().cert_store().as_ptr(),
+            shared_store.as_ptr()
+        );
+        c
+    };
+
+    set_tls_mode("tls");
+    let dot = dns(false, b"\x03dot");
+    let doh = dns(false, b"\x02h2");
+    let empty = dns(false, b"");
+    let skip_dot = dns(true, b"\x03dot");
+    assert_eq!(dot.context_ptr(), dns(false, b"\x03dot").context_ptr());
+    assert_eq!(empty.context_ptr(), dns(false, b"").context_ptr());
+    assert_ne!(doh.context_ptr(), dot.context_ptr());
+    assert_ne!(empty.context_ptr(), dot.context_ptr());
+    assert_ne!(skip_dot.context_ptr(), dot.context_ptr());
+
+    let mut plain = test_node();
+    plain.tls_mut().unwrap().skip_cert_verify = false;
+    assert_eq!(
+        empty.context_ptr(),
+        build_connector(&plain).unwrap().context_ptr()
+    );
+
+    assert!(build_dns_connector(false, b"\x05hi").is_err());
+    assert!(build_dns_connector(false, b"\x05hi").is_err());
+
+    set_tls_mode("utls");
+    let dot_utls = dns(false, b"\x03dot");
+    assert!(!dot.is_chrome() && dot_utls.is_chrome());
+    assert_ne!(dot_utls.context_ptr(), dot.context_ptr());
+    assert_eq!(dot_utls.context_ptr(), dns(false, b"\x03dot").context_ptr());
+
+    set_tls_mode("tls");
+    assert_eq!(dns(false, b"\x03dot").context_ptr(), dot.context_ptr());
+}
+
+#[tokio::test]
+async fn ech_discovery_cache_enforces_bound_and_eviction_order() {
+    use std::sync::atomic::Ordering as AOrd;
+    use std::time::{Duration, Instant};
+    if crate::bootstrap::run_global_test_in_child(
+        "tls::tests::ech_discovery_cache_enforces_bound_and_eviction_order",
+    ) {
+        return;
+    }
+
+    let now = Instant::now();
+    let entry = |cfg: Option<&[u8]>, expires| EchCacheEntry {
+        config: cfg.map(<[u8]>::to_vec),
+        expires,
+    };
+    let has = |k: &str| ECH_DISCOVERY_CACHE.lock().contains_key(k);
+    let len = || ECH_DISCOVERY_CACHE.lock().len();
+    {
+        let mut cache = ECH_DISCOVERY_CACHE.lock();
+        cache.clear();
+        for name in ["expired-1.test", "expired-2.test"] {
+            cache.insert(
+                name.into(),
+                entry(Some(b"old"), now - Duration::from_secs(1)),
+            );
+        }
+        for name in ["tie-b.test", "tie-a.test"] {
+            cache.insert(name.into(), entry(None, now + Duration::from_secs(30)));
+        }
+        for i in 0..(MAX_ECH_CACHE_ENTRIES - 4) {
+            cache.insert(
+                format!("live-{i:03}.test"),
+                entry(Some(&[i as u8]), now + Duration::from_secs(600)),
+            );
+        }
+    }
+
+    let (addr, count) = spawn_https_dns(Some(b"\x00\x01ech".to_vec()), 120).await;
+    crate::bootstrap::set_global(crate::bootstrap::BootstrapResolver::parse(&format!(
+        "udp://{addr}"
+    )));
+
+    assert_eq!(
+        discover_ech_config("fresh.test").await.as_deref(),
+        Some(b"\x00\x01ech".as_slice())
+    );
+    assert_eq!(len(), MAX_ECH_CACHE_ENTRIES - 1);
+    assert!(!has("expired-1.test") && !has("expired-2.test") && has("tie-a.test"));
+
+    assert!(discover_ech_config("fill.test").await.is_some());
+    insert_ech_cache_entry(
+        &mut ECH_DISCOVERY_CACHE.lock(),
+        "fresh.test".into(),
+        entry(Some(b"updated"), now + Duration::from_secs(700)),
+        Instant::now(),
+    );
+    assert_eq!(len(), MAX_ECH_CACHE_ENTRIES);
+    assert!(has("tie-a.test"));
+    assert_eq!(
+        discover_ech_config("fresh.test").await.as_deref(),
+        Some(b"updated".as_slice())
+    );
+    assert_eq!(count.load(AOrd::SeqCst), 2);
+
+    assert!(discover_ech_config("overflow-1.test").await.is_some());
+    assert_eq!(len(), MAX_ECH_CACHE_ENTRIES);
+    assert!(!has("tie-a.test") && has("tie-b.test") && has("overflow-1.test"));
+    assert!(discover_ech_config("overflow-1.test").await.is_some());
+    assert_eq!(count.load(AOrd::SeqCst), 3);
+
+    assert!(discover_ech_config("tie-a.test").await.is_some());
+    assert_eq!(count.load(AOrd::SeqCst), 4);
+    assert_eq!(len(), MAX_ECH_CACHE_ENTRIES);
+    assert!(!has("tie-b.test") && has("tie-a.test"));
     crate::bootstrap::set_global(None);
 }

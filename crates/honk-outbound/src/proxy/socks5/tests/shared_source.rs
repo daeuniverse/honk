@@ -319,3 +319,39 @@ async fn socks5_send_to_names_only_the_dialed_destination() {
     }
     server.close_control();
 }
+
+#[tokio::test]
+async fn socks5_checked_send_admits_the_addressed_datagram() {
+    let mut server =
+        run_udp_associate_test_server(socks5_udp_associate_reply("127.0.0.1:0".parse().unwrap()))
+            .await;
+    let dialed = "127.0.0.1:443".parse().unwrap();
+    let target = "127.0.0.1:5353".parse().unwrap();
+    let transport =
+        prepare_shared_test_transport(server.proxy_addr, dialed, Some("dialed.example.test")).await;
+    let admitted = AtomicBool::new(false);
+    let checked = AtomicBool::new(false);
+    let current = || {
+        checked.store(true, Ordering::Release);
+        true
+    };
+
+    transport
+        .send_to_checked(
+            target,
+            Some("other.example.test"),
+            b"addressed",
+            Some(&admitted),
+            &current,
+        )
+        .await
+        .unwrap();
+    assert!(checked.load(Ordering::Acquire));
+    assert!(admitted.load(Ordering::Acquire));
+    let (packet, _) = peer_recv(&server.relay).await;
+    assert_eq!(
+        packet,
+        expected_socks5_udp_datagram(target, None, 0, b"addressed")
+    );
+    server.close_control();
+}

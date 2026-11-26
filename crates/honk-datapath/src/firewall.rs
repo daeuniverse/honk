@@ -871,10 +871,7 @@ impl Firewall {
                 return true;
             }
             let retired_at = *entry.retired_at.get_or_insert(now);
-            if now.saturating_duration_since(retired_at) < IPV4_ID_LIFETIME {
-                return true;
-            }
-            false
+            now.saturating_duration_since(retired_at) < IPV4_ID_LIFETIME
         });
         let origin = *self.overflow_origin.get_or_insert(now);
         let tick = now

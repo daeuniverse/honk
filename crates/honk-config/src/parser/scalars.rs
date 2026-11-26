@@ -73,6 +73,13 @@ pub(super) const GLOBAL_KEYS: &[&str] = &[
     "so_mark_from_dae",
     "log_level",
     "log_file",
+    "syslog_addr",
+    "syslog_dns_enabled",
+    "syslog_cee_enabled",
+    "syslog_dns_template",
+    "syslog_dns_json",
+    "syslog_hostname",
+    "syslog_app_name",
     "disable_waiting_network",
     "shutdown_wait_connections",
     "lan_interface",
@@ -325,6 +332,55 @@ pub(super) fn parse_global_section(
     if let Some(value) = settings.get("log_file").map(|text| text.unquote().raw()) {
         cfg.log_file = value.to_owned();
     }
+    if let Some(value) = settings.get("syslog_addr").map(|text| text.unquote().raw()) {
+        cfg.syslog_addr = value.to_owned();
+    }
+    if let Some(value) = settings
+        .get("syslog_hostname")
+        .map(|text| text.unquote().raw())
+    {
+        cfg.syslog_hostname = value.to_owned();
+    }
+    if let Some(value) = settings
+        .get("syslog_app_name")
+        .map(|text| text.unquote().raw())
+    {
+        cfg.syslog_app_name = value.to_owned();
+    }
+    if let Some(value) = settings.get("syslog_dns_enabled") {
+        cfg.syslog_dns_enabled = strict_bool(value.unquote().raw()).ok_or_else(|| {
+            scalar_error(
+                *value,
+                "invalid-config-value",
+                "global.syslog_dns_enabled",
+                "expected true/false, yes/no, 1/0 or on/off",
+            )
+        })?;
+    }
+    if let Some(value) = settings.get("syslog_cee_enabled") {
+        cfg.syslog_cee_enabled = strict_bool(value.unquote().raw()).ok_or_else(|| {
+            scalar_error(
+                *value,
+                "invalid-config-value",
+                "global.syslog_cee_enabled",
+                "expected true/false, yes/no, 1/0 or on/off",
+            )
+        })?;
+    }
+    for (key, path) in [
+        ("syslog_dns_template", "global.syslog_dns_template"),
+        ("syslog_dns_json", "global.syslog_dns_json"),
+    ] {
+        if let Some(value) = settings.get(key) {
+            return Err(scalar_error(
+                *value,
+                "removed-config-setting",
+                path,
+                "DNS syslog uses a fixed JSON schema; remove this formatting setting",
+            )
+            .into());
+        }
+    }
     if settings.contains_key("disable_waiting_network") {
         cfg.disable_waiting_network = bool_value(
             &settings,
@@ -378,7 +434,7 @@ pub(super) fn parse_global_section(
         cfg.tcp_check_http_method = value.to_owned();
     }
     if let Some(value) = settings.get("udp_check_dns") {
-        cfg.udp_check_dns = list_value(*value, ListOptions::CHECK_TARGETS, diagnostics);
+        cfg.udp_check_dns = Some(list_value(*value, ListOptions::CHECK_TARGETS, diagnostics));
     }
     if let Some(text) = settings.get("check_interval") {
         let value = text.unquote().raw();
@@ -543,18 +599,20 @@ pub(super) fn parse_global_section(
         })?;
     }
 
-    crate::check::validate_dns_check_targets(&cfg.udp_check_dns).map_err(|mut error| {
-        if let Some(value) = settings.get("udp_check_dns") {
-            let (line, column) = value.source.location(value.span.start);
-            error.diagnostic.source = value.source.reference();
-            error.diagnostic.line = Some(line);
-            error.diagnostic.span = Some(value.span.start..value.span.end);
-            error.diagnostic.byte_column = Some(column);
-        } else {
-            error.diagnostic.source = diagnostics.source();
-        }
-        super::ParseFailure::Detailed(error)
-    })?;
+    crate::check::validate_dns_check_targets(cfg.effective_udp_check_dns()).map_err(
+        |mut error| {
+            if let Some(value) = settings.get("udp_check_dns") {
+                let (line, column) = value.source.location(value.span.start);
+                error.diagnostic.source = value.source.reference();
+                error.diagnostic.line = Some(line);
+                error.diagnostic.span = Some(value.span.start..value.span.end);
+                error.diagnostic.byte_column = Some(column);
+            } else {
+                error.diagnostic.source = diagnostics.source();
+            }
+            super::ParseFailure::Detailed(error)
+        },
+    )?;
     Ok(cfg)
 }
 

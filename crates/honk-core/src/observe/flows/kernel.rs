@@ -14,8 +14,8 @@ use std::{
 };
 
 const MAX_DICTIONARIES: usize = 16;
-const MAX_DICTIONARY_BYTES: usize = 64 * 1024;
-pub(super) const MAX_RETAINED_BYTES: usize = 1024 * 1024;
+const MAX_DICTIONARY_BYTES: usize = 128 * 1024;
+pub(super) const MAX_RETAINED_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct KernelRouteReference {

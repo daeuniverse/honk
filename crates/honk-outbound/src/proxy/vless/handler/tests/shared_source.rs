@@ -124,7 +124,7 @@ async fn shared_uot_source_serves_two_destinations_and_releases_the_carrier() {
     let transport = prepared.commit().await.unwrap();
     // The one stream serves both destinations; the request went out once.
     transport
-        .send_to(sock(A), None, b"aa", true, None)
+        .send_to_checked(sock(A), None, b"aa", None, &|| true)
         .await
         .unwrap();
     transport

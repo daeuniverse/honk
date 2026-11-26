@@ -5,6 +5,7 @@
 pub(crate) mod addr;
 pub mod anytls;
 pub mod block;
+mod chain;
 pub mod direct;
 pub mod hysteria2;
 pub mod juicity;
@@ -27,17 +28,19 @@ mod registry;
 
 pub use direct::DirectMark;
 pub use error::{
-    FrameInterrupted, NodeFailure, PacketErrorClass, PacketRejection, TargetFailure,
-    is_frame_interrupted, is_packet_rejection, node_failure, packet_error_class, packet_rejection,
-    target_failure,
+    ChainHopFailure, DialFailureScope, FrameInterrupted, MissingProtocolHandler, NodeFailure,
+    PacketErrorClass, PacketRejection, TargetFailure, TunnelUnsupported, dial_failure_scope,
+    failed_hop, is_frame_interrupted, is_packet_rejection, node_failure, packet_error_class,
+    packet_rejection, target_failure, tunnel_unsupported,
 };
 pub(crate) use error::{
-    io_packet_rejection, io_target_failure, node_failure_episode, quic_carrier_error,
-    quic_carrier_io_error, send_size_refusal,
+    io_packet_rejection, io_target_failure, node_failure_cause, node_failure_episode,
+    quic_carrier_error, quic_carrier_io_error, retain_typed_io_error, send_size_refusal,
+    shared_failure_cause,
 };
 pub use outbound::{
-    PacketOutbound, ProbeableOutbound, SharedSourceOutbound, TcpOutbound, WarmOutcome,
-    WarmRequirement, WarmableOutbound,
+    PacketOutbound, ProbeableOutbound, SharedSourceOutbound, TcpOutbound, TunnelDialOptions,
+    WarmOutcome, WarmRequirement, WarmableOutbound,
 };
 use packet::prepare_detached_quic_transport;
 pub(crate) use packet::{FramePoison, MuxSession};
@@ -45,7 +48,15 @@ pub use packet::{
     MultiTargetTransport, PacketTransport, PreparedUdpTransport, QuicSendAttempt, QuicSendToken,
     UdpSocketTransport, packet_transport_with_owner,
 };
-pub use registry::{ProtocolEntry, ProxyRegistry};
+pub use registry::{DialRef, ProtocolEntry, ProxyRegistry};
+
+#[cfg(test)]
+pub(crate) fn test_prefix_refusal(next: usize) -> anyhow::Error {
+    error::IntermediateTargetFailure::dial(
+        next,
+        TargetFailure(anyhow::anyhow!("next hop refused")).into(),
+    )
+}
 
 #[cfg(test)]
 use anytls::AnyTlsHandler;
@@ -225,6 +236,8 @@ impl ProxyStream {
     }
 }
 
+#[cfg(all(test, feature = "flow-observation"))]
+mod request_observation_support;
 #[cfg(test)]
 mod tests;
 

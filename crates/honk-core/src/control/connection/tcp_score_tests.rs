@@ -1,4 +1,3 @@
-use super::score::started_score_reporter_count;
 use super::*;
 
 #[tokio::test]
@@ -362,34 +361,85 @@ fn tcp_score_context_uses_target_family_not_health_family() {
 
 #[test]
 fn unpack_tcp_score_plan_deduplicates_shared_leaf_metadata() {
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "shared".into(),
+    use crate::control::reload::{OutboundConstraint, resolve_outbound_plan_for_target};
+    use honk_outbound::group::{DialKey, ScoreAttribution};
+
+    let node = Node::from_share_link("socks5://127.0.0.1:1080#shared").unwrap();
+    let exit = Node::from_share_link("socks5://127.0.0.1:1081#exit").unwrap();
+    let mut groups = ["outer", "duplicate", "via"]
+        .map(|name| Group {
+            name: name.into(),
+            policy: GroupPolicy::Score,
+            final_outbound: Some("leaf".into()),
+            exit: (name == "via").then(|| exit.name.clone()),
+            ..Default::default()
+        })
+        .to_vec();
+    groups.push(Group {
+        name: "leaf".into(),
+        policy: GroupPolicy::Score,
+        nodes: vec![node.id],
+        ..Default::default()
+    });
+    let config = Config {
+        nodes: vec![node.clone(), exit.clone()],
+        groups,
         ..Default::default()
     };
-    let plan = crate::control::reload::ResolvedScorePlan {
-        mode: SelectionPlanMode::ColdUrlTest,
-        nodes: vec![node.clone(), node],
-        health_family: IpVersion::V4,
-        feedback: vec![None, None],
-        selection_chains: vec![
-            vec!["outer".into(), "shared".into()],
-            vec!["duplicate".into(), "shared".into()],
-        ],
-        final_owners: vec![Vec::new(), Vec::new()],
-        #[cfg(feature = "native-api")]
-        observation: None,
+    let manager = GroupManager::new(&config.groups, &config.nodes);
+    let context = tcp_score_context("192.0.2.1:443".parse().unwrap(), None, IpVersion::V4);
+    let resolve = |name| {
+        resolve_outbound_plan_for_target(&config, &manager, name, &context, OutboundConstraint::Any)
     };
-    let (nodes, mode, feedback, selection_chains, _, family) = unpack_tcp_score_plan(plan);
-
-    assert_eq!(nodes.len(), 1);
-    assert_eq!(mode, SelectionPlanMode::ColdUrlTest);
-    assert!(feedback.is_empty());
+    let mut plan = resolve("outer");
+    plan.mode = SelectionPlanMode::ColdUrlTest;
+    for name in ["via", "duplicate"] {
+        let mut extra = resolve(name);
+        assert_eq!(extra.targets.len(), 1);
+        plan.targets.append(&mut extra.targets);
+        plan.feedback.append(&mut extra.feedback);
+        plan.selection_chains.append(&mut extra.selection_chains);
+        plan.final_owners.append(&mut extra.final_owners);
+    }
+    assert_eq!(plan.targets.len(), 3);
+    let bare = DialKey::Node(node.id);
     assert_eq!(
-        selection_chains[&nodes[0].id],
-        ["outer".to_owned(), "shared".to_owned()]
+        plan.targets[2].key(),
+        bare,
+        "fixture must repeat the bare key"
     );
+
+    let (targets, mode, feedback, selection_chains, final_owners, family, _) =
+        unpack_tcp_score_plan(plan);
+    assert_eq!(targets.len(), 2);
+    assert_eq!(mode, SelectionPlanMode::ColdUrlTest);
     assert_eq!(family, IpVersion::V4);
+    assert_eq!(targets[0].key(), bare);
+    let via = targets[1].key();
+    let DialKey::Route(route) = via else {
+        panic!("the same leaf through the exit must keep its own dial key");
+    };
+    assert_eq!(targets[1].node.id, node.id);
+    assert_eq!(route.leaf(), node.id);
+    assert_eq!(route.hops(), [node.id, exit.id]);
+
+    assert_eq!(
+        (feedback.len(), selection_chains.len(), final_owners.len()),
+        (2, 2, 2)
+    );
+    for (key, root) in [(bare, "outer"), (via, "via")] {
+        let attempt = &feedback[&key];
+        assert_eq!(attempt.context(), &context);
+        assert_eq!(
+            attempt.attributions(),
+            [root, "leaf"].map(|group| ScoreAttribution {
+                group: group.into(),
+                node_id: node.id,
+            })
+        );
+        assert_eq!(selection_chains[&key], [root, "leaf", "shared"]);
+        assert_eq!(final_owners[&key], [root]);
+    }
 }
 
 #[test]
@@ -417,8 +467,7 @@ fn timeout_helper_finishes_started_reporter_before_abort_drop() {
     let feedback = manager
         .feedback_for_node(nodes[0].id, context.clone())
         .unwrap();
-    let reporters = parking_lot::Mutex::new(vec![feedback.start()]);
-    assert_eq!(started_score_reporter_count(&reporters), 1);
+    let reporters = parking_lot::Mutex::new(vec![(feedback.start(), false)]);
     timeout_started_score_reporters(&reporters);
     drop(reporters);
 

@@ -41,10 +41,10 @@ export CARGO_PROFILE_DEV_OPT_LEVEL=2
 ' > "$GITHUB_WORKSPACE/target/kernel-test-bins.env"
 
 if ! test -f "$kernel_dir/$image"; then
-  curl -fsSL --retry 3 --retry-all-errors -o "$kernel_dir/$image" "$base/$image"
+  curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$kernel_dir/$image" "$base/$image"
 fi
 if ! test -f "$kernel_dir/$modules"; then
-  curl -fsSL --retry 3 --retry-all-errors -o "$kernel_dir/$modules" "$base/$modules"
+  curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$kernel_dir/$modules" "$base/$modules"
 fi
 echo "$image_sha256  $kernel_dir/$image" | sha256sum -c -
 echo "$modules_sha256  $kernel_dir/$modules" | sha256sum -c -

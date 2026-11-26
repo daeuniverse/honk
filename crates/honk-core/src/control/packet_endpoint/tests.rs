@@ -53,7 +53,7 @@ async fn local_plane_with(
     config.ensure_builtin_nodes();
     config.global.dial_mode = "ip".into();
     config.global.tcp_check_url.clear();
-    config.global.udp_check_dns = vec!["127.0.0.1:9".into()];
+    config.global.udp_check_dns = Some(vec!["127.0.0.1:9".into()]);
     config.global.preconnect_node_count = 0;
     config.global.udp_warm_node_count = 0;
     config.groups.push(honk_config::node::Group {
@@ -274,7 +274,7 @@ async fn real_udp_outbound_replies_stay_in_their_original_scope() {
         config.ensure_builtin_nodes();
         config.global.dial_mode = "ip".into();
         config.global.tcp_check_url.clear();
-        config.global.udp_check_dns = vec!["127.0.0.1:9".into()];
+        config.global.udp_check_dns = Some(vec!["127.0.0.1:9".into()]);
         let plane = super::super::tests::support::control_plane(config);
         let health = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         plane
@@ -388,7 +388,7 @@ async fn dropped_join_waiter_keeps_supervisor_until_exported_output_returns() {
         let mut config = honk_config::Config::default();
         config.ensure_builtin_nodes();
         config.global.tcp_check_url.clear();
-        config.global.udp_check_dns = vec!["127.0.0.1:9".into()];
+        config.global.udp_check_dns = Some(vec!["127.0.0.1:9".into()]);
         let plane = super::super::tests::support::control_plane(config);
         let health = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         plane

@@ -797,8 +797,8 @@ fn settle(inner: &mut StateInner, item: &Work, outcome: ScoreOutcome, now: Insta
                 c.trial_cancelled = c.trial_cancelled.saturating_add(1);
                 None
             }
-            // A refusing target says nothing about the scope's other targets.
-            ScoreOutcome::TargetFailure => {
+            // A target or routed path failure is not a failed trial of the leaf itself.
+            ScoreOutcome::TargetFailure | ScoreOutcome::RouteFailure => {
                 c.trial_failure = c.trial_failure.saturating_add(1);
                 None
             }

@@ -202,6 +202,55 @@ async fn node_management_commits_disk_catalog_and_generation_before_success() {
 }
 
 #[tokio::test]
+async fn deleting_a_bound_chain_keeps_the_managed_source_unchanged() {
+    let fixture = Fixture::new_custom(Access::Admin, false, |_, originals| {
+        originals.get_mut("main.dae").unwrap().push_str(
+            "node {\n via: front -> land\n front: 'socks5://127.0.0.1:1080'\n land: 'socks5://127.0.0.1:1081'\n}\ngroup { pool { filter: name(via) } }\n",
+        );
+    })
+    .await;
+    let before = fixture.get(CONFIG).await;
+    let catalog = fixture.get(NODES).await;
+    let node = catalog["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "via")
+        .unwrap();
+    let id = node["id"].as_str().unwrap();
+    let id_value = uuid::Uuid::parse_str(id).unwrap();
+    {
+        let active = fixture.active.read().await;
+        let via = active
+            .nodes
+            .iter()
+            .find(|node| node.id == id_value)
+            .unwrap();
+        assert!(!id_value.is_nil());
+        assert_eq!(via.derive_id(), id_value);
+        assert!(via.resolved_chain_hops().is_some());
+    }
+    error(
+        fixture
+            .request(Method::DELETE, &format!("{NODES}/{id}"))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::NOT_FOUND,
+        "capability_not_supported",
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(fixture.path("main.dae")).unwrap(),
+        fixture.originals["main.dae"]
+    );
+    let after = fixture.get(CONFIG).await;
+    assert_eq!(after["revision"], before["revision"]);
+    assert_eq!(after["generation_id"], before["generation_id"]);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn queued_delete_cannot_change_committed_creation_response() {
     use crate::native_api::management::{Mutation, NodeCreate};
 
@@ -460,6 +509,39 @@ async fn management_rejects_duplicate_invalid_and_foreign_source_entries_without
         refused["error"]["details"]["reason"],
         "configuration_unavailable"
     );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn deleting_a_chain_from_the_main_source_is_refused_without_writing() {
+    let fixture = Fixture::new_custom(Access::Admin, false, |_, originals| {
+        originals.get_mut("main.dae").unwrap().push_str(
+            "node {\n front: 'socks5://127.0.0.1:11081'\n land: 'socks5://127.0.0.1:11082'\n via: front -> land\n}\n",
+        );
+    })
+    .await;
+    let original = disk(fixture.directory.path());
+    let rows = fixture.get(NODES).await;
+    let chain = rows["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "via")
+        .unwrap();
+    error(
+        fixture
+            .request(
+                Method::DELETE,
+                &format!("{NODES}/{}", chain["id"].as_str().unwrap()),
+            )
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::NOT_FOUND,
+        "capability_not_supported",
+    )
+    .await;
+    assert_eq!(disk(fixture.directory.path()), original);
     fixture.shutdown().await;
 }
 

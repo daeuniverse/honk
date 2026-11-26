@@ -481,6 +481,17 @@ pub enum DnsDomainMatcher {
     Geosite(String),
 }
 
+/// How to match a subscription tag, with group `subtag(...)` semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsTagMatcher {
+    /// Case-sensitive whole-tag match.
+    Exact(String),
+    /// Case-sensitive substring match.
+    Keyword(String),
+    /// Regex match against the tag.
+    Regex(String),
+}
+
 /// One AND-ed condition. Matchers within the condition are OR-ed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsCond {
@@ -504,6 +515,14 @@ pub enum DnsCond {
         not: bool,
         /// IP hosts or CIDRs (OR-ed within).
         cidrs: Vec<String>,
+    },
+    /// Request only: match the subscription tags of the node whose server
+    /// host is being resolved. Ordinary queries never match a rule holding it.
+    Subtag {
+        /// Negate this condition.
+        not: bool,
+        /// Tag matchers (OR-ed within).
+        tags: Vec<DnsTagMatcher>,
     },
     /// Response only: match the upstream that produced the answer.
     Upstream {

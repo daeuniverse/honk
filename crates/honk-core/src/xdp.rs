@@ -2971,7 +2971,7 @@ async fn run_capture(
             }
             if let Some(publisher) = &runtime.gateway {
                 let mut backend = backend.write().await;
-                let plan = active_routing_plan.read().clone();
+                let plan = active_routing_plan.read().plan.clone();
                 publisher.prepare_start(&plan)?;
                 backend
                     .userspace_mut()?
@@ -3012,7 +3012,7 @@ async fn run_capture(
                 runtime.activate_capture(&shutdown, direct)?;
                 backend.userspace_mut()?.activate_gateway_start(
                     publisher,
-                    active_routing_plan.read().fingerprint,
+                    active_routing_plan.read().plan.fingerprint,
                     diagnostics_generation.read().generation,
                 )?;
             } else {
@@ -3618,7 +3618,7 @@ async fn prepare(
     };
     let policy = if gateway_enabled {
         let policy = GatewayPolicy::prepare(
-            &plane.active_routing_plan_handle().read(),
+            &plane.active_routing_plan_handle().read().plan,
             false,
             has_host.then_some(false),
         )?;
@@ -3682,7 +3682,7 @@ async fn prepare(
     };
     #[cfg(feature = "ebpf")]
     let (host_resources, source_support) = if has_host {
-        let needs_pname = plane.active_routing_plan_handle().read().features
+        let needs_pname = plane.active_routing_plan_handle().read().plan.features
             & honk_ebpf_common::ROUTING_FEATURE_PROCESS
             != 0;
         let identity = host_identity::HostIdentity::load(&budget, needs_pname)?;

@@ -58,7 +58,6 @@ impl DnsClientAnswer {
         }
     }
 
-    #[cfg(feature = "native-api")]
     pub(crate) fn outcome(&self) -> Option<&crate::dns::outcome::DnsOutcome> {
         self.0.as_ref().ok()
     }
@@ -186,8 +185,11 @@ impl DnsController {
 
     /// Resolve a domain (A + AAAA) through the *currently installed*
     /// forwarder — reload-safe, unlike holding a resolver from startup.
-    /// Used by the health-check resolver hook.
+    /// Hosts aliases and claiming `subtag()` rules take precedence for node hosts.
     pub async fn resolve_domain(&self, domain: &str) -> anyhow::Result<Vec<std::net::IpAddr>> {
+        if let Some(addresses) = self.dns_service.resolve_node_host(domain).await? {
+            return Ok(addresses);
+        }
         let resolved = self.dns_service.resolve_name(domain).await?;
         Ok(resolved.ipv4.into_iter().chain(resolved.ipv6).collect())
     }
@@ -196,6 +198,11 @@ impl DnsController {
         self.dns_service
             .provider()
             .unwrap_or_else(|| unreachable!("controller always uses runtime DNS service"))
+    }
+
+    #[inline]
+    pub(crate) fn dns_audit(&self) -> &crate::audit::DnsAudit {
+        &self.dns_service.audit
     }
 
     pub(crate) fn dns_service(&self) -> crate::dns::DnsService {
@@ -516,7 +523,19 @@ impl DnsController {
             28 => Some(IpVersion::V6),
             _ => None,
         };
-        let observation = if crate::dns::response::is_truncated(outcome.reusable()) {
+        // Only outcomes that can change the projection pay for the wire checks.
+        let projects = outcome.status() == OutcomeStatus::Accepted
+            && matches!(
+                (outcome.response_class(), family),
+                (ResponseClass::Positive | ResponseClass::Nodata, Some(_))
+                    | (ResponseClass::Nxdomain, _)
+            );
+        let observation = if projects
+            && (crate::dns::response::is_truncated(outcome.reusable())
+                || !matches!(
+                    crate::dns::response::response_rcode(outcome.reusable()),
+                    Ok(0 | 3)
+                )) {
             ProjectionObservation::Retain
         } else {
             match (outcome.status(), outcome.response_class(), family) {

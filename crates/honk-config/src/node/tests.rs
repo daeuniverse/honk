@@ -540,3 +540,60 @@ fn test_validate_redacts_vless_path_context_name() {
     let rendered = format!("{error} {error:?}");
     assert!(!rendered.contains(CANARY), "{rendered}");
 }
+
+#[test]
+fn tunneled_udp_follows_the_exit_protocol_and_vless_path() {
+    let link = |link: &str| Node::from_share_link(link).unwrap();
+    let vless = |change: &dyn Fn(&mut VlessConfig)| {
+        let mut node = link("vless://00000000-0000-0000-0000-000000000001@example.com:443");
+        change(node.vless_mut().unwrap());
+        node
+    };
+    let mut trojan_tcp = link("trojan://secret@example.com:443");
+    trojan_tcp.trojan_mut().unwrap().network = Some("tcp".into());
+    let cases = [
+        (link("trojan://secret@example.com:443"), true),
+        (
+            link("trojan://secret@example.com:443?type=ws&path=%2Fws"),
+            true,
+        ),
+        (
+            link("trojan://secret@127.0.0.1:443?ech=1&type=ws&host=a.example"),
+            false,
+        ),
+        (trojan_tcp, false),
+        (
+            link("trojan://secret@example.com:443?type=xhttp&path=%2Fx"),
+            false,
+        ),
+        (vless(&|_| {}), true),
+        (vless(&|v| v.udp_encoding = VlessUdpEncoding::Native), true),
+        (vless(&|v| v.udp_encoding = VlessUdpEncoding::Xudp), false),
+        (vless(&|v| v.udp_encoding = VlessUdpEncoding::UotV2), false),
+        (vless(&|v| v.network = Some("tcp".into())), false),
+        (
+            vless(&|v| v.multiplex = VlessMultiplex::H2 { padding: false }),
+            false,
+        ),
+        (
+            vless(&|v| v.multiplex = VlessMultiplex::xray(8, 0, Udp443Policy::Allow)),
+            false,
+        ),
+        (
+            vless(&|v| v.multiplex = VlessMultiplex::xray(-1, 0, Udp443Policy::Reject)),
+            false,
+        ),
+        (vless(&|v| v.flow = Some("xtls-rprx-vision".into())), false),
+        (link("socks5://example.com:1080"), false),
+        (link("ss://YWVzLTEyOC1nY206cGFzcw@example.com:8388"), false),
+        (link("hysteria2://auth@example.com:443"), false),
+    ];
+    for (node, expected) in cases {
+        assert_eq!(
+            node.supports_tunneled_udp(),
+            expected,
+            "{:?}",
+            node.outbound
+        );
+    }
+}

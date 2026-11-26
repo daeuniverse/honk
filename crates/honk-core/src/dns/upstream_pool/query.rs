@@ -11,7 +11,7 @@ use super::entries::{UdpFamily, UpstreamEntry};
 use super::routing::DnsDialRoute;
 use crate::dns::ecs::EcsQuery;
 use crate::dns::forwarder::DnsUpstreamPool;
-use crate::dns::transport::{IdlePressureRelease, UdpPool, UdpPoolCapacity};
+use crate::dns::transport::{IdlePressureRelease, RouteFailures, UdpPool, UdpPoolCapacity};
 
 struct UdpRetirementDrain<'a>(&'a UpstreamPool);
 
@@ -308,6 +308,7 @@ impl UpstreamPool {
         &self,
         entry: &UpstreamEntry,
     ) -> anyhow::Result<Vec<SocketAddr>> {
+        entry.check_explicit_block()?;
         entry
             .endpoint
             .resolve_addrs_budgeted(
@@ -356,6 +357,7 @@ impl UpstreamPool {
         route: &DnsDialRoute,
         raw_query: &[u8],
         business: Option<honk_outbound::group::ScoreBusinessGuard>,
+        route_failures: &mut RouteFailures,
     ) -> anyhow::Result<Vec<u8>> {
         Box::pin(async move {
             let _release = IdlePressureRelease(&self.socket_budget);
@@ -363,10 +365,26 @@ impl UpstreamPool {
                 .get_transport(entry, route.node.as_ref(), route.target)
                 .await
             {
-                Ok(transport) => transport.exchange(raw_query, business).await,
+                Ok(transport) => {
+                    transport
+                        .exchange(
+                            raw_query,
+                            business,
+                            route.route_exchange(entry.protocol, route_failures),
+                        )
+                        .await
+                }
                 Err(error) => {
                     if let Some(business) = business {
-                        business.finish(honk_outbound::group::ScoreOutcome::from_error(&error));
+                        let outcome = honk_outbound::group::ScoreOutcome::from_error(&error);
+                        let outcome = route
+                            .node
+                            .as_ref()
+                            .filter(|target| target.uses_route_evidence())
+                            .map_or(outcome, |target| {
+                                target.score_failure(outcome, error.as_ref())
+                            });
+                        business.finish(outcome);
                     }
                     Err(error)
                 }
@@ -382,6 +400,7 @@ impl UpstreamPool {
         route: &DnsDialRoute,
         raw_query: &[u8],
         original: &mut Option<honk_outbound::group::ScoreContinuation>,
+        route_failures: &mut RouteFailures,
     ) -> anyhow::Result<Vec<u8>> {
         let exchange = async {
             let node = route
@@ -391,7 +410,7 @@ impl UpstreamPool {
             let _admission = self.admit_query().await?;
             let business = admit_score_attempt(route.feedback.as_ref(), original)?;
             let response = self
-                .exchange_routed(entry, route, raw_query, business)
+                .exchange_routed(entry, route, raw_query, business, route_failures)
                 .await?;
             let response = if crate::dns::response::is_truncated(&response) {
                 crate::observe::flows::dns::tcp_fallback();
@@ -401,7 +420,7 @@ impl UpstreamPool {
                     "DNS upstream '{}' proxied UDP answer has TC set — retrying over proxied TCP",
                     upstream_name
                 );
-                self.exchange_routed(entry, route, raw_query, business)
+                self.exchange_routed(entry, route, raw_query, business, route_failures)
                     .await?
             } else {
                 response
@@ -409,7 +428,7 @@ impl UpstreamPool {
             debug!(
                 "DNS upstream '{}' (udp via proxy {}) returned {} bytes",
                 upstream_name,
-                node.name,
+                node.node.name,
                 response.len()
             );
             Ok(response)
@@ -437,8 +456,14 @@ impl UpstreamPool {
             );
             let exchange = async {
                 crate::observe::flows::dns::tcp_fallback();
-                self.exchange_routed(entry, route, effective_query, None)
-                    .await
+                self.exchange_routed(
+                    entry,
+                    route,
+                    effective_query,
+                    None,
+                    &mut RouteFailures::default(),
+                )
+                .await
             };
             crate::observe::scope_pin!(exchange);
             let exchange =
@@ -466,6 +491,7 @@ impl UpstreamPool {
         raw_query: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
         let mut original_business = None;
+        let mut route_failures = RouteFailures::default();
         let current = { entry.udp.lock().current_address() };
         let has_traffic_router =
             self.traffic_router_snapshot.read().is_some() || self.traffic_router.read().is_some();
@@ -497,6 +523,7 @@ impl UpstreamPool {
                         &route,
                         raw_query,
                         &mut original_business,
+                        &mut route_failures,
                     )
                     .await
                 {
@@ -559,6 +586,7 @@ impl UpstreamPool {
                         &route,
                         raw_query,
                         &mut original_business,
+                        &mut route_failures,
                     )
                     .await
                 {
@@ -609,6 +637,7 @@ impl UpstreamPool {
                     &route,
                     raw_query,
                     &mut original_business,
+                    &mut route_failures,
                 )
                 .await
                 .with_context(|| {
@@ -653,6 +682,7 @@ impl UpstreamPool {
         let mut last_error = None;
         let mut first_error = None;
         let mut original_business = None;
+        let mut route_failures = RouteFailures::default();
         for target in targets {
             let route = self
                 .resolve_dial_route_for_address(entry, target, original_business.as_ref())
@@ -665,7 +695,7 @@ impl UpstreamPool {
             debug!(
                 "DNS upstream '{}' dial leaf={:?} (forced={})",
                 upstream_name,
-                route.node.as_ref().map(|node| node.name.as_str()),
+                route.node.as_ref().map(|target| target.node.name.as_str()),
                 entry.outbound.is_some()
             );
             let injected = if route.node.is_none() {
@@ -675,7 +705,13 @@ impl UpstreamPool {
             };
             let effective_query = injected.as_ref().map_or(raw_query, EcsQuery::wire);
             let response = {
-                let exchange = self.exchange_routed(entry, &route, effective_query, business);
+                let exchange = self.exchange_routed(
+                    entry,
+                    &route,
+                    effective_query,
+                    business,
+                    &mut route_failures,
+                );
                 crate::observe::scope_pin!(exchange);
                 let exchange = crate::observe::flows::dns::outbound_scope(
                     route.observation.as_ref(),
@@ -693,7 +729,7 @@ impl UpstreamPool {
                         route
                             .node
                             .as_ref()
-                            .map(|node| node.name.as_str())
+                            .map(|target| target.node.name.as_str())
                             .unwrap_or("direct"),
                         response.len()
                     );
@@ -711,7 +747,7 @@ impl UpstreamPool {
                         upstream = upstream_name,
                         protocol = ?entry.protocol,
                         server = %route.target,
-                        leaf = ?route.node.as_ref().map(|node| node.name.as_str()),
+                        leaf = ?route.node.as_ref().map(|target| target.node.name.as_str()),
                         error = %error,
                         "DNS upstream route failed"
                     );

@@ -347,8 +347,10 @@ impl Stats {
         ) {
             return;
         }
-        let hard_failure = sample.outcome != ScoreOutcome::Success
-            && hard_failure
+        let hard_failure = !matches!(
+            sample.outcome,
+            ScoreOutcome::Success | ScoreOutcome::RouteFailure
+        ) && hard_failure
             && match sample.outcome {
                 ScoreOutcome::SharedNodeFailure(episode) => {
                     let fresh = episode > self.last_node_failure_episode;
@@ -763,6 +765,7 @@ impl ScorePolicyState {
                         && matches!(
                             sample.outcome,
                             ScoreOutcome::Success
+                                | ScoreOutcome::RouteFailure
                                 | ScoreOutcome::Rejected
                                 | ScoreOutcome::Cancelled
                                 | ScoreOutcome::Shutdown

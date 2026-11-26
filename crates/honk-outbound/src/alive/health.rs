@@ -8,9 +8,109 @@ use honk_config::config::{BLOCK_NODE_ID, DIRECT_NODE_ID};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+pub(super) type ConnectivityCallback = dyn Fn(Option<Uuid>) + Send + Sync;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProbeChange {
+    None,
+    Node,
+    Route,
+}
+
+impl ProbeChange {
+    fn from_evidence(node_changed: bool, route_changed: bool) -> Self {
+        if node_changed {
+            Self::Node
+        } else if route_changed {
+            Self::Route
+        } else {
+            Self::None
+        }
+    }
+}
+
 impl AliveDialerSet {
+    pub(super) fn notify_probe_change(
+        &self,
+        change: ProbeChange,
+        node: Uuid,
+        domain: ProbeDomain,
+        family: IpVersion,
+        alive: bool,
+        current: impl Fn() -> bool,
+    ) {
+        match change {
+            ProbeChange::Node => self.notify_health_change(node, domain, family, alive, current),
+            ProbeChange::Route if current() => self.notify_route_change(node, family),
+            _ => (),
+        }
+    }
+
+    pub fn set_connectivity_callback(
+        &self,
+        callback: impl Fn(Option<Uuid>) + Send + Sync + 'static,
+    ) {
+        *self.connectivity_callback.write() = Some(std::sync::Arc::new(callback));
+    }
+
+    pub fn notify_policy_change(&self) {
+        let callback = self.connectivity_callback.read().clone();
+        if let Some(callback) = callback {
+            callback(None);
+        }
+    }
+
+    pub(super) fn notify_route_change(&self, node_id: Uuid, _family: IpVersion) {
+        let callback = self.connectivity_callback.read().clone();
+        if let Some(callback) = callback {
+            callback(Some(node_id));
+        }
+    }
+
     fn push_ebpf(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion, alive: bool) {
         self.notify_health_change(node_id, domain, ipver, alive, || true);
+    }
+
+    pub(super) fn notify_routed_udp_change(
+        &self,
+        node_id: Uuid,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        role: super::UdpHopRole,
+        alive: bool,
+        is_current: impl Fn() -> bool,
+    ) {
+        if !is_current() {
+            return;
+        }
+        let callback = self.routed_udp_connectivity_callback.read().clone();
+        if let Some(callback) = callback {
+            callback(node_id, domain, ipver);
+        }
+        if !alive && is_current() {
+            let callback = self.routed_udp_death_callback.read().clone();
+            if let Some(callback) = callback
+                && is_current()
+                && self.routed_udp_retirable(node_id, domain, ipver, role)
+            {
+                callback(node_id, domain, ipver, role);
+            }
+        }
+    }
+
+    pub(super) fn routed_udp_retirable(
+        &self,
+        id: Uuid,
+        domain: ProbeDomain,
+        family: IpVersion,
+        role: super::UdpHopRole,
+    ) -> bool {
+        domain != ProbeDomain::Tcp
+            && (match role {
+                super::UdpHopRole::Framing => !self.routed_udp_node_available(id, domain, family),
+                super::UdpHopRole::Carrier => !self.udp_carrier_available(id, domain, family),
+            })
+            && !self.udp_sibling_alive_in(id, domain, family, role)
     }
 
     pub(super) fn notify_health_change(
@@ -85,18 +185,33 @@ impl AliveDialerSet {
     /// recorded, currently-alive state — the node is still carrying UDP
     /// traffic despite this domain's death.
     fn udp_sibling_explicitly_alive(&self, node_id: Uuid, dead: ProbeDomain) -> bool {
+        [IpVersion::V4, IpVersion::V6]
+            .into_iter()
+            .any(|v| self.udp_sibling_alive_in(node_id, dead, v, super::UdpHopRole::Framing))
+    }
+
+    fn udp_sibling_alive_in(
+        &self,
+        node_id: Uuid,
+        dead: ProbeDomain,
+        family: IpVersion,
+        role: super::UdpHopRole,
+    ) -> bool {
         let sibling = match dead {
             ProbeDomain::DataUdp => ProbeDomain::DnsUdp,
             ProbeDomain::DnsUdp => ProbeDomain::DataUdp,
             ProbeDomain::Tcp => return false,
         };
+        if role == super::UdpHopRole::Carrier {
+            return self.udp_carrier_available(node_id, sibling, family)
+                && self.routed_udp_hop_proven(node_id, sibling, family, role);
+        }
         let history = self.probe_history.read();
-        [IpVersion::V4, IpVersion::V6].into_iter().any(|v| {
-            self.is_alive_for(node_id, sibling, v)
-                && history
-                    .get(&(node_id, alive_index(sibling, v)))
-                    .is_some_and(|records| !records.is_empty())
-        })
+        self.is_alive_for(node_id, sibling, family)
+            && (history
+                .get(&(node_id, alive_index(sibling, family)))
+                .is_some_and(|records| !records.is_empty())
+                || self.routed_udp_node_proven(node_id, sibling, family))
     }
 
     #[cfg(test)]
@@ -114,13 +229,12 @@ impl AliveDialerSet {
         ipver: IpVersion,
         latency: Duration,
     ) {
-        if self.record_probe_latency_state(node_id, domain, ipver, latency, true) {
-            self.push_ebpf(node_id, domain, ipver, true);
-        }
+        let change = self.record_probe_latency_state(node_id, domain, ipver, latency, true);
+        self.notify_probe_change(change, node_id, domain, ipver, true, || true);
     }
 
     /// Check if a node is within its grace period.
-    fn is_in_grace_period(&self, node_id: Uuid) -> bool {
+    pub(super) fn is_in_grace_period(&self, node_id: Uuid) -> bool {
         self.node_registered_at
             .read()
             .get(&node_id)
@@ -128,17 +242,18 @@ impl AliveDialerSet {
             .unwrap_or(false)
     }
 
-    /// Append a probe record to history.
+    /// A first UDP sample can replace inherited TCP eligibility even without a node flip.
     fn record_probe_history(
         &self,
         node_id: Uuid,
         idx: usize,
         success: bool,
         latency: Option<Duration>,
-    ) {
+    ) -> bool {
         let key = (node_id, idx);
         let mut history = self.probe_history.write();
         let entry = history.entry(key).or_default();
+        let first_udp_sample = idx >= IpVersion::count() && entry.is_empty();
         entry.push(ProbeRecord {
             timestamp: Instant::now(),
             success,
@@ -147,6 +262,7 @@ impl AliveDialerSet {
         if entry.len() > MAX_PROBE_HISTORY {
             entry.remove(0);
         }
+        first_udp_sample
     }
 
     /// Internal: mark a node as unavailable using either probe or traffic counters.
@@ -162,19 +278,46 @@ impl AliveDialerSet {
         force: bool,
         is_traffic: bool,
     ) {
-        if self.mark_unavailable_state(node_id, domain, ipver, force, is_traffic) {
-            self.notify_health_change(node_id, domain, ipver, false, || true);
-        }
+        let change = self.unavailable_change(node_id, domain, ipver, force, is_traffic);
+        self.notify_probe_change(change, node_id, domain, ipver, false, || true);
     }
 
-    pub(super) fn mark_unavailable_state(
+    pub(super) fn mark_routed_unavailable_state(
+        &self,
+        node_id: Uuid,
+        family: IpVersion,
+        event: u64,
+    ) -> bool {
+        self.unavailable_change_with_route(
+            node_id,
+            ProbeDomain::Tcp,
+            family,
+            false,
+            true,
+            Some(event),
+        ) == ProbeChange::Node
+    }
+
+    pub(super) fn unavailable_change(
         &self,
         node_id: Uuid,
         domain: ProbeDomain,
         ipver: IpVersion,
         force: bool,
         is_traffic: bool,
-    ) -> bool {
+    ) -> ProbeChange {
+        self.unavailable_change_with_route(node_id, domain, ipver, force, is_traffic, None)
+    }
+
+    fn unavailable_change_with_route(
+        &self,
+        node_id: Uuid,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        force: bool,
+        is_traffic: bool,
+        routed_event: Option<u64>,
+    ) -> ProbeChange {
         let idx = alive_index(domain, ipver);
 
         // Builtins are the base layer, not candidates: direct failures are
@@ -185,7 +328,7 @@ impl AliveDialerSet {
         // proxied. Only the liveness verdict is suppressed — probes and
         // dial outcomes still feed latency ranking.
         if node_id == DIRECT_NODE_ID || node_id == BLOCK_NODE_ID {
-            return false;
+            return ProbeChange::None;
         }
 
         // During the grace period (fresh registrations, e.g. right after a
@@ -194,8 +337,10 @@ impl AliveDialerSet {
         // and cause a full proxy outage that then needs minutes of revival
         // cycles to recover from. Forced deaths always bypass grace.
         if !force && self.is_in_grace_period(node_id) {
-            self.record_probe_history(node_id, idx, false, None);
-            return false;
+            return ProbeChange::from_evidence(
+                false,
+                self.record_probe_history(node_id, idx, false, None),
+            );
         }
 
         let threshold = if is_traffic {
@@ -231,7 +376,11 @@ impl AliveDialerSet {
                     e.alive = false;
                 }
             }
-            was && !e.alive && !force
+            let changed = was && !e.alive;
+            if changed || force {
+                e.route_down_at = routed_event.unwrap_or(0);
+            }
+            changed
         });
 
         if !is_traffic {
@@ -241,8 +390,8 @@ impl AliveDialerSet {
                 .mark_probe_unavailable();
         }
 
-        self.record_probe_history(node_id, idx, false, None);
-        changed
+        let first = self.record_probe_history(node_id, idx, false, None);
+        ProbeChange::from_evidence(changed && !force, first || changed)
     }
 
     pub(super) fn mark_dead_for(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
@@ -282,6 +431,18 @@ impl AliveDialerSet {
     /// For DataUDP: a single successful real UDP flow can instantly revive
     /// the data-UDP health domain (Go: `ReportAvailableTraffic`).
     pub fn report_available_traffic(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
+        if let Some(notify) = self.settle_available_traffic(node_id, domain, ipver) {
+            notify();
+        }
+    }
+
+    /// Apply the traffic sample now and defer callbacks until the caller releases its guards.
+    pub fn settle_available_traffic(
+        &self,
+        node_id: Uuid,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+    ) -> Option<impl FnOnce() + '_> {
         let idx = alive_index(domain, ipver);
         // A real dial success breaks the consecutive dial-failure streak —
         // even when the state is clean and nothing else needs updating.
@@ -294,16 +455,14 @@ impl AliveDialerSet {
             .get(&node_id)
             .is_some_and(|states| states[idx].is_clean_alive())
         {
-            return;
+            return None;
         }
         let was_alive = self.with_state(node_id, idx, |e| {
             let was = e.alive;
             e.reset_on_success();
             was
         });
-        if !was_alive {
-            self.push_ebpf(node_id, domain, ipver, true);
-        }
+        (!was_alive).then_some(move || self.push_ebpf(node_id, domain, ipver, true))
     }
 
     /// Trigger an emergency TCP health check on this node.
@@ -358,9 +517,8 @@ impl AliveDialerSet {
         ipver: IpVersion,
         latency: Duration,
     ) {
-        if self.record_probe_latency_state(node_id, domain, ipver, latency, false) {
-            self.push_ebpf(node_id, domain, ipver, true);
-        }
+        let change = self.record_probe_latency_state(node_id, domain, ipver, latency, false);
+        self.notify_probe_change(change, node_id, domain, ipver, true, || true);
     }
 
     pub(super) fn record_probe_latency_state(
@@ -370,7 +528,7 @@ impl AliveDialerSet {
         ipver: IpVersion,
         latency: Duration,
         immediate: bool,
-    ) -> bool {
+    ) -> ProbeChange {
         let idx = alive_index(domain, ipver);
         let revived = self.with_state(node_id, idx, |e| {
             let was = e.alive;
@@ -383,6 +541,7 @@ impl AliveDialerSet {
                 e.traffic_failures = 0;
                 if e.consecutive_successes >= RECOVERY_SUCCESSES_NEEDED {
                     e.alive = true;
+                    e.route_down_at = 0;
                     e.stopped = false;
                     e.cooldown_until = Instant::now();
                     e.consecutive_successes = 0;
@@ -407,8 +566,8 @@ impl AliveDialerSet {
                 .mark_available(latency);
         }
 
-        self.record_probe_history(node_id, idx, true, Some(latency));
-        revived
+        let first = self.record_probe_history(node_id, idx, true, Some(latency));
+        ProbeChange::from_evidence(revived, first)
     }
 
     /// Read the moving average latency for a node-domain pair.

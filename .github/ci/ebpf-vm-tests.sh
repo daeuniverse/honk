@@ -28,6 +28,19 @@ test "$(stat -f -c %T /sys/fs/bpf)" = bpf_fs
 
 log_dir="${GITHUB_WORKSPACE:?}/target/vm-tests/${HONK_CI_VM_LANE:?}"
 mkdir -p "$log_dir"
+# A hung gate prints nothing before the step timeout; record every task's
+# state and kernel stack first so the uploaded guest output shows where.
+(
+  sleep 2100
+  echo 1 > /proc/sys/kernel/sysrq
+  echo t > /proc/sysrq-trigger
+  dmesg > "$log_dir/hang-dmesg.txt"
+  ps -eo pid,ppid,stat,wchan:32,etime,args > "$log_dir/hang-ps.txt"
+) </dev/null >/dev/null 2>&1 &
+watchdog=$!
+# vng waits for the console to close, so the watchdog and its sleep must not
+# hold it or outlive the gate.
+trap 'pkill -P "$watchdog" 2>/dev/null || true; kill "$watchdog" 2>/dev/null || true' EXIT
 
 host_smoke() {
   HONK_XDP_DAEMON="$HONK_XDP_DAEMON" \
@@ -75,9 +88,16 @@ for real_test in \
 done
 "$HONK_CORE_TEST_BIN" ebpf::real::receive_trace::tests --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-core-receive-trace.log"
-"$HONK_CORE_TEST_BIN" \
-  ebpf::real::routing::tests \
-  --ignored --test-threads=1 2>&1 | tee "$log_dir/honk-core-routing.log"
+route_health_test=ebpf::real::routing::tests::dns_ownership::health::accepted_prefix_failure_updates_real_tc_admission
+test "$("$HONK_CORE_TEST_BIN" "$route_health_test" --exact --ignored --list --format terse)" = "$route_health_test: test"
+"$HONK_CORE_TEST_BIN" "$route_health_test" --exact --ignored --test-threads=1 \
+  2>&1 | tee "$log_dir/honk-core-route-health.log"
+udp_route_health_test=ebpf::real::routing::tests::dns_ownership::health::accepted_udp_prefix_failure_updates_real_tc_admission
+test "$("$HONK_CORE_TEST_BIN" "$udp_route_health_test" --exact --ignored --list --format terse)" = "$udp_route_health_test: test"
+"$HONK_CORE_TEST_BIN" "$udp_route_health_test" --exact --ignored --test-threads=1 \
+  2>&1 | tee "$log_dir/honk-core-udp-route-health.log"
+"$HONK_CORE_TEST_BIN" ebpf::real::routing::tests --skip "$route_health_test" \
+  --skip "$udp_route_health_test" --ignored --test-threads=1 2>&1 | tee "$log_dir/honk-core-routing.log"
 "$HONK_DATAPATH_TEST_BIN" --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/ebpf-datapath.log"
 "$HONK_NFQUEUE_TEST_BIN" nfqueue_service_isolated_netns_kernel_contract \

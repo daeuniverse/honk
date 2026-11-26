@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use honk_config::Config;
-use honk_config::node::Node;
 use honk_outbound::group::{
     ScoreAttempt, ScoreBusinessGuard, ScoreContinuation, ScoreOutcome, ScoreReporter,
     SharedGroupManager,
@@ -305,9 +304,9 @@ async fn fetch_routed(
             UiRoute::Block => {
                 anyhow::bail!("routing sends the external UI download to 'block'");
             }
-            UiRoute::Proxy { node, feedback } => {
+            UiRoute::Proxy { proxy, feedback } => {
                 let target = (&parsed, host.as_str(), port);
-                fetch_proxied(ctx, &node, feedback, target, archive, stop).await?
+                fetch_proxied(&ctx.proxy_registry, &proxy, feedback, target, archive, stop).await?
             }
         };
         match response {
@@ -374,53 +373,78 @@ enum ProxiedFetch {
     Stopped,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum UiResponseFailure {
+    #[error("download external ui failed: {0}")]
+    Status(http::StatusCode),
+    #[error("{0}")]
+    Archive(#[source] anyhow::Error),
+}
+
 /// One proxied GET of `url` through `node`'s tunnel to `host:port`.
 async fn fetch_proxied(
-    ctx: &UiDownloadContext,
-    node: &Node,
+    registry: &ProxyRegistry,
+    proxy: &crate::download_route::DownloadProxy,
     feedback: Option<ScoreAttempt>,
     (url, host, port): (&reqwest::Url, &str, u16),
     archive: &mut ArchiveFile,
     stop: &mut Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<ProxiedFetch> {
-    let outbounds = ctx.outbounds();
-    let tunnel = tokio::select! {
-        biased;
-        _ = download_stopped(stop) => return Ok(ProxiedFetch::Stopped),
-        tunnel = outbounds.tunnel(node, (host, port)) => tunnel?,
-    };
+    if stop
+        .as_ref()
+        .is_some_and(|stop| *stop.borrow() || stop.has_changed().is_err())
+    {
+        return Ok(ProxiedFetch::Stopped);
+    }
+    let tunnel = proxy.tunnel(registry, (host, port))?;
     let mut reporter = None;
+    let mut stamp = None;
     let result = tokio::select! {
         biased;
         _ = download_stopped(stop) => Ok(ProxiedFetch::Stopped),
         result = async {
-        reporter = feedback
-            .as_ref()
-            .map(ScoreAttempt::begin)
-            .transpose()?
-            .map(ScoreBusinessGuard::start);
-        match tunnel.dial().await {
-        Ok(stream) => match tokio::time::timeout(
-            DOWNLOAD_TIMEOUT,
-            async {
+            reporter = feedback
+                .as_ref()
+                .map(ScoreAttempt::begin)
+                .transpose()?
+                .map(ScoreBusinessGuard::start);
+            stamp = proxy.admit_route_health();
+            let stream = tunnel.dial().await.map_err(|error| {
+                error.context("external UI download dial failed")
+            })?;
+            tokio::time::timeout(DOWNLOAD_TIMEOUT, async {
                 let by = tokio::time::Instant::now() + DOWNLOAD_TIMEOUT;
-                proxied_get(&crate::marked_http::Client::new()?, stream, url, archive, &reporter, by).await
-            },
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(timed_out()),
-        },
-        Err(e) => Err(e.context("external UI download dial failed")),
-        } } => result,
+                proxied_get(&crate::marked_http::Client::new()?, stream, url, archive, &reporter, by)
+                    .await
+            })
+            .await
+            .map_err(|_| timed_out())?
+        } => result,
     };
+    let response_failure = result
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<UiResponseFailure>());
+    let archive_failure = matches!(response_failure, Some(UiResponseFailure::Archive(_)));
     if let Some(reporter) = &reporter {
         reporter.finish(match &result {
             Ok(ProxiedFetch::Stopped) => ScoreOutcome::Cancelled,
             Ok(_) => ScoreOutcome::Success,
+            Err(_) if stamp.is_some() && archive_failure => ScoreOutcome::Cancelled,
+            Err(error) if stamp.is_some() => proxy
+                .target
+                .score_failure(ScoreOutcome::from_error(error), error.as_ref()),
             Err(error) => ScoreOutcome::from_error(error),
         });
+    }
+    match &result {
+        Ok(ProxiedFetch::Stopped) => {}
+        Ok(_) => proxy.report_route_outcome(stamp, Ok(())),
+        Err(_) if archive_failure => {}
+        Err(_) if matches!(response_failure, Some(UiResponseFailure::Status(_))) => {
+            proxy.report_route_outcome(stamp, Ok(()));
+        }
+        Err(error) => proxy.report_route_outcome(stamp, Err(error.as_ref())),
     }
     tunnel.close().await?;
     result
@@ -477,13 +501,16 @@ async fn receive(
         return Ok(ProxiedFetch::Redirect(location));
     }
     if !response.status().is_success() {
-        anyhow::bail!("download external ui failed: {}", response.status());
+        return Err(UiResponseFailure::Status(response.status()).into());
     }
     while let Some(chunk) = response.body_mut().chunk().await? {
         if let Some(reporter) = reporter {
             reporter.rx(chunk.len() as u64);
         }
-        archive.append(&chunk).await?;
+        archive
+            .append(&chunk)
+            .await
+            .map_err(UiResponseFailure::Archive)?;
     }
     Ok(ProxiedFetch::Body)
 }
@@ -693,6 +720,7 @@ fn remove_all_in_directory(directory: &Path) {
 mod tests {
     use super::*;
     use honk_config::group::{Group, GroupPolicy};
+    use honk_config::node::Node;
     use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
     use honk_config::types::NodeProtocol;
     use honk_outbound::alive::{IpVersion, ProbeDomain};
@@ -1296,6 +1324,156 @@ mod tests {
             b"<html>p</html>"
         );
     }
+
+    #[tokio::test]
+    async fn a_download_selected_before_retirement_cannot_dial_the_successor() {
+        use crate::test_support::{socks5_chain, socks5_relay};
+        use honk_outbound::runtime::OutboundRuntimeRegistry;
+
+        let front = socks5_relay().await;
+        let land = socks5_relay().await;
+        let [_, leaf, exit] = socks5_chain(&front, &land);
+        let mut config = Config {
+            groups: vec![Group {
+                name: "dashboard".into(),
+                nodes: vec![leaf.id],
+                exit: Some(exit.name.clone()),
+                ..Default::default()
+            }],
+            nodes: vec![leaf, exit],
+            ..Default::default()
+        };
+        config.experimental.clash_api.external_ui_download_detour = "dashboard".into();
+        let old = Arc::new(OutboundRuntimeRegistry::build(&config.nodes).unwrap());
+        let successor = Arc::new(OutboundRuntimeRegistry::build(&config.nodes).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path(), &[]);
+        *ctx.group_manager.write() = Arc::new(GroupManager::new(&config.groups, &config.nodes));
+        *ctx.config.write().await = Arc::new(config);
+        *ctx.runtime_registry.write() = Arc::clone(&old);
+        let origin = spawn_zip_server(make_zip(&[("dist/index.html", b"new")])).await;
+        let url = reqwest::Url::parse(&format!("http://{origin}/ui.zip")).unwrap();
+        let UiRoute::Proxy { proxy, feedback } =
+            decide_route(&ctx, "127.0.0.1", origin.port(), None)
+                .await
+                .unwrap()
+        else {
+            panic!("expected a routed download");
+        };
+
+        *ctx.runtime_registry.write() = successor;
+        old.begin_retirement();
+        let mut archive = ArchiveFile::create(dir.path()).unwrap();
+        let Err(error) = fetch_proxied(
+            &ctx.proxy_registry,
+            &proxy,
+            feedback,
+            (&url, "127.0.0.1", origin.port()),
+            &mut archive,
+            &mut None,
+        )
+        .await
+        else {
+            panic!("a retired route dialed the origin");
+        };
+        assert_eq!(
+            honk_outbound::proxy::packet_rejection(&error),
+            Some(honk_outbound::proxy::PacketRejection::Cancelled)
+        );
+        assert!(front.requests.lock().is_empty() && land.requests.lock().is_empty());
+        drop(archive);
+        download_external_ui(&ctx, url.as_str()).await.unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("index.html")).unwrap(),
+            b"new"
+        );
+        assert_eq!(*front.requests.lock(), [land.addr]);
+        assert_eq!(*land.requests.lock(), [origin]);
+    }
+
+    #[tokio::test]
+    async fn a_valid_routed_ui_reply_can_restore_health_before_zip_validation() {
+        use crate::test_support::{socks5_chain, socks5_relay};
+        use honk_outbound::alive::AliveDialerSet;
+        use honk_outbound::group::SelectorNetworks;
+        use honk_outbound::runtime::OutboundRuntimeRegistry;
+
+        let front = socks5_relay().await;
+        let land = socks5_relay().await;
+        let [_, leaf, exit] = socks5_chain(&front, &land);
+        let exit_id = exit.id;
+        let mut config = Config {
+            groups: vec![Group {
+                name: "dashboard".into(),
+                policy: GroupPolicy::Selector,
+                nodes: vec![leaf.id, exit.id],
+                exit: Some(exit.name.clone()),
+                ..Default::default()
+            }],
+            nodes: vec![leaf, exit],
+            ..Default::default()
+        };
+        config.experimental.clash_api.external_ui_download_detour = "dashboard".into();
+        let alive = Arc::new(AliveDialerSet::new());
+        let group_manager = Arc::new(GroupManager::with_alive_set(
+            &config.groups,
+            &config.nodes,
+            Some(Arc::clone(&alive)),
+        ));
+        group_manager.publish_route_health();
+        let set_pin = |member| {
+            group_manager
+                .set_selector_choice("dashboard", member, SelectorNetworks::Tcp)
+                .unwrap()
+        };
+        let original_revision = set_pin("front");
+        let fail = || alive.record_dial_failure(exit_id, ProbeDomain::Tcp, IpVersion::V4);
+        fail();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path(), &[]);
+        *ctx.runtime_registry.write() =
+            Arc::new(OutboundRuntimeRegistry::build(&config.nodes).unwrap());
+        *ctx.group_manager.write() = Arc::clone(&group_manager);
+        *ctx.config.write().await = Arc::new(config);
+        let body = b"this reply is not a zip file";
+        let origin = spawn_zip_server(body.to_vec()).await;
+        let url = reqwest::Url::parse(&format!("http://{origin}/ui.zip")).unwrap();
+
+        assert!(download_external_ui(&ctx, url.as_str()).await.is_err());
+        assert_eq!(*front.requests.lock(), [land.addr]);
+        assert_eq!(*land.requests.lock(), [origin]);
+        fail();
+        assert!(!alive.is_failure_demoted(exit_id, ProbeDomain::Tcp, IpVersion::V4));
+
+        let UiRoute::Proxy { proxy, feedback } =
+            decide_route(&ctx, "127.0.0.1", origin.port(), None)
+                .await
+                .unwrap()
+        else {
+            panic!("expected a routed download");
+        };
+        assert_eq!(proxy.target.node.name, "front");
+        assert!(set_pin("land") > original_revision);
+        let mut archive = ArchiveFile::create(dir.path()).unwrap();
+        let fetched = fetch_proxied(
+            &ctx.proxy_registry,
+            &proxy,
+            feedback,
+            (&url, "127.0.0.1", origin.port()),
+            &mut archive,
+            &mut None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(fetched, ProxiedFetch::Body));
+        assert_eq!(archive_bytes(archive).await, body.as_slice());
+        assert_eq!(*front.requests.lock(), [land.addr; 2]);
+        assert_eq!(*land.requests.lock(), [origin; 2]);
+        set_pin("front");
+        fail();
+        assert!(alive.is_failure_demoted(exit_id, ProbeDomain::Tcp, IpVersion::V4));
+    }
+
     #[tokio::test]
     async fn score_route_attributes_target_and_rewards_useful_body_exchange() {
         let body = b"dashboard bytes".to_vec();
@@ -1359,13 +1537,13 @@ mod tests {
             ))),
         };
 
-        let UiRoute::Proxy { node, feedback } = decide_route(&ctx, "127.0.0.1", addr.port(), None)
+        let UiRoute::Proxy { proxy, feedback } = decide_route(&ctx, "127.0.0.1", addr.port(), None)
             .await
             .unwrap()
         else {
             panic!("Score group must resolve to a proxy leaf");
         };
-        assert_eq!(node.id, nodes[0].id);
+        assert_eq!(proxy.target.node.id, nodes[0].id);
         let feedback = feedback.expect("Score route must carry feedback");
         assert_eq!(
             feedback
@@ -1378,8 +1556,8 @@ mod tests {
         let mut archive = ArchiveFile::create(dir.path()).unwrap();
         let url = reqwest::Url::parse(&format!("http://{addr}/ui.zip")).unwrap();
         let fetched = fetch_proxied(
-            &ctx,
-            &node,
+            &ctx.proxy_registry,
+            &proxy,
             Some(feedback),
             (&url, "127.0.0.1", addr.port()),
             &mut archive,
@@ -1390,24 +1568,24 @@ mod tests {
         assert!(matches!(fetched, ProxiedFetch::Body));
         assert_eq!(archive_bytes(archive).await, body);
 
-        let UiRoute::Proxy { node, feedback } = decide_route(&ctx, "127.0.0.1", addr.port(), None)
+        let UiRoute::Proxy { proxy, feedback } = decide_route(&ctx, "127.0.0.1", addr.port(), None)
             .await
             .unwrap()
         else {
             panic!("Score group must resolve to a proxy leaf");
         };
-        assert_eq!(node.id, nodes[1].id);
+        assert_eq!(proxy.target.node.id, nodes[1].id);
         let reporter = feedback.unwrap().begin().unwrap().start();
         reporter.setup_succeeded();
         reporter.finish(ScoreOutcome::Success);
 
-        let UiRoute::Proxy { node, .. } = decide_route(&ctx, "127.0.0.1", addr.port(), None)
+        let UiRoute::Proxy { proxy, .. } = decide_route(&ctx, "127.0.0.1", addr.port(), None)
             .await
             .unwrap()
         else {
             panic!("Score group must resolve to a proxy leaf");
         };
-        assert_eq!(node.id, nodes[0].id);
+        assert_eq!(proxy.target.node.id, nodes[0].id);
     }
 
     #[tokio::test]

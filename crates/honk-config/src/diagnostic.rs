@@ -238,6 +238,9 @@ pub(crate) fn project_legacy(d: ConfigDiagnostic, source: SourceRef) -> Detailed
         "experimental.cache_file.store_fakeip",
         "experimental.cache_file.store_rdrc",
         "experimental.cache_file.store_dns",
+        "assets.geodata.auto_update",
+        "assets.geodata.cron",
+        "assets.geodata.checksum",
     ]
     .into_iter()
     .find(|setting| *setting == d.setting);
@@ -286,6 +289,8 @@ pub(crate) fn project_legacy(d: ConfigDiagnostic, source: SourceRef) -> Detailed
         "duration is not milliseconds, `ms` or `s`; keeping the default (30ms)",
         "value is not a boolean spelling honk recognises; using fallback false",
         "value is not a boolean; using fallback true",
+        "value is not a boolean; ignored",
+        "value is not a five-field cron expression that fires at most four times a day; ignored",
         "honk could not parse this port as a decimal in 0-65535; using fallback 12345",
         "honk could not parse this port as a decimal in 0-65535; using fallback 0",
         "honk could not parse this mark as a u32; using fallback 0",

@@ -1,9 +1,20 @@
 use super::*;
+use honk_outbound::alive::{RouteHealthRevision, RouteHealthStamp};
+use honk_outbound::group::DialKey;
+
+#[derive(Clone, Copy)]
+pub(super) struct RouteTraffic {
+    pub(super) stamp: RouteHealthStamp,
+    pub(super) family: IpVersion,
+    pub(super) latency: Option<Duration>,
+    pub(super) confirmed: bool,
+}
 
 pub(super) struct TcpDialWinner {
     pub(super) stream: crate::proxy::ProxyStream,
-    pub(super) node: Node,
+    pub(super) target: OwnedTarget,
     pub(super) reporter: Option<crate::group::ScoreReporter>,
+    pub(super) route_traffic: Option<RouteTraffic>,
     #[cfg(feature = "native-api")]
     pub(super) attempt_id: Option<uuid::Uuid>,
     #[cfg(feature = "native-api")]
@@ -21,7 +32,7 @@ impl ControlPlaneHandle {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn race_candidates(
         &self,
-        candidates: &[&Node],
+        candidates: &[&OwnedTarget],
         target: SocketAddr,
         target_domain: Option<String>,
         outbound_name: &str,
@@ -30,10 +41,12 @@ impl ControlPlaneHandle {
         connect_timeout: Duration,
         dial_deadline: tokio::time::Instant,
         runtime_generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+        group_manager: &honk_outbound::group::GroupManager,
         ipver: IpVersion,
-        feedback: &HashMap<uuid::Uuid, crate::group::ScoreAttempt>,
+        route_revision: RouteHealthRevision,
+        feedback: &HashMap<DialKey, crate::group::ScoreAttempt>,
         cold_urltest: bool,
-        #[cfg(feature = "native-api")] selection_chains: &HashMap<uuid::Uuid, Vec<String>>,
+        #[cfg(feature = "native-api")] selection_chains: &HashMap<DialKey, Vec<String>>,
         #[cfg(feature = "native-api")] native: &ConnectionObservation,
     ) -> anyhow::Result<Option<TcpDialWinner>> {
         anyhow::ensure!(
@@ -50,21 +63,22 @@ impl ControlPlaneHandle {
 
         let mut set = futures::stream::FuturesUnordered::new();
         let started_reporters = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        for (idx, node) in candidates.iter().enumerate() {
+        for (idx, candidate) in candidates.iter().enumerate() {
             let ctx = ctx.clone();
-            let node = (*node).clone();
+            let candidate = (*candidate).clone();
             let target_domain = target_domain.clone();
             let generation = Arc::clone(&runtime_generation);
-            let feedback = feedback.get(&node.id).cloned();
+            let key = candidate.key();
+            let feedback = feedback.get(&key).cloned();
             let started_reporters = Arc::clone(&started_reporters);
             #[cfg(feature = "native-api")]
             let chain = selection_chains
-                .get(&node.id)
+                .get(&key)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             #[cfg(feature = "native-api")]
             if candidates.len() == 1 {
-                native.selected(chain, &node);
+                native.selected(chain, &candidate);
             }
             set.push(
                 std::panic::AssertUnwindSafe(async move {
@@ -73,7 +87,8 @@ impl ControlPlaneHandle {
                         wait_for_cold_urltest_release(idx).await;
                     }
                     #[cfg(feature = "native-api")]
-                    let mut native_attempt = native.attempt(chain, &node, target_domain.as_deref());
+                    let mut native_attempt =
+                        native.attempt(chain, &candidate, target_domain.as_deref());
                     #[cfg(feature = "native-api")]
                     let native_observer = native_attempt
                         .as_ref()
@@ -88,24 +103,36 @@ impl ControlPlaneHandle {
                             let error: anyhow::Error = error.into();
                             #[cfg(feature = "native-api")]
                             if let Some(attempt) = &mut native_attempt {
-                                attempt.tcp_finished(Some(&error), &node);
+                                attempt.tcp_finished(Some(&error), &candidate.node);
                             }
                             #[cfg(feature = "native-api")]
                             let native = (None, None);
                             #[cfg(not(feature = "native-api"))]
                             let native = ();
-                            return (Err(error), idx, Duration::ZERO, node, None, native);
+                            return (
+                                Err(error),
+                                idx,
+                                Duration::ZERO,
+                                candidate,
+                                None,
+                                native,
+                                None,
+                            );
                         }
                     };
+                    let stamp = candidate
+                        .uses_route_evidence()
+                        .then(|| route_revision.admit());
                     let score = Arc::new(parking_lot::Mutex::new((business, None)));
                     let on_start = {
                         let score = Arc::clone(&score);
+                        let routed = candidate.uses_route_evidence();
                         move || {
                             let mut score = score.lock();
                             let started =
                                 score.0.take().map(crate::group::ScoreBusinessGuard::start);
                             if let Some(reporter) = &started {
-                                started_reporters.lock().push(reporter.clone());
+                                started_reporters.lock().push((reporter.clone(), routed));
                             }
                             score.1 = started;
                         }
@@ -114,11 +141,11 @@ impl ControlPlaneHandle {
                     let start = std::time::Instant::now();
                     let per_dial_timeout = connect_timeout * 3;
                     let result = {
-                        let dial = Self::dial_pooled(
+                        let dial = Self::dial_target(
                             &ctx.proxy_registry,
                             &ctx.connection_pool,
                             &generation,
-                            &node,
+                            &candidate,
                             (target, target_domain.as_deref()),
                             connect_timeout,
                             direct_mark,
@@ -156,17 +183,22 @@ impl ControlPlaneHandle {
                             }
                         }
                         Err(error) => {
+                            let outcome = || {
+                                candidate.score_failure(
+                                    score_runtime_outcome(&generation, error),
+                                    error.as_ref(),
+                                )
+                            };
                             if let Some(business) = score.0.take() {
-                                business.finish(score_runtime_outcome(&generation, error));
-                            }
-                            if let Some(reporter) = &reporter {
-                                reporter.setup_failed(score_runtime_outcome(&generation, error));
+                                business.finish(outcome());
+                            } else if let Some(reporter) = &reporter {
+                                reporter.setup_failed(outcome());
                             }
                         }
                     }
                     #[cfg(feature = "native-api")]
                     if let Some(attempt) = &mut native_attempt {
-                        attempt.tcp_finished(result.as_ref().err(), &node);
+                        attempt.tcp_finished(result.as_ref().err(), &candidate.node);
                     }
                     #[cfg(feature = "native-api")]
                     let native = (
@@ -175,7 +207,7 @@ impl ControlPlaneHandle {
                     );
                     #[cfg(not(feature = "native-api"))]
                     let native = ();
-                    (result, idx, elapsed, node, reporter, native)
+                    (result, idx, elapsed, candidate, reporter, native, stamp)
                 })
                 .catch_unwind(),
             );
@@ -195,27 +227,35 @@ impl ControlPlaneHandle {
             remaining -= 1;
             match tokio::time::timeout_at(dial_deadline, set.next()).await {
                 Ok(Some(task_result)) => match task_result {
-                    Ok((Ok((stream, fresh)), idx, elapsed, node, reporter, native)) => {
-                        ctx.alive_set
-                            .report_available_traffic(node.id, ProbeDomain::Tcp, ipver);
-                        // Real-traffic degradation fast path: a fresh
-                        // network dial far above the node's own EMA
-                        // counts toward strike demotion (3 in a row);
-                        // the emergency probe verifies the suspicion.
-                        if fresh
-                            && ctx.alive_set.report_dial_latency(
-                                node.id,
-                                ProbeDomain::Tcp,
-                                ipver,
-                                elapsed,
-                            )
-                        {
-                            ctx.alive_set.notify_check_tcp(node.id);
+                    Ok((Ok((stream, fresh)), idx, elapsed, target, reporter, native, stamp)) => {
+                        if stamp.is_none() {
+                            let owner = target.node.id;
+                            ctx.alive_set
+                                .report_available_traffic(owner, ProbeDomain::Tcp, ipver);
+                            if fresh
+                                && ctx.alive_set.report_dial_latency(
+                                    owner,
+                                    ProbeDomain::Tcp,
+                                    ipver,
+                                    elapsed,
+                                )
+                            {
+                                ctx.alive_set.notify_check_tcp(owner);
+                            }
                         }
-                        winner = Some((stream, idx, node, reporter, native));
+                        winner = Some((
+                            stream,
+                            idx,
+                            target,
+                            reporter,
+                            native,
+                            stamp,
+                            fresh.then_some(elapsed),
+                        ));
                         break;
                     }
-                    Ok((Err(e), _idx, _elapsed, node, _reporter, _native)) => {
+                    Ok((Err(e), _idx, _elapsed, target, _reporter, _native, stamp)) => {
+                        let node = &target.node;
                         debug!("Parallel dial to {} failed: {}", node.name, e);
                         if node.protocol() != honk_config::types::NodeProtocol::Block {
                             ctx.stats.record_error(&outbound, outbound_kind);
@@ -226,13 +266,23 @@ impl ControlPlaneHandle {
                             rejection = Some(e);
                             break;
                         }
-                        report_dial_failure_if_current(
-                            &runtime_generation,
-                            &ctx.alive_set,
-                            node.id,
-                            ProbeDomain::Tcp,
-                            ipver,
-                        );
+                        if let Some(stamp) = stamp {
+                            group_manager.report_route_failure(
+                                outbound_name,
+                                &target,
+                                ipver,
+                                stamp,
+                                e.as_ref(),
+                            );
+                        } else if let Some(owner) = target.failure_owner(&e) {
+                            report_dial_failure_if_current(
+                                &runtime_generation,
+                                &ctx.alive_set,
+                                owner,
+                                ProbeDomain::Tcp,
+                                ipver,
+                            );
+                        }
                         let msg = e.to_string();
                         if msg.starts_with("dial timed out after") {
                             timeout_count += 1;
@@ -251,7 +301,7 @@ impl ControlPlaneHandle {
                     #[cfg(feature = "native-api")]
                     native.tcp_deadline();
                     if runtime_generation.is_shutdown() {
-                        for reporter in started_reporters.lock().iter() {
+                        for (reporter, _) in started_reporters.lock().iter() {
                             reporter.finish(crate::group::ScoreOutcome::Shutdown);
                         }
                     } else {
@@ -290,20 +340,22 @@ impl ControlPlaneHandle {
             && let Some((_, winning_idx, ..)) = &winner
         {
             let mut deposit_count = 0u32;
-            for (idx, node) in candidates.iter().enumerate() {
-                if idx == *winning_idx {
+            for (idx, candidate) in candidates.iter().enumerate() {
+                // A route has no pool of its own; its leaf's would skip
+                // the exits.
+                if idx == *winning_idx || candidate.route.is_some() {
                     continue;
                 }
                 if deposit_count >= 2 {
                     break;
                 }
-                let node = (*node).clone();
+                let node = candidate.node.clone();
                 let node_addr = format!("{}:{}", node.host(), node.port);
                 let pool = ctx.connection_pool.clone();
                 let registry = ctx.proxy_registry.clone();
                 let target_domain = target_domain.clone();
                 let generation = Arc::clone(&runtime_generation);
-                let pool_feedback = feedback.get(&node.id).cloned();
+                let pool_feedback = feedback.get(&candidate.key()).cloned();
                 let pool_health_family = ipver;
                 deposit_count += 1;
                 let _ = runtime_generation.spawn_background(async move {
@@ -428,15 +480,39 @@ impl ControlPlaneHandle {
         }
 
         Ok(match winner {
-            Some((stream, _, node, reporter, _native)) => Some(TcpDialWinner {
-                stream,
-                node,
-                reporter,
-                #[cfg(feature = "native-api")]
-                attempt_id: _native.0,
-                #[cfg(feature = "native-api")]
-                observer: _native.1,
-            }),
+            Some((stream, _, target, reporter, _native, stamp, latency)) => {
+                let route_traffic = stamp.map(|stamp| {
+                    let confirmed = latency.is_some()
+                        && ctx
+                            .proxy_registry
+                            .confirms_target_on_open(&runtime_generation, target.dial_ref());
+                    if confirmed && !runtime_generation.is_shutdown() {
+                        group_manager.report_route_response(
+                            outbound_name,
+                            target.key(),
+                            ipver,
+                            stamp,
+                            latency,
+                        );
+                    }
+                    RouteTraffic {
+                        stamp,
+                        family: ipver,
+                        latency,
+                        confirmed,
+                    }
+                });
+                Some(TcpDialWinner {
+                    stream,
+                    target,
+                    reporter,
+                    route_traffic,
+                    #[cfg(feature = "native-api")]
+                    attempt_id: _native.0,
+                    #[cfg(feature = "native-api")]
+                    observer: _native.1,
+                })
+            }
             None => {
                 if let Some((last_msg, last_name)) = last_err {
                     let (first_msg, first_name) =
@@ -602,6 +678,46 @@ impl ControlPlaneHandle {
         });
     }
 
+    /// Dial a selected target: a route over the generation's hop runtimes,
+    /// which no pool or mark applies to, or a node through
+    /// [`Self::dial_pooled`].
+    #[allow(clippy::too_many_arguments)]
+    async fn dial_target(
+        registry: &ProxyRegistry,
+        pool: &ConnectionPool,
+        generation: &Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+        target: &OwnedTarget,
+        destination: (SocketAddr, Option<&str>),
+        connect_timeout: Duration,
+        direct_mark: Option<honk_outbound::proxy::DirectMark>,
+        scope: &Arc<honk_outbound::runtime::DialScope>,
+    ) -> anyhow::Result<(crate::proxy::ProxyStream, bool)> {
+        let Some(route) = target.route() else {
+            return Self::dial_pooled(
+                registry,
+                pool,
+                generation,
+                &target.node,
+                destination,
+                connect_timeout,
+                direct_mark,
+                scope,
+            )
+            .await;
+        };
+        let (destination, domain) = destination;
+        scope
+            .scope(registry.dial_ref(
+                Arc::clone(generation),
+                honk_outbound::proxy::DialRef::Route(route),
+                destination,
+                domain,
+                connect_timeout,
+            ))
+            .await
+            .map(|stream| (stream, true))
+    }
+
     /// Dial through a node using the TCP connection pool.
     ///
     /// Acquisition order:
@@ -664,7 +780,7 @@ impl ControlPlaneHandle {
         let protocol = node.protocol();
         let entry = registry
             .find(protocol)
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
+            .ok_or(honk_outbound::proxy::MissingProtocolHandler(protocol))?;
 
         if !pool_disabled && (entry.descriptor.pool_ready_streams)(node) {
             let key =

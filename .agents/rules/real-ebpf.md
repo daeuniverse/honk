@@ -1,6 +1,15 @@
 ### honk-core with real eBPF
 
-Read with: `AGENTS.md` (Technology stack, Current validation guidance, Notes for agents); `configuration.md` for NFQUEUE activation; `test-locations.md` for where the real-kernel tests live; the VM procedure is `.github/workflows/ci.yml` and skill `honk-real-ebpf-tests`.
+TC startup verifies only the initial interface-plan variants plus a routing target
+when necessary. Later variants are verified on a blocking thread without the shared
+backend lock; commit installs the current routing extension before bindability.
+Attempt every independent variant after individual load or extension errors. Keep
+original relocation map FDs alive through every verifier job, including after logger
+or event-consumer cancellation; consumers use duplicate handles. Routing publication
+uses committed target metadata, and receive-trace preparation cannot wait for the
+program-loader mutex while holding backend ownership.
+
+Read with: `AGENTS.md` (Technology stack, Current validation guidance); `datapath.md` for the ABI and runtime invariants; `configuration.md` for NFQUEUE activation; `test-locations.md` for where the real-kernel tests live; the VM procedure is `.github/workflows/ci.yml` and skill `honk-real-ebpf-tests`.
 
 The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
@@ -48,7 +57,7 @@ host-relative namespace ID, never the packet namespace or an assumed ID zero.
 ABI sizes: ConnState 72 bytes (80 with its lock wrapper), TcpSocketBinding 120
 with syn_isn at offset 116, DaeParam 44. The sock_ops child proof compares the
 owned daens netns cookie and reads no kernel structure. Proof selection, IPv6
-and sysctl rules live in `AGENTS.md` (Notes for agents).
+and sysctl rules live in `datapath.md` (Kernel and userspace ABI).
 
 Socket process identity is native non-cloned `SK_STORAGE`, captured once by
 create/connect/sendmsg and reclaimed only with the actual socket object. The
@@ -80,9 +89,9 @@ fallback. The recipes do not install host packages or change shared-host KVM
 permissions. Non-x86_64/non-Linux hosts and restricted containers without these
 prerequisites cannot run this runner; report the gate as not run and use CI.
 Native builds and unprivileged tests remain supported, but Linux 6.12+ and root
-are not sufficient isolation for direct protected-suite execution. Never invoke
-the guest script directly on a host or export its VM identity markers to bypass
-the fixture guard.
+are not sufficient isolation for direct protected-suite execution: the protected
+suites run only in the guest, under the fixture guard and markers that skill
+`honk-real-ebpf-tests` describes.
 
 Keep every object map unpinned, including allocator maps; core owns explicit pin paths (see [object admission](../../doc/en/design/control-plane.md#startup-and-shutdown)).
 
@@ -114,5 +123,3 @@ cargo build --release -Zbuild-std=core --target bpfel-unknown-none
 ```
 
 `.cargo/config.toml` resolves `bpf-linker` from `PATH`. The root `rust-toolchain.toml` pins the host compiler; `crates/honk-ebpf/rust-toolchain.toml` pins the eBPF compiler and components for local builds and CI. CI pins the prebuilt `bpf-linker` 0.11.0 release.
-
-

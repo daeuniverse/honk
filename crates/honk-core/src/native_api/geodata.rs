@@ -20,7 +20,7 @@ mod sources;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use sources::{Fetched, Patch as SourcesPatch, Route, Sources};
+pub(crate) use sources::{Error as SourcesError, Fetched, Patch as SourcesPatch, Route, Sources};
 
 /// How long a file download may wait for any progress: the setup up to the
 /// answer's headers, and then each wait for more of the body.
@@ -333,7 +333,7 @@ pub(super) async fn capability(state: &NativeState) -> Value {
                 value["max_urls"] = json!(sources::MAX_URLS);
                 value["interval_hours"] = json!({"min": sources::INTERVAL_HOURS.start(),
                     "max": sources::INTERVAL_HOURS.end(),
-                    "default": sources::AutoUpdate::default().interval_hours});
+                    "default": sources::NOMINAL_INTERVAL_HOURS});
                 // The file is read at startup only; patches live in the state db.
                 value["lifecycle"] = json!({"file_values": "start", "overrides_persist": true});
             }
@@ -654,18 +654,16 @@ async fn exchange(
         Some((outbounds, detour)) => outbounds
             .fetch(detour, DETOUR_SETTING, PURPOSE, &request, &mut None)
             .await
+            .map(|(reply, group, _)| (reply, group))
             .map_err(|failed| match failed {
                 Failed::Route(_) => "group_unavailable",
-                Failed::Stage(stage) => stage,
+                Failed::Stage(stage, _) => stage,
             })?,
     };
     match reply.status {
         StatusCode::OK => Ok((reply.body, group)),
         status => Err(Failure {
-            code: match status {
-                StatusCode::NOT_FOUND => "http_not_found",
-                _ => "http_status_rejected",
-            },
+            code: download_route::status_stage(status),
             status: Some(status.as_u16()),
         }),
     }

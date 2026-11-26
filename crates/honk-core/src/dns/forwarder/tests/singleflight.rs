@@ -1,5 +1,78 @@
 use super::*;
 
+#[tokio::test]
+async fn joined_queries_keep_final_upstream_and_stale_result_source() {
+    use crate::dns::cache::{CacheKey, OperationKind};
+    use crate::dns::outcome::Provenance;
+    use crate::dns::planner::{RequestScope, UpstreamTag};
+    use crate::dns::query::QueryContext;
+
+    for stale in [false, true] {
+        let cache = test_cache();
+        let router = test_router();
+        let mut response = make_a_response([192, 0, 2, 1], 300);
+        let query = make_a_query();
+        if stale {
+            let seed = DnsForwarder::new(
+                Arc::new(MockUpstream::new(response.clone())),
+                cache.clone(),
+                router.clone(),
+            );
+            seed.resolve_outcome(&query).await.unwrap();
+            let context = QueryContext::parse(&query).unwrap();
+            let key = CacheKey::new(
+                &context,
+                None,
+                RequestScope::Upstream(UpstreamTag::new("default").unwrap()),
+                OperationKind::Resolve,
+            );
+            seed.cache_service()
+                .await
+                .expire_positive_exact_for_test(&key);
+            response[3] = 0x82;
+        }
+        let upstream = Arc::new(GatedUpstream {
+            response,
+            call_count: AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let forwarder =
+            Arc::new(DnsForwarder::new(upstream.clone(), cache, router).with_cache_enabled(stale));
+        let mut tasks = tokio::task::JoinSet::new();
+        for txid in [1u16, 2] {
+            let forwarder = forwarder.clone();
+            let mut query = query.clone();
+            query[..2].copy_from_slice(&txid.to_be_bytes());
+            tasks.spawn(async move { (txid, forwarder.resolve_outcome(&query).await.unwrap()) });
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            upstream.entered.notified().await;
+            while forwarder.singleflight().counters().waiters != 1 {
+                tokio::task::yield_now().await;
+            }
+            upstream.release.notify_one();
+            while let Some(task) = tasks.join_next().await {
+                let (txid, outcome) = task.unwrap();
+                assert_eq!(&outcome.rendered()[..2], &txid.to_be_bytes());
+                assert_eq!(outcome.final_upstream(), Some("default"));
+                assert_eq!(outcome.is_cached(), stale);
+                assert_eq!(
+                    outcome.provenance(),
+                    if stale {
+                        Provenance::Stale
+                    } else {
+                        Provenance::Upstream
+                    }
+                );
+            }
+        })
+        .await
+        .expect("one shared exchange settles both callers");
+        assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn identical_concurrent_queries_share_one_exchange_and_render_each_txid() {
     const CALLERS: usize = 128;

@@ -112,11 +112,16 @@ impl ReceiveTrace {
     #[cfg(test)]
     pub(crate) fn load_for_test() -> anyhow::Result<(Ebpf, Arc<Self>)> {
         let (mut bpf, _, kernel_btf) = Self::load_unattached_for_test()?;
-        let trace = Self::attach(&mut bpf, &kernel_btf)?;
+        let map = bpf.take_map("RECEIVE_TRACE");
+        let trace = Self::attach(&mut bpf, &kernel_btf, map.as_ref())?;
         Ok((bpf, trace))
     }
 
-    pub(super) fn attach(bpf: &mut Ebpf, btf: &Btf) -> anyhow::Result<Arc<Self>> {
+    pub(super) fn attach(
+        bpf: &mut Ebpf,
+        btf: &Btf,
+        map: Option<&Map>,
+    ) -> anyhow::Result<Arc<Self>> {
         // Both recvmsg paths consume the candidate from this shared helper.
         let candidate = attach_exit(bpf, btf, "honk_udp_receive_candidate", "__skb_recv_udp")?;
         let ipv4 = attach_family(
@@ -145,7 +150,7 @@ impl ReceiveTrace {
                 );
             }
         }
-        let Some(Map::HashMap(map)) = bpf.map("RECEIVE_TRACE") else {
+        let Some(Map::HashMap(map)) = map else {
             anyhow::bail!("missing RECEIVE_TRACE hash map");
         };
         Ok(Arc::new(Self {
@@ -322,7 +327,8 @@ mod tests {
                     missing_btf = without_target(data, target)?;
                     &missing_btf
                 };
-                let trace = ReceiveTrace::attach(&mut bpf, attach_btf)
+                let map = bpf.take_map("RECEIVE_TRACE");
+                let trace = ReceiveTrace::attach(&mut bpf, attach_btf, map.as_ref())
                     .expect("one family must survive a sibling hook failure");
                 if fail_exit {
                     let failed_entry_id = bpf.program(enter).unwrap().info()?.id();
@@ -353,7 +359,8 @@ mod tests {
         }
         let (mut bpf, data, _) = ReceiveTrace::load_unattached_for_test()?;
         let missing_btf = without_target(data, "__skb_recv_udp")?;
-        assert!(ReceiveTrace::attach(&mut bpf, &missing_btf).is_err());
+        let map = bpf.take_map("RECEIVE_TRACE");
+        assert!(ReceiveTrace::attach(&mut bpf, &missing_btf, map.as_ref()).is_err());
         Ok(())
     }
 

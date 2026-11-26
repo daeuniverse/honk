@@ -834,6 +834,76 @@ fn owned_packet_raw_socks5_winner_relays_while_owner_is_unpolled() -> anyhow::Re
     })
 }
 
+#[test]
+fn owned_packet_direct_leaf_uses_both_group_exits_on_the_shared_relay() -> anyhow::Result<()> {
+    let owner = relay_runtime()?;
+    let shared = relay_runtime()?;
+    shared.block_on(async {
+        tokio::time::timeout(RELAY_WAIT, async {
+            let front = crate::test_support::socks5_relay().await;
+            let land = crate::test_support::socks5_relay().await;
+            let application = TcpListener::bind("127.0.0.1:0").await?;
+            let destination = application.local_addr()?;
+            let (mut wire, flow) = Wire::connect(destination)?;
+            let funding = flow.reserve_memory(RELAY_MEMORY)?;
+            let mut config = config();
+            let [_, front_node, land_node] = crate::test_support::socks5_chain(&front, &land);
+            select_leaf(&mut config, honk_config::config::DIRECT_NODE_ID);
+            config.groups[0].nodes.clear();
+            config.groups[0].groups.push("inner".into());
+            config.groups[0].exit = Some(land_node.name.clone());
+            config.groups.push(Group {
+                name: "inner".into(),
+                nodes: vec![honk_config::config::DIRECT_NODE_ID],
+                exit: Some(front_node.name.clone()),
+                ..Default::default()
+            });
+            config.nodes.extend([front_node, land_node]);
+            let plane = plane(config)?;
+            let handle = plane.spawn_handle();
+            let plan = crate::control::reload::resolve_group_outbound_plan_for_target(
+                &handle.group_manager.read(),
+                MEASURED_SELECTOR,
+                &tcp_score_context(destination, None, IpVersion::V4),
+            );
+            let [selected] = plan.targets.as_slice() else {
+                panic!("expected one route")
+            };
+            assert_eq!(
+                selected.node.protocol(),
+                honk_config::types::NodeProtocol::Direct
+            );
+            assert!(
+                !handle
+                    .proxy_registry
+                    .can_handoff_packet_direct(&handle.runtime_registry.read(), selected)
+            );
+            let (abort, registration) = futures::future::AbortHandle::new_pair();
+            let target = wire.relay_owner(owner.handle())?;
+            let serving = tokio::spawn(async move {
+                handle
+                    .serve_owned_packet_connection(flow, target, registration)
+                    .await
+            });
+            let (mut upstream, _) = application.accept().await?;
+            wire.send(b"s");
+            assert_eq!(upstream.read_u8().await?, b's');
+            upstream.write_all(b"r").await?;
+            wire.until(|wire| !wire.received.is_empty()).await?;
+            assert_eq!(wire.received, b"r");
+            assert_eq!(*front.requests.lock(), [land.addr]);
+            assert_eq!(*land.requests.lock(), [destination]);
+            assert_eq!(owner.metrics().num_alive_tasks(), 0);
+            abort.abort();
+            serving.await??;
+            drop(funding);
+            wire.finish().await;
+            Ok(())
+        })
+        .await?
+    })
+}
+
 fn config() -> Config {
     let mut config = Config::default();
     config.ensure_builtin_nodes();

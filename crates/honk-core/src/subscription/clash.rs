@@ -14,7 +14,7 @@ pub(super) use self::fields::duration_secs as parse_feed_duration_secs;
 use self::fields::{
     active as yaml_active, active_for_key as yaml_active_for_key, bool_alias as yaml_bool_alias,
     duration_alias as yaml_duration_alias, list_alias as yaml_list_alias, optional_text_alias,
-    ports as yaml_ports, rate_alias as yaml_rate_alias, raw_alias as yaml_alias, text as yaml_text,
+    port_hopping_alias, rate_alias as yaml_rate_alias, text as yaml_text,
     text_alias as yaml_text_alias, u64_alias as yaml_u64_alias,
 };
 use super::yaml_value;
@@ -377,7 +377,9 @@ fn apply_protocol(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str
                 yaml_duration_alias(mapping, &["idle-session-timeout", "idle_session_timeout"])?;
         }
         OutboundConfig::WireGuard(_) => unreachable!("WireGuard has a dedicated record adapter"),
-        OutboundConfig::Direct | OutboundConfig::Block => unreachable!(),
+        OutboundConfig::Direct | OutboundConfig::Block | OutboundConfig::Chain(_) => {
+            unreachable!()
+        }
     }
     Ok(())
 }
@@ -608,16 +610,7 @@ fn apply_quic(
                 mapping,
                 &["down", "download-bandwidth", "down-speed", "down_mbps"],
             )?;
-            let ports = yaml_alias(mapping, &["ports"])?
-                .map(yaml_ports)
-                .transpose()?
-                .flatten();
-            let mport = yaml_text_alias(mapping, &["mport", "port-hopping", "port_hopping"])?
-                .map(|value| value.replace(':', "-"));
-            if ports.is_some() && mport.is_some() {
-                return Err("Hysteria2 port hopping aliases conflict");
-            }
-            config.port_hopping = ports.or(mport);
+            config.port_hopping = port_hopping_alias(mapping)?;
             config.hop_interval =
                 yaml_duration_alias(mapping, &["hop-interval", "hop_interval", "mhop"])?;
             config.init_stream_recv_window = yaml_u64_alias(mapping, STREAM_WINDOW_KEYS)?;

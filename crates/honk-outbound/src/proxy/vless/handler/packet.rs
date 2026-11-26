@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
+use crate::proxy::chain::native_udp_writer_handoff;
 use crate::proxy::uot::{AddrDecoder, AddrFraming, Decoder, MAX_PACKET_SIZE};
 use crate::proxy::vless::cool;
 use crate::proxy::{AsyncReadWrite, FramePoison, MultiTargetTransport, PacketTransport};
@@ -62,10 +63,15 @@ pub(super) struct VlessConnectedTransport {
     writer: tokio::sync::Mutex<VlessPacketWriter>,
     poison: FramePoison,
     target: SocketAddr,
+    tls_handoff: Option<bool>,
 }
 
 impl VlessConnectedTransport {
-    pub(super) fn new(stream: Box<dyn AsyncReadWrite>, target: SocketAddr) -> Self {
+    pub(super) fn new(
+        stream: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        tls_handoff: Option<bool>,
+    ) -> Self {
         let (reader, writer) = tokio::io::split(stream);
         Self {
             reader: tokio::sync::Mutex::new((reader, Decoder::default())),
@@ -75,19 +81,30 @@ impl VlessConnectedTransport {
             }),
             poison: FramePoison::default(),
             target,
+            tls_handoff,
         }
     }
 
-    async fn send(&self, data: &[u8]) -> std::io::Result<()> {
+    async fn send(
+        &self,
+        data: &[u8],
+        current: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    ) -> std::io::Result<()> {
         if data.is_empty() || data.len() > MAX_NATIVE_PACKET_SIZE {
             return Err(crate::proxy::PacketRejection::InvalidSize.into());
         }
         let packet = crate::proxy::uot::encode_packet(data, MAX_PACKET_SIZE)?;
-        self.writer
-            .lock()
-            .await
-            .write_frame(&self.poison, &packet, false, None)
-            .await
+        let mut writer = self.writer.lock().await;
+        if let Some(current) = current {
+            let tls_handoff = self
+                .tls_handoff
+                .ok_or(crate::proxy::PacketRejection::Policy)?;
+            return self
+                .poison
+                .write_checked(&mut writer.stream, &packet, None, tls_handoff, current)
+                .await;
+        }
+        writer.write_frame(&self.poison, &packet, false, None).await
     }
 }
 
@@ -106,11 +123,19 @@ impl PacketTransport for VlessConnectedTransport {
     }
 
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
-        self.send(data).await
+        self.send(data, None).await
     }
 
     async fn send_packet_confirmed(&self, data: &[u8]) -> std::io::Result<()> {
-        self.send(data).await
+        self.send(data, None).await
+    }
+
+    async fn send_packet_checked(
+        &self,
+        data: &[u8],
+        current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> std::io::Result<()> {
+        self.send(data, Some(current)).await
     }
 
     async fn recv_packet(&self, output: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
@@ -139,6 +164,7 @@ pub(crate) struct VlessUotTransport {
     poison: FramePoison,
     target: SocketAddr,
     target_domain: Option<Box<str>>,
+    tls_handoff: Option<bool>,
 }
 
 impl VlessUotTransport {
@@ -147,6 +173,7 @@ impl VlessUotTransport {
         target: SocketAddr,
         target_domain: Option<&str>,
         request: bytes::Bytes,
+        tls_handoff: Option<bool>,
     ) -> Self {
         let (reader, writer) = tokio::io::split(stream);
         Self {
@@ -158,10 +185,11 @@ impl VlessUotTransport {
             poison: FramePoison::default(),
             target,
             target_domain: target_domain.map(Box::from),
+            tls_handoff,
         }
     }
 
-    /// The one send path of `send_packet`, `send_packet_confirmed` and `send_to`.
+    /// All sends serialize here so a withdrawn first send leaves setup for the next view.
     async fn send_inner(
         &self,
         target: SocketAddr,
@@ -169,6 +197,7 @@ impl VlessUotTransport {
         data: &[u8],
         confirmed: bool,
         admitted: Option<&AtomicBool>,
+        current: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> std::io::Result<()> {
         let mut writer = self.writer.lock().await;
         let frame = AddrFraming::UOT_V1.encode(
@@ -178,6 +207,21 @@ impl VlessUotTransport {
             data,
             MAX_PACKET_SIZE,
         )?;
+        if let Some(current) = current {
+            let tls_handoff = self
+                .tls_handoff
+                .ok_or(crate::proxy::PacketRejection::Policy)?;
+            let write = self.poison.write_checked(
+                &mut writer.stream,
+                &frame,
+                admitted,
+                tls_handoff,
+                current,
+            );
+            crate::runtime::flow_observation::request_write(std::pin::pin!(write)).await?;
+            writer.setup = None;
+            return Ok(());
+        }
         writer
             .write_frame(&self.poison, &frame, confirmed, admitted)
             .await
@@ -209,13 +253,21 @@ impl PacketTransport for VlessUotTransport {
             data,
             false,
             None,
+            None,
         )
         .await
     }
 
     async fn send_packet_confirmed(&self, data: &[u8]) -> std::io::Result<()> {
-        self.send_inner(self.target, self.target_domain.as_deref(), data, true, None)
-            .await
+        self.send_inner(
+            self.target,
+            self.target_domain.as_deref(),
+            data,
+            true,
+            None,
+            None,
+        )
+        .await
     }
 
     async fn recv_packet(&self, output: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
@@ -248,7 +300,20 @@ impl MultiTargetTransport for VlessUotTransport {
         admitted: Option<&AtomicBool>,
     ) -> std::io::Result<()> {
         let domain = crate::proxy::addr::dialed_name(self.target_domain.as_deref(), domain);
-        self.send_inner(target, domain, data, confirmed, admitted)
+        self.send_inner(target, domain, data, confirmed, admitted, None)
+            .await
+    }
+
+    async fn send_to_checked(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        admitted: Option<&AtomicBool>,
+        current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> std::io::Result<()> {
+        let domain = crate::proxy::addr::dialed_name(self.target_domain.as_deref(), domain);
+        self.send_inner(target, domain, data, true, admitted, Some(current))
             .await
     }
 
@@ -284,7 +349,13 @@ impl VLessHandler {
             .prepare_retained_carrier(runtime, uuid, header, timeout)
             .await?;
         Ok((
-            Arc::new(VlessUotTransport::new(stream, target, domain, request)),
+            Arc::new(VlessUotTransport::new(
+                stream,
+                target,
+                domain,
+                request,
+                native_udp_writer_handoff(&runtime.node),
+            )),
             preparation,
         ))
     }
@@ -320,7 +391,11 @@ impl VLessHandler {
         let transport: Arc<dyn PacketTransport> = if path == VlessUdpPath::Xudp {
             cool::connect_single_xudp(stream, target, domain, [0; 8]).await?
         } else {
-            Arc::new(VlessConnectedTransport::new(stream, target))
+            Arc::new(VlessConnectedTransport::new(
+                stream,
+                target,
+                native_udp_writer_handoff(&runtime.node),
+            ))
         };
         Ok(publish_on_commit(transport, preparation))
     }
@@ -533,6 +608,39 @@ impl PacketOutbound for VLessHandler {
         let path = Self::udp_path(&runtime.node, target.port())?;
         self.open_udp(runtime, path, target, target_domain, connect_timeout)
             .await
+    }
+
+    /// Native UDP only: XUDP and the multiplexed paths need sessions owned
+    /// by this node's runtime, which a tunneled hop does not dial.
+    async fn dial_udp_over(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        options: crate::proxy::TunnelDialOptions,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        if !runtime.node.supports_tunneled_udp() {
+            return Err(crate::proxy::TunnelUnsupported("vless udp").into());
+        }
+        let stream = Self::start_tunneled(
+            &runtime.node,
+            carrier,
+            CMD_UDP,
+            target,
+            target_domain,
+            options,
+        )
+        .await?;
+        let stream = crate::proxy::chain::locate_udp_exit_stream(stream);
+        let tls_handoff = crate::proxy::chain::UDP_EXIT_HOP
+            .try_with(|exit| exit.tls_handoff)
+            .ok();
+        Ok(Arc::new(VlessConnectedTransport::new(
+            stream,
+            target,
+            tls_handoff,
+        )))
     }
 
     async fn dial_udp_transport_speculative_runtime(

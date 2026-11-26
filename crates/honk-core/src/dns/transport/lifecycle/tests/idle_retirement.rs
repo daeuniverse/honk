@@ -10,8 +10,10 @@ async fn idle_retirement_leaves_borrowed_resource_ready() {
         .expect("resource");
 
     assert!(
-        slot.retire_idle(|_| async { panic!("borrowed resource must not close") })
-            .is_none()
+        slot.retire_idle(None, |_| async {
+            panic!("borrowed resource must not close")
+        })
+        .is_none()
     );
 
     let current = slot
@@ -37,7 +39,7 @@ async fn idle_retirement_blocks_replacement_until_close_finishes() {
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let first_closes = Arc::clone(&closes);
     let mut closing = Box::pin(
-        slot.retire_idle(move |_| async move {
+        slot.retire_idle(None, move |_| async move {
             release_rx.await.expect("release original cleanup");
             first_closes.fetch_add(1, Ordering::SeqCst);
         })
@@ -83,33 +85,33 @@ async fn cancelled_idle_retirement_resumes_retained_close() {
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let first_closes = Arc::clone(&closes);
     let first = slot
-        .retire_idle(move |_| async move {
+        .retire_idle(None, move |_| async move {
             release_rx.await.expect("release original cleanup");
             first_closes.fetch_add(1, Ordering::SeqCst);
         })
         .expect("idle resource");
     assert!(
-        slot.retire_idle(|_| async { panic!("duplicate idle driver") })
+        slot.retire_idle(None, |_| async { panic!("duplicate idle driver") })
             .is_none()
     );
     drop(first);
     assert_eq!(closes.load(Ordering::SeqCst), 0);
 
     let mut second = Box::pin(
-        slot.retire_idle(|_| async {
+        slot.retire_idle(None, |_| async {
             panic!("a second closer must not replace the original cleanup");
         })
         .expect("unpolled driver drop releases retirement"),
     );
     assert!(futures::poll!(second.as_mut()).is_pending());
     assert!(
-        slot.retire_idle(|_| async { panic!("duplicate idle driver") })
+        slot.retire_idle(None, |_| async { panic!("duplicate idle driver") })
             .is_none()
     );
     drop(second);
 
     let mut third = Box::pin(
-        slot.retire_idle(|_| async {
+        slot.retire_idle(None, |_| async {
             panic!("a second closer must not replace the original cleanup");
         })
         .expect("cancelled driver releases retirement"),

@@ -99,7 +99,7 @@ body:
     id: logs
     attributes:
       label: Relevant logs / 相关日志
-      description: Include only relevant lines from `journalctl -u honk` or `logread` on OpenWrt; if none are available, write "none" and explain why. / 只贴 `journalctl -u honk` 或 OpenWrt 上 `logread` 输出中的相关几行。没有日志请填“无”并说明原因。
+      description: Set `log_level` to `debug`, reproduce the problem, and paste the honk log from startup to the failure. Get it with `sudo journalctl -u honk-core -b` under systemd, `logread -e honk` on OpenWrt, or the Logs page in doona. A report without a log is closed and reopens once one is added. / 先把 `log_level` 设为 `debug` 并复现问题，再贴出 honk 从启动到出问题的日志。可以用 systemd 的 `sudo journalctl -u honk-core -b`、OpenWrt 的 `logread -e honk`，或 doona 的“日志”页获取。没有日志的报告会被关闭，补上后自动重新打开。
       render: text
     validations:
       required: true

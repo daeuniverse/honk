@@ -74,6 +74,7 @@ pub(super) fn parse_group_section(
                     "filter",
                     "policy",
                     "final",
+                    "exit",
                     "default",
                     "check_url",
                     "icon",
@@ -108,6 +109,9 @@ pub(super) fn parse_group_section(
             }
             if let Some(value) = fields.get("final").copied() {
                 group.final_outbound = Some(value.raw().to_owned());
+            }
+            if let Some(value) = fields.get("exit").copied() {
+                group.exit = Some(value.raw().to_owned());
             }
             if let Some(value) = fields.get("default").copied() {
                 group.default = Some(value.raw().to_owned());
@@ -157,6 +161,7 @@ pub(super) fn parse_group_section(
                     })?;
             }
 
+            group.own.implicit_all_nodes = group.filters.is_empty() && group.groups.is_empty();
             groups.push(group);
         }
     }
@@ -294,6 +299,7 @@ pub(super) fn resolve_group_filters_inner(
     groups: &mut [Group],
     nodes: &[Node],
     subscriptions: &[Subscription],
+    append_unfiltered: bool,
     mut diagnostics: Option<&mut ParserDiagnostics<'_>>,
 ) {
     let mut subscription_tags: HashMap<uuid::Uuid, Vec<&str>> = HashMap::new();
@@ -303,6 +309,7 @@ pub(super) fn resolve_group_filters_inner(
             .or_default()
             .push(subscription.name.as_str());
     }
+    let has_pending_chains = nodes.iter().any(unbound_chain);
 
     for (group_index, group) in groups.iter_mut().enumerate() {
         if let Some(sink) = diagnostics.as_deref_mut() {
@@ -331,12 +338,16 @@ pub(super) fn resolve_group_filters_inner(
             }
         }
 
+        if has_pending_chains {
+            continue;
+        }
+
         // The injected `direct` and `block` are outbounds, not part of the
         // node pool a group draws from: an unfiltered group and every
         // pattern skip them, and only a filter line that spells the name
         // literally (`name(direct)`) admits one.
         if !has_node_filter {
-            if group.groups.is_empty() {
+            if (append_unfiltered || group.own.implicit_all_nodes) && group.groups.is_empty() {
                 for node in nodes.iter().filter(|node| !is_builtin(node)) {
                     if !group.nodes.contains(&node.id) {
                         group.nodes.push(node.id);
@@ -359,6 +370,10 @@ pub(super) fn resolve_group_filters_inner(
             }
         }
     }
+}
+
+fn unbound_chain(node: &Node) -> bool {
+    node.chain_hops().is_some() && node.resolved_chain_hops().is_none()
 }
 
 fn is_builtin(node: &Node) -> bool {

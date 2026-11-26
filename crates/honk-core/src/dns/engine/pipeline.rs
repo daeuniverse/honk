@@ -3,7 +3,8 @@ use tracing::debug;
 use super::{DnsEngine, PreparedQuery};
 use crate::dns::cache::{CacheKey, OperationKind, PublicationEpoch};
 use crate::dns::forwarder::{
-    CacheAccess, DnsForwardError, DnsForwarder, ResolveMode, ResolveOptions, is_filtered_qtype,
+    CacheAccess, DnsForwardError, DnsForwarder, HostsResolution, ResolveMode, ResolveOptions,
+    is_filtered_qtype,
 };
 use crate::dns::outcome::{DnsOutcome, OutcomeStatus};
 use crate::dns::planner::{RequestPlan, RequestScope, UpstreamTag};
@@ -23,26 +24,30 @@ mod flight {
 
     pub(super) fn publish_outcome(leader: FlightLeader, outcome: DnsOutcome) -> DnsOutcome {
         if let Some(template) = outcome.template() {
-            leader.publish(Ok(Arc::new(FlightAnswer {
-                template: template.clone(),
-                // A waiter without a cache hit receives this template, not the leader's cache policy.
-                projection_expires_at: outcome
-                    .projection_lifetime()
-                    .map(|lifetime| lifetime.expires_at)
-                    .or_else(|| {
-                        (outcome.status() == OutcomeStatus::Accepted
-                            && outcome.response_class() == ResponseClass::Positive
-                            && outcome.provenance() != Provenance::Stale
-                            && !crate::dns::response::is_truncated(outcome.reusable()))
-                        .then(|| {
-                            ProjectionLifetime::from_wire(
-                                outcome.reusable(),
-                                tokio::time::Instant::now(),
-                            )
-                            .expires_at
-                        })
-                    }),
-            })));
+            leader.publish(|| {
+                Ok(Arc::new(FlightAnswer {
+                    template: template.clone(),
+                    // A waiter without a cache hit receives this template, not the leader's cache policy.
+                    projection_expires_at: outcome
+                        .projection_lifetime()
+                        .map(|lifetime| lifetime.expires_at)
+                        .or_else(|| {
+                            (outcome.status() == OutcomeStatus::Accepted
+                                && outcome.response_class() == ResponseClass::Positive
+                                && outcome.provenance() != Provenance::Stale
+                                && !crate::dns::response::is_truncated(outcome.reusable()))
+                            .then(|| {
+                                ProjectionLifetime::from_wire(
+                                    outcome.reusable(),
+                                    tokio::time::Instant::now(),
+                                )
+                                .expires_at
+                            })
+                        }),
+                    provenance: outcome.provenance(),
+                    final_upstream: outcome.final_upstream().map(Into::into),
+                }))
+            });
         }
         outcome
     }
@@ -70,10 +75,10 @@ mod flight {
                 answer.template.wire(),
                 None,
                 OutcomeStatus::Accepted,
-                Provenance::Upstream,
+                answer.provenance,
                 EffectiveExpiry::do_not_cache(),
                 None,
-                None,
+                answer.final_upstream.clone(),
                 Vec::new(),
                 context.mode,
             )
@@ -216,8 +221,26 @@ pub(crate) async fn resolve_with_owner(
     let parsed = DnsEngine::parse_query(raw_query, ingress)?;
     let qtype = parsed.qtype();
     if !is_filtered_qtype(qtype, &forwarder.strategy)
-        && let Some(outcome) = forwarder.resolve_hosts(engine, &parsed, raw_query, mode)?
+        && let Some(hosts) = forwarder.resolve_hosts(engine, &parsed, raw_query, mode)?
     {
+        let outcome = match hosts {
+            HostsResolution::Answered(outcome) => outcome,
+            // Boxed so queries without an alias do not reserve the recursion's state.
+            HostsResolution::Alias(chain) => {
+                Box::pin(forwarder.resolve_hosts_alias(
+                    engine,
+                    &parsed,
+                    raw_query,
+                    &chain,
+                    metadata,
+                    ingress,
+                    options,
+                    mode,
+                    publication_epoch,
+                ))
+                .await?
+            }
+        };
         crate::observe::flows::dns::source("hosts", Some("bypass"));
         return Ok(outcome);
     }

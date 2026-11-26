@@ -262,7 +262,10 @@ fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedCon
                 config.encryption = Some("auto".into());
             }
             OutboundConfig::WireGuard(_) => unreachable!("WireGuard has a dedicated URI adapter"),
-            OutboundConfig::Shadowsocks(_) | OutboundConfig::Direct | OutboundConfig::Block => {}
+            OutboundConfig::Shadowsocks(_)
+            | OutboundConfig::Direct
+            | OutboundConfig::Block
+            | OutboundConfig::Chain(_) => {}
         }
     }
     Ok(node)

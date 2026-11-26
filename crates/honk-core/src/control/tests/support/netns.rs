@@ -184,7 +184,7 @@ pub(in crate::control::tests) fn lab_config(node: &honk_config::node::Node) -> h
     config.global.store_subscribe = false;
     config.experimental.cache_file.enabled = Some(false);
     config.global.tcp_check_url.clear();
-    config.global.udp_check_dns.clear();
+    config.global.udp_check_dns = Some(Vec::new());
     config.dns.bind.clear();
     config
 }

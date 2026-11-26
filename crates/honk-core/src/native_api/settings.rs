@@ -687,7 +687,10 @@ pub(super) async fn patch(
         let _gate = gate;
         let geodata_stored = stored.is_some();
         if let Some((sources, patch)) = stored {
-            sources.apply(patch).map_err(|_| unavailable(&request_id))?;
+            sources.apply(patch).map_err(|error| match error {
+                super::geodata::SourcesError::ScheduleUnavailable => invalid(&request_id),
+                super::geodata::SourcesError::Storage(_) => unavailable(&request_id),
+            })?;
         }
         match staged {
             Some(patch) => owner

@@ -4,6 +4,44 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const WAIT: Duration = Duration::from_secs(20);
 
+#[cfg(feature = "ebpf")]
+impl ControlPlane {
+    pub(crate) fn tc_health_fixture(
+        config: Config,
+        mut backend: crate::ebpf::real::RealEbpfBackend,
+    ) -> anyhow::Result<(Self, impl Future<Output = anyhow::Result<()>>)> {
+        let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+        let udp_recovery = config
+            .global
+            .udp_check_dns
+            .as_ref()
+            .is_some_and(|targets| !targets.is_empty());
+        // The program-only test loader skips the real loader's default-alive initialization.
+        open_group_connectivity(&mut backend, config.groups.len())?;
+        let plane = Self::new(
+            config,
+            Box::new(backend),
+            router,
+            Arc::new(ProxyRegistry::default_resolver()?),
+            DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+            crate::control::tests::support::udp_test_forwarder(),
+        )?;
+        if udp_recovery {
+            plane.alive_set.set_route_http_probe(Arc::new(
+                crate::control::probers::http::ProxyHttpProber::new(
+                    plane.config.clone(),
+                    plane.proxy_registry.clone(),
+                    plane.runtime_registry.clone(),
+                    "HEAD".into(),
+                    plane.group_manager.clone(),
+                ),
+            ));
+        }
+        let mut updates = HealthUpdates::start(&plane);
+        Ok((plane, async move { updates.stop().await }))
+    }
+}
+
 struct Fixture {
     commands: mpsc::Sender<ControlCommand>,
     phase: watch::Receiver<EnginePhase>,
@@ -49,7 +87,7 @@ impl Fixture {
         config.global.check_interval_secs = 3600;
         config.global.bootstrap_resolver = "127.0.0.1:9".into();
         config.global.tcp_check_url.clear();
-        config.global.udp_check_dns = vec!["127.0.0.1:9".into()];
+        config.global.udp_check_dns = Some(vec!["127.0.0.1:9".into()]);
         let tproxy = SocketAddr::from(([127, 0, 0, 1], config.global.tproxy_port));
         let dns = SocketAddr::from(([127, 0, 0, 1], free_port()));
         config.dns.bind = format!("tcp://{dns}");

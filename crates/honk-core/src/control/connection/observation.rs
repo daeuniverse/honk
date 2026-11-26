@@ -566,7 +566,7 @@ impl ConnectionObservation {
         configured: DialMode,
         sniff: &crate::sniffing::SniffResult,
         verification: &'static str,
-        candidates: &[Node],
+        candidates: &[honk_outbound::group::OwnedTarget],
         domain: Option<&str>,
     ) {
         let Some(record) = &self.recorded else { return };
@@ -587,7 +587,7 @@ impl ConnectionObservation {
         let target = target_kind(first, domain);
         let target = if candidates
             .iter()
-            .all(|node| target_kind(node, domain) == target)
+            .all(|candidate| target_kind(candidate, domain) == target)
         {
             target
         } else {
@@ -616,16 +616,16 @@ impl ConnectionObservation {
         configured: DialMode,
         domain: Option<&str>,
         verification: &'static str,
-        selected: Option<(&Node, Option<&str>)>,
+        selected: Option<(&honk_outbound::group::OwnedTarget, Option<&str>)>,
     ) {
         let Some(record) = &self.recorded else { return };
         let (generation, target, reason) = match selected {
-            Some((node, target)) => (
+            Some((outbound, target)) => (
                 record
                     .selection
                     .as_ref()
                     .map(|selection| selection.generation),
-                target_kind(node, target),
+                target_kind(outbound, target),
                 "leaf_target_selected",
             ),
             None => (
@@ -651,41 +651,46 @@ impl ConnectionObservation {
         );
     }
 
-    pub(super) fn selected(&self, chain: &[String], node: &Node) {
+    pub(super) fn selected<'a>(&self, chain: &[String], dialed: impl Into<Dialed<'a>>) {
         let Some(record) = &self.recorded else { return };
-        if matches!(node.protocol(), NodeProtocol::Direct | NodeProtocol::Block) {
+        let dialed = dialed.into();
+        if matches!(
+            dialed.protocol(),
+            NodeProtocol::Direct | NodeProtocol::Block
+        ) {
             record.flow.selected(Vec::new());
             return;
         }
         let Some(selection) = &record.selection else {
             return;
         };
-        let count = chain
-            .len()
-            .saturating_sub(usize::from(chain.last() == Some(&node.name)));
+        let (member_id, _) = dialed.selected_member();
+        let count = chain.len().saturating_sub(1);
         let groups: Option<Vec<_>> = chain
             .iter()
             .take(count)
             .map(|name| selection.catalog.groups.get(name).cloned())
             .collect();
         if let Some(mut chain) = groups {
-            chain.push(node.id.to_string());
+            chain.push(member_id.to_string());
             record.flow.selected(chain);
         }
     }
 
-    pub(super) fn attempt(
+    pub(super) fn attempt<'a>(
         &self,
         chain: &[String],
-        node: &Node,
+        dialed: impl Into<Dialed<'a>>,
         domain: Option<&str>,
     ) -> Option<ConnectionAttempt> {
         let record = self.recorded.as_ref()?;
+        let dialed = dialed.into();
+        let node = dialed.node;
         let selection = record
             .selection
             .as_ref()
             .expect("captured selection generation");
-        let target_kind = target_kind(node, domain);
+        let target_kind = target_kind(dialed, domain);
         let data = OutboundAttempt {
             parent_attempt_id: None,
             lookup_id: None,
@@ -707,7 +712,7 @@ impl ConnectionObservation {
             } else {
                 "global"
             },
-            selection_path: selection_path(selection, chain, node),
+            selection_path: selection_path(selection, chain, dialed),
             leaf_node_id: Some(node.id.to_string()),
             leaf_node_name: Some(node.name.clone()),
             target: match target_kind {
@@ -716,12 +721,12 @@ impl ConnectionObservation {
                 _ => Some(record.destination.to_string()),
             },
             target_kind,
-            dial_ip: (record.network == Network::Udp && node.protocol() == NodeProtocol::Direct)
+            dial_ip: (record.network == Network::Udp && dialed.protocol() == NodeProtocol::Direct)
                 .then(|| record.destination.ip()),
             server_addr: None,
             resolution_location: if target_kind == "none" {
                 ResolutionLocation::NotApplicable
-            } else if node.protocol() == NodeProtocol::Direct
+            } else if dialed.protocol() == NodeProtocol::Direct
                 || (record.network == Network::Tcp && target_kind == "ip")
             {
                 ResolutionLocation::OriginalIp
@@ -733,7 +738,7 @@ impl ConnectionObservation {
             Arc::clone(&record.flow),
             selection.generation,
             data,
-            if node.protocol() == NodeProtocol::Direct {
+            if dialed.protocol() == NodeProtocol::Direct {
                 "dial_target"
             } else {
                 "proxy_server"
@@ -747,8 +752,12 @@ impl ConnectionObservation {
         }
     }
 
-    pub(super) fn tcp_connected(&self, chain: &[String], node: &Node) {
-        self.selected(chain, node);
+    pub(super) fn tcp_connected(
+        &self,
+        chain: &[String],
+        target: &honk_outbound::group::OwnedTarget,
+    ) {
+        self.selected(chain, target);
         if let Some(flow) = self.flow() {
             flow.transition(
                 ConnectionState::Active,
@@ -844,8 +853,47 @@ fn tcp_domain_source(sniff: &crate::sniffing::SniffResult) -> Option<DomainSourc
     }
 }
 
-fn target_kind(node: &Node, domain: Option<&str>) -> &'static str {
-    match node.protocol() {
+/// What an attempt dials: a configured node, or a route whose leaf is
+/// `node`. A route dials a proxy whatever its leaf's protocol.
+#[derive(Clone, Copy)]
+pub(super) struct Dialed<'a> {
+    node: &'a Node,
+    target: Option<&'a honk_outbound::group::OwnedTarget>,
+}
+
+impl Dialed<'_> {
+    fn protocol(&self) -> NodeProtocol {
+        match self.target.is_some_and(|target| target.route.is_some()) {
+            true => NodeProtocol::Chain,
+            false => self.node.protocol(),
+        }
+    }
+
+    fn selected_member(&self) -> (uuid::Uuid, &str) {
+        self.target
+            .map_or((self.node.id, self.node.name.as_str()), |target| {
+                target.selected_member()
+            })
+    }
+}
+
+impl<'a> From<&'a Node> for Dialed<'a> {
+    fn from(node: &'a Node) -> Self {
+        Self { node, target: None }
+    }
+}
+
+impl<'a> From<&'a honk_outbound::group::OwnedTarget> for Dialed<'a> {
+    fn from(target: &'a honk_outbound::group::OwnedTarget) -> Self {
+        Self {
+            node: &target.node,
+            target: Some(target),
+        }
+    }
+}
+
+fn target_kind<'a>(dialed: impl Into<Dialed<'a>>, domain: Option<&str>) -> &'static str {
+    match dialed.into().protocol() {
         NodeProtocol::Block => "none",
         NodeProtocol::Direct => "ip",
         _ if domain.is_some() => "domain",
@@ -966,23 +1014,22 @@ impl Drop for ConnectionAttempt {
 fn selection_path(
     selection: &SelectionGeneration,
     chain: &[String],
-    node: &Node,
+    dialed: Dialed<'_>,
 ) -> Vec<Selection> {
     let catalog = &selection.catalog;
-    chain
+    let (member_id, member_name) = dialed.selected_member();
+    let Some((_, groups)) = chain.split_last() else {
+        return Vec::new();
+    };
+    groups
         .iter()
         .enumerate()
         .filter_map(|(index, name)| {
             let group_id = catalog.groups.get(name)?;
-            let next = chain
-                .get(index + 1)
-                .and_then(|name| {
-                    catalog
-                        .groups
-                        .get(name)
-                        .map(|id| (id.clone(), name.clone()))
-                })
-                .unwrap_or_else(|| (node.id.to_string(), node.name.clone()));
+            let next = match groups.get(index + 1) {
+                Some(group) => (catalog.groups.get(group)?.clone(), group.clone()),
+                None => (member_id.to_string(), member_name.to_owned()),
+            };
             if let Some(captured) = crate::observe::flows::producer::captured_selection(
                 &selection.decisions,
                 group_id,

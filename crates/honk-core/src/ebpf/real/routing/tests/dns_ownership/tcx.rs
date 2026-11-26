@@ -2,6 +2,56 @@ use super::*;
 
 #[test]
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+fn deferred_ingress_executes_generation_current_at_commit() {
+    use crate::ebpf::interface::TcProgram;
+
+    isolated(|| {
+        let mut backend = RealEbpfBackend::load_routing_test_fixture_with_programs(
+            &object(),
+            fixture_param(),
+            &[TcProgram::WanEgressL2],
+        )
+        .unwrap();
+        let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 91));
+        let condition = RoutingCondition {
+            ip: vec![dst.to_string()],
+            ..Default::default()
+        };
+        let blocked = compile(&[rule("original-policy", condition.clone(), "block", 0, true)]);
+        backend.publish_routing_plan(&blocked, &[]).unwrap();
+        let prepared = backend
+            .prepare_tc_programs(&[TcProgram::LanIngressL3])
+            .unwrap()();
+        let direct = compile(&[rule("current-policy", condition, "direct", 0, true)]);
+        backend.publish_routing_plan(&direct, &[]).unwrap();
+        backend.commit_tc_programs(prepared).unwrap();
+        set_array(&mut backend, "DATAPATH_STATE_MAP", 0, 1u32);
+        let src = IpAddr::V4(Ipv4Addr::new(8, 0, 2, 91));
+        let run_syn = |backend: &RealEbpfBackend, port| {
+            run(
+                backend,
+                "lan_ingress_l3",
+                &packet(src, dst, IPPROTO_TCP, port, 443, 0, 0x02),
+                SkbInput::default(),
+            )
+            .verdict
+        };
+        assert_eq!(
+            run_syn(&backend, 46300),
+            TC_ACT_OK,
+            "first packet must execute the policy published after verification"
+        );
+        backend.publish_routing_plan(&blocked, &[]).unwrap();
+        assert_eq!(
+            run_syn(&backend, 46301),
+            TC_ACT_SHOT,
+            "later publication must also replace the deferred target's policy"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
 fn untouched_passes_return_next_before_backend_admission() {
     isolated(|| {
         // No backend ABI validation: this also replays the pre-cutover object.
@@ -302,9 +352,9 @@ fn conn_capacity_native_passes_continue_tcx_without_clearing_marks() {
         load_classifier(&mut backend, "wan_egress_l2");
         {
             let map = backend
-                .bpf_mut()
+                .maps_mut()
                 .unwrap()
-                .map_mut("CONN_STATE_MAP")
+                .get_mut("CONN_STATE_MAP")
                 .unwrap();
             let mut map = HashMap::<_, TuplesKey, FlowMapValue<ConnState>>::try_from(map).unwrap();
             for index in 0..honk_ebpf_common::conn::MAX_CONN_STATE_NUM {

@@ -653,7 +653,7 @@ mod linux {
             cfg.global.dial_mode = "ip".into();
             cfg.global.so_mark_from_dae = 0x100;
             cfg.global.tcp_check_url.clear();
-            cfg.global.udp_check_dns = vec!["127.0.0.1:9".into()];
+            cfg.global.udp_check_dns = Some(vec!["127.0.0.1:9".into()]);
             cfg.global.preconnect_node_count = 0;
             cfg.global.udp_warm_node_count = 0;
             cfg.routing.default_outbound = "direct".into();

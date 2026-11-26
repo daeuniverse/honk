@@ -8,6 +8,11 @@ use tokio::net::TcpStream;
 
 const EINPROGRESS: i32 = libc::EINPROGRESS;
 
+/// A failed TCP connect to the proxy endpoint, before any proxy handshake.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct ProxyConnectFailure(#[source] io::Error);
+
 static BYPASS_MARK: OnceLock<(u32, bool)> = OnceLock::new();
 
 /// Process-wide mark and enforcement policy; initialize before startup network I/O.
@@ -153,11 +158,20 @@ pub async fn connect_marked_addr(
     mark: Option<u32>,
     connect_timeout: Duration,
 ) -> io::Result<TcpStream> {
+    connect_marked_addr_observed(addr, mark, connect_timeout, false).await
+}
+
+async fn connect_marked_addr_observed(
+    addr: SocketAddr,
+    mark: Option<u32>,
+    connect_timeout: Duration,
+    proxy: bool,
+) -> io::Result<TcpStream> {
     use crate::runtime::flow_observation::{
         ResolutionLocation, TransportAttempt, TransportError, TransportStatus,
     };
     let mut attempt = TransportAttempt::start(Some(addr), ResolutionLocation::Unknown);
-    let result = connect_marked_addr_inner(addr, mark, connect_timeout).await;
+    let result = connect_marked_addr_inner(addr, mark, connect_timeout, proxy).await;
     if let Some(attempt) = &mut attempt {
         attempt.finish(
             if result.is_ok() {
@@ -179,8 +193,25 @@ async fn connect_marked_addr_inner(
     addr: SocketAddr,
     mark: Option<u32>,
     connect_timeout: Duration,
+    proxy: bool,
 ) -> io::Result<TcpStream> {
     let socket = new_tcp_socket(&addr, mark)?;
+    let connect_error = |error: io::Error| {
+        if proxy
+            && matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::HostUnreachable
+                    | io::ErrorKind::NetworkUnreachable
+            )
+        {
+            io::Error::new(error.kind(), ProxyConnectFailure(error))
+        } else {
+            error
+        }
+    };
     match socket.connect(&addr.into()) {
         Ok(()) => {
             let std_stream: std::net::TcpStream = socket.into();
@@ -193,13 +224,15 @@ async fn connect_marked_addr_inner(
             let stream = TcpStream::from_std(std_stream)?;
             tokio::time::timeout(connect_timeout, stream.writable())
                 .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
+                .map_err(|_| {
+                    connect_error(io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))
+                })??;
             if let Some(e) = stream.take_error()? {
-                return Err(e);
+                return Err(connect_error(e));
             }
             Ok(stream)
         }
-        Err(e) => Err(e),
+        Err(e) => Err(connect_error(e)),
     }
 }
 
@@ -209,6 +242,15 @@ pub async fn connect_marked(
     addr: &str,
     mark: Option<u32>,
     connect_timeout: Duration,
+) -> io::Result<TcpStream> {
+    connect_marked_inner(addr, mark, connect_timeout, false).await
+}
+
+async fn connect_marked_inner(
+    addr: &str,
+    mark: Option<u32>,
+    connect_timeout: Duration,
+    proxy: bool,
 ) -> io::Result<TcpStream> {
     // Server hostnames are resolved through the bootstrap resolver when one
     // is configured, so proxy-server DNS does not depend on the regular
@@ -238,7 +280,7 @@ pub async fn connect_marked(
             if let Some(selection) = selection {
                 selection.selected_ip(addr.ip());
             }
-            connect_marked_addr(addr, mark, connect_timeout).await
+            connect_marked_addr_observed(addr, mark, connect_timeout, proxy).await
         }
     })
     .await
@@ -272,6 +314,19 @@ pub async fn connect_marked_resolved(
 /// Connect to a proxy server from the control plane, bypassing eBPF re-routing.
 pub async fn connect_outbound(addr: &str, connect_timeout: Duration) -> io::Result<TcpStream> {
     connect_marked(addr, Some(bypass_mark()), connect_timeout).await
+}
+
+/// Connect to a fresh proxy endpoint with socket failure provenance.
+pub(crate) async fn connect_proxy(addr: &str, connect_timeout: Duration) -> io::Result<TcpStream> {
+    connect_marked_inner(addr, Some(bypass_mark()), connect_timeout, true).await
+}
+
+/// Connect to an already-resolved proxy endpoint with socket failure provenance.
+pub(crate) async fn connect_proxy_addr(
+    addr: SocketAddr,
+    connect_timeout: Duration,
+) -> io::Result<TcpStream> {
+    connect_marked_addr_observed(addr, Some(bypass_mark()), connect_timeout, true).await
 }
 
 /// Bind a UDP socket with `SO_MARK` set so the local eBPF datapath treats it

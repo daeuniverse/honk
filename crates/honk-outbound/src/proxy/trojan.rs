@@ -12,8 +12,8 @@ use tokio::net::TcpStream;
 use super::addr;
 use super::{
     AsyncReadWrite, MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport,
-    ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound, WarmRequirement,
-    WarmableOutbound,
+    ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound, TunnelDialOptions,
+    WarmRequirement, WarmableOutbound,
 };
 
 const CRLF: &[u8] = b"\r\n";
@@ -54,10 +54,21 @@ impl TrojanHandler {
     ) -> anyhow::Result<ProxyStream> {
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
         let header = Self::build_request_header(password, target, target_domain)?;
-        let (mut stream, preparation) =
+        let (stream, preparation) =
             Self::prepare_transport(node, runtime, tcp, connect_timeout).await?;
         preparation.commit()?;
-        super::transport::write_request(&mut stream, &header).await?;
+        Self::send_request(stream, &header, target, target_domain).await
+    }
+
+    /// Sends a request header built before the transport was opened, so an
+    /// unencodable target fails without dialing.
+    async fn send_request(
+        mut stream: Box<dyn AsyncReadWrite>,
+        header: &[u8],
+        target: SocketAddr,
+        target_domain: Option<&str>,
+    ) -> anyhow::Result<ProxyStream> {
+        super::transport::write_request(&mut stream, header).await?;
         Ok(ProxyStream {
             stream,
             target_addr: target,
@@ -147,8 +158,24 @@ impl TrojanHandler {
             );
         }
         let (control, preparation) = Self::prepare_transport(node, runtime, None, timeout).await?;
-        let transport = Self::finish_udp_stream(node, target, domain, control).await?;
+        let tls_handoff = super::chain::native_udp_writer_handoff(node);
+        let transport = Self::finish_udp_stream(node, target, domain, control, tls_handoff).await?;
         Ok((transport, preparation))
+    }
+
+    /// The UDP associate over `carrier`, a stream tunneled through earlier hops.
+    async fn open_udp_over(
+        node: &Node,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<Arc<TrojanUdpTransport>> {
+        if !node.supports_tunneled_udp() {
+            return Err(super::TunnelUnsupported("trojan udp").into());
+        }
+        let control = super::transport::wrap_tunnel(node, carrier, options).await?;
+        Self::finish_udp_stream(node, target, domain, control, None).await
     }
 
     fn commit_udp_stream<T: ?Sized + Send + Sync + 'static>(
@@ -166,6 +193,7 @@ impl TrojanHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         mut control: Box<dyn AsyncReadWrite>,
+        native_tls_handoff: Option<bool>,
     ) -> anyhow::Result<Arc<TrojanUdpTransport>> {
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
         let addr_header = addr::encode_address(target, target_domain)?;
@@ -178,6 +206,7 @@ impl TrojanHandler {
         super::transport::write_request(&mut control, &header).await?;
 
         let (rd, wr) = tokio::io::split(control);
+        let exit = super::chain::UDP_EXIT_HOP.try_with(|exit| *exit).ok();
         Ok(Arc::new(TrojanUdpTransport {
             writer: tokio::sync::Mutex::new(wr),
             poison: super::FramePoison::default(),
@@ -185,6 +214,8 @@ impl TrojanHandler {
             addr_header,
             domain: target_domain.map(Box::from),
             relay_addr: target,
+            tls_handoff: exit.map(|exit| exit.tls_handoff).or(native_tls_handoff),
+            exit,
         }))
     }
 }
@@ -237,6 +268,21 @@ impl TcpOutbound for TrojanHandler {
         )
         .await
     }
+
+    async fn dial_over(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<ProxyStream> {
+        let node = &runtime.node;
+        let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
+        let header = Self::build_request_header(password, target, target_domain)?;
+        let stream = super::transport::wrap_tunnel(node, carrier, options).await?;
+        Self::send_request(stream, &header, target, target_domain).await
+    }
 }
 
 #[async_trait]
@@ -251,6 +297,17 @@ impl SharedSourceOutbound for TrojanHandler {
     ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
         let _ = speculative;
         Self::prepare_udp_source(&runtime, target, target_domain, connect_timeout).await
+    }
+
+    async fn prepare_shared_source_over(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<Arc<dyn MultiTargetTransport>> {
+        Ok(Self::open_udp_over(&runtime.node, carrier, target, target_domain, options).await?)
     }
 }
 
@@ -298,6 +355,17 @@ impl PacketOutbound for TrojanHandler {
             connect_timeout,
         )
         .await
+    }
+
+    async fn dial_udp_over(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        Ok(Self::open_udp_over(&runtime.node, carrier, target, target_domain, options).await?)
     }
 }
 
@@ -482,6 +550,57 @@ mod tests {
             .unwrap();
         server.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn dial_over_sends_the_request_through_the_carrier() {
+        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+        let password = "tunnel-secret";
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            // hex(sha224("tunnel-secret")) | CRLF | CONNECT | ATYP=domain |
+            // LEN | "example.com" | port 80 | CRLF, then the payload.
+            let mut expected = b"e18a99df762a533a40db57010c34dde76778a0ca43091577bf581b2b".to_vec();
+            expected.extend_from_slice(b"\r\n\x01\x03\x0bexample.com\x00\x50\r\nping");
+            let mut request = vec![0; expected.len()];
+            server.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, expected);
+            server.write_all(b"pong").await.unwrap();
+        });
+
+        let mut node = Node {
+            name: "trojan-tunnel".into(),
+            address: "198.51.100.1:443".into(),
+            host: "must-not-resolve.invalid".into(),
+            port: 443,
+            outbound: honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+                password: Some(password.into()),
+                tls: honk_config::node::TlsOptions {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
+        let mut stream = TrojanHandler::new()
+            .dial_over(
+                runtime,
+                Box::new(client),
+                target,
+                Some("example.com"),
+                TunnelDialOptions::new(std::time::Duration::from_secs(3)),
+            )
+            .await
+            .unwrap();
+        stream.stream.write_all(b"ping").await.unwrap();
+        stream.stream.flush().await.unwrap();
+        let mut reply = [0; 4];
+        stream.stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"pong");
+        server.await.unwrap();
+    }
 }
 
 /// Framed UDP-associate transport over the Trojan control stream: packets
@@ -497,6 +616,8 @@ struct TrojanUdpTransport {
     addr_header: Vec<u8>,
     domain: Option<Box<str>>,
     relay_addr: SocketAddr,
+    exit: Option<super::chain::UdpExit>,
+    tls_handoff: Option<bool>,
 }
 
 impl std::fmt::Debug for TrojanUdpTransport {
@@ -514,6 +635,7 @@ impl TrojanUdpTransport {
         domain: Option<&str>,
         data: &[u8],
         admitted: Option<&std::sync::atomic::AtomicBool>,
+        current: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> std::io::Result<()> {
         if data.len() > u16::MAX as usize {
             return Err(std::io::Error::new(
@@ -541,6 +663,13 @@ impl TrojanUdpTransport {
         frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
         frame.extend_from_slice(CRLF);
         frame.extend_from_slice(data);
+        if let Some(current) = current {
+            let tls_handoff = self.tls_handoff.ok_or(super::PacketRejection::Policy)?;
+            return self
+                .poison
+                .write_checked(&mut *writer, &frame, admitted, tls_handoff, current)
+                .await;
+        }
         let write = self.poison.begin(admitted)?;
         writer.write_all(&frame).await?;
         writer.flush().await?;
@@ -560,19 +689,57 @@ impl PacketTransport for TrojanUdpTransport {
     }
 
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
-        self.send_frame(self.relay_addr, self.domain.as_deref(), data, None)
+        self.send_frame(self.relay_addr, self.domain.as_deref(), data, None, None)
             .await
+    }
+
+    async fn send_packet_checked(
+        &self,
+        data: &[u8],
+        current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> std::io::Result<()> {
+        self.send_frame(
+            self.relay_addr,
+            self.domain.as_deref(),
+            data,
+            None,
+            Some(current),
+        )
+        .await
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         let mut rd = self.reader.lock().await;
+        let framing_error = |error: std::io::Error| match self.exit {
+            Some(exit) => {
+                let error = std::io::Error::new(error.kind(), super::NodeFailure(error.into()));
+                super::error::HopIoFailure::io(exit.index, error, false)
+            }
+            None => error,
+        };
         loop {
             // Only the dialed name projects back and no other is resolved; an
             // unknown ATYP has no derivable length, so it stays terminal.
-            let peer =
-                addr::read_reply_source(&mut *rd, self.domain.as_deref(), self.relay_addr).await?;
+            let peer = addr::read_reply_source(&mut *rd, self.domain.as_deref(), self.relay_addr)
+                .await
+                .map_err(|error| {
+                    if error
+                        .get_ref()
+                        .is_some_and(|cause| cause.is::<addr::UnknownReplyAddressType>())
+                    {
+                        framing_error(error)
+                    } else {
+                        error
+                    }
+                })?;
             let mut head = [0u8; 4];
             rd.read_exact(&mut head).await?;
+            if &head[2..] != CRLF {
+                return Err(framing_error(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid trojan udp frame delimiter",
+                )));
+            }
             let len = u16::from_be_bytes([head[0], head[1]]) as usize;
             if let Some(peer) = peer {
                 if len > buf.len() {
@@ -607,7 +774,20 @@ impl MultiTargetTransport for TrojanUdpTransport {
         admitted: Option<&std::sync::atomic::AtomicBool>,
     ) -> std::io::Result<()> {
         let domain = addr::dialed_name(self.domain.as_deref(), domain);
-        self.send_frame(target, domain, data, admitted).await
+        self.send_frame(target, domain, data, admitted, None).await
+    }
+
+    async fn send_to_checked(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        admitted: Option<&std::sync::atomic::AtomicBool>,
+        current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> std::io::Result<()> {
+        let domain = addr::dialed_name(self.domain.as_deref(), domain);
+        self.send_frame(target, domain, data, admitted, Some(current))
+            .await
     }
 
     fn frame_stream_torn(&self) -> bool {

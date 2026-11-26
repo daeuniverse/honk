@@ -628,7 +628,11 @@ impl GatewayPublisher {
 
     pub(super) fn compact_static(&self, inner: &mut PublisherInner) -> io::Result<()> {
         // Reload takes the plan writer before the publisher. Never wait in the reverse order.
-        let Some(plan) = self.active_plan.try_read().map(|plan| Arc::clone(&plan)) else {
+        let Some(plan) = self
+            .active_plan
+            .try_read()
+            .map(|plan| Arc::clone(&plan.plan))
+        else {
             return Ok(());
         };
         if inner.current.policy.bytecode.fingerprint != plan.fingerprint {

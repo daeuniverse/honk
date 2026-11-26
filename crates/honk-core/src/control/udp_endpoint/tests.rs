@@ -3884,7 +3884,7 @@ async fn udp_endpoint_node_death_before_dial_sends_nothing() {
         _ => panic!("death-before-dial fixture must initialize"),
     };
     let generation = lease.generation();
-    assert!(lease.bind_selected_node(DEAD_NODE_ID));
+    assert!(lease.bind_selected(DEAD_NODE_ID, None));
     // Simulate death winning immediately after bind, before dial await.
     pool.remove_by_node(DEAD_NODE_ID);
     assert!(
@@ -3959,7 +3959,7 @@ async fn udp_endpoint_node_death_during_dial_sends_nothing() {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("death-during-dial fixture must initialize"),
     };
-    assert!(lease.bind_selected_node(DEAD_NODE_ID));
+    assert!(lease.bind_selected(DEAD_NODE_ID, None));
     // Death arrives while dial would be in flight.
     pool.remove_by_node(DEAD_NODE_ID);
     assert!(!lease.still_initializing());
@@ -4017,7 +4017,7 @@ async fn udp_endpoint_node_death_before_commit_sends_nothing() {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("death-before-commit fixture must initialize"),
     };
-    assert!(lease.bind_selected_node(DEAD_NODE_ID));
+    assert!(lease.bind_selected(DEAD_NODE_ID, None));
     let transport = Arc::new(ScriptedPacketTransport::new(relay, [DriverSendAction::Ok]));
     let endpoint = Arc::new(UdpEndpoint::new(
         transport.clone() as Arc<dyn honk_outbound::proxy::PacketTransport>,
@@ -4222,7 +4222,7 @@ fn test_remove_by_node() {
     );
     assert!(initializing.still_initializing());
 
-    assert!(initializing.bind_selected_node(DEAD_NODE_ID));
+    assert!(initializing.bind_selected(DEAD_NODE_ID, None));
     pool.remove_by_node(DEAD_NODE_ID);
     assert!(
         !initializing.still_initializing(),

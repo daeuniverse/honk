@@ -102,6 +102,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                     config.global.tproxy_port,
                     &dae0_setup,
                     local_ip,
+                    &crate::ebpf::interface::TcProgram::ALL,
                 )
                 .await?;
                 backend.bind_test_interfaces(&["honk-lan0"], &["honk-wan0"]);

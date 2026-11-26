@@ -17,10 +17,21 @@ pub(in crate::control) enum SourcePreparation {
         node_id: uuid::Uuid,
         node_name: String,
         health_family: honk_outbound::alive::IpVersion,
+        evidence: Option<Arc<UdpTrafficEvidence>>,
     },
 }
 
 impl SourcePreparation {
+    pub(in crate::control) fn with_evidence(
+        mut self,
+        creator_evidence: Option<Arc<UdpTrafficEvidence>>,
+    ) -> Self {
+        if let Self::Fresh { evidence, .. } = &mut self {
+            *evidence = creator_evidence;
+        }
+        self
+    }
+
     #[cfg(all(test, feature = "rprx"))]
     pub(in crate::control::udp_endpoint) fn attached_owner(&self) -> Option<Arc<SourceOwner>> {
         match self {
@@ -55,6 +66,7 @@ impl SourcePreparation {
                 node_id,
                 node_name,
                 health_family,
+                evidence,
             } => {
                 let mut prepared = Some(prepared);
                 let mut transport = None;
@@ -132,6 +144,7 @@ impl SourcePreparation {
                                     stats,
                                     source_permit,
                                     packet_source,
+                                    evidence,
                                 )?;
                                 let receiver =
                                     run_source_receiver(Arc::clone(pool), Arc::clone(&owner));

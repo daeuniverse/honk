@@ -1,5 +1,7 @@
 use super::*;
 
+mod exit;
+
 #[cfg(feature = "flow-observation")]
 mod observation;
 mod selector_networks;
@@ -547,7 +549,7 @@ fn test_select_marks_group_active() {
     let n = nid("a");
     let nodes = vec![make_node(n, "a")];
     let alive = Arc::new(AliveDialerSet::new());
-    alive.register_urltest_group("g", &[nid("a")], Some(Duration::from_secs(3600)));
+    alive.register_idle_group("g", &[nid("a")], Some(Duration::from_secs(3600)));
     let m = GroupManager::with_alive_set(
         &[make_group("g", GroupPolicy::URLTest, vec![n])],
         &nodes,
@@ -555,20 +557,42 @@ fn test_select_marks_group_active() {
     );
 
     // Lazy start: idle before first use, active after selection.
-    assert!(alive.is_urltest_group_idle("g"));
+    assert!(alive.is_group_idle("g"));
     m.select_node("g");
-    assert!(!alive.is_urltest_group_idle("g"));
+    assert!(!alive.is_group_idle("g"));
 
     // The parallel-dial path also counts as activity.
-    alive.register_urltest_group("g2", &[nid("a")], Some(Duration::from_millis(50)));
+    alive.register_idle_group("g2", &[nid("a")], Some(Duration::from_millis(50)));
     let m2 = GroupManager::with_alive_set(
         &[make_group("g2", GroupPolicy::URLTest, vec![n])],
         &nodes,
         Some(alive.clone()),
     );
-    assert!(alive.is_urltest_group_idle("g2"));
+    assert!(alive.is_group_idle("g2"));
     m2.select_nodes_in_order_for_domain("g2", ProbeDomain::Tcp, IpVersion::V4);
-    assert!(!alive.is_urltest_group_idle("g2"));
+    assert!(!alive.is_group_idle("g2"));
+}
+
+#[test]
+fn idle_selector_suspends_all_but_selected_member() {
+    let (a, b) = (nid("a"), nid("b"));
+    let nodes = vec![make_node(a, "a"), make_node(b, "b")];
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.register_idle_group("sel", &[a, b], None);
+    let m = GroupManager::with_alive_set(
+        &[make_group("sel", GroupPolicy::Selector, vec![a, b])],
+        &nodes,
+        Some(alive.clone()),
+    );
+    m.publish_selected_probe_nodes();
+    assert!(alive.is_group_idle("sel"));
+    assert!(!alive.is_probe_suspended(a));
+    assert!(alive.is_probe_suspended(b));
+
+    m.set_selector_choice("sel", "b", crate::group::SelectorNetworks::Both)
+        .unwrap();
+    assert!(alive.is_probe_suspended(a));
+    assert!(!alive.is_probe_suspended(b));
 }
 
 /// Authoritative selection (sing-box semantics): the dial path returns
@@ -2015,15 +2039,15 @@ fn peek_selection_plan_keeps_cold_urltest_idle_and_cache_empty() {
     let nodes = vec![make_node(node_id, "cold")];
     let group = make_group("cold", GroupPolicy::URLTest, vec![node_id]);
     let alive = Arc::new(AliveDialerSet::new());
-    alive.register_urltest_group("cold", &[nid("cold")], Some(Duration::from_secs(60)));
+    alive.register_idle_group("cold", &[nid("cold")], Some(Duration::from_secs(60)));
     let manager = GroupManager::with_alive_set(&[group], &nodes, Some(Arc::clone(&alive)));
 
-    assert!(alive.is_urltest_group_idle("cold"));
+    assert!(alive.is_group_idle("cold"));
     let plan = manager.peek_selection_plan_for_domain("cold", ProbeDomain::DataUdp, IpVersion::V4);
 
     assert_eq!(plan.mode, SelectionPlanMode::ColdUrlTest);
     assert_eq!(plan.nodes[0].name, "cold");
-    assert!(alive.is_urltest_group_idle("cold"));
+    assert!(alive.is_group_idle("cold"));
     assert_eq!(manager.get_urltest_selection("cold"), None);
 }
 
@@ -2149,7 +2173,7 @@ fn peek_selection_plan_keeps_nested_child_idle_and_only_reads_tcp_mirror() {
     let parent = make_subgroup("parent", GroupPolicy::Selector, &["child"]);
     let alive = Arc::new(AliveDialerSet::new());
     for group in ["child", "parent"] {
-        alive.register_urltest_group(group, &[nid("a"), nid("b")], Some(Duration::from_secs(60)));
+        alive.register_idle_group(group, &[nid("a"), nid("b")], Some(Duration::from_secs(60)));
     }
     let manager = GroupManager::with_alive_set(&[child, parent], &nodes, Some(Arc::clone(&alive)));
     alive.record_probe_latency(
@@ -2169,8 +2193,8 @@ fn peek_selection_plan_keeps_nested_child_idle_and_only_reads_tcp_mirror() {
     let plan =
         manager.peek_selection_plan_for_domain("parent", ProbeDomain::DataUdp, IpVersion::V4);
     assert_eq!(plan.nodes[0].name, "a");
-    assert!(alive.is_urltest_group_idle("parent"));
-    assert!(alive.is_urltest_group_idle("child"));
+    assert!(alive.is_group_idle("parent"));
+    assert!(alive.is_group_idle("child"));
     assert_eq!(
         manager.get_urltest_selection_for_network("child", SelectionNetwork::Udp),
         None
@@ -2182,7 +2206,7 @@ fn peek_selection_plan_keeps_nested_child_idle_and_only_reads_tcp_mirror() {
     let plan =
         manager.peek_selection_plan_for_domain("parent", ProbeDomain::DataUdp, IpVersion::V4);
     assert_eq!(plan.nodes[0].name, "a");
-    assert!(alive.is_urltest_group_idle("parent"));
+    assert!(alive.is_group_idle("parent"));
     assert_eq!(
         manager.get_urltest_selection_for_network("child", SelectionNetwork::Udp),
         None
@@ -2233,4 +2257,725 @@ fn ranked_udp_leaves_orders_caps_and_filters() {
             .get_urltest_selection_for_network("g", SelectionNetwork::Udp)
             .is_none()
     );
+}
+
+fn idle_reg(
+    name: &str,
+    members: Vec<uuid::Uuid>,
+    idle_timeout: Option<Duration>,
+    kind: crate::alive::IdleGroupKind,
+) -> crate::alive::IdleGroupRegistration {
+    let recovery = if kind == crate::alive::IdleGroupKind::Automatic {
+        members.clone()
+    } else {
+        Vec::new()
+    };
+    crate::alive::IdleGroupRegistration {
+        name: name.to_owned(),
+        members,
+        idle_timeout,
+        kind,
+        tcp_recovery_members: recovery.clone(),
+        udp_recovery_members: recovery,
+    }
+}
+
+#[test]
+fn automatic_policies_pause_until_selected_and_ignore_peek() {
+    use crate::alive::IdleGroupKind;
+
+    for policy in [
+        GroupPolicy::URLTest,
+        GroupPolicy::Fallback,
+        GroupPolicy::LoadBalance,
+        GroupPolicy::Score,
+    ] {
+        let (a, b) = (nid("auto-a"), nid("auto-b"));
+        let nodes = vec![make_node(a, "a"), make_node(b, "b")];
+        let alive = Arc::new(AliveDialerSet::new());
+        alive.sync_idle_groups(&[idle_reg(
+            "g",
+            vec![a, b],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        )]);
+        let mut trigger_rx = alive.take_trigger_rx().expect("trigger receiver");
+        let manager = GroupManager::with_alive_set(
+            &[make_group("g", policy, vec![a, b])],
+            &nodes,
+            Some(Arc::clone(&alive)),
+        );
+        manager.publish_selected_probe_nodes();
+
+        assert!(alive.is_group_idle("g"), "{policy:?} starts idle");
+        assert!(alive.is_probe_suspended(a), "{policy:?} suspends a");
+        assert!(alive.is_probe_suspended(b), "{policy:?} suspends b");
+
+        let _ = manager.peek_selection_plan_for_domain("g", ProbeDomain::Tcp, IpVersion::V4);
+        assert!(alive.is_group_idle("g"), "{policy:?} peek keeps idle");
+        assert!(trigger_rx.try_recv().is_err());
+
+        if policy == GroupPolicy::Score {
+            let ctx = ScoreSelectionContext::aggregate(
+                SelectionNetwork::Tcp,
+                ProbeDomain::Tcp,
+                IpVersion::V4,
+            );
+            assert!(
+                !manager
+                    .selection_plan_for_target("g", &ctx)
+                    .entries
+                    .is_empty()
+            );
+        } else {
+            assert!(manager.select_node("g").is_some());
+        }
+        assert!(!alive.is_group_idle("g"), "{policy:?} wakes on selection");
+        assert!(!alive.is_probe_suspended(a));
+        assert!(!alive.is_probe_suspended(b));
+        let mut woken = std::collections::HashSet::new();
+        while let Ok(id) = trigger_rx.try_recv() {
+            woken.insert(id);
+        }
+        assert_eq!(woken, std::collections::HashSet::from([a, b]));
+    }
+}
+
+#[test]
+fn active_selector_and_pinned_automatic_groups_isolate_unselected_members() {
+    use crate::alive::IdleGroupKind;
+
+    let (a, b, hk1, hk2, jp1, jp2, o1, s1, s2, f1, p1, p2) = (
+        nid("a"),
+        nid("b"),
+        nid("hk1"),
+        nid("hk2"),
+        nid("jp1"),
+        nid("jp2"),
+        nid("o1"),
+        nid("s1"),
+        nid("s2"),
+        nid("f1"),
+        nid("p1"),
+        nid("p2"),
+    );
+    let nodes = vec![
+        make_node(a, "a"),
+        make_node(b, "b"),
+        make_node(hk1, "hk1"),
+        make_node(hk2, "hk2"),
+        make_node(jp1, "jp1"),
+        make_node(jp2, "jp2"),
+        make_node(o1, "o1"),
+        make_node(s1, "s1"),
+        make_node(s2, "s2"),
+        make_node(f1, "f1"),
+        make_node(p1, "p1"),
+        make_node(p2, "p2"),
+    ];
+    let mut proxy = make_group("proxy", GroupPolicy::Selector, vec![a, b]);
+    proxy.groups = vec!["auto_hk".into(), "auto_jp".into()];
+    proxy.default = Some("a".into());
+    let auto_hk = make_group("auto_hk", GroupPolicy::Score, vec![hk1, hk2]);
+    let auto_jp = make_group("auto_jp", GroupPolicy::Fallback, vec![jp1, jp2]);
+
+    let mut outer_auto = make_group("outer_auto", GroupPolicy::URLTest, vec![o1]);
+    outer_auto.groups = vec!["nested_sel".into()];
+    outer_auto.final_outbound = Some("final_auto".into());
+    let mut nested_sel = make_group("nested_sel", GroupPolicy::Selector, vec![s1, s2]);
+    nested_sel.default = Some("s1".into());
+    let final_auto = make_group("final_auto", GroupPolicy::Fallback, vec![f1]);
+    let pinned_score = make_group("pinned_score", GroupPolicy::Score, vec![p1, p2]);
+
+    let groups = vec![
+        proxy,
+        auto_hk,
+        auto_jp,
+        outer_auto,
+        nested_sel,
+        final_auto,
+        pinned_score,
+    ];
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.sync_idle_groups(&[
+        idle_reg(
+            "proxy",
+            vec![a, b],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Selector,
+        ),
+        idle_reg(
+            "auto_hk",
+            vec![hk1, hk2],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "auto_jp",
+            vec![jp1, jp2],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "outer_auto",
+            vec![o1],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "nested_sel",
+            vec![s1, s2],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Selector,
+        ),
+        idle_reg(
+            "final_auto",
+            vec![f1],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "pinned_score",
+            vec![p1, p2],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+    let manager = GroupManager::with_alive_set(&groups, &nodes, Some(Arc::clone(&alive)));
+    manager.publish_selected_probe_nodes();
+
+    // Selecting through Proxy (pointing to direct node `a`) across every entry point
+    // must keep unselected direct node `b` and unselected subgroups suspended.
+    assert_eq!(manager.select_node("proxy").map(|n| n.id), Some(a));
+    assert_eq!(
+        manager
+            .selection_plan_for_domain("proxy", ProbeDomain::Tcp, IpVersion::V4)
+            .nodes
+            .first()
+            .map(|n| n.id),
+        Some(a)
+    );
+    let tcp_ctx =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(
+        manager
+            .selection_plan_for_target("proxy", &tcp_ctx)
+            .entries
+            .first()
+            .map(|e| e.node.id),
+        Some(a)
+    );
+    assert!(!alive.is_probe_suspended(a));
+    for suspended in [b, hk1, hk2, jp1, jp2] {
+        assert!(alive.is_probe_suspended(suspended));
+    }
+    assert!(alive.is_group_idle("auto_hk"));
+    assert!(alive.is_group_idle("auto_jp"));
+
+    // Switching Proxy to `auto_hk` wakes only `auto_hk` on traffic, not `a`, `b`, or `auto_jp`.
+    manager
+        .set_selector_choice("proxy", "auto_hk", SelectorNetworks::Both)
+        .unwrap();
+    assert!(alive.is_group_idle("auto_hk"));
+    assert!(manager.select_node("proxy").is_some());
+    assert!(!alive.is_group_idle("auto_hk"));
+    assert!(!alive.is_probe_suspended(hk1));
+    assert!(!alive.is_probe_suspended(hk2));
+    for suspended in [a, b, jp1, jp2] {
+        assert!(alive.is_probe_suspended(suspended));
+    }
+    assert!(alive.is_group_idle("auto_jp"));
+
+    // Active automatic group wakes its own members, not nested Selector's unselected
+    // member `s2` or untraversed `final_auto`.
+    assert!(manager.select_node("outer_auto").is_some());
+    assert!(!alive.is_probe_suspended(o1));
+    assert!(!alive.is_probe_suspended(s1));
+    assert!(alive.is_probe_suspended(s2));
+    assert!(alive.is_group_idle("final_auto"));
+    assert!(alive.is_probe_suspended(f1));
+
+    // When `outer_auto` falls back to `final_auto`, `final_auto` wakes.
+    alive.report_unavailable_forced(o1, ProbeDomain::Tcp, IpVersion::V4);
+    alive.report_unavailable_forced(s1, ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(manager.select_node("outer_auto").map(|n| n.id), Some(f1));
+    assert!(!alive.is_group_idle("final_auto"));
+    assert!(!alive.is_probe_suspended(f1));
+
+    // Pinned automatic group isolates unpinned siblings on the pinned network,
+    // while unpinned UDP traffic still activates the group.
+    manager
+        .publish_override(
+            "pinned_score",
+            &SelectorMember::Node(p1),
+            SelectorNetworks::Tcp,
+        )
+        .unwrap()
+        .run_callbacks();
+    assert_eq!(manager.select_node("pinned_score").map(|n| n.id), Some(p1));
+    assert!(alive.is_group_idle("pinned_score"));
+    assert!(!alive.is_probe_suspended(p1));
+    assert!(alive.is_probe_suspended(p2));
+
+    let udp_ctx = ScoreSelectionContext::aggregate(
+        SelectionNetwork::Udp,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+    );
+    assert!(
+        !manager
+            .selection_plan_for_target("pinned_score", &udp_ctx)
+            .entries
+            .is_empty()
+    );
+    assert!(!alive.is_group_idle("pinned_score"));
+    assert!(!alive.is_probe_suspended(p2));
+}
+
+#[test]
+fn selector_update_defers_probe_wake_and_excludes_builtin_finals() {
+    use crate::alive::IdleGroupKind;
+    use honk_config::config::{BLOCK_NODE_ID, DIRECT_NODE_ID};
+
+    let (a, b, c, d, e, f, backup) = (
+        nid("u-a"),
+        nid("u-b"),
+        nid("u-c"),
+        nid("u-d"),
+        nid("u-e"),
+        nid("u-f"),
+        nid("u-backup"),
+    );
+    let nodes = vec![
+        make_node(a, "a"),
+        make_node(b, "b"),
+        make_node(c, "c"),
+        make_node(d, "d"),
+        make_node(e, "e"),
+        make_node(f, "f"),
+        make_node(backup, "backup"),
+        honk_config::Config::builtin_direct_node(),
+        honk_config::Config::builtin_block_node(),
+    ];
+    let mut sel = make_group("sel", GroupPolicy::Selector, vec![a, b, c]);
+    sel.final_outbound = Some("block".into());
+    let mut auto_g = make_group("auto_g", GroupPolicy::Score, vec![d, e]);
+    auto_g.final_outbound = Some("direct".into());
+    let mut auto_final = make_group("auto_final", GroupPolicy::Fallback, vec![f]);
+    auto_final.final_outbound = Some("backup".into());
+
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.sync_idle_groups(&[
+        idle_reg(
+            "sel",
+            vec![a, b, c, BLOCK_NODE_ID],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Selector,
+        ),
+        idle_reg(
+            "auto_g",
+            vec![d, e, DIRECT_NODE_ID],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "auto_final",
+            vec![f, backup],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+    let mut trigger_rx = alive.take_trigger_rx().expect("trigger receiver");
+    let manager =
+        GroupManager::with_alive_set(&[sel, auto_g, auto_final], &nodes, Some(Arc::clone(&alive)));
+    manager.publish_selected_probe_nodes();
+
+    assert!(!alive.is_probe_suspended(a));
+    assert!(!alive.is_probe_suspended(backup));
+    assert!(alive.is_probe_suspended(DIRECT_NODE_ID));
+    assert!(alive.is_probe_suspended(BLOCK_NODE_ID));
+    assert!(trigger_rx.try_recv().is_err());
+
+    // Split TCP/UDP Selector choice: swap is immediate, wake is deferred to run_callbacks.
+    let update = manager
+        .publish_selector_choice("sel", &SelectorMember::Node(b), SelectorNetworks::Udp)
+        .unwrap();
+    assert!(!alive.is_probe_suspended(a));
+    assert!(!alive.is_probe_suspended(b));
+    assert!(alive.is_probe_suspended(c));
+    assert!(trigger_rx.try_recv().is_err());
+    update.run_callbacks();
+    assert_eq!(trigger_rx.try_recv(), Ok(b));
+    assert!(trigger_rx.try_recv().is_err());
+
+    // Automatic group pin & unpin defer wake until run_callbacks.
+    let pin = manager
+        .publish_override("auto_g", &SelectorMember::Node(e), SelectorNetworks::Both)
+        .unwrap();
+    assert!(!alive.is_probe_suspended(e));
+    assert!(trigger_rx.try_recv().is_err());
+    pin.run_callbacks();
+    assert_eq!(trigger_rx.try_recv(), Ok(e));
+
+    let clear = manager
+        .clear_override("auto_g", SelectorNetworks::Both)
+        .unwrap();
+    assert!(alive.is_probe_suspended(e));
+    clear.run_callbacks();
+    assert!(trigger_rx.try_recv().is_err());
+
+    // Suppressing wake (startup restore path) publishes without queuing trigger_tx.
+    let restore = manager
+        .publish_selector_choice("sel", &SelectorMember::Node(c), SelectorNetworks::Tcp)
+        .unwrap();
+    restore
+        .without_probe_wake()
+        .run_callbacks_without_interrupt();
+    assert!(!alive.is_probe_suspended(c));
+    assert!(alive.is_probe_suspended(a));
+    assert!(trigger_rx.try_recv().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn pinned_custom_check_url_automatic_group_probes_and_recovers_pin_only() {
+    use crate::alive::{
+        HttpProbeOutcome, HttpProbeResult, HttpProber, IdleGroupKind, ProbeCancellation,
+        UrlProbeMember,
+    };
+    use parking_lot::Mutex;
+    use std::future::Future;
+    use std::net::SocketAddr;
+    use std::pin::Pin;
+
+    struct UrlRecorder(Arc<Mutex<Vec<(uuid::Uuid, String)>>>);
+    impl HttpProber for UrlRecorder {
+        fn probe_http(
+            &self,
+            node_id: uuid::Uuid,
+            _addr: SocketAddr,
+            url: &str,
+            _timeout: Duration,
+            _cancel: ProbeCancellation,
+        ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>> {
+            self.0.lock().push((node_id, url.to_owned()));
+            Box::pin(async { HttpProbeResult::WarmSuccess(Duration::from_millis(5)).into() })
+        }
+    }
+
+    let (a, b, c, sub_leaf) = (nid("curl-a"), nid("curl-b"), nid("curl-c"), nid("curl-sub"));
+    let nodes = vec![
+        make_node(a, "a"),
+        make_node(b, "b"),
+        make_node(c, "c"),
+        make_node(sub_leaf, "sub_leaf"),
+    ];
+    let url = "http://127.0.0.1/custom";
+    let url_sub = "http://127.0.0.1/custom-sub";
+    let mut group = make_group("custom", GroupPolicy::URLTest, vec![a, b, c]);
+    group.check_url = Some(url.into());
+    let sub = make_group("sub", GroupPolicy::Fallback, vec![sub_leaf]);
+    let mut custom_sub = make_group("custom_sub", GroupPolicy::URLTest, vec![]);
+    custom_sub.groups = vec!["sub".into()];
+    custom_sub.check_url = Some(url_sub.into());
+
+    let alive = Arc::new(AliveDialerSet::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    alive
+        .set_http_probe(
+            Arc::new(UrlRecorder(Arc::clone(&calls))),
+            "http://127.0.0.1/global".into(),
+            "HEAD".into(),
+        )
+        .await;
+    for (id, name) in [(a, "a"), (b, "b"), (c, "c"), (sub_leaf, "sub_leaf")] {
+        alive.register_node(id, name.into(), Some("127.0.0.1:1".into()));
+    }
+    alive.sync_idle_groups(&[
+        idle_reg(
+            "custom",
+            vec![a, b, c],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "sub",
+            vec![sub_leaf],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "custom_sub",
+            Vec::new(),
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+    alive.sync_group_check_urls(&[
+        ("custom".into(), url.into()),
+        ("custom_sub".into(), url_sub.into()),
+    ]);
+
+    let manager = Arc::new(GroupManager::with_alive_set(
+        &[group, sub, custom_sub],
+        &nodes,
+        Some(Arc::clone(&alive)),
+    ));
+    let resolver_gm = Arc::clone(&manager);
+    alive.set_url_member_resolver(Some(Arc::new(move |name| {
+        resolver_gm
+            .delay_test_members(name)
+            .into_iter()
+            .map(|(tag, leaf)| UrlProbeMember {
+                tag,
+                leaf: leaf.id,
+                native: None,
+            })
+            .collect()
+    })));
+    manager.publish_selected_probe_nodes();
+
+    // Unpinned idle groups run zero custom-URL probes.
+    alive
+        .run_health_check_cycle_concurrent(Duration::from_secs(1), 2)
+        .await;
+    assert!(calls.lock().is_empty());
+
+    // Start the health loop and advance past initial stagger jitter while unpinned
+    // so the next periodic tick is 3600s away (cannot mask immediate pin wakes).
+    // The loop schedules its first tick when first polled, so let it run before
+    // advancing; otherwise the jittered tick can land inside the waits below.
+    let loop_task = alive.spawn_health_check_loop_concurrent(
+        Duration::from_secs(3600),
+        Duration::from_secs(1),
+        2,
+    );
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    assert!(calls.lock().is_empty());
+
+    // Pinning both a direct node and a subgroup wakes their custom-URL probes immediately
+    // via SelectedProbeWake -> wake_pinned_url_members, without probing unpinned siblings.
+    manager
+        .publish_override("custom", &SelectorMember::Node(a), SelectorNetworks::Tcp)
+        .unwrap()
+        .run_callbacks();
+    manager
+        .publish_override(
+            "custom_sub",
+            &SelectorMember::Group("sub".into()),
+            SelectorNetworks::Tcp,
+        )
+        .unwrap()
+        .run_callbacks();
+    let mut woke = false;
+    for _ in 0..20 {
+        {
+            let recorded = calls.lock();
+            if recorded
+                .iter()
+                .any(|(id, target)| *id == a && target == "http://127.0.0.1/global")
+                && recorded
+                    .iter()
+                    .any(|(id, target)| *id == a && target == url)
+                && recorded
+                    .iter()
+                    .any(|(id, target)| *id == sub_leaf && target == url_sub)
+            {
+                woke = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        woke,
+        "pinning direct and subgroup custom-URL members must trigger immediate probes before periodic tick"
+    );
+    // Let any in-flight emergency workers settle before asserting exact counts.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    {
+        let recorded = calls.lock();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|(id, target)| *id == a && target == url)
+                .count(),
+            1,
+            "pinning a direct member must probe its custom check_url exactly once"
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|(id, target)| *id == sub_leaf && target == url_sub)
+                .count(),
+            1,
+            "pinning a subgroup member must probe its custom check_url exactly once"
+        );
+        assert!(
+            !recorded.iter().any(|(id, _)| *id == b || *id == c),
+            "unpinned siblings must not be probed"
+        );
+    }
+
+    // While health checks are STILL running: killing both pinned `a` and unpinned `b`
+    // (with `c` alive) recovers only the pinned member `a`.
+    calls.lock().clear();
+    for tag in ["a", "b"] {
+        for _ in 0..3 {
+            alive.record_url_probe_failure(tag, url);
+        }
+        alive.reset_url_backoff_for_recovery(tag, url);
+    }
+    assert!(!alive.is_alive_for_url("a", url));
+    assert!(!alive.is_alive_for_url("b", url));
+    alive
+        .run_recovery_check_cycle_concurrent(Duration::from_secs(1), 2)
+        .await;
+    assert_eq!(calls.lock().as_slice(), &[(a, url.to_owned())]);
+    assert!(alive.is_alive_for_url("a", url));
+    assert!(!alive.is_alive_for_url("b", url));
+
+    // Still BEFORE shutdown: after unpinning, a real periodic cycle skips custom-URL probes.
+    calls.lock().clear();
+    manager
+        .clear_override("custom", SelectorNetworks::Tcp)
+        .unwrap()
+        .run_callbacks();
+    manager
+        .clear_override("custom_sub", SelectorNetworks::Tcp)
+        .unwrap()
+        .run_callbacks();
+    assert!(alive.acquire_health_probe().is_ok());
+    alive
+        .run_health_check_cycle_concurrent(Duration::from_secs(1), 2)
+        .await;
+    assert!(calls.lock().is_empty());
+
+    alive.shutdown_health_checks().await.unwrap();
+    loop_task.await.unwrap();
+}
+
+#[test]
+fn concurrent_publish_selector_choice_and_stage_probe_wake_stay_consistent() {
+    use crate::alive::IdleGroupKind;
+
+    let (a, b) = (nid("conc-a"), nid("conc-b"));
+    let nodes = vec![make_node(a, "a"), make_node(b, "b")];
+    let mut sel = make_group("sel", GroupPolicy::Selector, vec![a, b]);
+    sel.default = Some("a".into());
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.sync_idle_groups(&[idle_reg(
+        "sel",
+        vec![a, b],
+        Some(Duration::from_secs(3600)),
+        IdleGroupKind::Selector,
+    )]);
+    let manager = Arc::new(GroupManager::with_alive_set(
+        &[sel],
+        &nodes,
+        Some(Arc::clone(&alive)),
+    ));
+    manager.publish_selected_probe_nodes();
+
+    let mut handles = Vec::new();
+    for worker in 0..4 {
+        let gm = Arc::clone(&manager);
+        handles.push(std::thread::spawn(move || {
+            for step in 0..100 {
+                let target = if (worker + step) % 2 == 0 { a } else { b };
+                gm.publish_selector_choice(
+                    "sel",
+                    &SelectorMember::Node(target),
+                    SelectorNetworks::Both,
+                )
+                .unwrap()
+                .run_callbacks();
+            }
+        }));
+    }
+    for _ in 0..2 {
+        let gm = Arc::clone(&manager);
+        let alive = Arc::clone(&alive);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..100 {
+                gm.stage_selected_probe_wake().wake();
+                let _ = alive.is_probe_suspended(a);
+                let _ = alive.is_probe_suspended(b);
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let final_choice = manager
+        .selector_member_choice("sel", SelectionNetwork::Tcp)
+        .expect("selector choice");
+    let (selected, other) = if final_choice == SelectorMember::Node(a) {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    assert!(!alive.is_probe_suspended(selected));
+    assert!(alive.is_probe_suspended(other));
+}
+
+#[tokio::test]
+async fn cached_idle_activity_slot_obeys_sync_idle_groups_generation_changes() {
+    use crate::alive::IdleGroupKind;
+
+    let (a, b) = (nid("slot-a"), nid("slot-b"));
+    let nodes = vec![make_node(a, "a"), make_node(b, "b")];
+    let fb = make_group("fb", GroupPolicy::Fallback, vec![a, b]);
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.sync_idle_groups(&[idle_reg(
+        "fb",
+        vec![a, b],
+        Some(Duration::from_secs(1800)),
+        IdleGroupKind::Automatic,
+    )]);
+    let mut trigger_rx = alive.take_trigger_rx().expect("trigger receiver");
+    let manager = GroupManager::with_alive_set(&[fb], &nodes, Some(Arc::clone(&alive)));
+
+    // First selection populates ManagedGroup.idle_activity and wakes members once.
+    assert_eq!(manager.select_node("fb").map(|n| n.id), Some(a));
+    assert!(!alive.is_group_idle("fb"));
+    assert!(manager.groups["fb"].idle_activity.get().is_some());
+    while let Ok(id) = trigger_rx.try_recv() {
+        alive.finish_trigger_probe(id);
+    }
+
+    // Second selection hits lock-free fast path without queuing another wake.
+    assert_eq!(manager.select_node("fb").map(|n| n.id), Some(a));
+    assert!(trigger_rx.try_recv().is_err());
+
+    // Re-syncing to idle_timeout=0 invalidates the cached slot; selections keep it idle.
+    alive.sync_idle_groups(&[idle_reg(
+        "fb",
+        vec![a, b],
+        Some(Duration::ZERO),
+        IdleGroupKind::Automatic,
+    )]);
+    assert_eq!(manager.select_node("fb").map(|n| n.id), Some(a));
+    assert!(alive.is_group_idle("fb"));
+    assert!(trigger_rx.try_recv().is_err());
+
+    // Re-syncing to a short 50ms exact-clock timeout wakes on selection and expires cleanly.
+    alive.sync_idle_groups(&[idle_reg(
+        "fb",
+        vec![a, b],
+        Some(Duration::from_millis(50)),
+        IdleGroupKind::Automatic,
+    )]);
+    assert!(alive.is_group_idle("fb"));
+    assert_eq!(manager.select_node("fb").map(|n| n.id), Some(a));
+    assert!(!alive.is_group_idle("fb"));
+    let mut woken = std::collections::HashSet::new();
+    while let Ok(id) = trigger_rx.try_recv() {
+        woken.insert(id);
+    }
+    assert_eq!(woken, std::collections::HashSet::from([a, b]));
+    tokio::time::sleep(Duration::from_millis(65)).await;
+    assert!(alive.is_group_idle("fb"));
 }

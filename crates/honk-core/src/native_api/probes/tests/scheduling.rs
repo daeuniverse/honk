@@ -245,3 +245,145 @@ async fn four_active_jobs_bound_wire_work_and_fifth_request_is_answered_as_queue
     stop.send(true).unwrap();
     worker.await.unwrap();
 }
+
+async fn socks_member(slow: bool) -> Node {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node = node(listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            if slow {
+                held.push(socket);
+                continue;
+            }
+            tokio::spawn(async move {
+                let mut greeting = [0; 3];
+                socket.read_exact(&mut greeting).await.unwrap();
+                socket.write_all(&[5, 0]).await.unwrap();
+                let mut connect = [0; 10];
+                socket.read_exact(&mut connect).await.unwrap();
+                socket
+                    .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+                    .await
+                    .unwrap();
+                receive_headers(&mut socket).await;
+                socket
+                    .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    node
+}
+
+async fn group_plan(members: &[Node]) -> (Arc<NativeState>, PreparedPlan) {
+    let mut config = Config::default();
+    let hosts = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(hosts.path(), "authority.example 1.1.1.1\n").unwrap();
+    config.dns.hosts = vec![hosts.path().to_string_lossy().into_owned()];
+    config.nodes.extend(members.iter().cloned());
+    let ids: Vec<_> = members.iter().map(|node| node.id).collect();
+    config
+        .groups
+        .push(serde_json::from_value(json!({"name":"members","nodes":ids})).unwrap());
+    config.global.tcp_check_url = vec!["http://authority.example:8443/check".into()];
+    let state = state(config).await;
+    let identity = state.observation.core.catalog.snapshot();
+    let input = request(
+        json!({"type":"group","group_id":identity.groups["members"]}),
+        "http",
+        json!(["tcp"]),
+        "ipv4",
+    );
+    let plan = capture(&state, serde_json::from_value(input).unwrap())
+        .await
+        .unwrap();
+    let plan = prepare(plan).await.unwrap();
+    (state, plan)
+}
+
+#[tokio::test]
+async fn a_slow_member_does_not_starve_later_members_of_the_deadline() {
+    let mut members = vec![socks_member(true).await];
+    for _ in 0..3 {
+        members.push(socks_member(false).await);
+    }
+    let (state, mut plan) = group_plan(&members).await;
+    let (_stop, receiver) = watch::channel(false);
+    execute(
+        &state,
+        &mut plan,
+        Instant::now() + Duration::from_secs(1),
+        receiver,
+    )
+    .await
+    .unwrap();
+    let rows: HashMap<_, _> = plan
+        .result
+        .results
+        .iter()
+        .map(|row| (row.resolved_leaf_node_id.clone().unwrap(), row))
+        .collect();
+    let slow = rows[&members[0].id.to_string()];
+    assert_eq!((slow.state, slow.error), ("unknown", Some("deadline")));
+    for member in &members[1..] {
+        let row = rows[&member.id.to_string()];
+        assert_eq!((row.state, row.error), ("healthy", None));
+    }
+}
+
+#[tokio::test]
+async fn members_beyond_the_concurrency_bound_still_report_deadline_or_cancelled() {
+    let mut members = Vec::new();
+    for _ in 0..honk_outbound::urltest::URLTEST_MAX_CONCURRENT {
+        members.push(socks_member(true).await);
+    }
+    members.push(socks_member(false).await);
+
+    let (state, mut plan) = group_plan(&members).await;
+    let (_stop, receiver) = watch::channel(false);
+    execute(
+        &state,
+        &mut plan,
+        Instant::now() + Duration::from_millis(300),
+        receiver,
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.result.results.len(), members.len());
+    assert!(
+        plan.result
+            .results
+            .iter()
+            .all(|row| row.state == "unknown" && row.error == Some("deadline"))
+    );
+
+    let (state, mut plan) = group_plan(&members).await;
+    let (stop, receiver) = watch::channel(false);
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop.send(true).unwrap();
+        stop
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        execute(
+            &state,
+            &mut plan,
+            Instant::now() + Duration::from_secs(10),
+            receiver,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        plan.result
+            .results
+            .iter()
+            .all(|row| row.state == "unknown" && row.error == Some("cancelled"))
+    );
+    canceller.await.unwrap();
+}

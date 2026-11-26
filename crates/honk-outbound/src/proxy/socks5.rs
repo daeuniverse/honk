@@ -6,13 +6,14 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::debug;
 
+use super::packet::send_with_admission_check;
 use super::{
-    MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
-    ProxyStream, SharedSourceOutbound, TcpOutbound,
+    AsyncReadWrite, MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport,
+    ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound, TunnelDialOptions,
 };
 
 const SOCKS5_VERSION: u8 = 0x05;
@@ -59,8 +60,8 @@ impl Socks5Handler {
     }
 
     /// Perform full SOCKS5 handshake.
-    async fn handshake(
-        stream: &mut TcpStream,
+    async fn handshake<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
+        stream: &mut S,
         target: SocketAddr,
         target_domain: Option<&str>,
         username: Option<&str>,
@@ -73,6 +74,9 @@ impl Socks5Handler {
                 &[SOCKS5_VERSION, 1, METHOD_NO_AUTH]
             };
             stream.write_all(greeting).await?;
+            // A tunneled carrier may buffer writes until flushed; a TCP
+            // flush is a no-op.
+            stream.flush().await?;
 
             // Read: VER(1) | METHOD(1)
             let mut response = [0u8; 2];
@@ -92,6 +96,7 @@ impl Socks5Handler {
                     // Send: VER(1) | ULEN(1) | UNAME(ULEN) | PLEN(1) | PASSWD(PLEN)
                     let auth_req = Self::username_password_auth_request(user, pass)?;
                     stream.write_all(&auth_req).await?;
+                    stream.flush().await?;
 
                     // Read: VER(1) | STATUS(1)
                     let mut auth_resp = [0u8; 2];
@@ -154,10 +159,7 @@ impl Socks5Handler {
                 target
             );
 
-            stream.write_all(&request).await?;
-            crate::runtime::flow_observation::milestone(
-                crate::runtime::flow_observation::Milestone::TargetRequestSent,
-            );
+            super::transport::write_request(&mut *stream, &request).await?;
 
             // Reply: VER | REP | RSV | ATYP | BND.ADDR | BND.PORT
             let mut reply_header = [0u8; 4];
@@ -629,6 +631,25 @@ impl MultiTargetTransport for Socks5UdpTransport {
         self.send(target, domain, data, admitted).await
     }
 
+    async fn send_to_checked(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        admitted: Option<&AtomicBool>,
+        current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> io::Result<()> {
+        let local_admitted = AtomicBool::new(false);
+        let admitted = admitted.unwrap_or(&local_admitted);
+        let domain = crate::proxy::addr::dialed_name(self.target_domain.as_deref(), domain);
+        send_with_admission_check(
+            self.send(target, domain, data, Some(admitted)),
+            admitted,
+            current,
+        )
+        .await
+    }
+
     fn carrier_addr(&self) -> Option<SocketAddr> {
         self.socket.peer_addr().ok()
     }
@@ -636,6 +657,10 @@ impl MultiTargetTransport for Socks5UdpTransport {
 
 #[async_trait]
 impl TcpOutbound for Socks5Handler {
+    fn confirms_target_on_open(&self) -> bool {
+        true
+    }
+
     async fn dial(
         &self,
         node: &Node,
@@ -645,7 +670,7 @@ impl TcpOutbound for Socks5Handler {
     ) -> anyhow::Result<ProxyStream> {
         let addr = format!("{}:{}", node.host(), node.port);
         debug!("SOCKS5: connecting to {} for target {}", addr, target);
-        let stream = crate::util::connect_outbound(&addr, connect_timeout).await?;
+        let stream = crate::util::connect_proxy(&addr, connect_timeout).await?;
         self.dial_with_tcp(node, target, target_domain, stream, connect_timeout)
             .await
     }
@@ -672,6 +697,30 @@ impl TcpOutbound for Socks5Handler {
         .await?;
         Ok(ProxyStream {
             stream: Box::new(stream),
+            target_addr: target,
+            target_domain: target_domain.map(|s| s.to_string()),
+        })
+    }
+
+    async fn dial_over(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        mut carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        _options: TunnelDialOptions,
+    ) -> anyhow::Result<ProxyStream> {
+        let config = runtime.node.socks5().unwrap();
+        Self::handshake(
+            &mut carrier,
+            target,
+            target_domain,
+            config.username.as_deref(),
+            config.password.as_deref(),
+        )
+        .await?;
+        Ok(ProxyStream {
+            stream: carrier,
             target_addr: target,
             target_domain: target_domain.map(|s| s.to_string()),
         })

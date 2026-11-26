@@ -98,7 +98,26 @@ impl SourceTransport {
         data: &[u8],
         confirmed: bool,
         admitted: Option<&AtomicBool>,
+        current: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> io::Result<()> {
+        if let Some(current) = current {
+            return match self {
+                #[cfg(feature = "rprx")]
+                Self::Vless(transport) => {
+                    transport
+                        .send_to_checked(target, target_domain, data, admitted, current)
+                        .await
+                }
+                Self::Shared(transport) => {
+                    transport
+                        .send_to_checked(target, target_domain, data, admitted, current)
+                        .await
+                }
+                Self::Hysteria2(_) | Self::Tuic(_) => {
+                    Err(honk_outbound::proxy::PacketRejection::Policy.into())
+                }
+            };
+        }
         match self {
             #[cfg(feature = "rprx")]
             Self::Vless(transport) => {

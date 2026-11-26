@@ -59,6 +59,22 @@ pub(crate) fn restart_required_fields(
     log_files: &LogFiles,
     downgrades: &StartupDowngrades,
 ) -> Vec<RestartField> {
+    restart_required_fields_with_udp_dns(
+        current,
+        candidate,
+        log_files,
+        downgrades,
+        current.global.effective_udp_check_dns(),
+    )
+}
+
+pub(super) fn restart_required_fields_with_udp_dns(
+    current: &Config,
+    candidate: &Config,
+    log_files: &LogFiles,
+    downgrades: &StartupDowngrades,
+    current_udp_check_dns: &[String],
+) -> Vec<RestartField> {
     let candidate_log_file =
         crate::resolved_log_file_path(candidate, log_files.cli_override.as_deref());
     let mut changed = restart_required_changes(
@@ -66,6 +82,7 @@ pub(crate) fn restart_required_fields(
         candidate,
         log_files.effective.as_deref(),
         candidate_log_file.as_deref(),
+        current_udp_check_dns,
     );
     if downgrades.nfqueue_unavailable() {
         changed.retain(|field| *field != field!("global.nfqueue_enable"));
@@ -80,6 +97,7 @@ pub(crate) fn restart_required_changes(
     candidate: &Config,
     current_log_file: Option<&Path>,
     candidate_log_file: Option<&Path>,
+    current_udp_check_dns: &[String],
 ) -> Vec<RestartField> {
     let mut changed = Vec::new();
     let default_datapath = honk_config::datapath::DatapathConfig::default();
@@ -111,7 +129,7 @@ pub(crate) fn restart_required_changes(
     if old_http.map(|input| input.1) != new_http.map(|input| input.1) {
         changed.push(field!("global.tcp_check_http_method"));
     }
-    if udp_probe_input_changed(&old_global.udp_check_dns, &new_global.udp_check_dns) {
+    if udp_probe_input_changed(current_udp_check_dns, new_global.effective_udp_check_dns()) {
         changed.push(field!("global.udp_check_dns"));
     }
     if old_global.tls_implementation.eq_ignore_ascii_case("utls")
@@ -133,6 +151,21 @@ pub(crate) fn restart_required_changes(
     }
     if old_global.so_mark_from_dae != new_global.so_mark_from_dae {
         changed.push(field!("global.so_mark_from_dae"));
+    }
+    if old_global.syslog_addr != new_global.syslog_addr {
+        changed.push(field!("global.syslog_addr"));
+    }
+    if old_global.syslog_dns_enabled != new_global.syslog_dns_enabled {
+        changed.push(field!("global.syslog_dns_enabled"));
+    }
+    if old_global.syslog_cee_enabled != new_global.syslog_cee_enabled {
+        changed.push(field!("global.syslog_cee_enabled"));
+    }
+    if old_global.syslog_hostname != new_global.syslog_hostname {
+        changed.push(field!("global.syslog_hostname"));
+    }
+    if old_global.syslog_app_name != new_global.syslog_app_name {
+        changed.push(field!("global.syslog_app_name"));
     }
     if old_global.log_level != new_global.log_level {
         changed.push(field!("global.log_level"));
@@ -182,6 +215,9 @@ pub(crate) fn restart_required_changes(
     if current.experimental.native_api != candidate.experimental.native_api {
         changed.push(field!("experimental.native_api"));
     }
+    if current.assets.geodata != candidate.assets.geodata {
+        changed.push(field!("assets.geodata"));
+    }
     if serde_json::to_value(&current.experimental.cache_file).ok()
         != serde_json::to_value(&candidate.experimental.cache_file).ok()
     {
@@ -221,5 +257,55 @@ fn udp_probe_input_changed(current: &[String], candidate: &[String]) -> bool {
                     .eq_ignore_ascii_case(b.strip_suffix('.').unwrap_or(b))
         }
         (a, b) => a != b,
+    }
+}
+
+#[cfg(test)]
+mod syslog_tests {
+    use super::*;
+
+    #[test]
+    fn dns_syslog_settings_require_restart() {
+        let current = Config::default();
+        let mut candidate = current.clone();
+        candidate.global.syslog_addr = "192.0.2.10:514".into();
+        candidate.global.syslog_dns_enabled = true;
+        candidate.global.syslog_cee_enabled = true;
+        candidate.global.syslog_hostname = "router01".into();
+        candidate.global.syslog_app_name = "dns-audit".into();
+        let changed = restart_required_changes(
+            &current,
+            &candidate,
+            None,
+            None,
+            current.global.effective_udp_check_dns(),
+        );
+        let paths: Vec<_> = changed.iter().map(|field| field.path).collect();
+        assert_eq!(
+            paths,
+            [
+                "global.syslog_addr",
+                "global.syslog_dns_enabled",
+                "global.syslog_cee_enabled",
+                "global.syslog_hostname",
+                "global.syslog_app_name"
+            ]
+        );
+    }
+
+    #[test]
+    fn cee_mode_requires_restart_while_dns_audit_is_disabled() {
+        let current = Config::default();
+        let mut candidate = current.clone();
+        candidate.global.syslog_cee_enabled = true;
+        let changed = restart_required_changes(
+            &current,
+            &candidate,
+            None,
+            None,
+            current.global.effective_udp_check_dns(),
+        );
+        let paths: Vec<_> = changed.iter().map(|field| field.path).collect();
+        assert_eq!(paths, ["global.syslog_cee_enabled"]);
     }
 }

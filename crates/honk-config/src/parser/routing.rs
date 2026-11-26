@@ -205,8 +205,10 @@ pub(super) fn parse_section_indexed(
         }
         ordinal += 1;
         let statement = Expression::new(&lines[start..=end]).trim();
+        // The lexer keeps U+000B as a word but `trim` drops it, so the statement can be empty.
+        let anchor = statement.parts().next().unwrap_or(lines[start]);
         start = end + 1;
-        diagnostics.entry_text(statement.parts().next().unwrap(), ordinal);
+        diagnostics.entry_text(anchor, ordinal);
         if let Some(prefix) = ["fallback:", "default:"]
             .into_iter()
             .find(|prefix| statement.starts_with(prefix))
@@ -233,7 +235,7 @@ pub(super) fn parse_section_indexed(
                     location(Some(config.rules.len()), statement);
                     config.rules.push(rule);
                 }
-                Ok(None) => statement.parts().next().unwrap().notice(
+                Ok(None) => anchor.notice(
                     diagnostics,
                     Severity::Warning,
                     "unknown-statement",

@@ -72,6 +72,7 @@ async fn diagnostic_force_precedes_reject_and_bypass_preserves_cached_answer() {
     let normal = ResolveOptions {
         cache: CacheAccess::Normal,
         forced_upstream: Some(UpstreamTag::new("unreferenced").unwrap()),
+        ..Default::default()
     };
     let deadline = || tokio::time::Instant::now() + Duration::from_secs(2);
     let first = service
@@ -118,6 +119,7 @@ async fn diagnostic_force_precedes_reject_and_bypass_preserves_cached_answer() {
     let bad = ResolveOptions {
         cache: CacheAccess::Normal,
         forced_upstream: Some(UpstreamTag::new("missing").unwrap()),
+        ..Default::default()
     };
     assert!(matches!(
         service
@@ -146,6 +148,7 @@ async fn diagnostic_bypass_and_force_propagate_to_preferred_sibling() {
     let options = ResolveOptions {
         cache: CacheAccess::Bypass,
         forced_upstream: Some(UpstreamTag::new("unreferenced").unwrap()),
+        ..Default::default()
     };
     let answer = service
         .diagnostic(
@@ -264,6 +267,7 @@ async fn diagnostic_bypass_ignores_negative_without_replacing_it_or_joining_flig
     let bypass = ResolveOptions {
         cache: CacheAccess::Bypass,
         forced_upstream: Some(tag),
+        ..Default::default()
     };
     let answer = service
         .diagnostic(

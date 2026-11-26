@@ -245,3 +245,157 @@ fn clash_controller_in_the_head_refuses_startup() {
         "{error}"
     );
 }
+
+struct Refusal {
+    name: &'static str,
+    /// Breaks one precondition of the tree that `tree` writes.
+    edit: fn(entry: &Path, auth: &Path),
+    needle: &'static str,
+}
+
+fn replace_in(path: &Path, from: &str, to: &str) {
+    let content = fs::read_to_string(path).unwrap();
+    assert!(content.contains(from), "{from} not in {content}");
+    fs::write(path, content.replace(from, to)).unwrap();
+}
+
+const REFUSALS: &[Refusal] = &[
+    Refusal {
+        name: "native api disabled",
+        edit: |_, auth| replace_in(auth, "enabled: true", "enabled: false"),
+        needle: "--store db needs experimental.native_api",
+    },
+    Refusal {
+        name: "config_write off",
+        edit: |_, auth| replace_in(auth, "config_write: true", "config_write: false"),
+        needle: "--store db needs experimental.native_api",
+    },
+    Refusal {
+        name: "clash controller",
+        edit: |_, auth| replace_in(auth, "native_api {", CONTROLLER),
+        needle: "without the Clash API",
+    },
+    Refusal {
+        name: "data dir mismatch",
+        edit: |entry, _| replace_in(entry, "data_dir: '", "data_dir: '/elsewhere"),
+        needle: "differs from --data-dir",
+    },
+    Refusal {
+        name: "secret copy",
+        edit: |entry, _| {
+            let mut main = fs::read_to_string(entry).unwrap();
+            main.push_str("# old startup-token copied here\n");
+            fs::write(entry, main).unwrap();
+        },
+        needle: "copies",
+    },
+    Refusal {
+        name: "missing entry",
+        edit: |entry, _| fs::remove_file(entry).unwrap(),
+        needle: "cannot be imported",
+    },
+];
+
+fn refused(entry: &Path, data_dir: &Path) -> String {
+    DatabaseStartup::open(entry, data_dir, &mut Vec::new())
+        .err()
+        .expect("the start must be refused")
+        .to_string()
+}
+
+#[test]
+fn a_refused_import_leaves_nothing_behind() {
+    for case in REFUSALS {
+        for data_dir_exists in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let data_dir = root.path().canonicalize().unwrap().join("data");
+            if data_dir_exists {
+                fs::create_dir(&data_dir).unwrap();
+            }
+            let (directory, entry) = tree(&data_dir);
+            (case.edit)(&entry, &directory.path().join("auth.dae"));
+            let error = refused(&entry, &data_dir);
+            assert!(
+                error.contains(case.needle),
+                "{} (data dir exists: {data_dir_exists}): {error}",
+                case.name
+            );
+            assert_eq!(data_dir.exists(), data_dir_exists, "{}", case.name);
+            assert!(!data_dir.join("state").exists(), "{}", case.name);
+        }
+    }
+}
+
+#[test]
+fn a_refused_start_on_an_existing_db_keeps_it() {
+    for case in REFUSALS.iter().filter(|case| case.name != "missing entry") {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().canonicalize().unwrap();
+        let (directory, entry) = tree(&data_dir);
+        // An empty db left by an earlier start; a db with a head is covered above.
+        drop(DbStore::open_in(&data_dir, &entry).unwrap());
+        (case.edit)(&entry, &directory.path().join("auth.dae"));
+        assert!(
+            refused(&entry, &data_dir).contains(case.needle),
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            DbStore::open_in(&data_dir, &entry).unwrap().head(),
+            Ok(None)
+        );
+    }
+}
+
+#[test]
+fn a_good_config_creates_the_data_dir_and_records_revision_one() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = root
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("nested")
+        .join("data");
+    let (_directory, entry) = tree(&data_dir);
+    let mut startup = DatabaseStartup::open(&entry, &data_dir, &mut Vec::new()).unwrap();
+    assert!(data_dir.join("state").join("honk.db").exists());
+    startup.record().unwrap();
+    assert_eq!(startup.store.head(), Ok(Some(1)));
+}
+
+#[test]
+fn the_first_failing_precondition_is_the_one_reported() {
+    // Native API, Clash controller and data dir all wrong, then the first one fixed in turn.
+    let steps = [
+        "--store db needs experimental.native_api",
+        "without the Clash API",
+        "differs from --data-dir",
+    ];
+    for existing_empty_db in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().canonicalize().unwrap().join("data");
+        let (directory, entry) = tree(&root.path().join("elsewhere"));
+        let auth = directory.path().join("auth.dae");
+        replace_in(&auth, "native_api {", CONTROLLER);
+        replace_in(&auth, "enabled: true", "enabled: false");
+        if existing_empty_db {
+            fs::create_dir(&data_dir).unwrap();
+            drop(DbStore::open_in(&data_dir, &entry).unwrap());
+        }
+        for needle in steps {
+            let error = refused(&entry, &data_dir);
+            assert!(error.contains(needle), "{needle}: {error}");
+            match needle {
+                "--store db needs experimental.native_api" => {
+                    replace_in(&auth, "enabled: false", "enabled: true")
+                }
+                "without the Clash API" => replace_in(
+                    &auth,
+                    "external_controller: '127.0.0.1:9090'",
+                    "external_controller: ''",
+                ),
+                _ => {}
+            }
+        }
+    }
+}

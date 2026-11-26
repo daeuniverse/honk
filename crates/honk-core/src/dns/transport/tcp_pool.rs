@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use super::{DialContext, IdlePoolState, close_idle_pool, exchange_with_retry, idle_pool_exchange};
+use super::idle_pool::IdleStream;
+use super::retry::exchange_with_route_retry;
+use super::{DialContext, IdlePoolState, RouteExchange, close_idle_pool, idle_pool_exchange};
 use parking_lot::Mutex;
 
 /// Direct or proxied pooled TCP stream.
@@ -12,7 +14,7 @@ type PooledStream = Box<dyn crate::proxy::AsyncReadWrite>;
 pub struct TcpPool {
     dial: DialContext,
     lifecycle: tokio::sync::RwLock<IdlePoolState>,
-    idle: Mutex<Vec<PooledStream>>,
+    idle: Mutex<Vec<IdleStream<PooledStream>>>,
 }
 
 impl TcpPool {
@@ -29,12 +31,26 @@ impl TcpPool {
         raw_query: &[u8],
         feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
-        exchange_with_retry(
+        self.exchange_routed(raw_query, feedback, None).await
+    }
+
+    pub(crate) async fn exchange_routed(
+        self: &Arc<Self>,
+        raw_query: &[u8],
+        feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
+        route: Option<RouteExchange<'_>>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let routed = route.is_some();
+        exchange_with_route_retry(
             "TCP DNS",
             raw_query,
-            |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
+            |reporter| async move {
+                self.exchange_once(raw_query, reporter.as_ref(), routed)
+                    .await
+            },
             |_| async {},
             feedback,
+            route,
         )
         .await
     }
@@ -43,6 +59,7 @@ impl TcpPool {
         &self,
         raw_query: &[u8],
         reporter: Option<&honk_outbound::group::ScoreReporter>,
+        routed: bool,
     ) -> anyhow::Result<Vec<u8>> {
         idle_pool_exchange(
             &self.lifecycle,
@@ -51,6 +68,7 @@ impl TcpPool {
             raw_query,
             self.dial.query_timeout,
             reporter,
+            routed,
         )
         .await
     }
@@ -61,6 +79,10 @@ impl TcpPool {
         } else {
             Ok(Box::new(self.dial.dial_tcp().await?))
         }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.idle.lock().is_empty()
     }
 
     pub(crate) async fn close(&self) {
@@ -191,6 +213,7 @@ mod tests {
                 registry: Arc::new(crate::proxy::ProxyRegistry::default_resolver().unwrap()),
                 generation: Some(generation),
                 node,
+                route: None,
             }),
         };
         let pool = TcpPool::new(dial.clone());

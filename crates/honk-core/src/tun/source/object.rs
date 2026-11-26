@@ -184,7 +184,11 @@ impl Object {
     }
 
     pub fn map(&self, name: &str) -> anyhow::Result<BorrowedFd<'_>> {
-        Ok(unsafe { BorrowedFd::borrow_raw(syscall::map_fd(&self.bpf, name)?) })
+        let map = self
+            .bpf
+            .map(name)
+            .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))?;
+        Ok(syscall::map_data(map).fd().as_fd())
     }
 
     pub fn gate(&mut self, value: u32) -> anyhow::Result<()> {

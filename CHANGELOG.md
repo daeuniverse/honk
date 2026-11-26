@@ -6,6 +6,97 @@ This changelog follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 Entries live in [changes/](changes/) until release.
 
+## [0.1.0-beta.7] - 2026-11-24
+
+### Added
+
+- Define a TCP proxy chain of two to four supported nodes with `via: front -> mid -> land` in `node {}`. Later hops must support an existing stream and cannot use hostname-based TLS ECH discovery. Groups can select a chain, and the native API reports it as `chain` with its own health and Score. Its ID stays stable across display-name changes and changes when a hop's physical identity or order changes. (#510)
+- Hysteria2 chain entries keep the opener and first payload in one scatter write when observation is enabled. Only submitted payload bytes count toward the final request's send milestone. (#510)
+- A completed VMess exchange no longer counts as a relay failure when its physical WebSocket peer closes normally before the empty upload terminator. (#510)
+- Queued native probes keep their admitted DNS and bootstrap configuration across reload, including separate XHTTP download peers. They skip physical peer lookups when the destination has no eligible address. (#510)
+- A successful Clash delay test of an unregistered ordinary node updates its display history without changing health or Score. (#510)
+- `honk-outbound` builds with `rprx` and `owned-tasks` enabled together without `flow-observation`. (#510)
+- Groups accept `exit`: TCP dials the selected leaf, then each nested exit from the innermost group out, up to four physical hops. A failed path to a shared exit does not mark other paths to that exit down. Recovery uses an existing configured HTTP check through the affected path. A group exit does not forward UDP; an explicit `block` remains terminal. (#511)
+- Chains and group exits can carry UDP when every hop supports tunneled TCP and the last hop supports Trojan or native VLESS UDP. Configured Trojan chains may share an association across a client’s destinations. Multi-hop group exits open one association per flow. Group exits, including one-node collapses, cancel a pending first datagram if its selected path is withdrawn before the transport accepts it. (#512)
+- Routed UDP failures affect the identified carrier, framing operation or ordered prefix in the matching UDP domain and address family. Active recovery uses an explicitly configured `udp_check_dns` target on the original path. Removing that path ends its active checks. (#512)
+- A reload that reassigns a group slot or changes its composed UDP capability can raise its minimum routing generation. Cached flows that need a new endpoint on that slot are dropped before dialing if their generation is missing or too old. (#512)
+- `use_host` rule files support domain aliases: A/AAAA replies include the CNAME chain and target records, and bootstrap-hook lookups such as node server and download URL hosts follow matching aliases. (#485)
+
+### Changed
+
+- Automatic geodata updates run daily at 03:00 local time, plus the existing random delay of up to an hour, instead of every 24 hours. A schedule stored with `interval_hours` keeps its interval. (#484)
+- `assets.geodata` takes `auto_update`, `cron` and `checksum`, written into the stored geodata settings at startup like the download URLs and route. (#484)
+- The native API's geodata `auto_update` accepts a `cron` expression in place of `interval_hours` and reports it in `cron`. (#484)
+- Cron schedules skip nonexistent local times and use the first occurrence of a repeated time. Startup and API changes reject a schedule with no future occurrence in the local time zone; a later time-zone change is reported without dropping pending failure retries. (#484)
+- `docker-compose.yml` mounts the host's `/etc/localtime` read-only, so the container uses the host's time zone for log timestamps and the geodata schedule instead of UTC. (#484)
+- Full builds embed doona 0.1.0-rc.7 with both editions. (#536)
+- Health checks pause for every idle group policy after `idle_timeout` (default 1800 seconds) without traffic. Automatic groups resume probing their direct members on the next selection while keeping unselected Selector branches suspended; a Selector's current TCP and UDP picks, manually pinned automatic-group members (including custom `check_url`), and non-builtin `final` nodes keep being probed and wake immediately on change, and idle automatic groups still recover when all members fail TCP, data UDP, or a custom `check_url`. (#527)
+
+### Fixed
+
+- honk-core loads its eBPF programs on Linux 7.4 again; the 7.4 verifier rejected how packet headers were copied. (#488)
+- Held-first-packet UDP is no longer disabled at startup when the `nfnetlink_queue` module is built but not loaded, as on Debian 13: honk binds the queue and the kernel loads the module. When the module cannot be loaded, the startup warning says so. (#520)
+- A `routing` line holding only a vertical tab is ignored with a warning instead of crashing the parser. (#535)
+- The native API accepts provider names outside `[A-Za-z0-9_.-]`, such as `机场`, and writes them quoted. (#518)
+- After a userspace TCP relay reads EOF, its 30-second idle timeout covers the final flush and write-side shutdown. Delayed polling no longer extends an idle drain. On timeout, the returned byte totals count only bytes accepted by the destination. (#526)
+- Kernel route trace keeps decoding rule hits on large policies: the per-policy and retained rule-text dictionary budgets grow from 64 KiB / 1 MiB to 128 KiB / 2 MiB; an oversized dictionary previously turned kernel route tracing off, with a warning at startup and reload. (#502)
+- Routing traces from the native API (`POST /api/v1/routing/trace`) no longer fail with `413 request_too_large` on larger policies; the step limit now covers the whole loaded policy. (#504)
+- WebSocket TLS nodes without an explicit `sni` offer the WebSocket `Host` name as SNI, so CDN-fronted nodes addressed by edge IP connect instead of failing certificate verification. (#514)
+
+### Security
+
+- Update `url` to 2.5.9 for RUSTSEC-2026-0592, a stack overflow in `Url::origin()` on nested `blob:` URLs. (#534)
+
+### Internal
+
+- SOCKS5, Shadowsocks, Trojan, VMess and VLESS outbounds can run their handshake over an already connected stream, in preparation for proxy chains. XHTTP, TLS that discovers its ECH configuration through DNS, and VLESS with Vision, encryption or TCP multiplexing are refused. Nothing changes for users yet. (#509)
+- Build with Rust 1.100. (#533)
+- Parser conformance cases follow the reordered reference examples. (#506)
+- Parser conformance cases point at the start guide fences after the guide gained new examples. (#522)
+- Tests that free an ephemeral port and rebind it, or open TCP and UDP on one port number, now use a loopback address of their own, which keeps them off the shared 127.0.0.1 port pool and narrows the AddrInUse race with parallel tests; a wildcard bind elsewhere can still take a freed port. (#498)
+- The UDP endpoint closure tests check that the endpoint released its socket through a weak handle instead of rebinding the freed port. (#498)
+- Janitor tests that count candidates per tick no longer trip the wall-clock scan budget on a loaded debug build, and password-mode API tests give the PBKDF2 derivation its own request timeout. (#486)
+
+## [0.1.0-beta.6] - 2026-11-09
+
+### Added
+
+- DNS request rules accept `subtag(...)`, which resolves the server hosts of nodes from matching subscriptions through a chosen `-> direct` upstream (for example a provider's own DoH) instead of the bootstrap resolver. Each DNS generation precomputes host policy outcomes; native flow traces explicitly mark consumption of these decisions as incomplete evidence (`not_instrumented`). (#463)
+- Add default-off `dns-syslog` Cargo support to send client DNS outcomes to a configured TCP syslog receiver with `global.syslog_dns_enabled` and `global.syslog_addr`, independently of native API history. (#462)
+- Preserve complete DNS answers and include deduplicated IP, CNAME and record-type arrays for search. (#462)
+- Include monotonic processing time as numeric `duration_ms` and final upstream name as `upstream` in DNS audit events; cache responses use `cache`, and results without upstream metadata use null. (#462)
+- Configure sender hostname and application name only in syslog headers using `global.syslog_hostname` and `global.syslog_app_name`, avoiding duplicate fields when receivers parse the JSON body. (#462)
+- Reuse one TCP connection with octet-counted whole events, bounded batching and reconnect backoff. (#462)
+- Emit a fixed RFC 5424 header and JSON schema; optionally prefix CEE with `global.syslog_cee_enabled` (default false), and reject obsolete format-template settings. (#462)
+- Preserve final-upstream and response-source metadata when a concurrent DNS query reuses an in-flight result without a cache hit, including stale-cache fallback. (#462)
+- Include a readable `message` in DNS audit JSON so CEE syslog receivers can display each event; VictoriaLogs maps it to `_msg` instead of using its missing-message placeholder. (#462)
+- Keep the DNS audit event when a delivered response's answers cannot be rendered, with `answers: null` and the reason in `answers_omitted`. (#462)
+
+### Changed
+
+- The shipped `honk-core` binary now allocates through jemalloc instead of mimalloc; `-stock` archives still use the system allocator. (#455)
+- The `honk-core` Cargo feature formerly named `mimalloc` is now `jemalloc`; builds with `--no-default-features` keep the system allocator. (#455)
+- Release downloads label the default allocator `jemalloc-*` instead of `mimalloc-*`. (#455)
+- Removed the mimalloc-only `HONK_MI_COLLECT_SECS` and `MIMALLOC_PURGE_DELAY` environment variables and the worker idle-collection machinery they controlled. (#455)
+- Runtime jemalloc options use `_RJEM_MALLOC_CONF`, not `MALLOC_CONF`: the crate prefixes jemalloc symbols and the environment variable with `_rjem_`. (#455)
+- Startup verifies only the TC programs the configured interfaces bind (plus one routing target when they bind none), so a WAN-only Ethernet host no longer loads the LAN or L3 variants. Later variants are verified outside the shared backend lock and become bindable only after receiving the current routing generation; a failed variant does not block independent variants. Logging and event-consumer cancellation preserve the original map FDs required by deferred loads. (#450)
+- Full builds embed doona 0.1.0-rc.6 with both editions. (#472)
+
+### Fixed
+
+- Bound each DNS cache shard's answer bytes to `max(entry capacity × 1 KiB, 65,535 bytes)`, evicting LRU entries when large answers fill the budget. (#454)
+- Inline DNS cache insert/remove accounting in size-optimized builds. (#454)
+- Group probes measure up to 10 members at once, so a slow member no longer leaves later members at `deadline`. (#459)
+- Probe target resolution failures are logged with the host and DNS error instead of appearing only as `address_unavailable`. (#459)
+- Probe targets fall back to bootstrap DNS when the running DNS configuration cannot answer, so `asis` routing no longer reports every probe as `address_unavailable`. (#459)
+- A refused `--store db` start no longer leaves an empty state database, or its data directory, behind. (#467)
+- Subscription connection and HTTP status failures name the selected node and group in the log. Classified fetch failures report their stage and available outbound attribution in native API provider `last_error.details`, including completed failures retained during shutdown; unusable subscription content reports `parse_failed`. (#451)
+
+### Internal
+
+- Move the aya family to userspace `aya` 0.16, `aya-obj` 0.6, `aya-log` 0.4 and kernel-side `aya-ebpf` 0.3, adapting call sites to the new map, loader and TC context APIs while preserving programs, map names and shared binary layouts. (#436)
+- Make shared payload padding explicit and restrict locked-value `Pod` implementations to the three audited payloads; reject stale BTF schemas without changing existing field offsets or map-value sizes. (#436)
+
 ## [0.1.0-beta.5] - 2026-11-03
 
 ### Added
@@ -118,7 +209,9 @@ Summarised from the [release notes](https://github.com/daeuniverse/honk/releases
 - Shared UDP sources survive malformed SOCKS5, Trojan and Juicity datagrams.
 - QUIC session tickets honour `skip_cert_verify`, and a reload restores warm carriers and probes.
 
-[Unreleased]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.5...HEAD
+[Unreleased]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.7...HEAD
+[0.1.0-beta.7]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.6...v0.1.0-beta.7
+[0.1.0-beta.6]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.5...v0.1.0-beta.6
 [0.1.0-beta.5]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.4...v0.1.0-beta.5
 [0.1.0-beta.4]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.3...v0.1.0-beta.4
 [0.1.0-beta.3]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.2...v0.1.0-beta.3

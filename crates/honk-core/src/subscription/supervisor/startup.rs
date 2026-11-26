@@ -118,7 +118,11 @@ impl SupervisorState {
                                 }
                             }
                             Some(Err(error)) => {
-                                self.fail_startup_load(subscription.id, super::super::failure_code(&error));
+                                self.fail_startup_load(
+                                    subscription.id,
+                                    super::super::failure_code(&error),
+                                    super::super::failure_stage(&error),
+                                );
                                 warn!(subscription = %subscription.name, %error, "Failed to fetch subscription");
                             }
                             None => {}
@@ -129,7 +133,7 @@ impl SupervisorState {
                         if let Some(id) = self.fetch_ids.remove(&error.id()) {
                             self.flights.remove(&id);
                             requires_network.remove(&id);
-                            self.fail_startup_load(id, "fetch_failed");
+                            self.fail_startup_load(id, "fetch_failed", None);
                         }
                         tracing::error!(%error, "Subscription startup task failed");
                     }
@@ -172,18 +176,25 @@ impl SupervisorState {
         super::drop_nodes_published_elsewhere(current, subscriptions, subscription.id, &mut nodes);
         let mut ids: HashSet<_> = current
             .iter()
-            .filter(|node| node.subscription_id != Some(subscription.id))
+            .filter(|node| {
+                node.chain_hops().is_none() && node.subscription_id != Some(subscription.id)
+            })
             .map(|node| node.id)
             .collect();
         let mut observations = self.observations.write();
         let load = &mut observations.get_mut(&subscription.id).unwrap().load;
-        if nodes.iter().any(|node| !ids.insert(node.id)) {
+        if nodes
+            .iter()
+            .filter(|node| node.chain_hops().is_none())
+            .any(|node| !ids.insert(node.id))
+        {
             warn!(
                 subscription = %subscription.name,
                 "Subscription node ID duplicates another node; provider rejected"
             );
             load.error = Some("publication_rejected");
             load.rejection = Some("duplicate-node-id");
+            load.fetch = None;
             return None;
         }
         let count = nodes.len();
@@ -195,16 +206,23 @@ impl SupervisorState {
             cached,
             error: None,
             rejection: None,
+            fetch: None,
         };
         Some(count)
     }
 
-    fn fail_startup_load(&mut self, id: uuid::Uuid, error: &'static str) {
+    fn fail_startup_load(
+        &mut self,
+        id: uuid::Uuid,
+        error: &'static str,
+        fetch: Option<super::super::route::FetchFailure>,
+    ) {
         {
             let mut observations = self.observations.write();
             let load = &mut observations.get_mut(&id).unwrap().load;
             load.error = Some(error);
             load.rejection = None;
+            load.fetch = fetch;
         }
         if let Some(provider) = self.providers.get_mut(&id) {
             provider.finished(Instant::now(), Some(error));

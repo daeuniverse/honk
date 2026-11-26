@@ -23,6 +23,7 @@ pub struct DnsService {
     backend: Arc<DnsServiceBackend>,
     flush_generation: watch::Sender<u64>,
     pub(crate) observer: crate::observe::DnsObserver,
+    pub(crate) audit: crate::audit::DnsAudit,
 }
 
 enum DnsServiceBackend {
@@ -88,6 +89,7 @@ impl DnsService {
             backend: Arc::new(DnsServiceBackend::Standalone(forwarder)),
             flush_generation,
             observer: Default::default(),
+            audit: Default::default(),
         }
     }
 
@@ -97,6 +99,7 @@ impl DnsService {
             backend: Arc::new(DnsServiceBackend::Runtime(provider)),
             flush_generation,
             observer: Default::default(),
+            audit: Default::default(),
         }
     }
 

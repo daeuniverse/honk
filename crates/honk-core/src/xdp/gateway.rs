@@ -516,7 +516,7 @@ pub(crate) struct GatewayPublisher {
     #[cfg(feature = "ebpf")]
     host: Option<HostResources>,
     budget: Arc<MemoryBudget>,
-    active_plan: Arc<parking_lot::RwLock<Arc<RoutingPushPlan>>>,
+    active_plan: crate::control::routing_matcher::SharedRoutingPlan,
     failure: std::sync::OnceLock<Arc<io::Error>>,
     #[cfg(all(test, feature = "ebpf"))]
     pub(super) replace_tcx_before_final: AtomicBool,
@@ -531,7 +531,7 @@ impl GatewayPublisher {
         conntrack: Option<Arc<ConntrackKfuncs>>,
         budget: Arc<MemoryBudget>,
         shadow: GatewayShadow,
-        active_plan: Arc<parking_lot::RwLock<Arc<RoutingPushPlan>>>,
+        active_plan: crate::control::routing_matcher::SharedRoutingPlan,
     ) -> Self {
         let (policy, initial_memory) = initial;
         Self {
@@ -932,7 +932,8 @@ impl GatewayPublisher {
         pair: Arc<AuxDevicePair>,
         broadcasts: &[Ipv4Addr],
     ) -> io::Result<()> {
-        let plan = self.active_plan.try_read().ok_or_else(publisher_busy)?;
+        let active = self.active_plan.try_read().ok_or_else(publisher_busy)?;
+        let plan = &active.plan;
         let mut inner = self.state.inner.try_lock().ok_or_else(publisher_busy)?;
         drop(self.state.try_open_links()?);
         if let Some(error) = self.capture_error() {

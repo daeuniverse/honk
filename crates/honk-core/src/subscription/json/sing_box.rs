@@ -78,7 +78,7 @@ pub(super) fn normalize(value: Value) -> NodeResult {
         NodeProtocol::Juicity => normalize_juicity(source, proxy),
         NodeProtocol::AnyTLS => normalize_anytls(source, proxy),
         NodeProtocol::WireGuard => normalize_wireguard(source, proxy),
-        NodeProtocol::Direct | NodeProtocol::Block => unreachable!(),
+        NodeProtocol::Direct | NodeProtocol::Block | NodeProtocol::Chain => unreachable!(),
     }
     .map(NormalizedEntry::Node)
 }

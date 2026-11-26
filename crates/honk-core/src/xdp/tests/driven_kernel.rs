@@ -498,7 +498,7 @@ async fn start_runtime(
     }
     if !defer_gateway && let Some(publisher) = &runtime.gateway {
         let mut backend = backend.write().await;
-        let plan = active_plan.read().clone();
+        let plan = active_plan.read().plan.clone();
         publisher.prepare_start(&plan)?;
         backend
             .userspace_mut()?
@@ -545,7 +545,7 @@ async fn start_runtime(
         runtime.activate_capture(&shutdown, direct)?;
         backend.userspace_mut()?.activate_gateway_start(
             publisher,
-            active_plan.read().fingerprint,
+            active_plan.read().plan.fingerprint,
             diagnostics_generation.read().generation,
         )?;
         publisher.validate_programs(|programs| {
@@ -703,7 +703,7 @@ async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
         config.datapath.as_mut().unwrap().workers = Some(workers);
         config.ensure_builtin_nodes();
         config.global.tcp_check_url.clear();
-        config.global.udp_check_dns = vec!["127.0.0.1:9".into()];
+        config.global.udp_check_dns = Some(vec!["127.0.0.1:9".into()]);
         config.global.preconnect_node_count = 0;
         config.global.udp_warm_node_count = 0;
         config.global.store_subscribe = false;

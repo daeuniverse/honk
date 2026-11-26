@@ -1172,7 +1172,7 @@ fn configuration(core: bool, xsk_mode: XskMode) -> anyhow::Result<Config> {
     ))?;
     config.ensure_builtin_nodes();
     config.global.tcp_check_url.clear();
-    config.global.udp_check_dns = vec!["127.0.0.1:9".into()];
+    config.global.udp_check_dns = Some(vec!["127.0.0.1:9".into()]);
     config.global.preconnect_node_count = 0;
     config.global.udp_warm_node_count = 0;
     config.global.store_subscribe = false;

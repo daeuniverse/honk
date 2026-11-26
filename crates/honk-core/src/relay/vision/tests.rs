@@ -7,13 +7,14 @@ use honk_config::node::{Node, OutboundConfig, VlessConfig};
 use honk_outbound::TcpOutbound as _;
 use honk_outbound::proxy::vless::VLessHandler;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
 use super::*;
 use crate::relay::splice::test_hook::{self, StateGuard, TEST_LOCK};
 use crate::relay::{copy_phase, relay_proxy};
 
 const UUID: &str = "05050505-0505-0505-0505-050505050505";
+const SNIFFED_UPLOAD: u64 = 17;
 
 fn record(record_type: u8, content: &[u8]) -> Vec<u8> {
     let mut record = vec![record_type, 3, 3];
@@ -94,12 +95,10 @@ async fn read_frame(tls: &mut tokio_boring::SslStream<TcpStream>) -> (u8, Vec<u8
     (head[0], body)
 }
 
-/// Accepts the VLESS request, answers the ClientHello with a ServerHello and
-/// reads uplink frames until the uplink switched to Direct.
-async fn accept_until_uplink_direct(
+async fn accept_vision_request(
     listener: &TcpListener,
     acceptor: &SslAcceptor,
-) -> (tokio_boring::SslStream<TcpStream>, Vec<u8>) {
+) -> (tokio_boring::SslStream<TcpStream>, [u8; 16]) {
     let (tcp, _) = listener.accept().await.unwrap();
     let mut tls = tokio_boring::accept(acceptor, tcp).await.unwrap();
     let mut request = [0; 18];
@@ -108,6 +107,16 @@ async fn accept_until_uplink_direct(
     tls.read_exact(&mut rest).await.unwrap();
     let mut uuid = [0; 16];
     tls.read_exact(&mut uuid).await.unwrap();
+    (tls, uuid)
+}
+
+/// Answers the ClientHello with a ServerHello and reads uplink frames until
+/// the uplink switches to Direct.
+async fn accept_until_uplink_direct(
+    listener: &TcpListener,
+    acceptor: &SslAcceptor,
+) -> (tokio_boring::SslStream<TcpStream>, Vec<u8>) {
+    let (mut tls, uuid) = accept_vision_request(listener, acceptor).await;
 
     let hello = client_hello();
     let mut upload = Vec::new();
@@ -211,11 +220,11 @@ struct Tally {
 }
 
 impl Tally {
-    fn new() -> Self {
+    fn new(sniffed_upload: u64) -> Self {
         let accepted = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
         let responses = Arc::new(AtomicUsize::new(0));
         let progress = RelayProgress {
-            upload: Arc::default(),
+            upload: Arc::new(AtomicU64::new(sniffed_upload)),
             download: Arc::default(),
             outbound_upload: None,
             outbound_download: None,
@@ -259,6 +268,7 @@ impl Tally {
 async fn spawn_relay(
     port: u16,
     progress: RelayProgress,
+    carrier: Option<TcpStream>,
 ) -> (
     SocketAddr,
     tokio::task::JoinHandle<anyhow::Result<RelayStats>>,
@@ -268,10 +278,18 @@ async fn spawn_relay(
     let relay = tokio::spawn(async move {
         let (mut client, client_addr) = front.accept().await.unwrap();
         let target = "127.0.0.1:443".parse().unwrap();
-        let proxy = VLessHandler::new()
-            .dial(&vision_node(port), target, None, Duration::from_secs(5))
-            .await
-            .unwrap();
+        let handler = VLessHandler::new();
+        let node = vision_node(port);
+        let timeout = Duration::from_secs(5);
+        let proxy = match carrier {
+            Some(tcp) => {
+                handler
+                    .dial_with_tcp(&node, target, None, tcp, timeout)
+                    .await
+            }
+            None => handler.dial(&node, target, None, timeout).await,
+        }
+        .unwrap();
         relay_proxy(&mut client, proxy, client_addr, target, progress).await
     });
     (front_addr, relay)
@@ -282,8 +300,8 @@ async fn relay_script(script: Script) -> Outcome {
     let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = peer.local_addr().unwrap().port();
     let server = tokio::spawn(vision_peer(peer, acceptor(), script.clone()));
-    let tally = Tally::new();
-    let (front_addr, relay) = spawn_relay(port, tally.progress.clone()).await;
+    let tally = Tally::new(SNIFFED_UPLOAD);
+    let (front_addr, relay) = spawn_relay(port, tally.progress.clone(), None).await;
 
     let mut app = TcpStream::connect(front_addr).await.unwrap();
     let hello = client_hello();
@@ -311,13 +329,13 @@ async fn relay_script(script: Script) -> Outcome {
 
 /// The uplink copy read a chunk the carrier has not accepted: nobody reads
 /// the uplink, so that `write_all` cannot finish.
-async fn uplink_write_stuck(tally: &Tally) {
+async fn uplink_write_stuck(tally: &Tally, sniffed_upload: u64) {
     let mut last = (0, 0);
     let mut steady = 0;
     while steady < 1000 {
         tokio::task::yield_now().await;
         let now = (
-            tally.progress.upload.load(Ordering::Relaxed),
+            tally.progress.upload.load(Ordering::Relaxed) - sniffed_upload,
             tally.accepted.0.load(Ordering::Relaxed),
         );
         // A copy the runtime paused for its budget lags briefly too, but
@@ -341,7 +359,7 @@ async fn duplex_peer(
     downloaded: tokio::sync::oneshot::Receiver<()>,
 ) {
     let (mut tls, mut upload) = accept_until_uplink_direct(&listener, &acceptor).await;
-    tokio::time::timeout(Duration::from_secs(10), uplink_write_stuck(&tally))
+    tokio::time::timeout(Duration::from_secs(10), uplink_write_stuck(&tally, 0))
         .await
         .expect("the uplink never backed up");
 
@@ -363,16 +381,27 @@ async fn duplex_peer(
     raw.shutdown().await.unwrap();
 }
 
-/// Uploads without pause while the downlink switches to Direct and the
-/// download completes.
-async fn relay_duplex(script: Script) -> Outcome {
+async fn backpressure_listener() -> TcpListener {
     let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    // A small receive window keeps kernel buffers from hiding the backed-up uplink.
+    // Set the receive window before the handshake to bound buffered uplink data.
     socket2::SockRef::from(&peer)
         .set_recv_buffer_size(4096)
         .unwrap();
+    peer
+}
+
+async fn backpressure_carrier(addr: SocketAddr) -> TcpStream {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.set_send_buffer_size(4096).unwrap();
+    socket.connect(addr).await.unwrap()
+}
+
+/// Uploads without pause while the downlink switches to Direct and the
+/// download completes.
+async fn relay_duplex(script: Script) -> Outcome {
+    let peer = backpressure_listener().await;
     let port = peer.local_addr().unwrap().port();
-    let tally = Tally::new();
+    let tally = Tally::new(0);
     let (downloaded_tx, downloaded_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(duplex_peer(
         peer,
@@ -381,7 +410,7 @@ async fn relay_duplex(script: Script) -> Outcome {
         tally.clone(),
         downloaded_rx,
     ));
-    let (front_addr, relay) = spawn_relay(port, tally.progress.clone()).await;
+    let (front_addr, relay) = spawn_relay(port, tally.progress.clone(), None).await;
 
     let mut app = TcpStream::connect(front_addr).await.unwrap();
     let hello = client_hello();
@@ -412,13 +441,20 @@ async fn relay_duplex(script: Script) -> Outcome {
     tally.outcome(stats)
 }
 
-fn assert_whole_connection(outcome: &Outcome, script: &Script) {
+fn assert_whole_connection(outcome: &Outcome, script: &Script, sniffed_upload: u64) {
     let upload = (script.upload.len() + script.late_upload.len()) as u64;
     let download =
         (server_hello().len() + script.download.len() + script.late_download.len()) as u64;
-    assert_eq!(outcome.stats.client_to_proxy, upload);
+    assert_eq!(outcome.stats.client_to_proxy, sniffed_upload + upload);
     assert_eq!(outcome.stats.proxy_to_client, download);
-    assert_eq!((outcome.upload, outcome.download), (upload, download));
+    assert_eq!(
+        outcome.stats.total_bytes,
+        sniffed_upload + upload + download
+    );
+    assert_eq!(
+        (outcome.upload, outcome.download),
+        (sniffed_upload + upload, download)
+    );
     assert_eq!(outcome.accepted, (upload, download));
     assert_eq!(outcome.responses, 1);
 }
@@ -428,7 +464,7 @@ async fn run_case(script: Script, prepare: impl FnOnce()) -> Outcome {
     let outcome = tokio::time::timeout(Duration::from_secs(20), relay_script(script.clone()))
         .await
         .expect("Vision relay did not finish");
-    assert_whole_connection(&outcome, &script);
+    assert_whole_connection(&outcome, &script, SNIFFED_UPLOAD);
     outcome
 }
 
@@ -480,8 +516,204 @@ async fn upload_in_flight_at_the_downlink_switch_survives_the_handover() {
     let outcome = tokio::time::timeout(Duration::from_secs(20), relay_duplex(script.clone()))
         .await
         .expect("Vision relay did not finish");
-    assert_whole_connection(&outcome, &script);
+    assert_whole_connection(&outcome, &script, 0);
     assert_eq!(test_hook::probe_calls(), 2, "both splice directions ran");
+}
+
+#[tokio::test]
+async fn vision_idle_cut_reports_only_accepted_uplink_plus_sniffed_bytes() {
+    let _lock = TEST_LOCK.lock().await;
+    let _state = StateGuard::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let listener = backpressure_listener().await;
+        let peer_addr = listener.local_addr().unwrap();
+        let carrier = backpressure_carrier(peer_addr).await;
+        let tally = Tally::new(SNIFFED_UPLOAD);
+        let (front_addr, relay) =
+            spawn_relay(peer_addr.port(), tally.progress.clone(), Some(carrier)).await;
+
+        let hello = client_hello();
+        let application = application_records(1);
+        let response = b"direct";
+        let payload = pattern(128 * 1024, 13);
+        let peer = async {
+            let (mut tls, mut prelude) = accept_until_uplink_direct(&listener, &acceptor()).await;
+            let framed = prelude.len();
+            prelude.resize(hello.len() + application.len(), 0);
+            tls.get_mut()
+                .read_exact(&mut prelude[framed..])
+                .await
+                .unwrap();
+            assert_eq!(&prelude[..hello.len()], hello.as_slice());
+            assert_eq!(&prelude[hello.len()..], application.as_slice());
+            tls.write_all(&vision_frame(2, response)).await.unwrap();
+            tls.flush().await.unwrap();
+            tls
+        };
+        let app = async {
+            let socket = TcpSocket::new_v4().unwrap();
+            socket.set_send_buffer_size(payload.len() as u32).unwrap();
+            let mut app = socket.connect(front_addr).await.unwrap();
+            app.write_all(&hello).await.unwrap();
+            let mut answer = vec![0; server_hello().len()];
+            app.read_exact(&mut answer).await.unwrap();
+            assert_eq!(answer, server_hello());
+            app.write_all(&application).await.unwrap();
+            let mut direct = [0; 6];
+            app.read_exact(&mut direct).await.unwrap();
+            assert_eq!(&direct, response);
+            app
+        };
+        let (mut tls, mut app) = tokio::join!(peer, app);
+        let raw = tls.get_mut();
+        app.write_all(&payload).await.unwrap();
+        uplink_write_stuck(&tally, SNIFFED_UPLOAD).await;
+        raw.shutdown().await.unwrap();
+        assert_eq!(app.read(&mut [0; 1]).await.unwrap(), 0);
+        assert!(!relay.is_finished());
+
+        // Advance only the idle clock once the app has observed the raw FIN.
+        tokio::time::pause();
+        let result = tokio::time::timeout(2 * splice::DRAIN_DEADLINE, relay).await;
+        tokio::time::resume();
+        let stats = result
+            .expect("Vision relay did not idle out")
+            .unwrap()
+            .unwrap();
+
+        let mut accepted_prefix = Vec::new();
+        raw.read_to_end(&mut accepted_prefix).await.unwrap();
+        assert!(!accepted_prefix.is_empty());
+        assert!(payload.starts_with(&accepted_prefix));
+        let accepted = (hello.len() + application.len() + accepted_prefix.len()) as u64;
+        let download = (server_hello().len() + response.len()) as u64;
+        let outcome = tally.outcome(stats);
+        assert!(outcome.upload > SNIFFED_UPLOAD + accepted);
+        assert_eq!(outcome.download, download);
+        assert_eq!(outcome.accepted, (accepted, download));
+        assert_eq!(outcome.stats.client_to_proxy, SNIFFED_UPLOAD + accepted);
+        assert_eq!(outcome.stats.proxy_to_client, download);
+        assert_eq!(
+            outcome.stats.total_bytes,
+            SNIFFED_UPLOAD + accepted + download
+        );
+        assert_eq!(outcome.responses, 1);
+    })
+    .await
+    .expect("Vision cutoff fixture stalled");
+}
+
+fn send_window(socket: &socket2::Socket) -> u32 {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: tcp_info is an integer-only C struct with a valid zero value.
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of_val(&info) as libc::socklen_t;
+    // SAFETY: the borrowed socket and both writable buffers outlive this synchronous call.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            (&mut info as *mut libc::tcp_info).cast(),
+            &mut len,
+        )
+    };
+    assert_eq!(result, 0, "TCP_INFO: {}", std::io::Error::last_os_error());
+    let field_end = std::mem::offset_of!(libc::tcp_info, tcpi_snd_wnd)
+        + std::mem::size_of_val(&info.tcpi_snd_wnd);
+    assert!(len as usize >= field_end, "TCP_INFO lacks the send window");
+    info.tcpi_snd_wnd
+}
+
+async fn wait_for_send_window(socket: &socket2::Socket, closed: bool) {
+    while (send_window(socket) == 0) != closed {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+#[tokio::test]
+async fn vision_error_returns_while_framed_proxy_shutdown_is_pending() {
+    let _lock = TEST_LOCK.lock().await;
+    let _state = StateGuard::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let listener = backpressure_listener().await;
+        let peer_addr = listener.local_addr().unwrap();
+        let target = "127.0.0.1:443".parse().unwrap();
+        let carrier = backpressure_carrier(peer_addr).await;
+        let socket = socket2::SockRef::from(&carrier).try_clone().unwrap();
+        let handler = VLessHandler::new();
+        let node = vision_node(peer_addr.port());
+        let acceptor = acceptor();
+        let (proxy, (mut peer, uuid)) = tokio::join!(
+            handler.dial_with_tcp(&node, target, None, carrier, Duration::from_secs(5)),
+            accept_vision_request(&listener, &acceptor),
+        );
+        let mut proxy = proxy.unwrap();
+        assert_eq!(read_frame(&mut peer).await, (0, Vec::new()));
+        wait_for_send_window(&socket, false).await;
+
+        // Keep Vision padding active while filling the unread TCP send path.
+        let mut upload = client_hello();
+        let handshake = record(22, &pattern(16 * 1024, 13));
+        for _ in 0..3 {
+            upload.extend_from_slice(&handshake);
+        }
+        tokio::select! {
+            biased;
+            result = proxy.stream.write_all(&upload) => panic!("framed upload was not blocked: {result:?}"),
+            () = wait_for_send_window(&socket, true) => {}
+        }
+        assert!(futures::poll!(std::pin::pin!(proxy.stream.flush())).is_pending());
+        assert!(futures::poll!(std::pin::pin!(proxy.stream.shutdown())).is_pending());
+
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (app, client) = tokio::join!(
+            TcpStream::connect(front.local_addr().unwrap()),
+            front.accept(),
+        );
+        let mut app = app.unwrap();
+        let (mut client, client_addr) = client.unwrap();
+        let tally = Tally::new(0);
+        let relay = relay_proxy(&mut client, proxy, client_addr, target, tally.progress.clone());
+        tokio::pin!(relay);
+
+        let reply = b"accepted";
+        let exchange = async {
+            let mut downlink = vec![0, 0];
+            downlink.extend_from_slice(&uuid);
+            downlink.extend(vision_frame(0, reply));
+            peer.write_all(&downlink).await.unwrap();
+            let mut received = [0; 8];
+            app.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, reply);
+        };
+        tokio::select! {
+            result = &mut relay => panic!("Vision relay ended before the terminal frame: {result:?}"),
+            () = exchange => {}
+        }
+        assert_eq!(tally.accepted.1.load(Ordering::Relaxed), reply.len() as u64);
+
+        // Feed a protocol error without ever reading the framed uplink.
+        assert_eq!(send_window(&socket), 0);
+        drop(socket);
+        peer.write_all(&vision_frame(u8::MAX, b"")).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), relay)
+            .await
+            .expect("Vision cleanup waited for the unread peer")
+            .unwrap_err();
+        assert!(honk_outbound::proxy::node_failure(&error));
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(error.to_string(), "vision: unknown padding command");
+        assert_eq!(tally.accepted.0.load(Ordering::Relaxed), 0);
+        assert_eq!(tally.accepted.1.load(Ordering::Relaxed), reply.len() as u64);
+        assert_eq!(tally.responses.load(Ordering::Relaxed), 1);
+    })
+    .await
+    .expect("framed Vision fixture stalled");
 }
 
 /// A direction waiting in a read still owes the bytes its writer buffered:

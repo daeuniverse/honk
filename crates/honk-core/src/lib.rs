@@ -9,6 +9,11 @@
 //! in dae netns"). Trait-based backends (real aya + mock) for testing
 //! without kernel eBPF support.
 
+#[cfg_attr(not(feature = "dns-syslog"), path = "audit/inert.rs")]
+mod audit;
+#[cfg(all(test, not(feature = "dns-syslog")))]
+#[path = "audit/inert_tests.rs"]
+mod audit_feature_tests;
 #[cfg(feature = "clash-api")]
 pub mod clash_api;
 pub mod config_diagnostics;
@@ -44,6 +49,8 @@ pub(crate) mod xdp;
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    pub(crate) mod routed_udp;
+
     pub(crate) fn run_exact_in_child(env: &str, name: &str) -> bool {
         if std::env::var(env).as_deref() == Ok(name) {
             return false;
@@ -67,6 +74,74 @@ pub(crate) mod test_support {
                 .success()
         );
         true
+    }
+
+    /// A no-auth SOCKS5 server that relays IPv4 CONNECT requests over real
+    /// sockets and records each requested target.
+    pub(crate) struct Socks5Relay {
+        pub(crate) addr: std::net::SocketAddr,
+        pub(crate) requests: std::sync::Arc<parking_lot::Mutex<Vec<std::net::SocketAddr>>>,
+    }
+
+    pub(crate) async fn socks5_relay() -> Socks5Relay {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests: std::sync::Arc<parking_lot::Mutex<Vec<_>>> = std::sync::Arc::default();
+        let log = std::sync::Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let (mut client, _) = listener.accept().await.unwrap();
+                let log = std::sync::Arc::clone(&log);
+                tokio::spawn(async move {
+                    let mut greeting = [0u8; 2];
+                    client.read_exact(&mut greeting).await.unwrap();
+                    let mut methods = vec![0u8; greeting[1] as usize];
+                    client.read_exact(&mut methods).await.unwrap();
+                    client.write_all(&[5, 0]).await.unwrap();
+                    let mut request = [0u8; 10];
+                    client.read_exact(&mut request).await.unwrap();
+                    assert_eq!(request[..4], [5, 1, 0, 1], "IPv4 CONNECT");
+                    let target = std::net::SocketAddr::from((
+                        [request[4], request[5], request[6], request[7]],
+                        u16::from_be_bytes([request[8], request[9]]),
+                    ));
+                    log.lock().push(target);
+                    let mut upstream = tokio::net::TcpStream::connect(target).await.unwrap();
+                    client
+                        .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                        .await
+                        .unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                });
+            }
+        });
+        Socks5Relay { addr, requests }
+    }
+
+    /// A chain `via` from a SOCKS5 `front` to a SOCKS5 `land`, then its hops.
+    pub(crate) fn socks5_chain(
+        front: &Socks5Relay,
+        land: &Socks5Relay,
+    ) -> [honk_config::node::Node; 3] {
+        use honk_config::node::{Node, OutboundConfig};
+
+        let socks5 = |name: &str, relay: &Socks5Relay| {
+            let mut node = Node {
+                name: name.into(),
+                address: relay.addr.to_string(),
+                port: relay.addr.port(),
+                outbound: OutboundConfig::Socks5(Default::default()),
+                ..Default::default()
+            };
+            node.id = node.derive_id();
+            node
+        };
+        let front = socks5("front", front);
+        let land = socks5("land", land);
+        let via = Node::chain_from_nodes("via", &[&front, &land]).unwrap();
+        [via, front, land]
     }
 }
 
@@ -383,6 +458,11 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
 
             let addr = if let Some(u) = url {
                 u.clone()
+            } else if target_node.chain_hops().is_some() {
+                anyhow::bail!(
+                    "Node '{}' is a proxy chain with no address of its own; pass a URL",
+                    node
+                );
             } else {
                 format!("{}:{}", target_node.host(), target_node.port)
             };
@@ -791,7 +871,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let startup = (|| -> anyhow::Result<_> {
         #[cfg(feature = "native-api")]
         let mut config = if cli.store == ConfigStore::Db {
-            std::fs::create_dir_all(&cli.data_dir)?;
             // DbStore needs an absolute, lexically normal entry; a missing -c
             // is fine once the db holds a revision.
             let entry =
@@ -818,6 +897,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             !config.experimental.native_api.enabled,
             "native-api feature is required"
         );
+        #[cfg(not(feature = "dns-syslog"))]
+        audit::validate_config(&config.global)?;
         let requested_data_dir = PathBuf::from(&config.global.data_dir);
         let (runtime_data_dir, data_dir_creation_error) =
             prepare_runtime_data_dir(&requested_data_dir)?;
@@ -1087,18 +1168,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     .await?;
     let startup_diagnostics = subscription_supervisor.take_startup_diagnostics();
 
-    // Resolve group filters into concrete node IDs. This must run for every
-    // config — not just when subscriptions delivered nodes — because groups
-    // defined with `filter:` (or with no filter at all, meaning "all nodes")
-    // would otherwise end up with an empty member list for static configs.
-    // Filter-backed membership is rebuilt from the current node provenance.
-    honk_config::parser::resolve_group_filters(
-        &mut config.groups,
-        &config.nodes,
-        &config.subscriptions,
-    );
-    config
-        .validate_assembled()
+    config = config
+        .assemble(honk_config::parser::resolve_group_filters)
         .map_err(|error| anyhow::anyhow!("invalid assembled configuration: {error}"))?;
     for group in &config.groups {
         info!(
@@ -1349,7 +1420,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32)
         .with_stale_reply_ttl(config.dns.cache.stale_reply_ttl)
         .with_policy_id(dns_policy)
-        .with_hosts_snapshot(hosts_snapshot),
+        .with_hosts_snapshot(hosts_snapshot)
+        .with_node_hosts(dns::node_host::index(&config)),
     );
     info!("DNS forwarder ready");
 
@@ -1370,6 +1442,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         control_plane =
             control_plane.with_process_polling(control::PollBudgetBinding::Publisher(publisher))?;
     }
+    honk_outbound::bootstrap::set_node_host_resolver(Some(dns::node_host::resolver(
+        &control_plane.dns_service(),
+    )));
     if nfqueue_unavailable {
         control_plane
             .startup_downgrades()
@@ -2103,5 +2178,44 @@ mod startup_lifecycle_tests {
         let rendered = error.to_string();
         assert!(rendered.contains("node ID duplicates another node"));
         assert!(!rendered.contains("configuration validation failed"));
+    }
+
+    #[tokio::test]
+    async fn delay_without_a_url_refuses_a_chain() {
+        let front = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        front.set_nonblocking(true).unwrap();
+        let front_addr = front.local_addr().unwrap();
+        let file = tempfile::Builder::new().suffix(".dae").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            format!(
+                "node {{\n front: 'socks5://{front_addr}'\n land: 'socks5://127.0.0.1:1'\n via: front -> land\n}}\n"
+            ),
+        )
+        .unwrap();
+        let config = file.path().to_str().unwrap();
+        let cli = Cli::try_parse_from(["honk-core", "-c", config, "delay", "via"]).unwrap();
+        let error = super::handle_clash_command(&cli)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("proxy chain") && error.contains("URL"),
+            "{error}"
+        );
+        assert_eq!(
+            front.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = target.local_addr().unwrap().to_string();
+        let cli = Cli::try_parse_from(["honk-core", "-c", config, "delay", "via", "--url", &url])
+            .unwrap();
+        super::handle_clash_command(&cli).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), target.accept())
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

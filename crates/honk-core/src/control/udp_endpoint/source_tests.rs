@@ -358,7 +358,7 @@ fn reserve_source(
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("source test expected a fresh endpoint"),
     };
-    assert!(lease.bind_selected_node(node_id));
+    assert!(lease.bind_selected(node_id, None));
     lease
 }
 
@@ -556,10 +556,14 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     let client_addr = client.local_addr().unwrap();
     let client_two = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client_two_addr = client_two.local_addr().unwrap();
-    let raw_a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let raw_b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let raw_c = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let raw_d = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    // The reply factory rebinds target_c after its first socket is gone. A
+    // loopback address of its own keeps the targets off the shared 127.0.0.1
+    // port pool; wildcard binds elsewhere can still take a freed port, so this
+    // narrows the race only.
+    let raw_a = std::net::UdpSocket::bind("127.0.0.78:0").unwrap();
+    let raw_b = std::net::UdpSocket::bind("127.0.0.78:0").unwrap();
+    let raw_c = std::net::UdpSocket::bind("127.0.0.78:0").unwrap();
+    let raw_d = std::net::UdpSocket::bind("127.0.0.78:0").unwrap();
     let target_a = raw_a.local_addr().unwrap();
     let target_b = raw_b.local_addr().unwrap();
     let target_c = raw_c.local_addr().unwrap();
@@ -954,7 +958,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     ));
     let remote_end = io::Error::new(io::ErrorKind::ConnectionAborted, "remote source END");
     assert!(!owner.handle_transport_error(&remote_end));
-    owner.fail(ScoreOutcome::from_io_error(&remote_end));
+    owner.fail(ScoreOutcome::from_io_error(&remote_end), Some(&remote_end));
     assert!(!alive.is_alive_for(
         node.id,
         honk_outbound::alive::ProbeDomain::DataUdp,
@@ -1001,7 +1005,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     let replacement = attachment_c.owner();
     assert!(!Arc::ptr_eq(&owner, &replacement));
     let endpoint_c = install_source(&pool, lease_c, attachment_c, target_c, &stats, node.id);
-    owner.fail(ScoreOutcome::NodeFailure);
+    owner.fail(ScoreOutcome::NodeFailure, None);
     drop(owner);
     endpoint_c.send_packet(b"to-c", true).await.unwrap();
     let replacement_new = next_data_frame(&mut events, &mut replies).await;

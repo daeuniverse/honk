@@ -192,6 +192,15 @@ impl Router {
         configured_rule_expression(conditions, configured)
     }
 
+    /// Steps `simulate` charges for the whole policy: the fallback plus every route and its conditions.
+    pub(crate) fn trace_steps(&self) -> usize {
+        1 + self
+            .routes
+            .iter()
+            .map(|route| 1 + route.conditions.len())
+            .sum::<usize>()
+    }
+
     pub(crate) fn simulate(
         &self,
         input: PredicateInput<'_>,

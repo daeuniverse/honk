@@ -1,6 +1,6 @@
 //! Single owner of the TCX links on configured interfaces.
 //!
-//! The backend holds the eight preloaded TC program FDs and one owned link per
+//! The backend holds the loaded TC program FDs and one owned link per
 //! `(ifindex, direction)`. [`apply`] turns one validated [`InterfacePlan`] into
 //! a [`BindingCommit`] without any lock held: it creates links by interface
 //! index, updates a link in place when the program changes, and proves a
@@ -23,6 +23,7 @@ use aya_obj::generated::{
     BPF_F_AFTER, BPF_F_REPLACE, bpf_attach_type, bpf_attr, bpf_cmd, bpf_link_info,
 };
 
+use super::routing::Target;
 use super::syscall::bpf_syscall;
 use crate::ebpf::interface::{
     ApplyReport, Binding, BindingCommit, BindingSnapshot, Direction, InterfacePlan, TcProgram,
@@ -38,48 +39,79 @@ const CHAIN_CAPACITY: usize = 64;
 
 type Key = (NonZeroU32, Direction);
 
+/// A verified TC variant with the routing extension targets it carries.
+pub struct PreparedTcProgram {
+    pub(super) program: TcProgram,
+    pub(super) fd: OwnedFd,
+    pub(super) routing: Option<[Target; 2]>,
+}
+
+impl PreparedTcProgram {
+    pub(super) fn load(bpf: &mut Ebpf, program: TcProgram) -> anyhow::Result<Self> {
+        let fd = load(bpf, program)?;
+        let routing = if program.routes() {
+            let classifier: &SchedClassifier = bpf
+                .program(program.name())
+                .expect("loaded TC program")
+                .try_into()?;
+            Some(super::routing::prepare_targets(classifier)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            program,
+            fd,
+            routing,
+        })
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct InterfaceBindings {
-    programs: Vec<(TcProgram, OwnedFd)>,
+    programs: Vec<PreparedTcProgram>,
     owned: Vec<(Binding, u32, OwnedFd)>,
 }
 
 impl InterfaceBindings {
-    /// Load every TC variant and keep a dup of its program FD, so no
-    /// `BPF_PROG_LOAD` (and no verifier run) happens while reconciling. Must
-    /// run before `EbpfLogger::init`, which takes a map FD the loads need.
-    pub(super) fn preload(bpf: &mut Ebpf) -> anyhow::Result<Self> {
-        let mut programs = Vec::with_capacity(TcProgram::ALL.len());
-        for program in TcProgram::ALL {
-            let name = program.name();
-            let classifier: &mut SchedClassifier = bpf
-                .program_mut(name)
-                .ok_or_else(|| anyhow::anyhow!("TC program '{name}' not found"))?
-                .try_into()?;
-            match classifier.load() {
-                Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
-                Err(error) => anyhow::bail!("load TC program '{name}': {error}"),
-            }
-            let fd = classifier
-                .fd()?
-                .as_fd()
-                .try_clone_to_owned()
-                .with_context(|| format!("duplicate TC program '{name}' fd"))?;
-            programs.push((program, fd));
+    /// Load `programs` and keep a dup of each program FD, so `apply` itself
+    /// never runs the verifier. A variant needed later is added by [`Self::add`].
+    pub(super) fn preload(bpf: &mut Ebpf, programs: &[TcProgram]) -> anyhow::Result<Self> {
+        let mut bindings = Self::default();
+        for program in programs {
+            bindings.add(PreparedTcProgram::load(bpf, *program)?);
         }
-        Ok(Self {
-            programs,
-            owned: Vec::new(),
-        })
+        Ok(bindings)
+    }
+
+    /// Make a loaded variant bindable. A routing target must already carry the
+    /// active routing extension.
+    pub(super) fn add(&mut self, prepared: PreparedTcProgram) {
+        if !self.has(prepared.program) {
+            self.programs.push(prepared);
+        }
+    }
+
+    pub(super) fn routing_targets(&self, slot: usize) -> impl Iterator<Item = &Target> {
+        self.programs
+            .iter()
+            .filter_map(move |program| program.routing.as_ref().map(|targets| &targets[slot]))
     }
 
     pub(super) fn owned(&self) -> &[(Binding, u32, OwnedFd)] {
         &self.owned
     }
 
-    #[cfg(test)]
-    pub(super) fn programs(&self) -> &[(TcProgram, OwnedFd)] {
-        &self.programs
+    pub(super) fn has(&self, program: TcProgram) -> bool {
+        self.programs.iter().any(|held| held.program == program)
+    }
+
+    pub(super) fn missing(&self, plan: &InterfacePlan) -> Vec<TcProgram> {
+        TcProgram::ALL
+            .into_iter()
+            .filter(|program| {
+                !self.has(*program) && plan.bindings.iter().any(|b| b.program == *program)
+            })
+            .collect()
     }
 
     pub(super) fn snapshot(&self) -> anyhow::Result<BindingSnapshot> {
@@ -88,7 +120,7 @@ impl InterfaceBindings {
             programs: self
                 .programs
                 .iter()
-                .map(|(program, fd)| Ok((*program, dup(fd)?)))
+                .map(|prepared| Ok((prepared.program, dup(&prepared.fd)?)))
                 .collect::<anyhow::Result<_>>()?,
             owned: self
                 .owned
@@ -286,6 +318,24 @@ pub(crate) fn apply(
         }
     }
     report
+}
+
+/// `BPF_PROG_LOAD` (the verifier run) of one TC variant; returns a dup of its FD.
+pub(super) fn load(bpf: &mut Ebpf, program: TcProgram) -> anyhow::Result<OwnedFd> {
+    let name = program.name();
+    let classifier: &mut SchedClassifier = bpf
+        .program_mut(name)
+        .ok_or_else(|| anyhow::anyhow!("TC program '{name}' not found"))?
+        .try_into()?;
+    match classifier.load() {
+        Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
+        Err(error) => anyhow::bail!("load TC program '{name}': {error}"),
+    }
+    classifier
+        .fd()?
+        .as_fd()
+        .try_clone_to_owned()
+        .with_context(|| format!("duplicate TC program '{name}' fd"))
 }
 
 fn program_fd(programs: &[(TcProgram, OwnedFd)], program: TcProgram) -> anyhow::Result<&OwnedFd> {
@@ -515,13 +565,66 @@ pub(super) fn query_chain(ifindex: u32, direction: Direction) -> io::Result<Chai
     unreachable!("the second attempt returns")
 }
 
+pub(super) fn commit_program_batch(
+    batch: super::programs::TcProgramBatch,
+    mut publish: impl FnMut(PreparedTcProgram) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut first_error = None;
+    for (_, result) in batch {
+        if let Err(error) = result.and_then(&mut publish) {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 impl super::RealEbpfBackend {
+    /// Verify and commit in place; only for a backend not yet shared.
+    pub(crate) fn load_tc_programs(&mut self, programs: &[TcProgram]) -> anyhow::Result<()> {
+        let prepare = self.prepare_tc_programs(programs)?;
+        self.commit_tc_programs(prepare())
+    }
+
+    pub(super) fn prepare_tc_programs(
+        &self,
+        programs: &[TcProgram],
+    ) -> anyhow::Result<super::programs::TcProgramPreparation> {
+        let missing = programs
+            .iter()
+            .copied()
+            .filter(|program| !self.bindings.has(*program))
+            .collect();
+        Ok(self
+            .programs
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("eBPF object not loaded"))?
+            .prepare(missing))
+    }
+
+    pub(super) fn commit_tc_programs(
+        &mut self,
+        batch: super::programs::TcProgramBatch,
+    ) -> anyhow::Result<()> {
+        commit_program_batch(batch, |prepared| {
+            let program = prepared.program;
+            if !self.bindings.has(program) {
+                self.extend_routing_target(&prepared)?;
+                self.bindings.add(prepared);
+                tracing::info!(program = program.name(), "loaded TC program on first use");
+            }
+            Ok(())
+        })
+    }
+
     /// Startup bind, before the backend is shared, using the watcher's apply.
     pub(crate) fn bind_interfaces(
         &mut self,
         plan: &InterfacePlan,
         topology: &Topology,
     ) -> ApplyReport {
+        if let Err(error) = self.load_tc_programs(&self.bindings.missing(plan)) {
+            tracing::warn!("load TC programs for the interface plan: {error:#}");
+        }
         let snapshot = match self.bindings.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {

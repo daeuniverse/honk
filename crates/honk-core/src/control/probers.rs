@@ -40,6 +40,22 @@ fn probe_finish(reporter: &ProbeReporter, outcome: ScoreOutcome) {
     }
 }
 
+fn udp_probe_local_refusal(error: &anyhow::Error) -> bool {
+    use honk_outbound::proxy::{DialFailureScope, dial_failure_scope};
+
+    dial_failure_scope(error.as_ref()) == DialFailureScope::LocalRejection
+}
+
+fn finish_udp_probe_error(reporter: &ProbeReporter, error: anyhow::Error) -> Option<anyhow::Error> {
+    // Packet refusals are consumed by the existing neutral probe outcome path.
+    if udp_probe_local_refusal(&error) && !honk_outbound::proxy::is_packet_rejection(&error) {
+        probe_finish(reporter, ScoreOutcome::Rejected);
+        return None;
+    }
+    probe_finish(reporter, ScoreOutcome::from_error(&error));
+    Some(error)
+}
+
 fn target_family(addr: SocketAddr) -> IpVersion {
     if addr.is_ipv6() {
         IpVersion::V6
@@ -315,60 +331,37 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
         let quic_score_target = self.quic_score_target.clone();
 
         Box::pin(async move {
-            if cancel.is_cancelled() {
-                return honk_outbound::alive::UdpProbeOutcome {
-                    dns: None,
-                    data_path: None,
-                    observations: [None, None],
-                };
-            }
-            let Some(node) = node else {
-                return honk_outbound::alive::UdpProbeOutcome {
-                    dns: Some(Err(anyhow::anyhow!("node not found"))),
-                    data_path: None,
-                    observations: [None, None],
-                };
-            };
-            let udp_capable =
-                (honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(&node);
-            let dns_allowed = udp_capable
-                && honk_outbound::descriptor::udp_target_allowed(&node, dns_probe.port());
-            let data_allowed = udp_capable
-                && quic_score_target.as_ref().is_some_and(|target| {
-                    target.port.is_some_and(|port| {
-                        honk_outbound::descriptor::udp_target_allowed(&node, port)
-                    })
-                });
-            let failed = |error: String| honk_outbound::alive::UdpProbeOutcome {
-                dns: dns_allowed.then(|| Err(anyhow::Error::msg(error.clone()))),
-                data_path: (!dns_allowed && data_allowed).then_some(Err(anyhow::Error::msg(error))),
+            let skipped = || honk_outbound::alive::UdpProbeOutcome {
+                dns: None,
+                data_path: None,
                 observations: [None, None],
             };
-            if !dns_allowed && !data_allowed {
-                return honk_outbound::alive::UdpProbeOutcome {
-                    dns: None,
-                    data_path: None,
-                    observations: [None, None],
-                };
+            if cancel.is_cancelled() {
+                return skipped();
             }
-            let protocol = node.protocol();
-            let Some(entry) = registry.find(protocol) else {
-                return failed(format!("no handler for protocol {:?}", protocol));
+            let Some(node) = node else {
+                return skipped();
             };
-            let Some(packet) = entry.packet.clone() else {
-                return failed(format!("protocol {:?} has no UDP capability", protocol));
+            let Ok((packet, terminal)) = registry.udp_probe_target(&generation, &node) else {
+                return skipped();
             };
+            let allows_port = |port| honk_outbound::descriptor::udp_target_allowed(terminal, port);
+            let dns_allowed = allows_port(dns_probe.port());
+            let data_allowed = quic_score_target
+                .as_ref()
+                .and_then(|target| target.port)
+                .is_some_and(allows_port);
+            if !dns_allowed && !data_allowed {
+                return skipped();
+            }
             let (connect_timeout, probe_interval) = {
-                let config = config
-                    .try_read()
-                    .map_err(|_| "config lock busy".to_string());
-                match config {
-                    Ok(config) => (
-                        Duration::from_millis(config.global.connect_timeout_ms),
-                        Duration::from_secs(config.global.check_interval_secs),
-                    ),
-                    Err(error) => return failed(error),
-                }
+                let Ok(config) = config.try_read() else {
+                    return skipped();
+                };
+                (
+                    Duration::from_millis(config.global.connect_timeout_ms),
+                    Duration::from_secs(config.global.check_interval_secs),
+                )
             };
             let (runtime, ephemeral) = match honk_outbound::urltest::try_probe_runtime(
                 &generation,
@@ -376,7 +369,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                 honk_outbound::proxy::WarmRequirement::Udp,
             ) {
                 Ok(runtime) => runtime,
-                Err(_) => return failed("invalid node for health probe".into()),
+                Err(_) => return skipped(),
             };
             let dns_deadline = tokio::time::Instant::now() + timeout;
             let dns_target = if dns_allowed {
@@ -394,8 +387,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             };
             let mut dns_observation = None;
             let dns = if let Some((dns_target, dns_identity)) = dns_target.filter(|(target, _)| {
-                tokio::time::Instant::now() < dns_deadline
-                    && honk_outbound::descriptor::udp_target_allowed(&node, target.port())
+                tokio::time::Instant::now() < dns_deadline && allows_port(target.port())
             }) {
                 let reporter = start_probe_feedback(
                     &group_manager,
@@ -429,8 +421,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     .run(tokio::time::timeout_at(dns_deadline, attempt))
                     .await
                 {
-                    if !matches!(&result, Ok(Err(error)) if honk_outbound::proxy::is_packet_rejection(error))
-                    {
+                    if !matches!(&result, Ok(Err(error)) if udp_probe_local_refusal(error)) {
                         let sample = result.as_ref().ok().and_then(|result| result.as_ref().ok());
                         dns_observation = Some(HealthObservation::probe(
                             ProbeDomain::DnsUdp,
@@ -442,31 +433,28 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                             }),
                         ));
                     }
-                    Some(match result {
+                    match result {
                         Ok(Ok(_)) => {
                             let elapsed = start.elapsed();
                             if let Some(reporter) = &reporter {
                                 reporter.probe_latency(elapsed);
                             }
                             probe_finish(&reporter, ScoreOutcome::Success);
-                            Ok(elapsed)
+                            Some(Ok(elapsed))
                         }
-                        Ok(Err(error)) => {
-                            probe_finish(&reporter, ScoreOutcome::from_error(&error));
-                            Err(error.context("UDP probe failed"))
-                        }
+                        Ok(Err(error)) => finish_udp_probe_error(&reporter, error)
+                            .map(|error| Err(error.context("UDP probe failed"))),
                         Err(_) => {
                             probe_finish(&reporter, ScoreOutcome::Timeout);
-                            Err(anyhow::anyhow!("UDP probe timeout"))
+                            Some(Err(anyhow::anyhow!("UDP probe timeout")))
                         }
-                    })
+                    }
                 } else {
                     None
                 }
             } else {
                 None
             };
-            let mut data_attempted = false;
             let mut data_observation = None;
             let data_path = match quic_score_target.as_ref() {
                 Some(target) if data_allowed => {
@@ -478,10 +466,12 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                         ))
                         .await
                     {
-                        Some(Ok(Ok(Some(target)))) if tokio::time::Instant::now() < deadline => {
-                            data_attempted = true;
+                        Some(Ok(Ok(Some(target))))
+                            if tokio::time::Instant::now() < deadline
+                                && allows_port(target.addr.port()) =>
+                        {
                             score_quic_probe(
-                                &packet,
+                                packet,
                                 &generation,
                                 Arc::clone(&runtime),
                                 &node,
@@ -501,7 +491,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                 }
                 Some(_) | None => None,
             };
-            if ephemeral.is_none() && (dns.is_some() || (data_attempted && data_path.is_some())) {
+            if ephemeral.is_none() && (dns_observation.is_some() || data_observation.is_some()) {
                 stats.mark_warm(node.id, crate::stats::WarmReason::Health);
             }
             close_ephemeral(ephemeral, &cancel).await;
@@ -527,7 +517,7 @@ pub(super) fn quic_probe_context(target: &QuicScoreTarget) -> ScoreSelectionCont
 
 #[allow(clippy::too_many_arguments)]
 async fn score_quic_probe(
-    packet: &Arc<dyn honk_outbound::proxy::PacketOutbound>,
+    packet: &dyn honk_outbound::proxy::PacketOutbound,
     generation: &Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
     runtime: Arc<honk_outbound::runtime::NodeRuntime>,
     node: &Node,
@@ -539,9 +529,6 @@ async fn score_quic_probe(
     observation: &mut Option<HealthObservation>,
     cancel: &honk_outbound::alive::ProbeCancellation,
 ) -> Option<anyhow::Result<Duration>> {
-    if !honk_outbound::descriptor::udp_target_allowed(node, target.addr.port()) {
-        return None;
-    }
     // Nodes outside Score groups create no reporter and are not probed.
     let reporter = start_probe_feedback(
         group_manager,
@@ -599,7 +586,7 @@ async fn score_quic_probe(
         }
         Err(error) => Err(error),
     };
-    if !matches!(&result, Err(error) if honk_outbound::proxy::is_packet_rejection(error)) {
+    if !matches!(&result, Err(error) if udp_probe_local_refusal(error)) {
         let sample = result.as_ref().ok();
         *observation = Some(HealthObservation::probe(
             ProbeDomain::DataUdp,
@@ -609,20 +596,17 @@ async fn score_quic_probe(
             sample.map_or_else(std::time::SystemTime::now, |sample| sample.observed_at),
         ));
     }
-    Some(match result {
+    match result {
         Ok(_) => {
             let elapsed = start.elapsed();
             if let Some(reporter) = &reporter {
                 reporter.probe_latency(elapsed);
             }
             probe_finish(&reporter, ScoreOutcome::Success);
-            Ok(elapsed)
+            Some(Ok(elapsed))
         }
-        Err(error) => {
-            probe_finish(&reporter, ScoreOutcome::from_error(&error));
-            Err(error)
-        }
-    })
+        Err(error) => finish_udp_probe_error(&reporter, error).map(Err),
+    }
 }
 
 /// Resolve the UDP health check target from `global.udp_check_dns`

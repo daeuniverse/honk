@@ -8,6 +8,8 @@ use tokio::net::{TcpSocket, TcpStream};
 
 #[cfg(feature = "native-api")]
 mod native_dns;
+#[cfg(feature = "dns-syslog")]
+mod syslog;
 
 struct FixedAddressUpstream {
     address: [u8; 4],
@@ -613,7 +615,10 @@ async fn tcp_listener_preserves_global_connection_capacity() {
 #[tokio::test]
 async fn shutdown_releases_listener_address_for_rebind() {
     let (controller, _) = controller([203, 0, 113, 12]);
-    let (mut listener, address, drain) = start_listener("tcp+udp://127.0.0.1:0", controller);
+    // A freed ephemeral port can be taken before the rebind below. A loopback
+    // address of its own keeps it off the shared 127.0.0.1 port pool; wildcard
+    // binds elsewhere can still take it, so this narrows the race only.
+    let (mut listener, address, drain) = start_listener("tcp+udp://127.0.0.77:0", controller);
     let mut closed_client = TcpStream::connect(address)
         .await
         .expect("connect malformed TCP DNS client");
@@ -688,18 +693,22 @@ async fn listener_queries_acquire_the_newly_published_runtime() {
 
 #[tokio::test]
 async fn supervisor_panic_is_a_listener_shutdown_failure() {
-    let (controller, _) = controller([203, 0, 113, 12]);
-    let (mut listener, address, drain) = start_listener("tcp+udp://127.0.0.1:0", controller);
-    listener
-        .supervisors
-        .spawn(async { panic!("DNS supervisor failed") });
-    assert!(listener.abort_and_join().await.is_err());
-    assert_eq!(drain.active_count(), 0);
-    BoundDnsListener::bind(
-        &DnsBindEndpoint::parse(&format!("tcp+udp://{address}")).unwrap(),
-        None,
-    )
-    .expect("failed shutdown must still join healthy supervisors");
+    // Another test's ephemeral socket can take the released port before the
+    // rebind; a leaked socket fails every attempt, a collision almost never repeats.
+    for _ in 0..8 {
+        let (controller, _) = controller([203, 0, 113, 12]);
+        let (mut listener, address, drain) = start_listener("tcp+udp://127.0.0.1:0", controller);
+        listener
+            .supervisors
+            .spawn(async { panic!("DNS supervisor failed") });
+        assert!(listener.abort_and_join().await.is_err());
+        assert_eq!(drain.active_count(), 0);
+        let endpoint = DnsBindEndpoint::parse(&format!("tcp+udp://{address}")).unwrap();
+        if BoundDnsListener::bind(&endpoint, None).is_ok() {
+            return;
+        }
+    }
+    panic!("failed shutdown must still join healthy supervisors");
 }
 
 #[tokio::test]

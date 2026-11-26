@@ -1,4 +1,6 @@
 use super::*;
+use honk_outbound::alive::RouteHealthRevision;
+use honk_outbound::group::{DialKey, OwnedTarget};
 use std::collections::HashSet;
 
 pub(super) fn tcp_relay_score_outcome(error: &anyhow::Error) -> crate::group::ScoreOutcome {
@@ -10,12 +12,13 @@ pub(super) fn tcp_relay_score_outcome(error: &anyhow::Error) -> crate::group::Sc
 }
 
 type UnpackedTcpScorePlan = (
-    Vec<Node>,
+    Vec<OwnedTarget>,
     SelectionPlanMode,
-    HashMap<uuid::Uuid, crate::group::ScoreAttempt>,
-    HashMap<uuid::Uuid, Vec<String>>,
-    HashMap<uuid::Uuid, Vec<String>>,
+    HashMap<DialKey, crate::group::ScoreAttempt>,
+    HashMap<DialKey, Vec<String>>,
+    HashMap<DialKey, Vec<String>>,
     IpVersion,
+    RouteHealthRevision,
 );
 
 pub(super) fn tcp_score_context(
@@ -44,52 +47,51 @@ pub(super) fn unpack_tcp_score_plan(
     plan: crate::control::reload::ResolvedScorePlan,
 ) -> UnpackedTcpScorePlan {
     let mut seen = HashSet::new();
-    let mut nodes = Vec::with_capacity(plan.nodes.len());
+    let mut targets = Vec::with_capacity(plan.targets.len());
     let mut feedback = HashMap::new();
     let mut selection_chains = HashMap::new();
     let mut final_owners = HashMap::new();
-    for (((node, value), selection_chain), used_final_owners) in plan
-        .nodes
+    for (((target, value), selection_chain), used_final_owners) in plan
+        .targets
         .into_iter()
         .zip(plan.feedback)
         .zip(plan.selection_chains)
         .zip(plan.final_owners)
     {
-        if !seen.insert(node.id) {
+        let key = target.key();
+        if !seen.insert(key) {
             continue;
         }
         if let Some(value) = value {
-            feedback.insert(node.id, value);
+            feedback.insert(key, value);
         }
-        selection_chains.insert(node.id, selection_chain);
+        selection_chains.insert(key, selection_chain);
         if !used_final_owners.is_empty() {
-            final_owners.insert(node.id, used_final_owners);
+            final_owners.insert(key, used_final_owners);
         }
-        nodes.push(node);
+        targets.push(target);
     }
     (
-        nodes,
+        targets,
         plan.mode,
         feedback,
         selection_chains,
         final_owners,
         plan.health_family,
+        plan.route_revision,
     )
 }
 
 pub(super) fn timeout_started_score_reporters(
-    reporters: &parking_lot::Mutex<Vec<crate::group::ScoreReporter>>,
+    reporters: &parking_lot::Mutex<Vec<(crate::group::ScoreReporter, bool)>>,
 ) {
-    for reporter in reporters.lock().iter() {
-        reporter.setup_failed(crate::group::ScoreOutcome::Timeout);
+    for (reporter, routed) in reporters.lock().iter() {
+        reporter.setup_failed(if *routed {
+            crate::group::ScoreOutcome::RouteFailure
+        } else {
+            crate::group::ScoreOutcome::Timeout
+        });
     }
-}
-
-#[cfg(test)]
-pub(super) fn started_score_reporter_count(
-    reporters: &parking_lot::Mutex<Vec<crate::group::ScoreReporter>>,
-) -> usize {
-    reporters.lock().len()
 }
 
 pub(super) const COLD_URLTEST_STAGGER: Duration = Duration::from_millis(200);

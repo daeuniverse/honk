@@ -1,10 +1,10 @@
 # honk Quick Start
 
-Install, configure, and start honk, an experimental eBPF transparent proxy engine for Linux.
+Install, configure, and start honk. honk is an experimental eBPF transparent proxy engine for Linux.
 
 > **Warning**
 >
-> honk is still alpha. Real mode loads eBPF programs, attaches TC and cgroup hooks, creates `dae0`/`daens`, changes sysctls, and uses NFQUEUE 320 by default. Keep an out-of-band management path available during the first deployment.
+> honk is an alpha release. Real mode loads eBPF programs, attaches TC and cgroup hooks, creates `dae0`/`daens`, changes sysctls, and uses NFQUEUE 320 by default. Keep an out-of-band management path available during the first deployment.
 
 ## Linux kernel requirements
 
@@ -15,7 +15,7 @@ uname -r
 ```
 
 - Only Linux is supported. The real transparent datapath must run as `root`.
-- Linux `6.12+` is required for compiled routing and its synchronous map-in-map publication guarantee. Older kernels are rejected before attachment.
+- Linux `6.12+` is required: compiled routing needs synchronous map-in-map publication. honk rejects older kernels before attachment.
 - `netkit` is optional. honk falls back to veth when the kernel does not support it.
 
 `lan_interface` intercepts traffic entering the gateway from the LAN. `wan_interface` intercepts traffic originated by the gateway itself:
@@ -33,7 +33,7 @@ Desktop and server distributions usually enable the required features. Check the
 zcat /proc/config.gz 2>/dev/null || cat /boot/config-$(uname -r)
 ```
 
-The real datapath requires the capabilities represented by at least these kernel options:
+The real datapath needs at least these kernel options:
 
 ```text
 CONFIG_BPF=y
@@ -46,9 +46,9 @@ CONFIG_NET_XGRESS=y
 CONFIG_NET_NS=y
 ```
 
-The TCX backend needs `CONFIG_NET_XGRESS`, a hidden option selected by `CONFIG_NET_CLS_ACT`, not legacy `CONFIG_NET_CLS_BPF` or `CONFIG_NET_SCH_INGRESS`. See [hook and qdisc ownership](./design/datapath.md#interface-hook-sets).
+The TCX backend needs `CONFIG_NET_XGRESS`. That hidden option is selected by `CONFIG_NET_CLS_ACT`, not by legacy `CONFIG_NET_CLS_BPF` or `CONFIG_NET_SCH_INGRESS`. See [hook and qdisc ownership](./design/datapath.md#interface-hook-sets).
 
-Held-first-packet UDP, which is enabled by default, additionally requires:
+Held-first-packet UDP is enabled by default. It also requires:
 
 ```text
 CONFIG_NF_TABLES=y|m
@@ -58,17 +58,19 @@ CONFIG_NFT_QUEUE=y|m
 CONFIG_NETFILTER_NETLINK_QUEUE=y|m
 ```
 
-cgroup v2 with `CONFIG_CGROUP_BPF` is required. The real datapath attaches socket-identity hooks and the TCP `sock_ops` program `honk_tcp_passive` to the root cgroup. Startup fails if either is unavailable. A legacy program with flags=0 already occupying the root cgroup's `sock_ops` slot also prevents startup, including one attached with `bpftool cgroup attach`.
+honk relies on kernel module autoloading for `nfnetlink_queue` and `nft_queue`. On a system with autoloading disabled, load both with `modprobe` and list them in `/etc/modules-load.d/`.
 
-`honk_tcp_passive` receives every host TCP `sock_ops` callback, a few per connection. It returns immediately for sockets outside honk's namespace. TCP ownership proof requires neither in-kernel BTF, ftrace nor built-in IPv6; an external raw BTF file is sufficient.
+cgroup v2 with `CONFIG_CGROUP_BPF` is required. The real datapath attaches socket-identity hooks and the TCP `sock_ops` program `honk_tcp_passive` to the root cgroup. Startup fails if either is unavailable. A legacy program with flags=0 that occupies the root cgroup's `sock_ops` slot also prevents startup, even one attached with `bpftool cgroup attach`.
 
-Startup always loads raw BTF for the eBPF loader's target BTF and the process-name and receive-trace offsets. It selects the file in this order:
+`honk_tcp_passive` receives every host TCP `sock_ops` callback, several per connection. It returns immediately for sockets outside honk's namespace. TCP ownership proof needs no in-kernel BTF, ftrace, or built-in IPv6 support; an external raw BTF file is enough.
+
+Startup always loads raw BTF. The eBPF loader needs raw BTF for its target and for the process-name and receive-trace offsets. It selects the file in this order:
 
 1. The file specified by `HONK_VMLINUX_BTF`.
 2. `/sys/kernel/btf/vmlinux` when no override is set.
 3. `/usr/lib/debug/boot/vmlinux` when the preceding default path is unreadable. OpenWrt's `vmlinux-btf` package installs this file.
 
-Only the optional `native-api` UDP receive-trace fallback, used when UDP receive-priority ancillary metadata is unavailable, attaches fentry/fexit programs. It needs the in-kernel BTF (`HONK_VMLINUX_BTF` does not substitute) and ftrace, and degrades without them:
+Only the optional `native-api` UDP receive-trace fallback attaches fentry/fexit programs. That fallback runs when UDP receive-priority ancillary metadata is unavailable. It needs the in-kernel BTF and ftrace; `HONK_VMLINUX_BTF` does not substitute. Without them it degrades:
 
 ```text
 CONFIG_DEBUG_INFO_BTF=y
@@ -76,7 +78,7 @@ CONFIG_FUNCTION_TRACER=y
 CONFIG_DYNAMIC_FTRACE=y
 ```
 
-A missing or incompatible `udp_recvmsg` or `udpv6_recvmsg` hook disables only that socket family's fallback; the shared `__skb_recv_udp` hook is required by both. A partial or failed fallback attachment is not retried on listener reload: restart after changing kernel/BTF support. See [receive-trace ownership](./design/control-plane.md#startup-and-shutdown).
+A missing or incompatible `udp_recvmsg` or `udpv6_recvmsg` hook disables the fallback for that socket family only. Both families require the shared `__skb_recv_udp` hook. honk does not retry a partial or failed fallback attachment when it reloads a listener. Restart honk after changing kernel or BTF support. See [receive-trace ownership](./design/control-plane.md#startup-and-shutdown).
 
 ### bpffs
 
@@ -98,7 +100,7 @@ bpf /sys/fs/bpf bpf defaults 0 0
 
 ### Prebuilt binaries
 
-Download the package matching the device architecture from [GitHub Releases](https://github.com/daeuniverse/honk/releases). Every name ends in its variant (older releases name the full build without a suffix):
+Download the package matching the device architecture from [GitHub Releases](https://github.com/daeuniverse/honk/releases). Every package name ends with its variant suffix; older releases name the full build without a suffix.
 
 | Variant | Package suffix | Release label | Contents |
 |---|---|---|---|
@@ -106,16 +108,16 @@ Download the package matching the device architecture from [GitHub Releases](htt
 | clash-api | `-clash-api` | `clashapi` | Clash API only; no native API and no embedded UI (musl only) |
 | native-api | `-native-api` | `nativeapi` | Native API only; no Clash API and no embedded UI (musl only) |
 
-The musl packages are static binaries intended for gateways.
+The musl packages are static binaries intended for gateways. A GNU build that reports a missing `GLIBC_*` version needs a newer glibc than the host provides; use the musl build for the same architecture.
 
 | Allocator variant | Release label | Intended use |
 | --- | --- | --- |
 | No `-stock` suffix: jemalloc | `jemalloc` | Prioritize throughput. |
-| `-stock`: system allocator | `stockalloc` | Small devices where the RSS high-water mark matters more. |
+| `-stock`: system allocator | `stockalloc` | Small devices where the RSS high-water mark matters more than throughput. |
 
 Each release's Downloads section lists every archive with its `{allocator}-{API}-{arch}-{libc}` label.
 
-The lean variants fail closed: enabling `experimental.native_api` on `-clash-api`, or `ui: embedded` or `ui: embedded-lite` without `native-ui`, fails startup. `--store db` and native configuration administration require `native-api`. `embedded-lite` selects the lighter doona lite edition (preview).
+The lean variants fail closed. Enabling `experimental.native_api` on `-clash-api` fails startup, as does `ui: embedded` or `ui: embedded-lite` without `native-ui`. `--store db` and native configuration administration require `native-api`. `embedded-lite` selects the lighter doona lite edition (preview).
 
 ```shell
 pkg=honk-core-<version>-<target>-full   # or -stock-full, -clash-api, -stock-native-api, as downloaded
@@ -141,7 +143,36 @@ sudo cp /etc/honk/example.dae /etc/honk/config.dae      # then edit it
 sudo systemctl enable --now honk-core
 ```
 
-Upgrading the package restarts a running `honk-core.service`; removing it stops and disables the service. honk and dae attach to the same interfaces and cannot run at the same time: the unit declares `Conflicts=dae.service`, so starting either service stops the other. When switching from dae, also run `sudo systemctl disable dae` so that dae does not start at boot.
+Upgrading the package restarts a running `honk-core.service`; removing it stops and disables the service. honk and dae attach to the same interfaces and cannot run at the same time. The unit declares `Conflicts=dae.service`, so starting either service stops the other. When switching from dae, also run `sudo systemctl disable dae` so that dae does not start at boot.
+
+### OpenWrt
+
+The [daeuniverse feed](https://daeuniverse.org/openwrt/) supports OpenWrt and ImmortalWrt 25.12 and later. It installs the backend as `honk` and the LuCI app as `luci-app-honk`. Its service is `/etc/init.d/honk`, and its data directory is `/etc/honk/data`. Follow the feed's enable and upgrade instructions; do not create a second service.
+
+```shell
+apk add honk@daeuniverse luci-app-honk@daeuniverse
+/etc/init.d/honk enable
+/etc/init.d/honk start
+```
+
+honk needs Linux `6.12+`. Official OpenWrt images also need the `vmlinux-btf` package.
+
+Without the feed, install a musl release at `/usr/bin/honk-core`, then set `global.data_dir` to a persistent directory:
+
+```shell
+install -m 0755 honk-core /usr/bin/honk-core
+/usr/bin/honk-core --version
+```
+
+```dae
+global {
+    data_dir: '/etc/honk/data'
+}
+```
+
+`/var` is volatile on OpenWrt: keep the configuration under `/etc/honk/` and the data directory at `/etc/honk/data`. The rest of this page uses `/usr/local/bin/honk-core` and `/var/lib/honk`; substitute the OpenWrt paths.
+
+apk records a package installed from a file in `/etc/apk/world` as a file pin. Once a repository carries another version, every `apk add` fails with `breaks: world[...]`, even for unrelated packages. Install from the feed with `apk add honk@daeuniverse`, naming any other packages in the same command, or name the local file again in the same command.
 
 ### Build from source
 
@@ -226,13 +257,15 @@ sudo install -d -m 0700 /etc/honk /var/lib/honk
 sudo install -m 0600 /path/to/config.dae /etc/honk/config.dae
 ```
 
-The default runtime root is `/var/lib/honk`. Existing artifacts under the legacy `/var/share/honk` root remain usable through the documented per-path fallback. Legacy cache and subscription imports copy eligible state into `state/honk.db`. Custom `data_dir` values use the same fallback order. Relative caches, subscription stores, ECH/UI and other read-only dependencies check the configured directory, then `/var/share/honk`, then their caller-specific legacy path. Relative logs are created only below the configured directory.
+The default runtime root is `/var/lib/honk`. Artifacts under the legacy `/var/share/honk` root remain usable through the documented per-path fallback. Legacy cache and subscription imports copy eligible state into `state/honk.db`. Custom `data_dir` values use the same fallback order. honk resolves a relative cache, subscription store, ECH/UI file or other read-only dependency against the directory selected by `global.data_dir`, then `/var/share/honk`, then its caller-specific legacy path. It creates relative logs only below that runtime directory, never below the directory that contains the configuration file.
 
 Start honk in the foreground:
 
 ```shell
 sudo /usr/local/bin/honk-core --config /etc/honk/config.dae
 ```
+
+honk ships no OpenRC service script. On an OpenRC host, use this foreground start to complete the first sign-in; Ctrl+C stops the process, and the command does not enable startup at boot. Stop the foreground process before starting a service wrapper.
 
 After `honk-core is running` appears, verify connectivity from a real LAN client before adding nodes, subscriptions, groups, routing, and DNS. To apply the minimal proxy example:
 
@@ -266,14 +299,29 @@ bootstrap_resolver: '1.1.1.1:53'
 
 See the [configuration guide](configuration.md) for the complete configuration flow. The repository's `config.dae`, `config.min.dae`, and `example.dae` contain example interfaces or nodes and must be adapted before deployment.
 
+### Side-router LAN clients
+
+A side router forwards client traffic through honk, while another router remains the WAN gateway. Set `lan_interface` to the interface that faces the clients, then point each client's gateway and DNS server at the side router's LAN address, either on the client or in the main router's DHCP settings.
+
+```dae
+global {
+    lan_interface: br-lan
+    wan_interface: auto
+}
+```
+
+`lan_interface: auto` does not select the LAN: it selects the interface with the lowest-metric IPv4 default route, usually the WAN. Name the LAN interface explicitly.
+
+This topology has a separate LAN interface. The [single-arm gateway](#single-arm-gateways) below puts the LAN and the WAN on one interface or bridge, and honk does not support that deployment.
+
 ### Single-arm gateways
 
-This setup is not supported; questions and bug reports about it are not answered.
+honk does not support this setup, and questions and bug reports about it are not answered.
 
-On a single-arm gateway, also called a bypass router, `lan_interface` and the WAN are the same interface or bridge: clients use the honk host as their gateway, and the host sends their traffic back out through that interface to the upstream router. Set the three kernel parameters below on such a host. honk does not set these three, and `auto_config_kernel_parameter` does not change that (see the [global reference](reference/global.md)).
+A single-arm gateway, also called a bypass router, uses one interface or bridge for `lan_interface` and the WAN. Clients use the honk host as their gateway, and the host sends their traffic back out through that interface to the upstream router. Set the three kernel parameters below on such a host. honk does not set these three, and `auto_config_kernel_parameter` does not change that; see the [global reference](reference/global.md).
 
 - With `send_redirects` on, the kernel sends clients ICMP redirects that point them at the upstream router, and their traffic then bypasses honk. The kernel sends redirects when either the `all` or the interface value is `1`, so set both to `0`.
-- honk sets `rp_filter` to `0` only on the first bound LAN interface, but the kernel applies the higher of the `all` and interface values, so a value of `1` or `2` under `all` overrides it. Set `all` to `0`.
+- honk sets `rp_filter` to `0` only on the first bound LAN interface. The kernel applies the higher of the `all` and interface values, so a value of `1` or `2` under `all` overrides it. Set `all` to `0`.
 
 Replace `br-lan` with the interface named in `lan_interface`, then load the file:
 
@@ -293,6 +341,25 @@ sysctl net.ipv4.conf.all.send_redirects net.ipv4.conf.br-lan.send_redirects net.
 ```
 
 A client that already received a redirect may keep the learned route for a while; reconnect it to the network before testing.
+
+#### Direct traffic fails
+
+Symptoms: proxied sites load, direct sites do not, `ping` fails, and the honk host itself reaches every destination. honk accepts proxied TCP and UDP on the host and opens a new connection from there. Direct traffic and ICMP are forwarded by the host instead, so a firewall that drops forwarded traffic breaks only them. Two firewall settings cause this.
+
+Docker usually sets the default policy of the iptables `FORWARD` chain to `DROP`, which drops all forwarded traffic. Check the policy. If the first command prints `-P FORWARD DROP`, accept traffic that enters and leaves the LAN interface in Docker's `DOCKER-USER` chain:
+
+```shell
+sudo iptables -S FORWARD | head -1
+sudo iptables -I DOCKER-USER -i br-lan -o br-lan -j ACCEPT
+```
+
+Other firewalls drop packets that connection tracking marks `INVALID`; OpenWrt's default zones do. The upstream router shares a subnet with the clients, so it replies to a client directly, and the host sees only one direction of each direct connection. Connection tracking then marks later packets of the connection `INVALID`. Masquerade forwarded traffic so that replies return through the host; the upstream router then sees every client as the host's address:
+
+```shell
+sudo iptables -t nat -A POSTROUTING -o br-lan -j MASQUERADE
+```
+
+On OpenWrt, enable masquerading on the LAN zone instead. Neither iptables rule persists across reboots; add the one you need to the host's firewall configuration.
 
 ### Web UI and APIs
 
@@ -315,7 +382,7 @@ experimental {
 Open `http://127.0.0.1:9527/ui/` after startup.
 
 - `enabled` starts the native API listener; `listen` sets its address and port.
-- `password_auth` enables password login. On the first visit, create the administrator account; honk stores it under `data_dir` in `state/honk.db`, not in the configuration file.
+- `password_auth` enables password login. Follow doona's [First sign-in](https://daeuniverse.org/doona/first-sign-in) to create the administrator account; honk stores it under `data_dir` in `state/honk.db`, not in the configuration file.
 - `config_write` permits authenticated configuration writes and reloads. Sources containing listener credentials remain read-only.
 - `ui: 'embedded'` serves the standard doona bundled in the binary; it does not download a dashboard at startup.
 
@@ -372,6 +439,16 @@ The engine selects the first existing regular file in this order:
 8. `/usr/share/dae/<name>`
 9. `/etc/dae/<name>`
 
+On OpenWrt, the `v2ray-geosite` and `v2ray-geoip` packages install under `/usr/share/v2ray`, which honk does not search. Link the files into `/usr/share/dae`:
+
+```shell
+mkdir -p /usr/share/dae
+ln -s ../v2ray/geosite.dat /usr/share/dae/geosite.dat
+ln -s ../v2ray/geoip.dat /usr/share/dae/geoip.dat
+```
+
+Files in the configured `data_dir` take precedence over these links.
+
 ## Run with systemd
 
 Create `/etc/systemd/system/honk-core.service`:
@@ -409,13 +486,61 @@ sudo systemctl status honk-core
 sudo journalctl -xefu honk-core
 ```
 
-Do not add strict capability bounding, a read-only `/proc/sys`, or `NoNewPrivileges=yes` before validating it. Startup needs BPF, network administration, network namespace, mount, sysctl, and transparent-socket privileges.
+Do not add strict capability bounding, a read-only `/proc/sys`, or `NoNewPrivileges=yes` before validating them. Startup needs BPF, network administration, network namespace, mount, sysctl, and transparent-socket privileges.
+
+## Run with OpenWrt procd
+
+Create `/etc/init.d/honk-core` on a manually installed router. The [daeuniverse feed](#openwrt) already ships `/etc/init.d/honk`; do not create a second service beside it.
+
+```shell
+cat > /etc/init.d/honk-core <<'EOF'
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+    procd_open_instance
+    procd_set_param command /usr/bin/honk-core --config /etc/honk/config.dae --disable-timestamp
+    procd_set_param limits nofile="1048576 1048576"
+    procd_set_param respawn
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+reload_service() {
+    /usr/bin/honk-core reload
+}
+EOF
+chmod 0755 /etc/init.d/honk-core
+```
+
+Set `global.data_dir` to `/etc/honk/data` in the configuration. procd sends the service's stdout and stderr to `logread`.
+
+```shell
+/etc/init.d/honk-core enable
+/etc/init.d/honk-core start
+/etc/init.d/honk-core status
+```
+
+`status` reports `running` after startup. Stop, restart or disable the service with the same subcommands. `disable` cancels startup at boot but does not stop a running process.
+
+A normal sysupgrade preserves the paths in the sysupgrade backup list. Confirm that the list covers the configuration, the data files and the init script:
+
+```shell
+printf '%s\n' '/etc/honk/' '/etc/init.d/honk-core' >> /etc/sysupgrade.conf
+sysupgrade -l
+```
+
+The backup does not restore `/usr/bin/honk-core`, kernel modules or geodata packages. Install those again after the upgrade.
 
 ## Run with Docker
 
-The image `ghcr.io/daeuniverse/honk` on [GitHub Container Registry](https://github.com/daeuniverse/honk/pkgs/container/honk) contains the musl `full` release binary and the GeoIP and Geosite files pinned by the repository; the build checks every download against its SHA-256 checksum. Each release is tagged with its version without the `v`, for example `ghcr.io/daeuniverse/honk:0.1.0-beta.4`; `latest` follows formal releases only, never pre-releases. Images are published for linux/amd64 and linux/arm64, and pulling needs no login.
+The image `ghcr.io/daeuniverse/honk` on [GitHub Container Registry](https://github.com/daeuniverse/honk/pkgs/container/honk) contains the musl `full` release binary and the GeoIP and Geosite files pinned by the repository. The build checks every download against its SHA-256 checksum. Each release is tagged with its version without the `v`, for example `ghcr.io/daeuniverse/honk:0.1.0-beta.4`. `latest` follows formal releases only, never pre-releases. Images are published for linux/amd64 and linux/arm64. Pulling needs no login.
 
-The container runs privileged in the host's network and PID namespaces, because honk loads and attaches eBPF programs, creates `dae0` and the `daens` namespace, changes sysctls and pins maps on the host's bpffs. It therefore changes the host exactly as a native installation does and provides no isolation. The host must meet the [kernel requirements](#linux-kernel-requirements), including Linux 6.12+ and a mounted bpffs.
+The container runs privileged in the host's network and PID namespaces. It needs that access because honk loads and attaches eBPF programs, creates `dae0` and the `daens` namespace, changes sysctls, and pins maps on the host's bpffs. It therefore changes the host exactly as a native installation does and provides no isolation. The host must meet the [kernel requirements](#linux-kernel-requirements), including Linux 6.12+ and a mounted bpffs.
 
 Prepare `/etc/honk/config.dae` and `/var/lib/honk` as in [Minimal configuration](#minimal-configuration), then start the repository's `docker-compose.yml` with the release version in `.env`:
 
@@ -427,9 +552,9 @@ sudo docker compose up -d
 sudo docker compose logs -f
 ```
 
-The file mounts `/sys`, `/etc/honk` and `/var/lib/honk` from the host. The configuration mount replaces the image's direct-only default, and `/var/lib/honk` keeps the runtime state, such as the native API administrator account, across restarts and upgrades. Reload the configuration with `sudo docker compose exec honk honk-core reload`. The image ships iproute2 and nftables, and the container shares the host's network namespace, so `sudo docker compose exec honk ip rule`, `ip route show table all`, `tc filter show dev <interface> ingress` and `nft list ruleset` show the host's state.
+The file mounts `/sys`, `/etc/honk` and `/var/lib/honk` from the host. It also mounts `/etc/localtime` read-only, which gives the container the host's time zone for log timestamps and the geodata update schedule. On a host without `/etc/localtime`, remove that mount and set `TZ` in the service's `environment` to a POSIX string such as `CST-8`. The configuration mount replaces the image's direct-only default. `/var/lib/honk` keeps the runtime state across restarts and upgrades, including the native API administrator account. Reload the configuration with `sudo docker compose exec honk honk-core reload`. The image ships iproute2 and nftables. The container shares the host's network namespace, so `sudo docker compose exec honk ip rule`, `ip route show table all`, `tc filter show dev <interface> ingress` and `nft list ruleset` show the host's state.
 
-The lock-file bind shares the native instance's `/run/honk-core.lock`, preventing containers from taking over an active datapath. Leave this file in place after stopping; never delete, replace or truncate an active lock. It must exist before automatic container startup on every boot. On systemd hosts, arrange non-truncating boot-time creation:
+The lock-file bind shares the native instance's `/run/honk-core.lock`, so a container cannot take over an active datapath. Leave this file in place after stopping; never delete, replace or truncate an active lock. It must exist before automatic container startup on every boot. On systemd hosts, arrange non-truncating boot-time creation:
 
 ```shell
 echo 'f /run/honk-core.lock 0600 root root -' | sudo tee /etc/tmpfiles.d/honk-container.conf
@@ -462,6 +587,24 @@ sudo docker compose up -d
 ```
 
 In a repository checkout, `sudo docker compose build` builds the same image from the published release instead of pulling it.
+
+## Service logs
+
+systemd writes the service output to the journal. The procd service writes to the system log, which `logread` reads.
+
+```shell
+sudo journalctl -u honk-core -e
+sudo journalctl -u honk-core -f
+```
+
+```shell
+logread -e honk-core
+logread -f -e honk-core
+```
+
+Earlier service runs may also be in the journal. Diagnose the current start from the latest `honk-core <version> starting` line, which also reports the running version.
+
+A successful start logs `native API listener ready` for an enabled listener, then `honk-core is running.` With a terminal attached, the last line reads `honk-core is running. Press Ctrl+C to stop.` A reachable `/api` or `/ui/` does not prove that the eBPF backend can route traffic; see [Check runtime status](#check-runtime-status).
 
 ## Check runtime status
 
@@ -503,7 +646,29 @@ sudo systemctl reload honk-core
 sudo /usr/local/bin/honk-core reload
 ```
 
-Use the running process logs and their `applied` or `rejected` result to determine whether the reload succeeded. Changes to interfaces, TPROXY settings, `data_dir`, the NFQUEUE switch, DNS bind, the Clash API listener/secret, cache settings, and other process-scoped fields require a restart. An interface that appears or disappears at runtime needs no reload: the watcher binds and releases it.
+The running process logs the outcome:
+
+| Log message | Meaning |
+| --- | --- |
+| `SIGHUP reload applied` | The candidate configuration passed validation and is active. |
+| `SIGHUP reload rejected` | The candidate was refused. The `stage` field and the accompanying error name the reason. A restart-required rejection means a process-scoped setting changed; edit it on the host and restart. |
+| `SIGHUP reload committed with degraded datapath` | The configuration is active, but a datapath component stayed degraded. Read the accompanying errors before treating the service as healthy. |
+
+The control plane also logs `SIGHUP reload request <id> started` and either `SIGHUP reload request <id> applied` or `SIGHUP reload request <id> rejected` for the same request.
+
+`honk-core reload` signals the process that holds `/run/honk-core.lock`. If no process holds it, the command reports `no running honk-core instance` and exits non-zero; a foreground `--mock-ebpf` process does not hold that lock. The command only delivers the signal: it does not prove that the candidate configuration passed validation.
+
+| Task | systemd | OpenWrt procd |
+| --- | --- | --- |
+| Start | `sudo systemctl start honk-core` | `/etc/init.d/honk-core start` |
+| Reload configuration | `sudo systemctl reload honk-core` | `/etc/init.d/honk-core reload` |
+| Restart | `sudo systemctl restart honk-core` | `/etc/init.d/honk-core restart` |
+| Stop | `sudo systemctl stop honk-core` | `/etc/init.d/honk-core stop` |
+| Disable startup at boot | `sudo systemctl disable honk-core` | `/etc/init.d/honk-core disable` |
+
+Disabling startup at boot does not stop a running service. To keep honk stopped after a reboot, run both stop and disable.
+
+Changes to interfaces, TPROXY settings, `data_dir`, the NFQUEUE switch, DNS bind, the Clash API listener/secret, cache settings, and other process-scoped fields require a restart. An interface that appears or disappears at runtime needs no reload: the watcher binds and releases it.
 
 Stop normally with:
 
@@ -511,7 +676,7 @@ Stop normally with:
 sudo systemctl stop honk-core
 ```
 
-Do not use `kill -9` for routine shutdown. honk first closes datapath admission, fences NFQUEUE, and then removes hooks and links. Only one real datapath instance may run on a host; `/run/honk-core.lock` prevents fixed-resource conflicts.
+Do not use `kill -9` for routine shutdown. honk closes datapath admission, fences NFQUEUE, then removes hooks and links. Only one real datapath instance may run on a host; `/run/honk-core.lock` prevents fixed-resource conflicts.
 
 ## Unprivileged development
 
@@ -539,8 +704,8 @@ cargo run --release -p honk-core -- \
 
 ## Current capabilities and limitations
 
-- Outbounds: Direct, Block, SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, and VLESS.
-- UDP: Direct, SOCKS5, Shadowsocks, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, and VLESS when its independent packet permission is enabled. VLESS fallback encoding and multiplex carrier are separate choices; VMess remains TCP-only. See the [VLESS node reference](reference/nodes.md#vless-udp-and-multiplexing).
+- Outbounds include Direct, Block, SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, and VLESS. [Proxy chains](reference/nodes.md#proxy-chains) carry TCP through two to four supported proxies.
+- UDP: Direct, SOCKS5, Shadowsocks, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, and VLESS when its independent packet permission is enabled. VLESS fallback encoding and the multiplex carrier are separate choices; VMess remains TCP-only. See the [VLESS node reference](reference/nodes.md#vless-udp-and-multiplexing).
 - Groups: Selector, URLTest, LoadBalance, Fallback, and Score.
 - DNS upstreams: UDP, TCP, DoT, DoH, DoH3, and DoQ, optionally through a node or group.
 - `direct` and `block` are built-in nodes and must not be redeclared.
@@ -558,9 +723,11 @@ cargo run --release -p honk-core -- \
 | Pinning a map returns `Invalid argument` | `/sys/fs/bpf` is not bpffs; mount it as shown above. |
 | Mock mode starts but traffic bypasses honk | This is expected. Build with the `ebpf` feature and run as root. |
 | NFQUEUE is disabled or queue 320 is busy | Check nftables/NFQUEUE kernel support, the queue owner, and stale honk instances. Set `nfqueue_enable: false` only when staging is intentionally unnecessary. |
+| Traffic fails after stopping OpenWrt's firewall | Stopping the firewall can remove honk's `inet honk_nfqueue` table and `udp_decision` chain. Start the firewall again, then restart the honk service. The firewall manager must leave both objects intact while honk runs. |
+| The NFQUEUE startup warning says `nfnetlink_queue is unavailable; the module may need loading` | The kernel could not load the module. Run `modprobe nfnetlink_queue nft_queue` and list both in `/etc/modules-load.d/`; if the module is missing, enable `CONFIG_NETFILTER_NETLINK_QUEUE`. |
 | LAN traffic is not intercepted | `lan_interface` is empty or names the wrong interface. honk does not substitute `lo`. If the interface is named correctly, see the next row. |
 | `GET /runtime` shows an `interface_binding` degradation | A configured interface is not bound yet; the logs name it. `pending`: it does not exist or an `auto` entry has no IPv4 default route. `unsupported_type`: the link type is refused (for example `lo`, a VRF device or `dae0`); name a supported interface or a member. `attach_failed`: the TCX link could not be created, updated or verified; see the warning in the logs. See the [native API reference](./reference/api.md#native-api) for interface-state fields. |
-| On a single-arm gateway, clients bypass honk or forwarded traffic is dropped | Set `send_redirects` to `0` for `all` and the LAN interface, and `net.ipv4.conf.all.rp_filter` to `0`. See [Single-arm gateways](#single-arm-gateways). |
+| On a single-arm gateway, clients bypass honk or forwarded traffic is dropped | Set `send_redirects` to `0` for `all` and the LAN interface, and `net.ipv4.conf.all.rp_filter` to `0`. See [Single-arm gateways](#single-arm-gateways); if direct traffic still fails, see [Direct traffic fails](#direct-traffic-fails). |
 | VLESS/VMess reports `No handler for protocol` | The build lacks `rprx`; use the default features or add `rprx` explicitly. |
 | A Geo rule fails to load | Put `geoip.dat`/`geosite.dat` in the configured `data_dir`, or verify the documented legacy/share search locations; remove unused Geo rules if not needed. |
 | A GNU binary does not execute on VyOS or a minimal system | Use the musl release for the same architecture. |
@@ -570,6 +737,7 @@ cargo run --release -p honk-core -- \
 - [Configuration guide](configuration.md)
 - [Global configuration](reference/global.md)
 - [Nodes and protocols](reference/nodes.md)
+- [Subscriptions](reference/subscription.md)
 - [Group policies](reference/groups.md)
 - [Routing rules](reference/routing.md)
 - [DNS configuration](reference/dns.md)

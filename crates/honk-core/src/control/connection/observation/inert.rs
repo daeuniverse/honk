@@ -3,7 +3,7 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use honk_config::{node::Node, types::DialMode};
+use honk_config::types::DialMode;
 use honk_outbound::runtime::flow_observation::FlowObserver;
 
 use super::{handoff::HandoffResult, routing::RoutingDecision};
@@ -96,7 +96,7 @@ impl ConnectionObservation {
         _configured: DialMode,
         _sniff: &crate::sniffing::SniffResult,
         _verification: &'static str,
-        _candidates: &[Node],
+        _candidates: &[honk_outbound::group::OwnedTarget],
         _domain: Option<&str>,
     ) {
     }
@@ -107,7 +107,7 @@ impl ConnectionObservation {
         _configured: DialMode,
         _domain: Option<&str>,
         _verification: &'static str,
-        _selected: Option<(&Node, Option<&str>)>,
+        _selected: Option<(&honk_outbound::group::OwnedTarget, Option<&str>)>,
     ) {
     }
 

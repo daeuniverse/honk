@@ -6,6 +6,7 @@
 //! and returns the result.  It also supports background prefetch to
 //! warm the cache for frequently-accessed domains.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,6 +107,10 @@ pub(crate) enum CacheAccess {
 pub(crate) struct ResolveOptions {
     pub(crate) cache: CacheAccess,
     pub(crate) forced_upstream: Option<super::planner::UpstreamTag>,
+    /// A node server host lookup on the dial path. It skips response rules,
+    /// which may requery through a proxy whose own dial would need this very
+    /// lookup, and family preference, which its caller applies itself.
+    pub(crate) node_host: bool,
 }
 
 impl ResolveOptions {
@@ -117,6 +122,7 @@ impl ResolveOptions {
                 self.cache
             },
             forced_upstream: self.forced_upstream.clone(),
+            node_host: self.node_host,
         }
     }
 }
@@ -146,6 +152,9 @@ pub struct DnsForwarder {
     /// `0` preserves the cached wire TTLs.
     pub(crate) stale_reply_ttl: u32,
     pub(crate) policy_id: Option<PolicyId>,
+    /// Precomputed node-host policy decisions for this generation, including
+    /// indexed hosts declined by every `subtag()` rule; empty without one.
+    pub(crate) node_host_upstreams: Arc<HashMap<String, Option<String>>>,
     pub(crate) query_timeout: Duration,
     pub(crate) dial_timeout: Duration,
     socket_budget: super::transport::DnsSocketBudget,
@@ -177,6 +186,7 @@ impl DnsForwarder {
             cache_ttl: 0,
             stale_reply_ttl: 30,
             policy_id: None,
+            node_host_upstreams: Arc::default(),
             query_timeout: Duration::from_secs(5),
             dial_timeout: Duration::from_secs(10),
             socket_budget: super::transport::DnsSocketBudget::default(),
@@ -200,6 +210,27 @@ impl DnsForwarder {
     /// Set the IP-version strategy used for DNS responses.
     pub fn with_strategy(mut self, strategy: DnsStrategy) -> Self {
         self.strategy = strategy;
+        self
+    }
+
+    /// Compile the node-host decisions of this generation's `subtag()` rules.
+    pub(crate) fn with_node_hosts(mut self, node_hosts: super::node_host::NodeHosts) -> Self {
+        if !node_hosts.is_empty() && self.routing.has_node_rules() {
+            self.node_host_upstreams = Arc::new(
+                node_hosts
+                    .into_iter()
+                    .map(|(host, tags)| {
+                        let upstream = self
+                            .routing
+                            .select_node_upstream(&host, &tags)
+                            .map(str::to_owned);
+                        (host, upstream)
+                    })
+                    .collect(),
+            );
+        } else {
+            self.node_host_upstreams = Arc::default();
+        }
         self
     }
 
@@ -359,6 +390,7 @@ impl DnsForwarder {
             cache_ttl: self.cache_ttl,
             stale_reply_ttl: self.stale_reply_ttl,
             policy_id: self.policy_id.clone(),
+            node_host_upstreams: Arc::clone(&self.node_host_upstreams),
             query_timeout: self.query_timeout,
             dial_timeout: self.dial_timeout,
             socket_budget: self.socket_budget.clone(),
@@ -385,7 +417,7 @@ impl DnsForwarder {
 mod exchange;
 mod hosts;
 mod refresh;
-pub(crate) use hosts::{HostsSnapshot, HostsSourceSet};
+pub(crate) use hosts::{HostsResolution, HostsSnapshot, HostsSourceSet, NodeHostAlias};
 mod message {
     use crate::dns::query::parse_name;
     use std::net::{IpAddr, SocketAddr};
@@ -512,29 +544,9 @@ mod response {
         addresses: &[IpAddr],
         ttl: u32,
     ) -> Vec<u8> {
-        let question_end = query
-            .question_offsets()
-            .map(|offsets| offsets.end())
-            .unwrap_or(12)
-            .min(raw_query.len());
-        let mut response = Vec::with_capacity(
-            question_end
-                .saturating_add(addresses.len().saturating_mul(28))
-                .saturating_add(11),
-        );
-        response.extend_from_slice(&raw_query[..question_end]);
-        response.resize(response.len().max(12), 0);
-        response[2..4].copy_from_slice(&dns_error_flags(raw_query, 0).to_be_bytes());
-        response[4..6].copy_from_slice(&1u16.to_be_bytes());
-        response[6..12].fill(0);
-
+        let (mut response, name_pointer) =
+            response_prefix(raw_query, query, 0, addresses.len().saturating_mul(28));
         let qtype = query.qtype().map(|value| value.get()).unwrap_or_default();
-        let question_offset = query
-            .question_offsets()
-            .and_then(|offsets| u16::try_from(offsets.start()).ok())
-            .filter(|offset| *offset <= 0x3fff)
-            .unwrap_or(12);
-        let name_pointer = (0xc000 | question_offset).to_be_bytes();
         let mut answer_count = 0u16;
         for address in addresses {
             if answer_count == u16::MAX {
@@ -552,16 +564,54 @@ mod response {
             answer_count += 1;
         }
         response[6..8].copy_from_slice(&answer_count.to_be_bytes());
+        append_edns(&mut response, query, 0);
+        response
+    }
 
-        if let Some(edns) = query.edns().filter(|edns| edns.version() == 0) {
+    /// The header and question of a local answer with `rcode` and empty
+    /// sections, plus a compression pointer to the question name.
+    pub(super) fn response_prefix(
+        raw_query: &[u8],
+        query: &QueryContext,
+        rcode: u8,
+        answer_capacity: usize,
+    ) -> (Vec<u8>, [u8; 2]) {
+        let question_end = query
+            .question_offsets()
+            .map(|offsets| offsets.end())
+            .unwrap_or(12)
+            .min(raw_query.len());
+        let mut response = Vec::with_capacity(
+            question_end
+                .saturating_add(answer_capacity)
+                .saturating_add(11),
+        );
+        response.extend_from_slice(&raw_query[..question_end]);
+        response.resize(response.len().max(12), 0);
+        response[2..4].copy_from_slice(&dns_error_flags(raw_query, rcode).to_be_bytes());
+        response[4..6].copy_from_slice(&1u16.to_be_bytes());
+        response[6..12].fill(0);
+
+        let question_offset = query
+            .question_offsets()
+            .and_then(|offsets| u16::try_from(offsets.start()).ok())
+            .filter(|offset| *offset <= 0x3fff)
+            .unwrap_or(12);
+        (response, (0xc000 | question_offset).to_be_bytes())
+    }
+
+    pub(super) fn append_edns(response: &mut Vec<u8>, query: &QueryContext, rcode: u16) {
+        if let Some(edns) = query
+            .edns()
+            .filter(|edns| edns.version() == 0 || rcode > 15)
+        {
             response[10..12].copy_from_slice(&1u16.to_be_bytes());
             response.extend_from_slice(&[0, 0, 41]);
             response.extend_from_slice(&edns.advertised_size().to_be_bytes());
             let flags = if edns.dnssec_ok() { 0x8000u32 } else { 0 };
-            response.extend_from_slice(&flags.to_be_bytes());
+            response.extend_from_slice(&((u32::from(rcode >> 4) << 24) | flags).to_be_bytes());
             response.extend_from_slice(&0u16.to_be_bytes());
         }
-        response
     }
 
     fn append_address_record(
@@ -610,6 +660,9 @@ mod strategy {
             options: &ResolveOptions,
         ) -> anyhow::Result<Bytes> {
             let preferred = match (&self.strategy, qtype) {
+                // A node host lookup orders both families itself; its uncached
+                // sibling probe would be an extra exchange that could empty one.
+                _ if options.node_host => return Ok(response),
                 (DnsStrategy::PreferIpv4, 28) => 1u16,
                 (DnsStrategy::PreferIpv6, 1) => 28u16,
                 _ => return Ok(response),
@@ -713,8 +766,10 @@ pub fn validate_dns_probe_response(query: &[u8], response: &[u8]) -> anyhow::Res
         query,
         crate::dns::query::IngressProfile::Tcp,
     )?;
-    crate::dns::response::ResponseTemplate::check(&context, response)?;
-    anyhow::ensure!(response[3] & 15 == 0, "DNS response reports failure");
+    anyhow::ensure!(
+        crate::dns::response::checked_response_rcode(Some(&context), response)? == 0,
+        "DNS response reports failure"
+    );
     Ok(())
 }
 
@@ -723,9 +778,56 @@ pub fn validate_dns_probe_response(query: &[u8], response: &[u8]) -> anyhow::Res
 pub async fn udp_dns_probe(
     transport: &dyn honk_outbound::proxy::PacketTransport,
 ) -> anyhow::Result<honk_outbound::alive::ProbeMeasurement> {
+    udp_dns_probe_exchange(transport, UdpProbeSend::Ordinary).await
+}
+
+pub(crate) enum UdpProbeSend<'a> {
+    Ordinary,
+    NativeRecovery(&'a (dyn Fn() -> bool + Send + Sync)),
+    ComposedRecovery(&'a (dyn Fn() -> bool + Send + Sync)),
+}
+
+impl<'a> UdpProbeSend<'a> {
+    pub(crate) fn recovery(
+        dial: honk_outbound::proxy::DialRef<'_>,
+        terminal: uuid::Uuid,
+        current: &'a (dyn Fn() -> bool + Send + Sync),
+    ) -> Self {
+        match dial {
+            honk_outbound::proxy::DialRef::Node(id) if id == terminal => {
+                Self::NativeRecovery(current)
+            }
+            _ => Self::ComposedRecovery(current),
+        }
+    }
+}
+
+pub(crate) async fn udp_dns_probe_exchange(
+    transport: &dyn honk_outbound::proxy::PacketTransport,
+    send: UdpProbeSend<'_>,
+) -> anyhow::Result<honk_outbound::alive::ProbeMeasurement> {
     let query = dns_probe_query();
     let start = std::time::Instant::now();
-    transport.send_packet_confirmed(&query).await?;
+    match send {
+        UdpProbeSend::Ordinary => transport.send_packet_confirmed(&query).await?,
+        UdpProbeSend::ComposedRecovery(current) => {
+            transport.send_packet_checked(&query, current).await?
+        }
+        UdpProbeSend::NativeRecovery(current) => {
+            let mut pending = transport.send_packet_confirmed(&query);
+            // A private probe may drop its send just as on timeout. A native
+            // writer already holding the frame retains custody of that one send.
+            std::future::poll_fn(|cx| {
+                if !current() {
+                    return std::task::Poll::Ready(Err(
+                        honk_outbound::proxy::PacketRejection::Cancelled.into(),
+                    ));
+                }
+                pending.as_mut().poll(cx)
+            })
+            .await?;
+        }
+    }
     let mut response = vec![0; 65535];
     let (length, source) = transport.recv_packet(&mut response).await?;
     let relay = transport.relay_addr();

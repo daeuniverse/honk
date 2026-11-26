@@ -7,6 +7,40 @@ use crate::netlink::LinkSnapshot;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+#[tokio::test]
+async fn verifier_keeps_backend_reads_and_writes_available() {
+    let fixture = fixture(&["eth0"], &[]);
+    let backend = crate::ebpf::mock::MockEbpfBackend::new();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+    *backend.tc_program_preparation.0.lock() = Some(Box::new(move || {
+        let _ = started_tx.send(());
+        finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        Vec::new()
+    }));
+    *fixture.ebpf.write().await = Box::new(backend);
+    let (mut watch, _commands) = fixture.watch();
+    let reconcile = tokio::spawn(async move { watch.reconcile(false).await });
+    tokio::time::timeout(Duration::from_secs(2), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let readable = tokio::time::timeout(Duration::from_millis(100), fixture.ebpf.read())
+        .await
+        .is_ok();
+    let writable = tokio::time::timeout(Duration::from_millis(100), fixture.ebpf.write())
+        .await
+        .is_ok();
+    finish_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), reconcile)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(readable, "verification blocked backend readers");
+    assert!(writable, "verification blocked backend writers");
+}
+
 /// Fixed topology: no `lo`, no kernel.
 fn topology() -> Topology {
     Topology {

@@ -13,7 +13,7 @@ pub async fn exchange_length_prefixed<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    exchange_length_prefixed_reported(stream, raw_query, query_timeout, None).await
+    exchange_length_prefixed_reported(stream, raw_query, query_timeout, None, None).await
 }
 
 pub(super) async fn exchange_length_prefixed_reported<S>(
@@ -21,17 +21,39 @@ pub(super) async fn exchange_length_prefixed_reported<S>(
     raw_query: &[u8],
     query_timeout: Duration,
     reporter: Option<&ScoreReporter>,
+    routed_id: Option<u16>,
 ) -> anyhow::Result<Vec<u8>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     timeout(query_timeout, async {
-        write_length_prefixed(stream, raw_query).await?;
+        if let Some(id) = routed_id {
+            let len = u16::try_from(raw_query.len())
+                .map_err(|_| anyhow::anyhow!("DNS message too large for stream framing"))?;
+            let payload = raw_query
+                .get(2..)
+                .ok_or_else(|| anyhow::anyhow!("missing DNS ID"))?;
+            let mut header = [0; 4];
+            header[..2].copy_from_slice(&len.to_be_bytes());
+            header[2..].copy_from_slice(&id.to_be_bytes());
+            stream.write_all(&header).await?;
+            stream.write_all(payload).await?;
+            stream.flush().await?;
+        } else {
+            write_length_prefixed(stream, raw_query).await?;
+        }
         if let Some(reporter) = reporter {
             reporter.tx(raw_query.len() as u64);
         }
         let mut response = Vec::new();
         read_length_prefixed_into(stream, &mut response, None).await?;
+        if let Some(id) = routed_id {
+            anyhow::ensure!(
+                response.get(..2) == Some(id.to_be_bytes().as_slice()),
+                "DNS stream response ID does not match the query"
+            );
+            response[..2].copy_from_slice(&raw_query[..2]);
+        }
         if let Some(reporter) = reporter
             && super::is_valid_response(raw_query, &response)
         {

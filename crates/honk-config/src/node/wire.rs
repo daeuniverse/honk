@@ -210,6 +210,8 @@ struct FlatNode {
     )]
     wg_peers: bool,
     #[serde(default)]
+    hops: Vec<String>,
+    #[serde(default)]
     mark: Option<u32>,
     #[serde(default)]
     tags: Vec<String>,
@@ -356,7 +358,10 @@ impl FlatNode {
             self.password.is_some()
                 && matches!(
                     self.protocol,
-                    NodeProtocol::Direct | NodeProtocol::Block | NodeProtocol::WireGuard
+                    NodeProtocol::Direct
+                        | NodeProtocol::Block
+                        | NodeProtocol::Chain
+                        | NodeProtocol::WireGuard
                 ),
             password
         );
@@ -389,6 +394,10 @@ impl FlatNode {
         strip!(
             self.plugin.is_some() && self.protocol != NodeProtocol::SS,
             plugin
+        );
+        strip!(
+            !self.hops.is_empty() && self.protocol != NodeProtocol::Chain,
+            hops
         );
         strip!(
             self.plugin_opts.is_some() && self.protocol != NodeProtocol::SS,
@@ -759,6 +768,9 @@ impl FlatNode {
             }
             NodeProtocol::Direct => OutboundConfig::Direct,
             NodeProtocol::Block => OutboundConfig::Block,
+            NodeProtocol::Chain => {
+                OutboundConfig::Chain(super::ChainConfig::new(std::mem::take(&mut flat.hops)))
+            }
         };
         if !flat.tls_alpn.is_empty() {
             return Err(semantic_error(
@@ -874,6 +886,8 @@ struct WireOptions<'a> {
     wg_reserved: Option<[u8; 3]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     wg_allowed_ips: Option<&'a [ipnet::IpNet]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hops: Option<&'a [String]>,
     mark: Option<u32>,
     tags: &'a [String],
     subscription_id: Option<uuid::Uuid>,
@@ -1023,6 +1037,7 @@ impl<'a> WireOptions<'a> {
                 wire.wg_allowed_ips = Some(&config.allowed_ips);
                 wire.network = config.network.as_deref();
             }
+            OutboundConfig::Chain(config) => wire.hops = Some(&config.hops),
             OutboundConfig::Direct | OutboundConfig::Block => {}
         }
         wire

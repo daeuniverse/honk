@@ -17,7 +17,11 @@ fn ciphers(master: &[u8], c2s_salt: &[u8], s2c_salt: &[u8]) -> (AeadCipher, Aead
     )
 }
 
-fn legacy_stream(server: TcpStream, send_cipher: AeadCipher, recv_cipher: AeadCipher) -> SsStream {
+fn legacy_stream(
+    server: TcpStream,
+    send_cipher: AeadCipher,
+    recv_cipher: AeadCipher,
+) -> SsStream<TcpStream> {
     SsStream::new(
         server,
         send_cipher,
@@ -253,4 +257,35 @@ async fn truncated_tail_is_unexpected_eof() {
         .await
         .expect_err("must fail on truncated tail");
     assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+}
+
+#[tokio::test]
+async fn tcp_carrier_samples_transport_pressure() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let quality = std::sync::Arc::new(crate::transport_quality::TransportQuality::default());
+    quality.enable();
+    let conf = CipherConf::for_method(METHOD).unwrap();
+    let master = ShadowsocksHandler::master_key(PASSWORD, conf.key_len);
+    let (send, recv) = ciphers(&master, &[7; 16], &[9; 16]);
+    let mut stream = quality
+        .scope(async move { legacy_stream(client, send, recv) })
+        .await;
+    assert!(stream.pressure.delivered_sample().is_none());
+
+    let started = std::time::Instant::now();
+    stream.write_all(b"ping").await.unwrap();
+    stream.flush().await.unwrap();
+    let flushed = std::time::Instant::now();
+    let mut sealed = [0; 2 + 16 + 4 + 16];
+    peer.read_exact(&mut sealed).await.unwrap();
+
+    let sample = stream
+        .pressure
+        .delivered_sample()
+        .expect("the authenticated write samples the socket");
+    assert!((started..=flushed).contains(&sample.at));
 }

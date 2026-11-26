@@ -141,6 +141,46 @@ fn target_comparison_rejects_name_framing_master_and_kind_changes_only() {
 }
 
 #[test]
+fn independent_variants_survive_load_and_extension_failures() {
+    let prepared = |program| PreparedTcProgram {
+        program,
+        fd: std::fs::File::open("/dev/null").unwrap().into(),
+        routing: None,
+    };
+    let batch = vec![
+        (TcProgram::LanIngressL3, Err(anyhow::anyhow!("load failed"))),
+        (TcProgram::LanEgressL3, Ok(prepared(TcProgram::LanEgressL3))),
+        (
+            TcProgram::WanIngressL3,
+            Ok(prepared(TcProgram::WanIngressL3)),
+        ),
+        (TcProgram::WanEgressL3, Ok(prepared(TcProgram::WanEgressL3))),
+    ];
+    let mut attempted = Vec::new();
+    let mut committed = Vec::new();
+    let error = commit_program_batch(batch, |prepared| {
+        attempted.push(prepared.program);
+        anyhow::ensure!(
+            prepared.program != TcProgram::WanIngressL3,
+            "extension failed"
+        );
+        committed.push(prepared.program);
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!(error.to_string(), "load failed");
+    assert_eq!(
+        attempted,
+        [
+            TcProgram::LanEgressL3,
+            TcProgram::WanIngressL3,
+            TcProgram::WanEgressL3
+        ]
+    );
+    assert_eq!(committed, [TcProgram::LanEgressL3, TcProgram::WanEgressL3]);
+}
+
+#[test]
 fn only_a_vanished_device_is_not_an_attach_failure() {
     let gone = anyhow::Error::from(io::Error::from_raw_os_error(libc::ENODEV))
         .context("attach lan_ingress_l2 to eth0");

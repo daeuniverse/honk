@@ -45,15 +45,15 @@ jobs:
           workspaces: |
             . -> target
             crates/honk-ebpf -> target
-      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: nextest
       - name: Install build dependencies
         run: |
           set -euo pipefail
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
-          sudo apt-get update
-          sudo apt-get install -y cmake libclang-dev clang llvm zstd
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y cmake libclang-dev clang llvm zstd
       - name: Install geo assets for the geosite tests
         run: |
           set -euo pipefail
@@ -61,11 +61,11 @@ jobs:
           geo_dir="$RUNNER_TEMP/geo-assets"
           mkdir -p "$geo_dir"
           if ! test -f "$geo_dir/geosite.dat"; then
-            curl -fsSL --retry 3 -o "$geo_dir/geosite.dat" \
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$geo_dir/geosite.dat" \
               "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat"
           fi
           if ! test -f "$geo_dir/geoip.dat"; then
-            curl -fsSL --retry 3 -o "$geo_dir/geoip.dat" \
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$geo_dir/geoip.dat" \
               "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat"
           fi
           echo "$GEOSITE_SHA256  $geo_dir/geosite.dat" | sha256sum -c -
@@ -76,7 +76,7 @@ jobs:
         run: |
           set -euo pipefail
           source .github/ci/pins.env
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
             "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
           echo "$BPF_LINKER_SHA256  $RUNNER_TEMP/bpf-linker.tar.zst" | sha256sum -c -
           zstd -dc "$RUNNER_TEMP/bpf-linker.tar.zst" | tar -xf - -C "$CARGO_HOME/bin"
@@ -99,7 +99,7 @@ jobs:
           readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
 
   public-vless-loopback:
-    name: Public VLESS and shared-source loopback interop (4 cases)
+    name: Public VLESS and shared-source loopback interop (5 cases)
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -115,24 +115,24 @@ jobs:
           key: public-vless-loopback-${{ steps.toolchain.outputs.stable }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' }}
-      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: nextest
       - name: Install build and archive dependencies
         run: |
           set -euo pipefail
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
-          sudo apt-get update
-          sudo apt-get install -y cmake libclang-dev unzip
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y cmake libclang-dev unzip
       - name: Install pinned official Xray prerelease and sing-box
         run: |
           set -euo pipefail
           source .github/ci/pins.env
           tools="$RUNNER_TEMP/public-vless-interop"
           mkdir -p "$tools"
-          curl -fsSL --retry 3 -o "$tools/Xray-linux-64.zip" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$tools/Xray-linux-64.zip" \
             "https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-64.zip"
-          curl -fsSL --retry 3 -o "$tools/sing-box.tar.gz" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$tools/sing-box.tar.gz" \
             "https://github.com/SagerNet/sing-box/releases/download/v$SING_BOX_VERSION/sing-box-$SING_BOX_VERSION-linux-amd64-musl.tar.gz"
           echo "$XRAY_SHA256  $tools/Xray-linux-64.zip" | sha256sum -c -
           echo "$SING_BOX_SHA256  $tools/sing-box.tar.gz" | sha256sum -c -
@@ -154,13 +154,14 @@ jobs:
           test "${{ runner.environment }}" = github-hosted
           sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0 net.ipv4.ip_unprivileged_port_start=0
           ip -6 address show dev lo scope host | grep -F '::1/128'
-      - name: Run exactly two public ignored loopback cases
+      - name: Run exactly three public ignored loopback cases
         run: |
           set -euo pipefail
           test -x "$HONK_XRAY_BIN"
           test -x "$HONK_SING_BOX_BIN"
           ci/run-exact-ignored-tests.sh --test vless_udp \
             official_xray_and_sing_box_vless_udp_loopback_interop \
+            'chain::official_xray_carries_auto_udp_through_a_chain' \
             'reality::official_xray_reality_authenticates_first_connection_and_rejects_wrong_key'
       - name: Run the official Vision uplink Direct case
         run: |
@@ -193,7 +194,7 @@ jobs:
           trap 'rm -rf "$downloads"' EXIT
           fetch() {
             local url=$1 sha256=$2 name=$3
-            curl -fsSL --retry 3 --retry-all-errors -H 'Cache-Control: no-cache' -o "$downloads/$name" "$url"
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -H 'Cache-Control: no-cache' -o "$downloads/$name" "$url"
             printf '%s  %s\n' "$sha256" "$downloads/$name" | sha256sum -c -
           }
           fetch "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat" "$GEOSITE_SHA256" geosite.dat
@@ -202,6 +203,7 @@ jobs:
           fetch "$VIRTME_NG_WHEEL_URL" "$VIRTME_NG_SHA256" virtme-ng.whl
           fetch "https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-64.zip" "$XRAY_SHA256" Xray-linux-64.zip
           fetch "https://github.com/SagerNet/sing-box/releases/download/v$SING_BOX_VERSION/sing-box-$SING_BOX_VERSION-linux-amd64-musl.tar.gz" "$SING_BOX_SHA256" sing-box.tar.gz
+          fetch "https://github.com/juicity/juicity-rs/releases/download/v$JUICITY_VERSION/juicity-x86_64-unknown-linux-musl.zip" "$JUICITY_SHA256" juicity.zip
           fetch "$KERNEL_FLOOR_BASE/$KERNEL_FLOOR_IMAGE" "$KERNEL_FLOOR_IMAGE_SHA256" "$KERNEL_FLOOR_IMAGE"
           fetch "$KERNEL_FLOOR_BASE/$KERNEL_FLOOR_MODULES" "$KERNEL_FLOOR_MODULES_SHA256" "$KERNEL_FLOOR_MODULES"
           fetch "$KERNEL_RECENT_BASE/$KERNEL_RECENT_IMAGE" "$KERNEL_RECENT_IMAGE_SHA256" "$KERNEL_RECENT_IMAGE"
@@ -223,7 +225,7 @@ jobs:
           key: advisories-${{ steps.toolchain.outputs.stable }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' }}
-      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-audit
       - run: cargo audit
@@ -252,8 +254,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
-          sudo apt-get update
-          sudo apt-get install -y clang
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y clang
           source .github/ci/pins.env
           cargo +"$FUZZ_NIGHTLY" install --locked "cargo-fuzz@$CARGO_FUZZ_VERSION"
           rustc +"$FUZZ_NIGHTLY" -V | tee -a "$GITHUB_STEP_SUMMARY"

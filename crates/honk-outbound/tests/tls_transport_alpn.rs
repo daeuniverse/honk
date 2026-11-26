@@ -13,6 +13,25 @@ const ALPS_OLD_CODEPOINT: u16 = 0x4469;
 
 static TLS_MODE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[test]
+fn tunnel_dial_options_accept_external_struct_literals() {
+    use honk_outbound::proxy::TunnelDialOptions;
+    use std::time::Duration;
+
+    let connect_timeout = Duration::from_secs(1);
+    let initial = TunnelDialOptions {
+        connect_timeout,
+        reality_key_shares: true,
+    };
+    assert_eq!(initial, TunnelDialOptions::new(connect_timeout));
+    let retry = TunnelDialOptions {
+        reality_key_shares: false,
+        ..initial
+    };
+    assert_eq!(retry.connect_timeout, connect_timeout);
+    assert!(!retry.reality_key_shares);
+}
+
 #[derive(Default)]
 struct ObservedHello {
     alpn: Option<Vec<u8>>,

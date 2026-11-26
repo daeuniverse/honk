@@ -253,10 +253,12 @@ fn capture_inner(
     }
     // Match the runtime's exact choice: same-fetch active nodes win over cached candidates.
     crate::control::reload::rebase_subscription_nodes(active, &mut config);
-    config.validate_assembled().map_err(|mut error| {
-        error.diagnostic.source = source.clone();
-        error
-    })?;
+    let config = config
+        .assemble(honk_config::parser::resolve_group_filters)
+        .map_err(|mut error| {
+            error.diagnostic.source = source.clone();
+            error
+        })?;
 
     let dns_requirements = DnsRouter::geo_requirements(&config.dns);
     let requirements = GeoRequirements::for_forwarding(&config).union(&dns_requirements);

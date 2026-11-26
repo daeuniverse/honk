@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use honk_config::dns::{
-    DnsCond, DnsDomainMatcher, DnsRequestAction, DnsResponseAction, DnsRouting,
+    DnsCond, DnsDomainMatcher, DnsRequestAction, DnsResponseAction, DnsRouting, DnsTagMatcher,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -214,6 +214,17 @@ fn display(conditions: &[DnsCond]) -> String {
                 render("qtype", *not, types.iter().map(u16::to_string).collect())
             }
             DnsCond::Sip { not, cidrs } => render("sip", *not, cidrs.clone()),
+            DnsCond::Subtag { not, tags } => render(
+                "subtag",
+                *not,
+                tags.iter()
+                    .map(|tag| match tag {
+                        DnsTagMatcher::Exact(value) => value.clone(),
+                        DnsTagMatcher::Keyword(value) => format!("keyword: {value}"),
+                        DnsTagMatcher::Regex(value) => format!("regex: {value}"),
+                    })
+                    .collect(),
+            ),
             DnsCond::Upstream { not, names } => render("upstream", *not, names.clone()),
             DnsCond::Ip { not, cidrs, geoip } => render(
                 "ip",

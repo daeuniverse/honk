@@ -58,7 +58,9 @@ async fn cancelled_encrypted_ws_handshake_retains_credit_until_bridge_teardown()
         let hello = ws.next().await.unwrap().unwrap();
         assert!(!hello.into_data().is_empty());
         hello_tx.send(()).unwrap();
-        while ws.next().await.is_some() {}
+        tokio::io::copy(&mut ws.into_inner(), &mut tokio::io::sink())
+            .await
+            .unwrap();
     });
 
     let mut node = configured_vless_node(
@@ -100,13 +102,12 @@ async fn cancelled_encrypted_ws_handshake_retains_credit_until_bridge_teardown()
         result = &mut dial => panic!("encrypted handshake completed before cancellation: {:?}", result.map(|(stream, _)| stream)),
         result = hello_rx => result.unwrap(),
     }
-    drop(dial);
-
     let error = runtime.acquire_vless_carrier().unwrap_err();
     assert!(matches!(
         error.downcast_ref::<super::super::PacketRejection>(),
         Some(super::super::PacketRejection::Capacity)
     ));
+    drop(dial);
     let reclaimed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
             if let Ok(permit) = runtime.acquire_vless_carrier() {

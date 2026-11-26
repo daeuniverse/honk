@@ -2007,6 +2007,7 @@ impl EndpointRuntime {
                     finish_packet_dns(&observation, None);
                     return;
                 }
+                let audit = dns.dns_audit().begin(&bytes, validated.ingress(), source);
                 match admission {
                     Ok(admission) => {
                         self.plane.stats.record_udp_slow_permit_accepted();
@@ -2019,10 +2020,10 @@ impl EndpointRuntime {
                                 let operation = dns.handle_udp_dns_admitted(
                                     &admission,
                                     &bytes,
-                                    source,
-                                    destination,
+                                    (source, destination),
                                     validated,
                                     DnsUdpReply::Packet(&sender),
+                                    audit,
                                 );
                                 #[cfg(feature = "native-api")]
                                 match observer {
@@ -2058,6 +2059,9 @@ impl EndpointRuntime {
                                     #[cfg(feature = "native-api")]
                                     let started = Instant::now();
                                     let response = crate::dns::response::build_dns_refused(&bytes);
+                                    if let Some(audit) = audit {
+                                        audit.finish(&response, None);
+                                    }
                                     let reply = async {
                                         crate::observe::flows::dns::decision(
                                             "rejected",
@@ -2121,6 +2125,9 @@ impl EndpointRuntime {
                                 let _ = completed;
                             });
                         } else {
+                            if let Some(audit) = audit {
+                                audit.discard();
+                            }
                             self.plane.stats.record_udp_slow_permit_rejected();
                             #[cfg(feature = "native-api")]
                             observation.finish(
