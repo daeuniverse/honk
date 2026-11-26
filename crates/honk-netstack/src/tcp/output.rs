@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::offload::{GsoKind, GsoTx, Transmit, TxCsum};
+use crate::offload::{GsoKind, GsoTx, Transmit, TxCaps, TxCsum};
 use crate::wire::{
     self,
     tcp::{self as wire_tcp, ACK, FIN, Header, Options, PSH, RST, SYN},
@@ -44,21 +44,22 @@ enum Kind {
 impl Tcb {
     #[cfg(test)]
     pub fn output(&mut self, now: Instant, out: &mut [u8], pool: &mut super::ring::Pool) -> Output {
-        self.output_with(now, out, pool, 0, &mut Transmit::plain(0), true)
+        self.output_with(now, out, pool, TxCaps::NONE, &mut Transmit::plain(0), true)
     }
 
-    /// [`Tcb::output`] that may build one TSO packet: up to `tso` payload bytes (`0`: never) as
-    /// several MSS-sized segments behind one header, with `tx` describing it. The packet keeps one
-    /// send descriptor per segment, so SACK, RACK and retransmission see ordinary segments.
+    /// Emits a TCP packet with the driver's capabilities. A TSO packet keeps one send descriptor
+    /// per segment, so SACK, RACK and retransmission see ordinary segments.
     pub fn output_with(
         &mut self,
         now: Instant,
         out: &mut [u8],
         pool: &mut super::ring::Pool,
-        tso: usize,
+        caps: TxCaps,
         tx: &mut Transmit,
         payload_allowed: bool,
     ) -> Output {
+        let v6 = self.tuple.local.is_ipv6();
+        let ip_len = wire::ip_header_len(v6);
         let syn = matches!(self.state, TcpState::SynSent | TcpState::SynReceived);
         let mut options = self.options(now, syn);
         let mut kind = if self.rst_pending {
@@ -84,15 +85,12 @@ impl Tcb {
                 .saturating_sub(self.snd_nxt.wrapping_sub(self.snd_una))
                 as usize;
             // Segments one TSO packet may hold at most: the 64 KiB IP limit and the caller's buffer.
-            let tso_max = if tso == 0 || cap == 0 {
+            let tso_max = if !caps.tso(v6) || cap == 0 {
                 1
             } else {
-                let headers = wire::ip_header_len(self.tuple.local.is_ipv6())
-                    + wire_tcp::header_len(&options, false);
-                (tso.min(usize::from(u16::MAX).saturating_sub(headers))
-                    .min(out.len().saturating_sub(headers))
-                    / cap)
-                    .max(1)
+                let headers = ip_len + wire_tcp::header_len(&options, false);
+                let capacity = usize::from(u16::MAX).min(out.len());
+                (capacity.saturating_sub(headers) / cap).max(1)
             };
             if self.tlp_due {
                 kind = self.tlp_kind(pool, cap, unsent, rwnd, can_send_new, payload_allowed);
@@ -229,9 +227,7 @@ impl Tcb {
             urgent: 0,
             options,
         };
-        let need = wire::ip_header_len(self.tuple.local.is_ipv6())
-            + wire_tcp::header_len(&hdr.options, flags & SYN != 0)
-            + data_len;
+        let need = ip_len + wire_tcp::header_len(&hdr.options, flags & SYN != 0) + data_len;
         if out.len() < need {
             return Output::Blocked;
         }
@@ -253,28 +249,26 @@ impl Tcb {
         };
         let (payload, parts) = self.tx.slices(off, data_len);
         let ips = (self.tuple.local.ip(), self.tuple.remote.ip());
-        let Some(n) = (if segs > 1 {
+        let partial = segs > 1 || caps.csum(v6);
+        let Some(n) = (if partial {
             wire_tcp::emit_partial_parts(out, ips.0, ips.1, &hdr, &payload[..parts])
         } else {
             wire_tcp::emit_packet_parts(out, ips.0, ips.1, &hdr, &payload[..parts])
         }) else {
             return Output::Blocked;
         };
-        if segs > 1 {
-            *tx = Transmit {
-                len: n,
-                gso: Some(GsoTx {
-                    kind: GsoKind::Tcp,
-                    size: seg_size as u16,
-                    hdr_len: (n - data_len) as u16,
-                }),
-                csum: TxCsum::Partial {
-                    start: wire::ip_header_len(self.tuple.local.is_ipv6()) as u16,
-                    offset: 16,
-                },
-                flow: None,
-                source: None,
+        if partial {
+            tx.csum = TxCsum::Partial {
+                start: ip_len as u16,
+                offset: 16,
             };
+        }
+        if segs > 1 {
+            tx.gso = Some(GsoTx {
+                kind: GsoKind::Tcp,
+                size: seg_size as u16,
+                hdr_len: (n - data_len) as u16,
+            });
         }
         if flags & (ACK | SYN) != 0 && flags & RST == 0 {
             let right = self.wire_right(flags & SYN != 0);

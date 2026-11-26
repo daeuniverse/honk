@@ -105,6 +105,10 @@ impl RxMeta {
 pub struct TxCaps {
     pub tso4: bool,
     pub tso6: bool,
+    /// Whether the driver can complete a TCP checksum on a single IPv4 packet.
+    pub csum4: bool,
+    /// Whether the driver can complete a TCP checksum on a single IPv6 packet.
+    pub csum6: bool,
     pub uso4: bool,
     pub uso6: bool,
 }
@@ -115,18 +119,26 @@ impl TxCaps {
     pub const NONE: TxCaps = TxCaps {
         tso4: false,
         tso6: false,
+        csum4: false,
+        csum6: false,
         uso4: false,
         uso6: false,
     };
     pub const ALL: TxCaps = TxCaps {
         tso4: true,
         tso6: true,
+        csum4: true,
+        csum6: true,
         uso4: true,
         uso6: true,
     };
 
     pub(crate) fn tso(&self, v6: bool) -> bool {
         if v6 { self.tso6 } else { self.tso4 }
+    }
+
+    pub(crate) fn csum(&self, v6: bool) -> bool {
+        if v6 { self.csum6 } else { self.csum4 }
     }
 
     pub(crate) fn uso(&self, v6: bool) -> bool {
@@ -149,7 +161,7 @@ pub struct GsoTx {
 pub enum TxCsum {
     /// Complete.
     Full,
-    /// The field holds the pseudo-header sum over the whole super-packet's L4 length (not
+    /// The field holds the pseudo-header sum over the whole packet's L4 length (not
     /// complemented, as Linux's `CHECKSUM_PARTIAL`); the receiver of the descriptor (kernel or
     /// device) sums from `start` and stores the result at `start + offset`.
     Partial { start: u16, offset: u16 },

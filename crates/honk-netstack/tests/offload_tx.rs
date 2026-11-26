@@ -155,14 +155,132 @@ fn pump(c: &mut Conn, total: usize, rtt: Duration) -> Bulk {
     b
 }
 
-fn all(c: &mut Conn) {
-    c.caps = TxCaps::ALL;
+fn complete_single_partial(tx: &Transmit, packet: &mut Pkt) {
+    let Pkt {
+        raw,
+        ip_len,
+        src,
+        dst,
+        ..
+    } = packet;
+    assert_eq!(tx.len, raw.len());
+    assert_eq!(tx.gso, None);
+    assert_eq!(
+        tx.csum,
+        TxCsum::Partial {
+            start: *ip_len as u16,
+            offset: 16,
+        }
+    );
+    let seed = pseudo_seed(src.ip(), dst.ip(), PROTO_TCP, raw.len() - *ip_len);
+    assert_eq!(
+        u16::from_be_bytes([raw[*ip_len + 16], raw[*ip_len + 17]]),
+        seed
+    );
+    complete_checksum(raw, *ip_len, 16);
+    assert_eq!(sum16(&raw[*ip_len..], u32::from(seed)), u16::MAX);
+}
+
+#[test]
+fn single_tcp_checksum_offload_is_independent_and_family_specific() {
+    let csum4 = TxCaps {
+        csum4: true,
+        ..TxCaps::NONE
+    };
+    let csum6 = TxCaps {
+        csum6: true,
+        ..TxCaps::NONE
+    };
+    assert_eq!(TxCaps::default(), TxCaps::NONE);
+    for (client, dst, own, other) in [(CLIENT, DST, csum4, csum6), (CLIENT6, DST6, csum6, csum4)] {
+        for (caps, partial) in [
+            (TxCaps::NONE, false),
+            (other, false),
+            (own, true),
+            (TxCaps::ALL, true),
+        ] {
+            let mut c = Conn::with_addrs(transparent(), client, dst);
+            c.caps = caps;
+            let data = pattern(173, 4);
+            assert_eq!(c.stack.tcp_write(c.id, &data), Ok(data.len()));
+            let mut out = c.drain();
+            assert_eq!(out.len(), 1);
+            let (tx, mut packet) = out.pop().unwrap();
+            assert_eq!(tx.flow, Some(c.id));
+            assert_eq!(packet.payload, data);
+            if partial {
+                complete_single_partial(&tx, &mut packet);
+            } else {
+                assert_eq!(check_packet(&tx, &packet), 1);
+            }
+
+            let mut legacy = vec![0; tx.len];
+            assert_eq!(
+                tcp::emit_packet(
+                    &mut legacy,
+                    packet.src.ip(),
+                    packet.dst.ip(),
+                    &packet.h,
+                    [&data, &[]],
+                ),
+                Some(tx.len)
+            );
+            assert_eq!(packet.raw, legacy);
+        }
+    }
+}
+
+#[test]
+fn queued_reset_and_compact_time_wait_ack_use_tcp_checksum_offload() {
+    for (client, dst) in [(CLIENT, DST), (CLIENT6, DST6)] {
+        let mut c = Conn::with_addrs(transparent(), client, dst);
+        c.caps = TxCaps::ALL;
+        c.stack.tcp_close(c.id);
+        let [(tx, mut fin)] = c.drain().try_into().unwrap();
+        assert_eq!(fin.h.flags, FIN | ACK);
+        complete_single_partial(&tx, &mut fin);
+        c.echo(&fin);
+        c.now += ms(5);
+        let end = fin.h.seq.wrapping_add(1);
+        c.ack_to(end, &[]);
+        c.now += ms(5);
+        let peer_fin = c.client_pkt(FIN | ACK, &[], &[]);
+        assert_eq!(c.stack.receive(c.now, &peer_fin), Rx::Consumed);
+        assert_eq!(c.drain().len(), 1);
+        assert_eq!(c.stack.stats().timewait_entries, 1);
+
+        c.now += ms(5);
+        assert_eq!(c.stack.receive(c.now, &peer_fin), Rx::Consumed);
+        let [(tx, mut ack)] = c.drain().try_into().unwrap();
+        assert_eq!(tx.flow, Some(c.id));
+        assert_eq!((ack.h.flags, ack.h.seq, ack.h.ack), (ACK, end, c.seq + 1));
+        complete_single_partial(&tx, &mut ack);
+
+        let now = c.now;
+        let mut stack = Stack::new(transparent(), now);
+        let syn = build(
+            addr(client),
+            addr(dst),
+            1000,
+            0,
+            tcp::SYN,
+            opts_syn(1440),
+            &[],
+        );
+        assert_eq!(stack.receive(now, &syn), Rx::Consumed);
+        let rejected = stack.poll_accept().unwrap().id;
+        stack.tcp_refuse(rejected, honk_netstack::Refuse::Rst);
+        let [(tx, mut rst)] = drain(&mut stack, now, TxCaps::ALL).try_into().unwrap();
+        assert_eq!(tx.flow, Some(rejected));
+        assert_eq!((rst.h.flags, rst.h.ack), (tcp::RST | ACK, 1001));
+        complete_single_partial(&tx, &mut rst);
+    }
 }
 
 #[test]
 fn tso_packets_carry_many_mss_segments_behind_one_header_and_a_pseudo_checksum() {
     let mut c = Conn::new(transparent());
-    all(&mut c);
+    c.caps = TCP_TSO;
     let b = pump(&mut c, 3 << 20, ms(1));
     assert!(b.tso_packets > 0);
     assert!(
@@ -187,7 +305,7 @@ fn tso_packets_carry_many_mss_segments_behind_one_header_and_a_pseudo_checksum()
 #[test]
 fn ipv6_tso_uses_the_v6_pseudo_header() {
     let mut c = Conn::with_addrs(transparent(), CLIENT6, DST6);
-    all(&mut c);
+    c.caps = TCP_TSO;
     let b = pump(&mut c, 1 << 20, ms(1));
     let (t, p) = b.first_tso.expect("a v6 TSO packet");
     assert_eq!(p.ip_len, 40);
@@ -277,7 +395,7 @@ fn the_first_flight_is_the_same_bytes_with_and_without_tso() {
         (bytes, out.len())
     };
     let (plain, plain_packets) = flight(TxCaps::NONE);
-    let (tso, tso_packets) = flight(TxCaps::ALL);
+    let (tso, tso_packets) = flight(TCP_TSO);
     assert_eq!(
         plain, tso,
         "TSO changes packaging, not what the windows allow"
@@ -288,7 +406,7 @@ fn the_first_flight_is_the_same_bytes_with_and_without_tso() {
 #[test]
 fn the_receive_window_cuts_a_tso_packet_at_the_byte() {
     let mut c = Conn::new(transparent());
-    all(&mut c);
+    c.caps = TCP_TSO;
     c.window = 20; // 20 << 7 = 2560 bytes
     c.client_ack(&[]);
     c.stack.tcp_write(c.id, &pattern(100_000, 2)).unwrap();
@@ -309,13 +427,13 @@ fn the_pacing_burst_is_two_milliseconds_at_the_pacing_rate() {
     // A slow, long path: the two-millisecond bucket limits the burst to far fewer segments than
     // on the fast path, even as its congestion window grows. `pump` checks the bound per packet.
     let mut c = Conn::new(transparent());
-    all(&mut c);
+    c.caps = TCP_TSO;
     let slow = pump(&mut c, 600_000, ms(100));
     let cap = 1368;
     assert!(slow.packets > 80, "{}", slow.packets);
     // A fast one takes whole TSO packets.
     let mut c = Conn::new(transparent());
-    all(&mut c);
+    c.caps = TCP_TSO;
     let b = pump(&mut c, 3 << 20, ms(1));
     assert!(b.max_payload > 30 * cap);
     assert!(slow.max_payload < 10 * cap, "{}", slow.max_payload);
@@ -324,7 +442,7 @@ fn the_pacing_burst_is_two_milliseconds_at_the_pacing_rate() {
 #[test]
 fn partial_acks_and_sack_see_one_descriptor_per_segment() {
     let mut c = Conn::new(transparent());
-    all(&mut c);
+    c.caps = TCP_TSO;
     let start = c.snd;
     c.stack
         .tcp_write(c.id, &pattern(8 * 1368 + 500, 4))
@@ -366,7 +484,7 @@ fn partial_acks_and_sack_see_one_descriptor_per_segment() {
 #[test]
 fn a_run_of_lost_segments_is_retransmitted_as_one_tso_packet() {
     let mut c = Conn::new(transparent());
-    all(&mut c);
+    c.caps = TCP_TSO;
     // Open the window first so a big flight and a big recovery allowance exist.
     pump(&mut c, 1 << 20, ms(1));
     let start = c.snd;
@@ -430,7 +548,7 @@ fn data_at(_data: &[u8], out: &[(Transmit, Pkt)], start: u32, seq: u32, len: usi
 #[test]
 fn fin_rides_on_the_last_segment_of_a_tso_packet() {
     let mut c = Conn::new(transparent());
-    all(&mut c);
+    c.caps = TCP_TSO;
     let start = c.snd;
     c.stack.tcp_write(c.id, &pattern(5000, 8)).unwrap();
     c.stack.tcp_shutdown(c.id).unwrap();
@@ -456,7 +574,7 @@ fn a_small_output_buffer_degrades_to_plain_packets() {
     c.stack.tcp_write(c.id, &pattern(50_000, 6)).unwrap();
     let mut buf = vec![0u8; 3000];
     let mut got = Vec::new();
-    while let Some(t) = c.stack.poll_transmit_with(c.now, &mut buf, TxCaps::ALL) {
+    while let Some(t) = c.stack.poll_transmit_with(c.now, &mut buf, TCP_TSO) {
         let p = decode(&buf[..t.len]);
         assert!(t.len <= 3000);
         if p.payload.len() > 1368 {
@@ -469,10 +587,7 @@ fn a_small_output_buffer_degrades_to_plain_packets() {
     assert!(got.len() > 10_000);
     // A buffer that cannot hold one MTU packet still blocks, as before.
     let mut tiny = vec![0u8; 500];
-    assert_eq!(
-        c.stack.poll_transmit_with(c.now, &mut tiny, TxCaps::ALL),
-        None
-    );
+    assert_eq!(c.stack.poll_transmit_with(c.now, &mut tiny, TCP_TSO), None);
 }
 
 fn endpoint_client() -> (Stack, honk_netstack::FlowId, Instant, u32, u32) {
@@ -638,7 +753,7 @@ fn max_mss_caps_each_segment_not_the_super_packet() {
         ..Default::default()
     };
     let mut c = Conn::with_opts(transparent(), opts);
-    all(&mut c);
+    c.caps = TCP_TSO;
     c.stack.tcp_write(c.id, &pattern(6000, 3)).unwrap();
     let out = c.drain();
     assert_eq!(out.len(), 1);

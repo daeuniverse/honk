@@ -37,3 +37,4 @@ Added
 - Stop waking physical AF_XDP queues after link detach; give pending TX and worker quiescence one bounded wait before returning forwarding to the kernel.
 - Use 512 AF_XDP RX frames per queue on eligible single-member, single-realm forced-ZeroCopy Endpoint gateways with sufficient capture memory; other devices retain their existing capacities.
 - Charge recorded packet connection and route payloads to the capture budget through queueing, sniff-based rerouting and task completion. Idle observation slots carry no payload allocation.
+- Add per-family checksum completion for single TCP packets emitted by transparent netstack devices.

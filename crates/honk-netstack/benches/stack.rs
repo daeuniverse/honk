@@ -192,7 +192,10 @@ impl Flow {
         let mut sent = 0;
         while sent < segments {
             let caps = if OFFLOAD && self.transparent {
-                TxCaps::ALL
+                TxCaps {
+                    tso4: true,
+                    ..TxCaps::NONE
+                }
             } else {
                 TxCaps::NONE
             };

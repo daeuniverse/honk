@@ -18,6 +18,12 @@ pub const CLIENT: &str = "10.0.0.2:40000";
 pub const DST6: &str = "[2001:db8::9]:443";
 pub const CLIENT6: &str = "[fd00::2]:40000";
 
+pub const TCP_TSO: TxCaps = TxCaps {
+    tso4: true,
+    tso6: true,
+    ..TxCaps::NONE
+};
+
 pub fn addr(s: &str) -> SocketAddr {
     s.parse().unwrap()
 }

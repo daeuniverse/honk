@@ -39,6 +39,8 @@ pub(crate) const RX_BYTES: usize = VNET_BYTES + MAX_IP_BYTES + 1;
 pub(crate) const TX_CAPS: TxCaps = TxCaps {
     tso4: true,
     tso6: true,
+    csum4: false,
+    csum6: false,
     uso4: false,
     uso6: false,
 };

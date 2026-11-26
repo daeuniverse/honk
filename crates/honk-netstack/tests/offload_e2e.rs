@@ -180,7 +180,7 @@ impl Pair {
 
 #[test]
 fn bulk_transfer_with_tso_and_gro_is_intact_and_cheap() {
-    let mut p = pair(TxCaps::ALL, |_| false);
+    let mut p = pair(TCP_TSO, |_| false);
     p.transfer(16 << 20, 100_000);
     let s = p.server.stats();
     let segments = (16u64 << 20) / 1368;
@@ -206,7 +206,7 @@ fn the_same_transfer_without_caps_sends_every_segment_alone() {
 
 #[test]
 fn single_holes_inside_super_packets_recover_by_sack() {
-    let mut p = pair(TxCaps::ALL, |n| n % 37 == 11);
+    let mut p = pair(TCP_TSO, |n| n % 37 == 11);
     p.transfer(8 << 20, 400_000);
     let t = p.server.tcp_stats(p.sid).unwrap();
     assert!(t.retrans_segments > 0, "{t:?}");
@@ -217,7 +217,7 @@ fn single_holes_inside_super_packets_recover_by_sack() {
 #[test]
 fn a_lost_run_inside_the_flight_is_retransmitted_as_a_tso_packet() {
     // Eight consecutive segments vanish now and then, the shape of a congested queue.
-    let mut p = pair(TxCaps::ALL, |n| n % 400 >= 300 && n % 400 < 308);
+    let mut p = pair(TCP_TSO, |n| n % 400 >= 300 && n % 400 < 308);
     p.transfer(12 << 20, 800_000);
     let t = p.server.tcp_stats(p.sid).unwrap();
     assert!(t.retrans_segments >= 8, "{t:?}");
@@ -230,7 +230,7 @@ fn a_lost_run_inside_the_flight_is_retransmitted_as_a_tso_packet() {
 
 #[test]
 fn a_long_burst_of_loss_recovers_too() {
-    let mut p = pair(TxCaps::ALL, |n| n % 3000 >= 2000 && n % 3000 < 2100);
+    let mut p = pair(TCP_TSO, |n| n % 3000 >= 2000 && n % 3000 < 2100);
     p.transfer(8 << 20, 800_000);
     let t = p.server.tcp_stats(p.sid).unwrap();
     assert!(t.retrans_segments >= 100, "{t:?}");
@@ -240,7 +240,7 @@ fn a_long_burst_of_loss_recovers_too() {
 fn throughput_paths_work_at_every_chunk_size() {
     // A TSO packet spans 16 chunks of 4 KiB, one of 64 KiB; the stream must not care.
     for chunk in [4096, 8192, 8193, 16384, 65536] {
-        let mut p = pair_chunk(TxCaps::ALL, |n| n % 500 == 123, Some(chunk));
+        let mut p = pair_chunk(TCP_TSO, |n| n % 500 == 123, Some(chunk));
         p.transfer(3 << 20, 400_000);
         assert!(p.tso_packets > 0 && p.super_packets > 0, "chunk {chunk}");
         let s = p.server.stats();

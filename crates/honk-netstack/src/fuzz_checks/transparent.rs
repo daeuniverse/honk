@@ -187,6 +187,14 @@ fn check_transmit(tx: &Transmit, packet: &[u8]) {
             let seed = wire::checksum::Checksum::pseudo(ip.src, ip.dst, ip.proto, l4.len()).fold();
             assert_eq!(u16::from_be_bytes([l4[field], l4[field + 1]]), seed);
         }
+        (None, TxCsum::Partial { start, offset }) => {
+            assert_eq!(ip.proto, wire::PROTO_TCP);
+            assert_eq!(usize::from(start), ip.payload.start);
+            assert_eq!(offset, 16);
+            tcp::parse(l4).expect("well-formed TCP header");
+            let seed = wire::checksum::Checksum::pseudo(ip.src, ip.dst, ip.proto, l4.len()).fold();
+            assert_eq!(u16::from_be_bytes([l4[16], l4[17]]), seed);
+        }
         (None, TxCsum::Full) => match ip.proto {
             wire::PROTO_TCP => assert!(tcp::verify_checksum(ip.src, ip.dst, l4)),
             wire::PROTO_UDP => assert!(wire::udp::verify_checksum(ip.src, ip.dst, l4)),
@@ -341,6 +349,10 @@ impl World {
             }
             check_transmit(&tx, packet);
             if ip.proto == wire::PROTO_TCP {
+                if tx.gso.is_none() {
+                    let partial = self.pull_flags & 128 == 0 && self.caps.csum(ip.src.is_ipv6());
+                    assert_eq!(matches!(tx.csum, TxCsum::Partial { .. }), partial);
+                }
                 let seg = &buf[ip.payload.clone()];
                 let (h, _) = tcp::parse(seg).expect("well-formed TCP");
                 if h.flags & (tcp::SYN | tcp::ACK) == tcp::SYN | tcp::ACK {
@@ -861,6 +873,8 @@ fn step(w: &mut World, r: &mut Reader) {
             w.caps = TxCaps {
                 tso4: mask & 1 != 0,
                 tso6: mask & 2 != 0,
+                csum4: mask & 16 != 0,
+                csum6: mask & 16 != 0,
                 uso4: mask & 4 != 0,
                 uso6: mask & 8 != 0,
             };
@@ -918,6 +932,7 @@ pub fn seeds() -> Vec<Vec<u8>> {
     let udp = vec![UDP, 0, 40, UDP, 9, 255, RAW, 8, 0x45, 0, 0, 20, 0, 0, 0x40, 0];
     let mut offloads = open.clone();
     offloads.extend([
+        CAPS, 16, APP, 0, 0, 1,
         CAPS, 15, TCP_GSO, 0, 32, 0, 4, 2, APP, 0, 0, 255,
         UDP_GSO, 0, 30, 3, 2, UDP_GSO, 1, 20, 3, 1,
         FRAGMENTS, 0, 90, 0, FRAGMENTS, 1, 90, 1,

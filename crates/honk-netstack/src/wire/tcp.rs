@@ -237,7 +237,7 @@ pub(crate) fn emit_packet_parts(
     emit_parts(out, src, dst, hdr, payload, false)
 }
 
-/// Like [`emit_packet_parts`] for a TSO packet: the payload is copied without being summed, and
+/// Like [`emit_packet_parts`] for checksum offload: the payload is copied without being summed, and
 /// the checksum field holds the uncomplemented pseudo-header sum over the whole TCP length
 /// (`CHECKSUM_PARTIAL`, checksum field at `ip header length + 16`).
 pub(crate) fn emit_partial_parts(
@@ -248,6 +248,39 @@ pub(crate) fn emit_partial_parts(
     payload: &[&[u8]],
 ) -> Option<usize> {
     emit_parts(out, src, dst, hdr, payload, true)
+}
+
+/// Writes only the IP and TCP headers. `payload_len` is the total payload extent. Full checksum
+/// output sums `parts` in wire order, while partial output needs only the length.
+pub(crate) fn emit_header_only(
+    out: &mut [u8],
+    src: IpAddr,
+    dst: IpAddr,
+    hdr: &Header,
+    payload_len: usize,
+    parts: &[&[u8]],
+    partial: bool,
+) -> Option<usize> {
+    let syn = hdr.flags & SYN != 0;
+    let hlen = header_len(&hdr.options, syn);
+    let seg_len = hlen.checked_add(payload_len)?;
+    let iplen = emit_ip_header(out, src, dst, PROTO_TCP, seg_len)?;
+    let header_len = iplen + hlen;
+    let head = out.get_mut(iplen..header_len)?;
+    write_header(head, hdr, syn);
+
+    let mut ck = Checksum::pseudo(src, dst, PROTO_TCP, seg_len);
+    let checksum = if partial {
+        ck.fold()
+    } else {
+        ck.add(head);
+        for part in parts {
+            ck.add(part);
+        }
+        ck.finish()
+    };
+    head[16..18].copy_from_slice(&checksum.to_be_bytes());
+    Some(header_len)
 }
 
 fn emit_parts(
@@ -266,22 +299,10 @@ fn emit_parts(
     let iplen = emit_ip_header(out, src, dst, PROTO_TCP, seg_len)?;
     let total = iplen + seg_len;
     let seg = out.get_mut(iplen..total)?;
-
-    seg[0..2].copy_from_slice(&hdr.src_port.to_be_bytes());
-    seg[2..4].copy_from_slice(&hdr.dst_port.to_be_bytes());
-    seg[4..8].copy_from_slice(&hdr.seq.to_be_bytes());
-    seg[8..12].copy_from_slice(&hdr.ack.to_be_bytes());
-    seg[12] = ((hlen / 4) as u8) << 4;
-    seg[13] = hdr.flags;
-    seg[14..16].copy_from_slice(&hdr.window.to_be_bytes());
-    seg[16..18].copy_from_slice(&[0, 0]);
-    seg[18..20].copy_from_slice(&hdr.urgent.to_be_bytes());
-    seg[FIXED_LEN..hlen].fill(0);
-    let olen = write_options(&hdr.options, syn, &mut seg[FIXED_LEN..hlen]);
-    debug_assert_eq!(hlen, FIXED_LEN + olen);
+    let (head, body) = seg.split_at_mut(hlen);
+    write_header(head, hdr, syn);
 
     let mut ck = Checksum::pseudo(src, dst, PROTO_TCP, seg_len);
-    let (head, body) = seg.split_at_mut(hlen);
     let mut offset = 0;
     if partial {
         for part in payload {
@@ -298,6 +319,23 @@ fn emit_parts(
         head[16..18].copy_from_slice(&ck.finish().to_be_bytes());
     }
     Some(total)
+}
+
+fn write_header(head: &mut [u8], hdr: &Header, syn: bool) {
+    let hlen = head.len();
+    head[0..2].copy_from_slice(&hdr.src_port.to_be_bytes());
+    head[2..4].copy_from_slice(&hdr.dst_port.to_be_bytes());
+    head[4..8].copy_from_slice(&hdr.seq.to_be_bytes());
+    head[8..12].copy_from_slice(&hdr.ack.to_be_bytes());
+    head[12] = ((hlen / 4) as u8) << 4;
+    head[13] = hdr.flags;
+    head[14..16].copy_from_slice(&hdr.window.to_be_bytes());
+    head[16..18].copy_from_slice(&[0, 0]);
+    head[18..20].copy_from_slice(&hdr.urgent.to_be_bytes());
+    let options = &mut head[FIXED_LEN..];
+    options.fill(0);
+    let olen = write_options(&hdr.options, syn, options);
+    debug_assert_eq!(hlen, FIXED_LEN + olen);
 }
 
 #[cfg(test)]
@@ -502,6 +540,96 @@ mod tests {
                 assert_eq!(&seg[off..], &joined[..]);
             }
         }
+    }
+
+    #[test]
+    fn header_only_matches_contiguous_full_and_partial_packets() {
+        let mut hdr = base();
+        hdr.options.timestamps = Some((7, 9));
+        hdr.options.sack = sack3();
+        let mut rng = Rng::new(19);
+        for (src, dst) in pairs() {
+            let ip_len = super::super::ip_header_len(src.is_ipv6());
+            for len in [73, 3 * 1400 + 17] {
+                let payload = rng.bytes(len);
+                let parts = [&payload[..3], &[][..], &payload[3..68], &payload[68..]];
+                for partial in [false, true] {
+                    let mut head = [0xA5; 128];
+                    let n =
+                        emit_header_only(&mut head, src, dst, &hdr, len, &parts, partial).unwrap();
+                    assert_eq!(n, ip_len + 60);
+                    assert!(head[n..].iter().all(|&byte| byte == 0xA5));
+                    let mut joined = head[..n].to_vec();
+                    for part in parts {
+                        joined.extend_from_slice(part);
+                    }
+                    let mut contiguous = vec![0; joined.len()];
+                    let emit = if partial {
+                        emit_partial_parts
+                    } else {
+                        emit_packet_parts
+                    };
+                    assert_eq!(emit(&mut contiguous, src, dst, &hdr, &parts), Some(n + len));
+                    assert_eq!(joined, contiguous);
+
+                    let ip = parse_ip(&joined).unwrap();
+                    assert_eq!((ip.src, ip.dst, ip.proto), (src, dst, PROTO_TCP));
+                    let seg = &joined[ip.payload];
+                    assert_eq!(parse(seg).unwrap(), (hdr, 60));
+                    assert_eq!(&seg[60..], payload.as_slice());
+                    let mut reference = pseudo_bytes(src, dst, PROTO_TCP, seg.len());
+                    if partial {
+                        assert_eq!(
+                            u16::from_be_bytes([seg[16], seg[17]]),
+                            !naive_checksum(&reference)
+                        );
+                    } else {
+                        reference.extend_from_slice(seg);
+                        assert_eq!(naive_checksum(&reference), 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn header_only_checks_buffer_and_ip_extents() {
+        let hdr = base();
+        let mut head = [0; 60];
+        for (src, dst) in pairs() {
+            let ip_len = super::super::ip_header_len(src.is_ipv6());
+            let ip_charge = if src.is_ipv4() { ip_len } else { 0 };
+            let len = usize::from(u16::MAX) - ip_charge - FIXED_LEN;
+            assert_eq!(
+                emit_header_only(&mut head, src, dst, &hdr, len, &[], true),
+                Some(ip_len + FIXED_LEN)
+            );
+            assert_eq!(
+                emit_header_only(&mut head, src, dst, &hdr, len + 1, &[], true),
+                None
+            );
+            assert_eq!(
+                emit_header_only(
+                    &mut head[..ip_len + FIXED_LEN - 1],
+                    src,
+                    dst,
+                    &hdr,
+                    0,
+                    &[],
+                    false
+                ),
+                None
+            );
+        }
+        let [(src4, dst4), (_, dst6)] = pairs();
+        assert_eq!(
+            emit_header_only(&mut head, src4, dst6, &hdr, 0, &[], false),
+            None
+        );
+        assert_eq!(
+            emit_header_only(&mut head, src4, dst4, &hdr, usize::MAX, &[], true),
+            None
+        );
     }
 
     #[test]

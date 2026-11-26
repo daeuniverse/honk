@@ -12,7 +12,7 @@ use crate::flow::{self, Flow, FourTuple, Ports, Table, TimeWait};
 use crate::fragment::{FragmentLimits, Push};
 use crate::icmp_out::IcmpLimits;
 use crate::mode::{Mode, is_unicast};
-use crate::offload::{RxMeta, SourceContext, Transmit, TxCaps};
+use crate::offload::{RxMeta, SourceContext, Transmit, TxCaps, TxCsum};
 use crate::tcp::output::Output;
 use crate::tcp::ring::{self, Pool};
 use crate::tcp::{Tcb, TcpState, TcpStats};
@@ -1103,11 +1103,11 @@ impl Stack {
             .map(|t| t.len)
     }
 
-    /// [`Stack::poll_transmit`] for a driver that can take segmentation offload. With `caps.tso4`
-    /// / `tso6` a TCP flow may emit one packet of up to 64 KiB of payload: one header, several
-    /// MSS-sized segments ([`Transmit::gso`]), the checksum field holding only the pseudo-header
-    /// sum ([`TxCsum::Partial`]). Packets of every other class, and every packet from an
-    /// endpoint-mode stack (which ignores `caps`), are ordinary, complete ones.
+    /// [`Stack::poll_transmit`] for a driver that can complete TCP checksums or segment a TSO
+    /// packet. With the family's `tso4` or `tso6` capability, a TCP flow may emit one packet of up
+    /// to 64 KiB of payload with several MSS-sized segments ([`Transmit::gso`]). TSO packets and
+    /// single TCP packets with the family's `csum4` or `csum6` capability use [`TxCsum::Partial`].
+    /// Other output carries complete checksums. Endpoint mode ignores `caps`.
     ///
     /// How much a packet carries follows the congestion and receive windows, the pacer (a burst is
     /// at most two milliseconds of traffic) and about a millisecond of the pacing rate, as TSO
@@ -1224,8 +1224,8 @@ impl Stack {
                 return AccountedTransmit::NeedsIcmp;
             }
             let result = match class {
-                0 => self.emit_control(now, out, &mut tx, &mut icmp),
-                1 => self.emit_timewait(now, out, &mut tx),
+                0 => self.emit_control(now, out, caps, &mut tx, &mut icmp),
+                1 => self.emit_timewait(now, out, caps, &mut tx),
                 2 => self.emit_flow(now, out, caps, &mut tx, control_only),
                 3 if !control_only => self.poll_udp_frag(out, &mut tx),
                 3 => Output::None,
@@ -1282,6 +1282,7 @@ impl Stack {
         &mut self,
         now: Instant,
         out: &mut [u8],
+        caps: TxCaps,
         tx: &mut Transmit,
         icmp: &mut Option<&mut crate::IcmpState>,
     ) -> Output {
@@ -1310,13 +1311,7 @@ impl Stack {
                 urgent: 0,
                 options: wire::tcp::Options::default(),
             };
-            return match wire::tcp::emit_packet(
-                out,
-                c.tuple.local.ip(),
-                c.tuple.remote.ip(),
-                &h,
-                [&[], &[]],
-            ) {
+            return match Self::emit_tcp_control(out, c.tuple, &h, caps, tx) {
                 Some(n) => {
                     self.pop_control();
                     tx.flow = c.flow;
@@ -1329,7 +1324,13 @@ impl Stack {
         Output::None
     }
 
-    fn emit_timewait(&mut self, now: Instant, out: &mut [u8], tx: &mut Transmit) -> Output {
+    fn emit_timewait(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        caps: TxCaps,
+        tx: &mut Transmit,
+    ) -> Output {
         while let Some(id) = self.timewait_ready.front().copied() {
             let source = self.table.source(id.idx);
             let slot = &mut self.table.slots[id.idx as usize];
@@ -1362,13 +1363,7 @@ impl Stack {
                 urgent: 0,
                 options,
             };
-            return match wire::tcp::emit_packet(
-                out,
-                t.tuple.local.ip(),
-                t.tuple.remote.ip(),
-                &h,
-                [&[], &[]],
-            ) {
+            return match Self::emit_tcp_control(out, t.tuple, &h, caps, tx) {
                 Some(n) => {
                     tx.flow = Some(FlowId {
                         idx: id.idx,
@@ -1383,6 +1378,33 @@ impl Stack {
             };
         }
         Output::None
+    }
+
+    fn emit_tcp_control(
+        out: &mut [u8],
+        tuple: FourTuple,
+        header: &wire::tcp::Header,
+        caps: TxCaps,
+        tx: &mut Transmit,
+    ) -> Option<usize> {
+        let v6 = tuple.local.is_ipv6();
+        let partial = caps.csum(v6);
+        let len = wire::tcp::emit_header_only(
+            out,
+            tuple.local.ip(),
+            tuple.remote.ip(),
+            header,
+            0,
+            &[],
+            partial,
+        )?;
+        if partial {
+            tx.csum = TxCsum::Partial {
+                start: wire::ip_header_len(v6) as u16,
+                offset: 16,
+            };
+        }
+        Some(len)
     }
 
     fn emit_flow(
@@ -1429,12 +1451,7 @@ impl Stack {
             if !control_only && slot.deficit < quantum {
                 slot.deficit += quantum;
             }
-            let tso = if caps.tso(t.tuple.local.is_ipv6()) {
-                usize::from(u16::MAX)
-            } else {
-                0
-            };
-            let result = t.output_with(now, out, &mut self.pool, tso, tx, !control_only);
+            let result = t.output_with(now, out, &mut self.pool, caps, tx, !control_only);
             match result {
                 Output::Sent(n) => {
                     tx.flow = Some(id);

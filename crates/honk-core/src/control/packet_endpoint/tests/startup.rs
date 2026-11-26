@@ -940,8 +940,7 @@ async fn tun_dual_capture_cold_start_fits_with_retained_producer_charge() {
         let caps = honk_netstack::TxCaps {
             tso4: true,
             tso6: true,
-            uso4: false,
-            uso6: false,
+            ..honk_netstack::TxCaps::NONE
         };
         let plain =
             capture_scope_with_output(1500, 2, 128, u16::MAX as usize, caps, &budget).unwrap();

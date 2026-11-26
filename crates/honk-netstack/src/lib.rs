@@ -140,6 +140,8 @@
 //! datagrams as one USO packet (the last may be shorter); without the family's capability, or in
 //! endpoint mode, a multi-datagram send returns [`UdpError::Offload`]. `poll_transmit_with` with no
 //! capabilities, and every `poll_transmit` call, keep the ordinary single-packet behavior.
+//! Transparent drivers can request a partial TCP checksum for a single packet through
+//! `TxCaps::csum4` or `csum6`, independently of segmentation.
 //!
 //! # Memory and datagrams
 //!
