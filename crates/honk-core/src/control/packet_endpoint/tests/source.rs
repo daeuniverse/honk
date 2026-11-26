@@ -133,33 +133,56 @@ async fn observed_routing_admission_funds_its_real_route_and_transfers_the_charg
     let destination: SocketAddr = "198.51.100.9:443".parse().unwrap();
     let budget = MemoryBudget::new(1 << 20);
     let scope = ScopeId::allocate().unwrap();
-    let plain = handle
-        .prepare_packet_routing_snapshot(scope, source, destination, "tcp", 0, None, None, false)
-        .await
-        .unwrap();
-    let plain = EndpointAdmission::new(plain, &budget).unwrap();
+    let prepare = |record| {
+        handle.prepare_packet_routing_snapshot(
+            scope,
+            source,
+            destination,
+            "tcp",
+            0,
+            None,
+            None,
+            (record, None),
+        )
+    };
+    let plain = EndpointAdmission::new(prepare(false).await.unwrap(), &budget).unwrap();
     let plain_bytes = budget.used();
     drop(plain);
     assert_eq!(budget.used(), 0);
-    let observed = handle
-        .prepare_packet_routing_snapshot(scope, source, destination, "tcp", 0, None, None, true)
-        .await
-        .unwrap();
-    let insufficient = MemoryBudget::new(plain_bytes);
-    let error = EndpointAdmission::new(observed, &insufficient).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-    assert_eq!(insufficient.used(), 0);
-    let observed = handle
-        .prepare_packet_routing_snapshot(scope, source, destination, "tcp", 0, None, None, true)
-        .await
-        .unwrap();
-    let admission = EndpointAdmission::new(observed, &budget).unwrap();
+    let observed = EndpointAdmission::new(prepare(true).await.unwrap(), &budget).unwrap();
     let charged = budget.used();
     assert!(charged > plain_bytes);
-    let snapshot = admission.into_snapshot();
-    assert_eq!(budget.used(), charged);
-    drop(snapshot);
+    drop(observed);
     assert_eq!(budget.used(), 0);
+    let short = MemoryBudget::new(charged - 1);
+    assert_eq!(
+        EndpointAdmission::new(prepare(true).await.unwrap(), &short)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(short.used(), 0);
+    let exact = MemoryBudget::new(charged);
+    let prepaid = handle
+        .prepare_packet_routing_snapshot(
+            scope,
+            source,
+            destination,
+            "tcp",
+            0,
+            None,
+            None,
+            (true, Some(&exact)),
+        )
+        .await
+        .unwrap();
+    assert!(exact.used() > 0);
+    let snapshot = EndpointAdmission::new(prepaid, &exact)
+        .unwrap()
+        .into_snapshot();
+    assert_eq!(exact.used(), charged);
+    drop(snapshot);
+    assert_eq!(exact.used(), 0);
 }
 
 #[tokio::test]
@@ -584,7 +607,7 @@ async fn host_dns_rejects_routing_captured_before_source_cell_reuse() {
                 Some(&original),
                 None,
                 #[cfg(feature = "native-api")]
-                false,
+                (false, None),
             )
             .await
             .unwrap();

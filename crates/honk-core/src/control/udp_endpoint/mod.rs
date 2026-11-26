@@ -1041,6 +1041,13 @@ impl UdpEndpointPool {
         }
     }
 
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn packet_memory_budget(
+        &self,
+    ) -> Option<&Arc<honk_netstack::MemoryBudget>> {
+        self.memory_budget.as_ref()
+    }
+
     pub(in crate::control) fn with_packet_reply_factory(
         capacity: usize,
         factory: Arc<dyn UdpReplySocketFactory>,

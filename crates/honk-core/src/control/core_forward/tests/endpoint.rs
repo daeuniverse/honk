@@ -72,6 +72,13 @@ async fn pending_reload_is_rejected_at_tcp_new_and_committed_flow_keeps_its_orig
     });
     let router = crate::routing::Router::from_config(&config.routing).unwrap();
     let plane = crate::control::tests::support::control_plane(config);
+    #[cfg(feature = "native-api")]
+    let (plane, native) = {
+        let mut plane = plane;
+        let native = crate::native_api::observation::NativeObservation::attach(&mut plane).await;
+        native.core.flows.set_recording(false);
+        (plane, native)
+    };
     *plane.router.write().await = router;
     let authority = plane
         .core_forward_policy(Execution::MixedEndpoints)
@@ -100,8 +107,15 @@ async fn pending_reload_is_rejected_at_tcp_new_and_committed_flow_keeps_its_orig
     let destination: SocketAddr = "198.51.100.1:443".parse().unwrap();
     let (bytes, admitted) =
         pending_syn(&mut core, &authority, ingress, source, destination, now).await;
+    #[cfg(feature = "native-api")]
+    native.core.flows.set_recording(true);
     let (stale_bytes, stale) =
         pending_syn(&mut core, &authority, ingress, next, destination, now).await;
+    #[cfg(feature = "native-api")]
+    assert!(
+        stale.captured_snapshot().decision.retained_bytes()
+            > admitted.captured_snapshot().decision.retained_bytes()
+    );
     let mut admitted = Some(admitted);
     assert_eq!(
         commit_syn(&scope, &bytes, now, &mut admitted).unwrap(),

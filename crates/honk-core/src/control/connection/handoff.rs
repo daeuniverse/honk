@@ -1,5 +1,5 @@
 #[cfg(feature = "native-api")]
-use super::observation::ConnectionObservation;
+use super::observation::{ConnectionObservation, PacketRouteSlot};
 use super::routing::RoutingDecision;
 use crate::control::*;
 use std::collections::HashMap;
@@ -69,7 +69,7 @@ fn check_udp_group(
 }
 
 /// Result from the eBPF routing handoff map lookup.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(in crate::control) struct HandoffResult {
     pub(super) outbound: u8,
     pub(super) mark: u32,
@@ -83,10 +83,13 @@ pub(in crate::control) struct HandoffResult {
     #[cfg(feature = "native-api")]
     pub(super) trace_id: u32,
     #[cfg(feature = "native-api")]
-    pub(super) capture: Option<crate::observe::flows::kernel::CapturedKernelRoute>,
-    #[cfg(feature = "native-api")]
-    pub(super) capture_gap: Option<&'static str>,
+    pub(super) packet_route: PacketRouteSlot,
 }
+
+#[cfg(feature = "native-api")]
+const _: () = assert!(size_of::<HandoffResult>() <= 80);
+#[cfg(not(feature = "native-api"))]
+const _: () = assert!(size_of::<HandoffResult>() <= 48);
 
 impl From<RoutingHandoffEntry> for HandoffResult {
     fn from(entry: RoutingHandoffEntry) -> Self {
@@ -103,58 +106,58 @@ impl From<RoutingHandoffEntry> for HandoffResult {
             #[cfg(feature = "native-api")]
             trace_id: entry.trace_id,
             #[cfg(feature = "native-api")]
-            capture: None,
-            #[cfg(feature = "native-api")]
-            capture_gap: Some("kernel_trace_not_captured"),
+            packet_route: PacketRouteSlot::failed("kernel_trace_not_captured"),
         }
     }
 }
 
 impl HandoffResult {
+    #[cfg(feature = "native-api")]
     fn captured(
         backend: &dyn crate::ebpf::EbpfBackend,
         key: &TuplesKey,
         entry: RoutingHandoffEntry,
-        #[cfg(feature = "native-api")] observation: &ConnectionObservation,
+        observation: &ConnectionObservation,
+        packet_trace_id: Option<u32>,
     ) -> Self {
-        let handoff = Self::from(entry);
-        #[cfg(feature = "native-api")]
+        let mut handoff = Self::from(entry);
+        if key.l4proto == 17
+            && handoff.decision_token == 0
+            && packet_trace_id != Some(handoff.trace_id)
+        {
+            // A queued socket datagram cannot identify a later token-zero tuple incarnation.
+            handoff.trace_id = 0;
+            handoff.packet_route = PacketRouteSlot::failed("kernel_handoff_ambiguous");
+            return handoff;
+        }
         if !observation.is_recording() {
             return handoff;
         }
-        #[cfg(feature = "native-api")]
-        let handoff = {
-            let mut handoff = handoff;
-            match backend.capture_kernel_route(key, (&entry).into()) {
-                Ok(mut capture) => {
-                    if key.dst_port != 53
-                        && !(key.l4proto == 17
-                            && honk_ebpf_common::conn::is_stateless_udp_ports(
-                                key.src_port,
-                                key.dst_port,
-                            ))
-                    {
-                        let state = backend.conn_state_lookup(key);
-                        if !state.ok().flatten().is_some_and(|state| {
-                            state.incarnation == entry.incarnation
-                                && state.trace_id == entry.trace_id
-                                && state.decision_token == entry.result.decision_token
-                        }) {
-                            capture.gap = Some("kernel_trace_conn_incarnation_mismatch");
-                            capture.ambiguous = true;
-                        }
+        match backend.capture_kernel_route(key, (&entry).into()) {
+            Ok(mut capture) => {
+                if key.dst_port != 53
+                    && !(key.l4proto == 17
+                        && honk_ebpf_common::conn::is_stateless_udp_ports(
+                            key.src_port,
+                            key.dst_port,
+                        ))
+                {
+                    let state = backend.conn_state_lookup(key);
+                    if !state.ok().flatten().is_some_and(|state| {
+                        state.incarnation == entry.incarnation
+                            && state.trace_id == entry.trace_id
+                            && state.decision_token == entry.result.decision_token
+                    }) {
+                        capture.gap = Some("kernel_trace_conn_incarnation_mismatch");
+                        capture.ambiguous = true;
                     }
-                    handoff.capture_gap = capture.gap;
-                    handoff.capture = Some(capture);
                 }
-                Err(gap) => {
-                    handoff.capture_gap = Some(gap);
-                }
+                handoff.packet_route = PacketRouteSlot::from_capture(Ok(capture));
             }
-            handoff
-        };
-        #[cfg(not(feature = "native-api"))]
-        let _ = (backend, key);
+            Err(gap) => {
+                handoff.packet_route = PacketRouteSlot::failed(gap);
+            }
+        }
         handoff
     }
     /// Convert the eBPF process name byte array to an optional string: bytes
@@ -173,11 +176,10 @@ impl HandoffResult {
     /// Resolve the process executable path from /proc. The process may have
     /// exited between the cgroup hook and now — any failure just omits the
     /// field. Off the runtime workers: even a /proc readlink is blocking I/O.
-    pub(super) async fn process_path(&self) -> Option<String> {
-        if self.pid == 0 {
+    pub(super) async fn process_path(pid: u32) -> Option<String> {
+        if pid == 0 {
             return None;
         }
-        let pid = self.pid;
         tokio::task::spawn_blocking(move || {
             std::fs::read_link(format!("/proc/{pid}/exe"))
                 .ok()
@@ -479,12 +481,12 @@ impl ControlPlaneHandle {
         conn_id: uuid::Uuid,
         handoff: Option<&HandoffResult>,
     ) {
-        let Some(handoff) = handoff.filter(|handoff| handoff.pid != 0).cloned() else {
+        let Some(pid) = handoff.map(|handoff| handoff.pid).filter(|pid| *pid != 0) else {
             return;
         };
         let tracker = Arc::clone(&self.connection_tracker);
         tokio::spawn(async move {
-            if let Some(process_path) = handoff.process_path().await {
+            if let Some(process_path) = HandoffResult::process_path(pid).await {
                 tracker.update_process_path(&conn_id, process_path);
             }
         });
@@ -591,6 +593,7 @@ impl ControlPlaneHandle {
         tuples: &TuplesKey,
         owner: crate::ebpf::UdpFlowOwner,
         #[cfg(feature = "native-api")] observation: &ConnectionObservation,
+        #[cfg(feature = "native-api")] packet_trace_id: Option<u32>,
     ) -> anyhow::Result<(Option<HandoffResult>, Option<UdpGroupProof>)> {
         let backend = self.ebpf.read().await;
         let tc = backend.tc()?;
@@ -615,13 +618,10 @@ impl ControlPlaneHandle {
         } else {
             None
         };
-        let handoff = HandoffResult::captured(
-            tc,
-            tuples,
-            entry,
-            #[cfg(feature = "native-api")]
-            observation,
-        );
+        #[cfg(feature = "native-api")]
+        let handoff = HandoffResult::captured(tc, tuples, entry, observation, packet_trace_id);
+        #[cfg(not(feature = "native-api"))]
+        let handoff = HandoffResult::from(entry);
         Ok((Some(handoff), group))
     }
 
@@ -663,16 +663,15 @@ impl ControlPlaneHandle {
             Arc::clone(&self.retirement),
             adoption.pin,
         );
+        #[cfg(feature = "native-api")]
         let tc = backend.tc()?;
-        let handoff = adoption.handoff.map(|entry| {
-            HandoffResult::captured(
-                tc,
-                &tuples,
-                entry,
-                #[cfg(feature = "native-api")]
-                observation,
-            )
-        });
+        #[cfg(feature = "native-api")]
+        let handoff = adoption
+            .handoff
+            .map(|entry| HandoffResult::captured(tc, &tuples, entry, observation, None));
+        #[cfg(not(feature = "native-api"))]
+        let handoff = adoption.handoff.map(HandoffResult::from);
+        drop(backend);
         Ok((flow, handoff))
     }
 
@@ -876,21 +875,36 @@ fn handoff_capture_follows_admission_without_changing_authority() {
             ..Default::default()
         },
         routing_generation: 9,
+        trace_id: 31,
         ..Default::default()
     };
-    for admitted in [false, true] {
+    for (admitted, l4proto, packet_trace_id, trace_id, gap) in [
+        (false, 6, None, 31, "kernel_trace_not_captured"),
+        (true, 6, None, 31, "kernel_trace_sidecar_missing"),
+        (true, 17, Some(30), 0, "kernel_handoff_ambiguous"),
+    ] {
         let native =
             crate::native_api::observation::NativeObservation::new(&honk_config::Config::default());
         native.core.flows.set_recording(admitted);
         let observation = ConnectionObservation::begin(
             Some(&native.core),
-            crate::observe::vocab::Network::Tcp,
+            if l4proto == 17 {
+                crate::observe::vocab::Network::Udp
+            } else {
+                crate::observe::vocab::Network::Tcp
+            },
             "127.0.0.1:31000".parse().unwrap(),
             "127.0.0.1:443".parse().unwrap(),
         );
         native.core.flows.set_recording(!admitted);
-        let result = HandoffResult::captured(&backend, &TuplesKey::default(), entry, &observation);
-        assert_eq!(result.capture_gap, Some("kernel_trace_not_captured"));
+        let key = TuplesKey {
+            l4proto,
+            ..Default::default()
+        };
+        let result = HandoffResult::captured(&backend, &key, entry, &observation, packet_trace_id);
+        assert_eq!(result.trace_id, trace_id);
+        assert!(result.packet_route.capture.is_none());
+        assert_eq!(result.packet_route.capture_gap, Some(gap));
         assert_eq!(
             (
                 result.outbound,

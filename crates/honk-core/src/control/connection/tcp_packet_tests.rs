@@ -1034,7 +1034,7 @@ async fn admitted_packet_tcp_keeps_route_and_mode_after_publication() -> anyhow:
                 flow.packet_source(),
                 flow.process(),
                 #[cfg(feature = "native-api")]
-                false,
+                (false, None),
             )
             .await?;
         snapshot.admission_final = true;

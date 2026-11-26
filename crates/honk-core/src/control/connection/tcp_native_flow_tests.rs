@@ -203,9 +203,12 @@ async fn pinned_tcp_dns_route_keeps_kernel_route_observation() -> anyhow::Result
         ..Default::default()
     });
     let route = fixture.handle.pin_tcp_dns_route(&handoff, true).await?;
-    assert!(route.decision.native_route.is_some());
+    assert_eq!(
+        route.decision.native_route.retained_bytes(),
+        size_of::<super::super::observation::RouteObservation>()
+    );
     let route = fixture.handle.pin_tcp_dns_route(&handoff, false).await?;
-    assert!(route.decision.native_route.is_none());
+    assert_eq!(route.decision.native_route.retained_bytes(), 0);
     fixture.task.abort();
     fixture.finish_removals().await?;
     fixture.server.shutdown().await;

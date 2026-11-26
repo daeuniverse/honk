@@ -36,3 +36,4 @@ Added
 - Keep a physical UDP datagram refused by closing Endpoint admission from failing XDP shutdown; device errors and completion-queue failures remain fatal.
 - Stop waking physical AF_XDP queues after link detach; give pending TX and worker quiescence one bounded wait before returning forwarding to the kernel.
 - Use 512 AF_XDP RX frames per queue on eligible single-member, single-realm forced-ZeroCopy Endpoint gateways with sufficient capture memory; other devices retain their existing capacities.
+- Charge recorded packet connection and route payloads to the capture budget through queueing, sniff-based rerouting and task completion. Idle observation slots carry no payload allocation.

@@ -1,12 +1,9 @@
 //! Transparent UDP provenance, bounded admission, and receive-loop dispatch.
 
+use super::connection::observation::{ConnectionObservation, PacketRouteSlot};
 use super::udp_endpoint::{DatagramPayload, RawDnsRoute};
 use super::*;
 use crate::ebpf::UdpFlowOwner;
-
-#[cfg(feature = "native-api")]
-pub(in crate::control) type PacketRoute =
-    Result<crate::observe::flows::kernel::CapturedKernelRoute, &'static str>;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct UdpOriginalDst {
@@ -40,8 +37,10 @@ pub(super) fn udp_original_dst(meta: &UdpRecvMeta, data: &[u8]) -> Option<UdpOri
 }
 
 /// Owns admitted work after routing publication guards have been released.
-// Keep the lease inline, as in EndpointReservation, without a per-flow allocation.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the inline UDP initializer lease avoids an allocation on each new flow"
+)]
 pub(super) enum UdpSlowPathWork {
     Initialize(UdpInitLease),
     #[cfg(feature = "ebpf")]
@@ -51,16 +50,14 @@ pub(super) enum UdpSlowPathWork {
         expected_epoch: u64,
         enqueued_at: u32,
         permit: tokio::sync::OwnedSemaphorePermit,
-        #[cfg(feature = "native-api")]
-        packet_route: Option<PacketRoute>,
+        packet_route: PacketRouteSlot,
     },
     Dns {
         admission: crate::control::dns_control::AdmittedDnsQuery,
         data: Bytes,
         validated: ValidatedDnsQuery,
         audit: Option<crate::audit::DnsAuditQuery>,
-        #[cfg(feature = "native-api")]
-        packet_route: Option<PacketRoute>,
+        packet_route: PacketRouteSlot,
     },
     DnsRefused {
         runtime: crate::dns::runtime::RuntimeLease,
@@ -71,21 +68,23 @@ pub(super) enum UdpSlowPathWork {
         query: Bytes,
         #[cfg(feature = "native-api")]
         ingress: crate::dns::query::IngressProfile,
-        #[cfg(feature = "native-api")]
-        packet_route: Option<PacketRoute>,
+        packet_route: PacketRouteSlot,
     },
     Done,
 }
 
+const _: () =
+    assert!(size_of::<UdpSlowPathWork>() <= size_of::<UdpInitLease>() + align_of::<UdpInitLease>());
+
 #[cfg(feature = "native-api")]
 impl UdpSlowPathWork {
-    fn with_packet_route(mut self, capture: Option<PacketRoute>) -> Self {
+    fn with_packet_route(mut self, capture: impl FnOnce() -> PacketRouteSlot) -> Self {
         match &mut self {
-            Self::Initialize(lease) => lease.set_packet_route(capture),
+            Self::Initialize(lease) => lease.set_packet_route(capture()),
             #[cfg(feature = "ebpf")]
-            Self::QueuedDatagram { packet_route, .. } => *packet_route = capture,
+            Self::QueuedDatagram { packet_route, .. } => *packet_route = capture(),
             Self::Dns { packet_route, .. } | Self::DnsRefused { packet_route, .. } => {
-                *packet_route = capture
+                *packet_route = capture();
             }
             Self::Done => {}
         }
@@ -201,8 +200,7 @@ fn begin_udp_dns_query(
                     query: data.into_bytes(),
                     #[cfg(feature = "native-api")]
                     ingress: validated.ingress(),
-                    #[cfg(feature = "native-api")]
-                    packet_route: None,
+                    packet_route: PacketRouteSlot::ABSENT,
                 };
             }
             stats.record_udp_slow_permit_rejected();
@@ -217,8 +215,7 @@ fn begin_udp_dns_query(
         data: data.into_bytes(),
         validated,
         audit,
-        #[cfg(feature = "native-api")]
-        packet_route: None,
+        packet_route: PacketRouteSlot::ABSENT,
     }
 }
 
@@ -380,11 +377,13 @@ impl UdpLoopState {
             return UdpSlowPathWork::Done;
         }
         #[cfg(feature = "native-api")]
-        let packet_route = self
+        let captured_route = self
             .handle
             .native
             .as_ref()
-            .filter(|_| config.experimental.native_api.record_flows)
+            .filter(|native| {
+                config.experimental.native_api.record_flows && native.flows.recording()
+            })
             .map(|_| match packet_priority {
                 Some(trace_id) => backend.capture_kernel_route(
                     &crate::control::connection::build_tuples_key(
@@ -405,6 +404,9 @@ impl UdpLoopState {
                 ),
                 None => Err("receive_metadata_unavailable"),
             });
+        #[cfg(feature = "native-api")]
+        let packet_route =
+            move || captured_route.map_or(PacketRouteSlot::ABSENT, PacketRouteSlot::from_capture);
         drop(backend_guard);
         let validated_dns = raw_dns_route
             .is_none()
@@ -467,8 +469,7 @@ impl UdpLoopState {
                     expected_epoch,
                     enqueued_at,
                     permit,
-                    #[cfg(feature = "native-api")]
-                    packet_route: None,
+                    packet_route: PacketRouteSlot::ABSENT,
                 }
             }
             #[cfg(all(test, not(feature = "ebpf")))]
@@ -569,7 +570,6 @@ impl UdpLoopState {
                 expected_epoch,
                 enqueued_at,
                 permit,
-                #[cfg(feature = "native-api")]
                 packet_route,
             } => {
                 if self.drain.should_reject()
@@ -578,7 +578,7 @@ impl UdpLoopState {
                     self.stats.record_udp_slow_permit_closed();
                     return;
                 }
-                if let EndpointReservation::Initializing(lease) =
+                if let EndpointReservation::Initializing(mut lease) =
                     self.udp_pool.reserve_payload_or_enqueue_at(
                         honk_datapath::ScopeId::HOST,
                         src_addr,
@@ -593,9 +593,6 @@ impl UdpLoopState {
                         None,
                     )
                 {
-                    #[cfg(feature = "native-api")]
-                    let mut lease = lease;
-                    #[cfg(feature = "native-api")]
                     lease.set_packet_route(packet_route);
                     self.spawn_work(src_addr, original_dst, UdpSlowPathWork::Initialize(lease));
                 }
@@ -615,23 +612,20 @@ impl UdpLoopState {
                 data,
                 validated,
                 audit,
-                #[cfg(feature = "native-api")]
                 packet_route,
             } => {
                 let guard = ConnectionGuard::new(Arc::clone(&self.drain));
                 let dns_controller = Arc::clone(&self.dns_controller);
                 #[cfg(feature = "native-api")]
-                let mut observation =
-                    crate::control::connection::observation::ConnectionObservation::begin(
-                        self.handle.native.as_deref(),
-                        crate::observe::vocab::Network::Udp,
-                        src_addr,
-                        original_dst,
-                    );
-                #[cfg(feature = "native-api")]
-                if let Some(capture) = packet_route {
-                    observation.packet_route(capture);
-                }
+                let mut observation = ConnectionObservation::begin(
+                    self.handle.native.as_deref(),
+                    crate::observe::vocab::Network::Udp,
+                    src_addr,
+                    original_dst,
+                );
+                #[cfg(not(feature = "native-api"))]
+                let mut observation = ConnectionObservation;
+                observation.packet_route(packet_route);
                 #[cfg(feature = "native-api")]
                 let observer = observation
                     .observer(|| self.handle.diagnostics.read().generation, "client_dns");
@@ -673,24 +667,21 @@ impl UdpLoopState {
                 query,
                 #[cfg(feature = "native-api")]
                 ingress,
-                #[cfg(feature = "native-api")]
                 packet_route,
             } => {
                 let guard = ConnectionGuard::new(Arc::clone(&self.drain));
                 #[cfg(feature = "native-api")]
                 let dns_controller = Arc::clone(&self.dns_controller);
                 #[cfg(feature = "native-api")]
-                let mut observation =
-                    crate::control::connection::observation::ConnectionObservation::begin(
-                        self.handle.native.as_deref(),
-                        crate::observe::vocab::Network::Udp,
-                        src_addr,
-                        original_dst,
-                    );
-                #[cfg(feature = "native-api")]
-                if let Some(capture) = packet_route {
-                    observation.packet_route(capture);
-                }
+                let mut observation = ConnectionObservation::begin(
+                    self.handle.native.as_deref(),
+                    crate::observe::vocab::Network::Udp,
+                    src_addr,
+                    original_dst,
+                );
+                #[cfg(not(feature = "native-api"))]
+                let mut observation = ConnectionObservation;
+                observation.packet_route(packet_route);
                 #[cfg(feature = "native-api")]
                 let observer = observation
                     .observer(|| self.handle.diagnostics.read().generation, "client_dns");

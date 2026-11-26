@@ -1,23 +1,14 @@
 use super::*;
 
 fn handoff(outbound: u8, must: u8) -> HandoffResult {
-    HandoffResult {
-        outbound,
-        must,
-        mark: 0,
-        decision_token: 0,
-        routing_generation: 0,
-        dscp: 0,
-        mac: [0; 6],
-        pname: [0; 16],
-        pid: 0,
-        #[cfg(feature = "native-api")]
-        trace_id: 0,
-        #[cfg(feature = "native-api")]
-        capture: None,
-        #[cfg(feature = "native-api")]
-        capture_gap: Some("not_instrumented"),
-    }
+    HandoffResult::from(honk_ebpf_common::RoutingHandoffEntry {
+        result: honk_ebpf_common::RoutingResult {
+            outbound,
+            must,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
 }
 
 #[test]
@@ -36,8 +27,7 @@ fn direct_mark_preserves_rule_and_clears_override() {
                 mark,
                 matched_rule: None,
                 reroute_by_sniffed_domain: false,
-                #[cfg(feature = "native-api")]
-                native_route: None,
+                native_route: Default::default(),
             };
             decision.apply_final_outbound(replacement.map(str::to_owned));
             assert_eq!(decision.outbound, final_outbound);
@@ -166,16 +156,18 @@ fn udp_domain_reroute_preserves_reserved_and_final_decisions() {
 async fn handoff_process_fields_decode_and_fail_closed() {
     let mut ho = handoff(OutboundIndex::UserBase as u8, 0);
     assert_eq!(ho.process_name(), None, "zeroed pname means no process");
-    assert_eq!(ho.process_path().await, None, "pid 0 means no process");
+    assert_eq!(HandoffResult::process_path(ho.pid).await, None);
 
     ho.pname[..4].copy_from_slice(b"curl");
     assert_eq!(ho.process_name().as_deref(), Some("curl"));
 
-    ho.pid = std::process::id();
-    assert!(ho.process_path().await.is_some());
+    assert!(
+        HandoffResult::process_path(std::process::id())
+            .await
+            .is_some()
+    );
     // A dead/invalid pid just omits the path instead of erroring.
-    ho.pid = u32::MAX;
-    assert_eq!(ho.process_path().await, None);
+    assert_eq!(HandoffResult::process_path(u32::MAX).await, None);
 }
 
 #[test]

@@ -123,6 +123,11 @@ impl FlowIo {
             .map(crate::control::packet_endpoint::EndpointAdmission::into_snapshot)
     }
 
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn memory_budget(&self) -> &std::sync::Arc<honk_netstack::MemoryBudget> {
+        &self.scope.0.budget
+    }
+
     pub fn reserve_memory(&self, bytes: usize) -> io::Result<MemoryReservation> {
         self.try_reserve_memory(bytes).ok_or_else(capacity)
     }

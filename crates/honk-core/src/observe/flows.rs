@@ -178,6 +178,10 @@ impl FlowStore {
         }
     }
 
+    pub(crate) fn recording(&self) -> bool {
+        self.recording.load(Ordering::Acquire)
+    }
+
     pub(crate) fn set_recording(&self, enabled: bool) {
         let mut store = self.inner.lock();
         if store.recording == enabled {
@@ -210,7 +214,7 @@ impl FlowStore {
     }
 
     pub(crate) fn maintain(&self) {
-        if !self.recording.load(Ordering::Acquire) {
+        if !self.recording() {
             return;
         }
         self.prune(&mut self.inner.lock(), Instant::now());
@@ -222,7 +226,7 @@ impl FlowStore {
         src: SocketAddr,
         dst: SocketAddr,
     ) -> Option<FlowGuard> {
-        if !self.recording.load(Ordering::Acquire) {
+        if !self.recording() {
             return None;
         }
         let mut store = self.inner.lock();

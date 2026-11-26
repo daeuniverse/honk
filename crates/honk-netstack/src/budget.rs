@@ -34,7 +34,7 @@ pub struct MemoryBudget {
     backing: Option<MemoryReservation>,
 }
 
-/// A fixed capacity charge. Keep it until the storage or commitment it funds is released.
+/// A capacity charge. Keep it until the storage or commitment it funds is released.
 #[derive(Debug)]
 #[must_use = "the reservation must outlive the storage it funds"]
 pub struct MemoryReservation {
@@ -51,6 +51,17 @@ impl MemoryReservation {
 
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Reserves additional capacity from the same budget, leaving this charge intact on failure.
+    pub fn try_grow(&mut self, additional: usize) -> bool {
+        if additional != 0 {
+            if !self.budget.try_charge(additional) {
+                return false;
+            }
+            self.bytes += additional;
+        }
+        true
     }
 
     /// Transfers another live charge from the same budget without refunding either one.
@@ -161,4 +172,19 @@ fn child_payload_retains_its_exact_root_grant() {
     assert_eq!(root.used(), 4096);
     drop(payload);
     assert_eq!(root.used(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn growth_preserves_the_original_charge_on_capacity_failure() {
+    let budget = MemoryBudget::new(8);
+    let mut reservation = budget.reserve(3).unwrap();
+    assert!(!reservation.try_grow(6));
+    assert_eq!(reservation.bytes(), 3);
+    assert_eq!(budget.used(), 3);
+    assert!(reservation.try_grow(5));
+    assert_eq!(reservation.bytes(), 8);
+    assert_eq!(budget.used(), 8);
+    drop(reservation);
+    assert_eq!(budget.used(), 0);
 }

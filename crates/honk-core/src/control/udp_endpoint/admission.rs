@@ -1,4 +1,5 @@
 use super::*;
+use crate::control::connection::observation::PacketRouteSlot;
 
 /// At most 64 datagrams, including the initializer's first packet, may be
 /// retained for one flow.
@@ -405,8 +406,10 @@ impl EndpointEntry {
 /// Result of the synchronous reservation performed by the UDP receive loop.
 /// `Initializing` owns the first packet and the slow-path permit; all other
 /// variants have released the permit before returning to the receive loop.
-/// The lease stays inline to avoid another allocation on every new UDP flow.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the inline initializer lease avoids an allocation on each new flow"
+)]
 pub(in crate::control) enum EndpointReservation {
     Initializing(UdpInitLease),
     Enqueued,
@@ -446,11 +449,15 @@ pub(in crate::control) struct UdpInitLease {
     pub(in crate::control) packet_observation:
         Option<crate::control::connection::observation::ConnectionObservation>,
     committed: bool,
-    #[cfg(feature = "native-api")]
-    packet_route: Option<crate::control::udp_ingress::PacketRoute>,
+    packet_route: PacketRouteSlot,
     #[cfg(feature = "native-api")]
     packet_trace_id: Option<u32>,
 }
+
+#[cfg(feature = "native-api")]
+const _: () = assert!(size_of::<UdpInitLease>() <= 672);
+#[cfg(not(feature = "native-api"))]
+const _: () = assert!(size_of::<UdpInitLease>() <= 544);
 
 impl UdpInitLease {
     pub(in crate::control) fn packet_source(&self) -> Option<&SourceWork> {
@@ -472,19 +479,13 @@ impl UdpInitLease {
         self.packet_trace_id
     }
 
-    #[cfg(feature = "native-api")]
-    pub(in crate::control) fn set_packet_route(
-        &mut self,
-        capture: Option<crate::control::udp_ingress::PacketRoute>,
-    ) {
+    #[cfg(any(feature = "native-api", feature = "ebpf"))]
+    pub(in crate::control) fn set_packet_route(&mut self, capture: PacketRouteSlot) {
         self.packet_route = capture;
     }
 
-    #[cfg(feature = "native-api")]
-    pub(in crate::control) fn take_packet_route(
-        &mut self,
-    ) -> Option<crate::control::udp_ingress::PacketRoute> {
-        self.packet_route.take()
+    pub(in crate::control) fn take_packet_route(&mut self) -> PacketRouteSlot {
+        std::mem::replace(&mut self.packet_route, PacketRouteSlot::ABSENT)
     }
 
     #[cfg(feature = "native-api")]
@@ -1102,8 +1103,7 @@ impl UdpEndpointPool {
             packet_dscp: None,
             #[cfg(feature = "native-api")]
             packet_observation: None,
-            #[cfg(feature = "native-api")]
-            packet_route: None,
+            packet_route: PacketRouteSlot::ABSENT,
             #[cfg(feature = "native-api")]
             packet_trace_id: None,
             committed: false,

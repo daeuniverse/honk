@@ -887,6 +887,8 @@ async fn udp_handoff_missing_auxiliary_cannot_skip_the_cached_group_cutoff() -> 
                 UdpFlowOwner::new(0, incarnation).unwrap(),
                 #[cfg(feature = "native-api")]
                 &observation,
+                #[cfg(feature = "native-api")]
+                None,
             )
             .await
     };
@@ -934,8 +936,7 @@ async fn udp_handoff_revalidates_the_original_group_after_a_mode_replacement() -
             mark: None,
             matched_rule: None,
             reroute_by_sniffed_domain: false,
-            #[cfg(feature = "native-api")]
-            native_route: None,
+            native_route: Default::default(),
         };
         handle
             .apply_mode_override(&mut route, OutboundConstraint::Group)

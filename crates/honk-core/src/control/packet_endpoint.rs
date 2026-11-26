@@ -208,7 +208,6 @@ impl Shared {
 pub struct EndpointAdmission {
     snapshot: Box<super::connection::routing::PacketRoutingSnapshot>,
     pending: Option<super::core_forward::PendingEndpointAdmission>,
-    _memory: MemoryReservation,
 }
 
 impl std::fmt::Debug for EndpointAdmission {
@@ -252,7 +251,7 @@ impl EndpointAdmission {
     }
 
     fn allocate(
-        snapshot: super::connection::routing::PacketRoutingSnapshot,
+        mut snapshot: super::connection::routing::PacketRoutingSnapshot,
         budget: &Arc<MemoryBudget>,
         pending: Option<super::core_forward::PendingEndpointAdmission>,
     ) -> io::Result<Self> {
@@ -266,16 +265,21 @@ impl EndpointAdmission {
             });
         #[cfg(feature = "native-api")]
         let bytes = bytes + snapshot.mode.group_id.as_ref().map_or(0, String::capacity);
-        let memory = budget.reserve(bytes).ok_or_else(|| {
+        let prepaid = snapshot.memory.as_ref().map_or(0, MemoryReservation::bytes);
+        let memory = budget.reserve(bytes - prepaid).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "packet routing admission memory capacity",
             )
         })?;
+        if let Some(prepaid) = &mut snapshot.memory {
+            prepaid.absorb(memory);
+        } else {
+            snapshot.memory = Some(memory);
+        }
         Ok(Self {
             snapshot: Box::new(snapshot),
             pending,
-            _memory: memory,
         })
     }
 
@@ -306,9 +310,7 @@ impl EndpointAdmission {
             self.pending.is_none(),
             "packet policy must commit before use"
         );
-        let mut snapshot = *self.snapshot;
-        snapshot.memory = Some(self._memory);
-        snapshot
+        *self.snapshot
     }
 }
 
@@ -1904,14 +1906,17 @@ impl EndpointRuntime {
         if destination.port() == 53 {
             #[cfg(feature = "native-api")]
             {
-                packet_observation = Some(
-                    super::connection::observation::ConnectionObservation::begin(
+                packet_observation =
+                    match super::connection::observation::ConnectionObservation::begin_in(
                         handle.native.as_deref(),
                         crate::observe::vocab::Network::Udp,
                         source,
                         destination,
-                    ),
-                );
+                        Some(&self.shared.budget),
+                    ) {
+                        Ok(observation) => Some(observation),
+                        Err(_) => return,
+                    };
                 if let Some((process, mark)) = source_work.packet_input() {
                     packet_observation
                         .as_mut()
@@ -1933,7 +1938,10 @@ impl EndpointRuntime {
                         packet_source,
                         None,
                         #[cfg(feature = "native-api")]
-                        packet_observation.as_ref().unwrap().is_recording(),
+                        (
+                            packet_observation.as_ref().unwrap().is_recording(),
+                            Some(&self.shared.budget),
+                        ),
                     );
                     match run_until_auxiliary_pause(auxiliary.as_ref(), prepare).await {
                         Some(Ok(snapshot)) => snapshot,

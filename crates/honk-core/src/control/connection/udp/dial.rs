@@ -119,7 +119,12 @@ impl ControlPlaneHandle {
             let manager = Arc::clone(selection_manager);
             let target_domain = target_domain.clone();
             #[cfg(feature = "native-api")]
-            let native = observation.shared();
+            let native = observation.shared(
+                packet_source
+                    .as_ref()
+                    .map(|source| source.memory_budget())
+                    .or(udp_pool.packet_memory_budget()),
+            )?;
             Arc::new(move |_, (index, target)| {
                 let registry = registry.clone();
                 let stats = stats.clone();
@@ -173,7 +178,7 @@ impl ControlPlaneHandle {
                     }
                     .map(Arc::new);
                     #[cfg(feature = "native-api")]
-                    let mut native_attempt = native.as_ref().and_then(|observation| {
+                    let mut native_attempt = native.as_ref().map(|observation| {
                         observation.attempt(&selection_chain, &target, target_domain.as_deref())
                     });
                     let reporter = feedback

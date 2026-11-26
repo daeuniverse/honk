@@ -59,17 +59,22 @@ impl ControlPlaneHandle {
             anyhow::bail!("staged UDP lease requires the ebpf feature");
         }
         let begin = || {
-            ConnectionObservation::begin(
+            ConnectionObservation::begin_in(
                 self.native.as_deref(),
                 crate::observe::vocab::Network::Udp,
                 lease.client_addr(),
                 lease.original_dst(),
+                #[cfg(feature = "native-api")]
+                lease
+                    .packet_source()
+                    .map(|source| source.memory_budget())
+                    .or(self.udp_pool.packet_memory_budget()),
             )
         };
         #[cfg(feature = "native-api")]
-        let mut observation = captured.unwrap_or_else(begin);
+        let mut observation = captured.map_or_else(begin, Ok)?;
         #[cfg(not(feature = "native-api"))]
-        let observation = begin();
+        let observation = begin()?;
         let native_terminal = lease.set_native_flow(observation.flow().cloned());
         let mut initializer = native_terminal
             .as_ref()
@@ -136,10 +141,7 @@ impl ControlPlaneHandle {
         #[cfg(not(feature = "native-api"))]
         let mut observation = ConnectionObservation;
         let native_terminal = lease.native_terminal();
-        #[cfg(feature = "native-api")]
-        if let Some(capture) = lease.take_packet_route() {
-            observation.packet_route(capture);
-        }
+        observation.packet_route(lease.take_packet_route());
         let client_addr = lease.client_addr();
         let original_dst = lease.original_dst();
         let packet_input = lease
@@ -156,6 +158,16 @@ impl ControlPlaneHandle {
         }
         let data = lease.first_payload();
         let raw_dns_route = lease.raw_dns_route();
+        #[cfg(feature = "native-api")]
+        let packet_route_budget = (observation.is_recording()
+            && !lease.owner().has_kernel_capture())
+        .then(|| {
+            lease
+                .packet_source()
+                .map(|source| source.owner().budget())
+                .or_else(|| self.udp_pool.packet_memory_budget().cloned())
+        })
+        .flatten();
         let mut packet_routing = if lease.owner().has_kernel_capture() {
             None
         } else {
@@ -173,7 +185,7 @@ impl ControlPlaneHandle {
                         lease.packet_source(),
                         None,
                         #[cfg(feature = "native-api")]
-                        observation.is_recording(),
+                        (observation.is_recording(), packet_route_budget.as_ref()),
                     )
                     .await?
                 }
@@ -270,7 +282,7 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
-        let (handoff, original_group) =
+        let (mut handoff, original_group) =
             if raw_dns_route.is_some() || !lease.owner().has_kernel_capture() {
                 (None, None)
             } else {
@@ -286,21 +298,13 @@ impl ControlPlaneHandle {
                     lease.owner(),
                     #[cfg(feature = "native-api")]
                     observation,
+                    #[cfg(feature = "native-api")]
+                    lease.packet_trace_id(),
                 )
                 .await?
             };
-        #[cfg(feature = "native-api")]
-        let handoff = handoff.map(|mut handoff| {
-            if lease.decision_token() == 0 && lease.packet_trace_id() != Some(handoff.trace_id) {
-                // A queued socket datagram cannot identify a later token-zero tuple incarnation.
-                handoff.trace_id = 0;
-                handoff.capture = None;
-                handoff.capture_gap = Some("kernel_handoff_ambiguous");
-            }
-            handoff
-        });
         observation.handoff(
-            handoff.as_ref(),
+            handoff.as_mut(),
             raw_dns_route.is_none() && lease.owner().has_kernel_capture(),
         );
         let skip_sniff = matches!(dial_mode, DialMode::Ip)
@@ -377,21 +381,10 @@ impl ControlPlaneHandle {
                 &input,
                 domain_verified,
                 #[cfg(feature = "native-api")]
-                observation.is_recording(),
+                (observation.is_recording(), packet_route_budget.as_ref()),
             )
             .await?;
-            std::mem::replace(
-                &mut snapshot.decision,
-                RoutingDecision {
-                    outbound: String::new(),
-                    must: false,
-                    mark: None,
-                    matched_rule: None,
-                    reroute_by_sniffed_domain: false,
-                    #[cfg(feature = "native-api")]
-                    native_route: None,
-                },
-            )
+            std::mem::take(&mut snapshot.decision)
         } else if let Some(raw_dns_route) = &raw_dns_route {
             let (outbound, mark) = match raw_dns_route {
                 RawDnsRoute::Group(name) => (name.to_string(), None),
@@ -406,8 +399,7 @@ impl ControlPlaneHandle {
                 mark,
                 matched_rule: None,
                 reroute_by_sniffed_domain: false,
-                #[cfg(feature = "native-api")]
-                native_route: None,
+                native_route: Default::default(),
             }
         } else {
             let conn_info = build_connection_info(

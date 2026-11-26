@@ -722,6 +722,10 @@ impl SourceWork {
     pub(in crate::control) fn owner(&self) -> &PacketScope {
         &self.scope
     }
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn memory_budget(&self) -> &Arc<MemoryBudget> {
+        &self.scope.0.budget
+    }
     pub(in crate::control) fn optional_context(&self) -> Option<SourceContext> {
         self.context
     }

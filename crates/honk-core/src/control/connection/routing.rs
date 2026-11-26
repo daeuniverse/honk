@@ -1,4 +1,5 @@
 use super::handoff::HandoffResult;
+use super::observation::RouteTraceSlot;
 use crate::control::*;
 
 /// Clash lists captured hops exit first. A collapsed exit and the selected `direct` remain distinct.
@@ -25,16 +26,18 @@ pub(super) fn connection_chains(
     selection_chain
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(in crate::control) struct RoutingDecision {
     pub(in crate::control) outbound: String,
     pub(in crate::control) must: bool,
     pub(in crate::control) mark: Option<u32>,
     pub(in crate::control) matched_rule: Option<(String, String)>,
     pub(in crate::control) reroute_by_sniffed_domain: bool,
-    #[cfg(feature = "native-api")]
-    pub(super) native_route: Option<super::observation::RouteObservation>,
+    pub(super) native_route: RouteTraceSlot,
 }
+
+#[cfg(feature = "native-api")]
+const _: () = assert!(size_of::<RoutingDecision>() <= 96);
 
 pub(in crate::control) struct PacketRoutingSnapshot {
     pub(in crate::control) source: Option<honk_netstack::SourceContext>,
@@ -69,9 +72,7 @@ impl RoutingDecision {
         #[cfg(feature = "native-api")] native: Option<(&crate::observe::Observation, u64)>,
     ) -> Self {
         #[cfg(feature = "native-api")]
-        let mut native_route = None;
-        #[cfg(feature = "native-api")]
-        let matched = if let Some((native, generation)) = native {
+        let (matched, native_route) = if let Some((native, generation)) = native {
             let observed = router.route_full_observed(
                 input,
                 domain_bitmap,
@@ -83,7 +84,7 @@ impl RoutingDecision {
                 router,
                 &observed.rules,
             );
-            native_route = Some(super::observation::RouteObservation::userspace(
+            let route = RouteTraceSlot::userspace(
                 &native.instance_id,
                 generation,
                 input,
@@ -91,13 +92,19 @@ impl RoutingDecision {
                 observed.matched.as_ref(),
                 rules,
                 observed.truncated,
-            ));
-            observed.matched
+            );
+            (observed.matched, route)
         } else {
-            router.route_full_with_domain_bitmap(input, domain_bitmap)
+            (
+                router.route_full_with_domain_bitmap(input, domain_bitmap),
+                RouteTraceSlot::default(),
+            )
         };
         #[cfg(not(feature = "native-api"))]
-        let matched = router.route_full_with_domain_bitmap(input, domain_bitmap);
+        let (matched, native_route) = (
+            router.route_full_with_domain_bitmap(input, domain_bitmap),
+            RouteTraceSlot,
+        );
         let action = matched.as_ref().map_or(router.fallback(), |hit| hit.action);
         Self {
             outbound: action.outbound.clone(),
@@ -106,24 +113,31 @@ impl RoutingDecision {
             matched_rule: matched
                 .map(|hit| (hit.rule_type.to_owned(), hit.rule_payload.to_owned())),
             reroute_by_sniffed_domain: false,
-            #[cfg(feature = "native-api")]
             native_route,
         }
     }
 
     pub(in crate::control) fn retained_bytes(&self) -> usize {
-        let bytes = self.outbound.capacity()
+        self.outbound.capacity()
             + self
                 .matched_rule
                 .as_ref()
-                .map_or(0, |(kind, payload)| kind.capacity() + payload.capacity());
-        #[cfg(feature = "native-api")]
-        let bytes = bytes
-            + self
-                .native_route
-                .as_ref()
-                .map_or(0, |route| route.retained_bytes());
-        bytes
+                .map_or(0, |(kind, payload)| kind.capacity() + payload.capacity())
+            + self.native_route.retained_bytes()
+    }
+
+    #[cfg(feature = "native-api")]
+    fn reserve_packet_trace(
+        &self,
+        budget: Option<&Arc<honk_netstack::MemoryBudget>>,
+    ) -> anyhow::Result<Option<honk_netstack::MemoryReservation>> {
+        let Some(budget) = budget.filter(|_| !self.native_route.is_empty()) else {
+            return Ok(None);
+        };
+        budget
+            .reserve(self.retained_bytes())
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("packet routing observation memory capacity"))
     }
 
     /// Installs a mode override's replacement outbound, if any. A rule mark
@@ -302,7 +316,10 @@ impl ControlPlaneHandle {
         dscp: u8,
         packet_source: Option<&crate::control::netstack::SourceWork>,
         gateway_process: Option<crate::control::netstack::ProcessMeta>,
-        #[cfg(feature = "native-api")] record_route: bool,
+        #[cfg(feature = "native-api")] (record_route, budget): (
+            bool,
+            Option<&Arc<honk_netstack::MemoryBudget>>,
+        ),
     ) -> anyhow::Result<PacketRoutingSnapshot> {
         let config = Arc::clone(&*self.config.read().await);
         let mut input = build_connection_info(None, destination, client, protocol, None);
@@ -343,6 +360,8 @@ impl ControlPlaneHandle {
             );
             (decision, facts)
         };
+        #[cfg(feature = "native-api")]
+        let memory = decision.reserve_packet_trace(budget)?;
         self.dns_controller.hot_fill_packet_domain(facts);
         let current = self.config.read().await;
         anyhow::ensure!(
@@ -372,6 +391,9 @@ impl ControlPlaneHandle {
             mode,
             mode_state,
             admission_final: false,
+            #[cfg(feature = "native-api")]
+            memory,
+            #[cfg(not(feature = "native-api"))]
             memory: None,
             decision,
             config,
@@ -388,7 +410,10 @@ impl ControlPlaneHandle {
         dial_mode: DialMode,
         conn_info: &ConnectionInfo,
         domain_verified: bool,
-        #[cfg(feature = "native-api")] record_route: bool,
+        #[cfg(feature = "native-api")] (record_route, budget): (
+            bool,
+            Option<&Arc<honk_netstack::MemoryBudget>>,
+        ),
     ) -> anyhow::Result<()> {
         if snapshot.final_before_sniff()
             || !Self::should_route_with_sniffed_domain(
@@ -402,7 +427,7 @@ impl ControlPlaneHandle {
         let mut conn_info = conn_info.clone();
         conn_info.mac = snapshot.source_mac;
         conn_info.process_name = snapshot.process.and_then(|process| process.name());
-        snapshot.decision = self
+        let decision = self
             .prepare_routing(
                 dial_mode,
                 &conn_info,
@@ -413,6 +438,21 @@ impl ControlPlaneHandle {
                 record_route,
             )
             .await;
+        #[cfg(feature = "native-api")]
+        if let Some(memory) = &mut snapshot.memory {
+            if !decision.native_route.is_empty() {
+                let growth = decision
+                    .retained_bytes()
+                    .saturating_sub(snapshot.decision.retained_bytes());
+                anyhow::ensure!(
+                    memory.try_grow(growth),
+                    "packet routing observation memory capacity"
+                );
+            }
+        } else {
+            snapshot.memory = decision.reserve_packet_trace(budget)?;
+        }
+        snapshot.decision = decision;
         anyhow::ensure!(
             Arc::ptr_eq(&snapshot.config, &*self.config.read().await),
             "packet routing generation changed during sniffing"
@@ -449,9 +489,11 @@ impl ControlPlaneHandle {
                 None => self.outbound_index_to_name(index).await,
             }
         };
-        if let Some(handoff) = handoff
-            && handoff.outbound != OutboundIndex::ControlPlaneRouting as u8
-            && !reroute_by_sniffed_domain
+        let kernel_route = handoff.filter(|handoff| {
+            handoff.outbound != OutboundIndex::ControlPlaneRouting as u8
+                && !reroute_by_sniffed_domain
+        });
+        if let Some(handoff) = kernel_route
             && !self.connection_tracker.needs_rule_details()
         {
             return RoutingDecision {
@@ -460,92 +502,63 @@ impl ControlPlaneHandle {
                 mark: (handoff.mark != 0).then_some(handoff.mark),
                 matched_rule: None,
                 reroute_by_sniffed_domain: false,
-                #[cfg(feature = "native-api")]
-                native_route: record_route.then(super::observation::RouteObservation::kernel),
+                native_route: RouteTraceSlot::kernel(
+                    #[cfg(feature = "native-api")]
+                    record_route,
+                ),
             };
         }
         let route_with_domain = Self::should_route_with_sniffed_domain(
             dial_mode,
             conn_info.domain.as_deref(),
             domain_verified,
-        ) && (handoff.is_none()
-            || handoff.is_some_and(|ho| ho.outbound == OutboundIndex::ControlPlaneRouting as u8)
-            || reroute_by_sniffed_domain);
+        ) && kernel_route.is_none();
         let mut routing_conn_info = conn_info.clone();
         if !route_with_domain {
             routing_conn_info.domain = None;
         }
-        #[cfg(feature = "native-api")]
-        let mut native_route = (record_route
-            && handoff.is_some_and(|handoff| {
-                handoff.outbound != OutboundIndex::ControlPlaneRouting as u8
-                    && !reroute_by_sniffed_domain
-            }))
-        .then(super::observation::RouteObservation::kernel);
-        let (userspace_outbound, userspace_must, userspace_mark, matched_rule) = {
+        let mut decision = {
             let router = self.router.read().await;
             #[cfg(feature = "native-api")]
             let native = self
                 .native
                 .as_deref()
-                .filter(|_| record_route && native_route.is_none());
+                .filter(|_| record_route && kernel_route.is_none());
             #[cfg(feature = "native-api")]
             let _config = if native.is_some() {
                 Some(self.config.read().await)
             } else {
                 None
             };
-            let decision = RoutingDecision::from_router(
+            RoutingDecision::from_router(
                 &router,
                 &routing_conn_info,
                 None,
                 #[cfg(feature = "native-api")]
                 native.map(|native| (native, self.diagnostics.read().generation)),
-            );
-            #[cfg(feature = "native-api")]
-            if native_route.is_none() {
-                native_route = decision.native_route;
-            }
-            (
-                decision.outbound,
-                decision.must,
-                decision.mark,
-                decision.matched_rule,
             )
         };
-        let (outbound, must, mark) = match handoff {
-            Some(ho) => {
-                debug!(
-                    outbound = ho.outbound,
-                    mark = ho.mark,
-                    must = ho.must,
-                    dscp = ho.dscp,
-                    decision_token = ho.decision_token,
-                    "eBPF routing handoff"
-                );
-                if ho.outbound == OutboundIndex::ControlPlaneRouting as u8
-                    || reroute_by_sniffed_domain
-                {
-                    (userspace_outbound, userspace_must, userspace_mark)
-                } else {
-                    (
-                        handoff_name(ho.outbound).await,
-                        ho.must != 0,
-                        (ho.mark != 0).then_some(ho.mark),
-                    )
-                }
-            }
-            None => (userspace_outbound, userspace_must, userspace_mark),
-        };
-        RoutingDecision {
-            outbound,
-            must,
-            mark,
-            matched_rule,
-            reroute_by_sniffed_domain,
-            #[cfg(feature = "native-api")]
-            native_route,
+        if let Some(ho) = handoff {
+            debug!(
+                outbound = ho.outbound,
+                mark = ho.mark,
+                must = ho.must,
+                dscp = ho.dscp,
+                decision_token = ho.decision_token,
+                "eBPF routing handoff"
+            );
         }
+        if let Some(ho) = kernel_route {
+            decision.outbound = handoff_name(ho.outbound).await;
+            decision.must = ho.must != 0;
+            decision.mark = (ho.mark != 0).then_some(ho.mark);
+            decision.native_route = RouteTraceSlot::kernel(
+                #[cfg(feature = "native-api")]
+                record_route,
+            );
+        }
+        decision.reroute_by_sniffed_domain = reroute_by_sniffed_domain;
+        decision
     }
 
     /// Publish all matching domain predicates, independently of the flow's
@@ -744,7 +757,7 @@ mod packet_mac_tests {
                     Some(&work),
                     None,
                     #[cfg(feature = "native-api")]
-                    false,
+                    (false, None),
                 )
                 .await
                 .unwrap();
@@ -765,7 +778,7 @@ mod packet_mac_tests {
                     &input,
                     false,
                     #[cfg(feature = "native-api")]
-                    false,
+                    (false, None),
                 )
                 .await
                 .unwrap();

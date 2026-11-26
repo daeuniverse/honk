@@ -106,6 +106,14 @@ impl TcpFlow {
         }
     }
 
+    #[cfg(feature = "native-api")]
+    pub(super) fn packet_memory_budget(&self) -> Option<&Arc<MemoryBudget>> {
+        match self {
+            Self::Kernel(_) => None,
+            Self::Packet(flow) => Some(flow.stream.memory_budget()),
+        }
+    }
+
     pub(super) fn mark_packet_rx_admitted(&self) {
         if let Self::Packet(flow) = self {
             flow.stream.mark_rx_admitted();

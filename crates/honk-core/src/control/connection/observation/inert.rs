@@ -9,6 +9,32 @@ use honk_outbound::runtime::flow_observation::FlowObserver;
 use super::{handoff::HandoffResult, routing::RoutingDecision};
 use crate::observe::{Observation, flows::FlowGuard};
 
+#[derive(Debug)]
+pub(in crate::control) struct PacketRouteSlot;
+
+const _: () = assert!(size_of::<PacketRouteSlot>() == 0);
+
+impl PacketRouteSlot {
+    pub(in crate::control) const ABSENT: Self = Self;
+}
+
+#[derive(Debug, Default)]
+pub(super) struct RouteTraceSlot;
+
+const _: () = assert!(size_of::<RouteTraceSlot>() == 0);
+
+impl RouteTraceSlot {
+    #[inline]
+    pub(super) fn kernel() -> Self {
+        Self
+    }
+
+    #[inline]
+    pub(super) fn retained_bytes(&self) -> usize {
+        0
+    }
+}
+
 #[derive(Clone, Default)]
 pub(in crate::control) struct ConnectionObservation;
 
@@ -23,6 +49,16 @@ impl ConnectionObservation {
         _destination: SocketAddr,
     ) -> Self {
         Self
+    }
+
+    #[inline]
+    pub(in crate::control) fn begin_in(
+        _native: Option<&Observation>,
+        _network: crate::observe::vocab::Network,
+        _source: SocketAddr,
+        _destination: SocketAddr,
+    ) -> std::io::Result<Self> {
+        Ok(Self)
     }
 
     #[inline]
@@ -71,7 +107,10 @@ impl ConnectionObservation {
     }
 
     #[inline]
-    pub(super) fn handoff(&mut self, _handoff: Option<&HandoffResult>, _expected: bool) {}
+    pub(super) fn handoff(&mut self, _handoff: Option<&mut HandoffResult>, _expected: bool) {}
+
+    #[inline]
+    pub(in crate::control) fn packet_route(&mut self, _slot: PacketRouteSlot) {}
 
     #[inline]
     pub(super) fn tcp_sniffed(

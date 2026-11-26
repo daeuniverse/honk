@@ -335,6 +335,7 @@ impl RoutingAuthority {
                 self.0
                     .native
                     .as_deref()
+                    .filter(|observation| observation.flows.recording())
                     .map(|observation| (observation, routing_generation)),
             ),
             mode,

@@ -940,7 +940,7 @@ async fn admitted_udp_keeps_route_and_mode_after_publication() {
                 None,
                 None,
                 #[cfg(feature = "native-api")]
-                false,
+                (false, None),
             )
             .await
             .unwrap();
@@ -1092,7 +1092,7 @@ async fn admitted_udp_keeps_route_after_fact_withdrawal() {
                 None,
                 None,
                 #[cfg(feature = "native-api")]
-                false,
+                (false, None),
             )
             .await
             .unwrap();
@@ -1117,7 +1117,7 @@ async fn admitted_udp_keeps_route_after_fact_withdrawal() {
                 None,
                 None,
                 #[cfg(feature = "native-api")]
-                false,
+                (false, None),
             )
             .await
             .unwrap();

@@ -17,7 +17,7 @@ use crate::connection_tracker::{
     CloseAction, CloseCompletion, CloseSignal, ConnectionOwner, captured_groups,
 };
 
-use super::observation::ConnectionObservation;
+use super::observation::{ConnectionObservation, RouteTraceSlot};
 
 mod dial;
 mod direct_relay;
@@ -136,8 +136,10 @@ impl ControlPlaneHandle {
             mark: (handoff.mark != 0).then_some(handoff.mark),
             matched_rule: None,
             reroute_by_sniffed_domain: false,
-            #[cfg(feature = "native-api")]
-            native_route: record_route.then(super::observation::RouteObservation::kernel),
+            native_route: RouteTraceSlot::kernel(
+                #[cfg(feature = "native-api")]
+                record_route,
+            ),
         };
         drop(backend);
         Ok(PacketRoutingSnapshot {
@@ -316,12 +318,17 @@ impl ControlPlaneHandle {
             ),
             TcpInput::Kernel(_) => (None, None, None, None),
         };
-        let mut observation = ConnectionObservation::begin(
+        let mut observation = ConnectionObservation::begin_in(
             self.native.as_deref(),
             crate::observe::vocab::Network::Tcp,
             client_addr,
             original_dst,
-        );
+            #[cfg(feature = "native-api")]
+            match &input {
+                TcpInput::Packet(stream) => Some(stream.memory_budget()),
+                TcpInput::Kernel(_) => None,
+            },
+        )?;
         #[cfg(feature = "native-api")]
         let native_observer = observation.flow().and_then(|flow| {
             flow.observer(self.diagnostics.read().generation, None, "dial_target")
@@ -335,7 +342,7 @@ impl ControlPlaneHandle {
         let close_signal = close.as_ref().map(|close| Arc::clone(&close.0));
         let result = {
             let operation = async {
-                let (mut flow, handoff) = match input {
+                let (mut flow, mut handoff) = match input {
                     TcpInput::Kernel(stream) => {
                         let tuples = build_tuples_key(
                             original_dst.ip(),
@@ -371,7 +378,7 @@ impl ControlPlaneHandle {
                     );
                 }
                 if flow.is_kernel() {
-                    observation.handoff(handoff.as_ref(), true);
+                    observation.handoff(handoff.as_mut(), true);
                 }
                 observation.routing_started();
 
@@ -388,7 +395,7 @@ impl ControlPlaneHandle {
                                 flow.packet_source(),
                                 gateway_process,
                                 #[cfg(feature = "native-api")]
-                                observation.is_recording(),
+                                (observation.is_recording(), flow.packet_memory_budget()),
                             )
                             .await?
                         }
@@ -566,7 +573,7 @@ impl ControlPlaneHandle {
                             &conn_info,
                             domain_verified,
                             #[cfg(feature = "native-api")]
-                            observation.is_recording(),
+                            (observation.is_recording(), flow.packet_memory_budget()),
                         )
                         .await?;
                     }
