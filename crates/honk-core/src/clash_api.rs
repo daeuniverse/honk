@@ -707,6 +707,9 @@ async fn put_proxy(
     }
 }
 
+const MAX_DELAY_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_GROUP_DELAY_MEMBERS: usize = 256;
+
 /// Query params for delay endpoints: `?url=<url>&timeout=<ms>`.
 #[derive(Debug, serde::Deserialize)]
 struct DelayQuery {
@@ -720,7 +723,7 @@ impl DelayQuery {
     fn timeout(&self) -> Duration {
         // Zero means "use the urltest default" (the measurement normalizes it).
         self.timeout
-            .map(Duration::from_millis)
+            .map(|ms| Duration::from_millis(ms).min(MAX_DELAY_TIMEOUT))
             .unwrap_or(Duration::ZERO)
     }
 }
@@ -869,6 +872,12 @@ async fn group_delay(
         let manager = s.group_manager.read();
         let registry = s.runtime_registry.read();
         members = manager.delay_test_members(name);
+        if members.len() > MAX_GROUP_DELAY_MEMBERS {
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!("group delay fan-out exceeds {MAX_GROUP_DELAY_MEMBERS} members"),
+            );
+        }
         let leaves = capture_delay_leaves(&s.alive_set, &members);
         (Arc::clone(&manager), Arc::clone(&registry), leaves)
     };
@@ -1805,6 +1814,23 @@ mod sampler_tests {
                 Duration::from_millis(expected_ms)
             );
         }
+    }
+
+    #[test]
+    fn delay_query_timeout_preserves_zero_sentinel_and_clamps_upper_bound() {
+        let timeout = |ms| {
+            DelayQuery {
+                url: String::new(),
+                timeout: ms,
+            }
+            .timeout()
+        };
+        assert_eq!(timeout(None), Duration::ZERO);
+        assert_eq!(timeout(Some(0)), Duration::ZERO);
+        assert_eq!(timeout(Some(5_000)), Duration::from_secs(5));
+        assert_eq!(timeout(Some(30_000)), Duration::from_secs(30));
+        assert_eq!(timeout(Some(30_001)), Duration::from_secs(30));
+        assert_eq!(timeout(Some(u64::MAX)), Duration::from_secs(30));
     }
 
     #[tokio::test]

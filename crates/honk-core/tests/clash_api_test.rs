@@ -1777,6 +1777,56 @@ async fn test_nested_group_delay_endpoints() {
 }
 
 #[tokio::test]
+async fn test_group_delay_rejects_oversized_member_fanout() {
+    let nodes: Vec<Node> = (0..257)
+        .map(|index| make_node(&format!("node-{index}")))
+        .collect();
+    let at_cap = Group {
+        name: "at-cap".into(),
+        policy: GroupPolicy::URLTest,
+        nodes: nodes[..256].iter().map(|node| node.id).collect(),
+        ..Default::default()
+    };
+    let oversized = Group {
+        name: "oversized".into(),
+        policy: GroupPolicy::URLTest,
+        nodes: nodes.iter().map(|node| node.id).collect(),
+        ..Default::default()
+    };
+    let app = spawn_app_with_config(
+        Config {
+            nodes,
+            groups: vec![at_cap, oversized],
+            ..Default::default()
+        },
+        "",
+        "",
+    )
+    .await;
+    let client = http_client();
+
+    for path in [
+        "/group/oversized/delay?url=http://127.0.0.1:1/&timeout=100",
+        "/proxies/oversized/delay?url=http://127.0.0.1:1/&timeout=100",
+    ] {
+        let resp = client.get(app.url(path)).send().await.unwrap();
+        assert_eq!(resp.status(), 413, "{path}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["message"].as_str().is_some_and(|m| m.contains("256")),
+            "{path}: {body}"
+        );
+    }
+
+    let ok = client
+        .get(app.url("/group/at-cap/delay?url=http://127.0.0.1:1/&timeout=100"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+}
+
+#[tokio::test]
 async fn test_cache_flush_endpoints() {
     let app = spawn_app("", "").await;
     let client = http_client();

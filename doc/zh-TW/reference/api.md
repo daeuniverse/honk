@@ -1525,9 +1525,9 @@ bucket 的順序列出已通過 admission 的非 worker 訂閱；各來源表內
 
 ### 延遲測量
 
-兩個介面使用上表所列的 URL 參數與並行上限。
+兩個介面使用上表所列的 URL 參數與並行上限；群組成員超過 256 個時回傳 `413 Payload Too Large`。
 
-兩個延遲介面都接受以毫秒計的 `timeout`；省略或為 0 時為 15000。範例：`GET /proxies/edge/delay?url=https%3A%2F%2Fexample.com%2Fgenerate_204&timeout=5000`。
+兩個延遲介面都接受以毫秒計的 `timeout`，非零值上限為 30000（30 秒）；省略或為 0 時為 15000。範例：`GET /proxies/edge/delay?url=https%3A%2F%2Fexample.com%2Fgenerate_204&timeout=5000`。
 
 延遲測試使用正規的 HTTP 檢查目標解碼器。HEAD 保留原始路徑與查詢字串，點段與只有查詢字串的 `/?query` 也算在內；authority 會去掉憑證與預設連接埠；片段不會送出。它和週期健康檢查共用 HTTP 實作，回報第二輪請求的熱路徑 RTT，不含代理撥號、目標 TLS 與第一輪請求。HTTPS 會驗證憑證，協商 HTTP/2 或 HTTP/1.1，並停用伺服器 push。
 

@@ -1623,9 +1623,9 @@ The generation matches the active DNS runtime generation. Source IDs are snapsho
 
 ### Delay measurement
 
-The caller selects the test URL with `?url=`. A group request fans out to at most `URLTEST_MAX_CONCURRENT` (10) proxied measurements at once.
+The caller selects the test URL with `?url=`. A group request fans out to at most `URLTEST_MAX_CONCURRENT` (10) proxied measurements at once and rejects groups with more than 256 members (`413 Payload Too Large`).
 
-Both delay routes accept `timeout` in milliseconds. An omitted value or 0 means 15000. Example: `GET /proxies/edge/delay?url=https%3A%2F%2Fexample.com%2Fgenerate_204&timeout=5000`.
+Both delay routes accept `timeout` in milliseconds, capped at 30000 (30 seconds) when nonzero. An omitted value or 0 means 15000. Example: `GET /proxies/edge/delay?url=https%3A%2F%2Fexample.com%2Fgenerate_204&timeout=5000`.
 
 Delay tests use the canonical HTTP check-target decoder:
 
