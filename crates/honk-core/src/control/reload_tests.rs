@@ -2972,6 +2972,8 @@ async fn canceled_auxiliary_reload_recovers_the_canonical_config_before_and_afte
     }
     #[cfg(feature = "native-api")]
     {
+        use crate::ebpf::userspace::GatewayReload;
+
         let current = cp.config.read().await.as_ref().clone();
         let flags = cp.datapath_flags.as_ref().unwrap();
         *cp.mode_state.as_ref().unwrap().write() = crate::mode::ModeState::native();

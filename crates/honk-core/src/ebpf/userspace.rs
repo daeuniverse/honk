@@ -17,6 +17,25 @@ enum GatewayDnsReload {
     Closed,
 }
 
+/// Reload operations for software policy, including before a gateway publisher is installed.
+#[cfg(target_os = "linux")]
+pub trait GatewayReload {
+    fn pause_gateway_auxiliary(&mut self);
+    fn restore_gateway_auxiliary(&mut self) -> std::io::Result<()>;
+    fn verify_gateway_auxiliary(
+        &self,
+        fingerprint: [u8; 32],
+        generation: u64,
+    ) -> std::io::Result<()>;
+    fn stage_gateway_dns_reload(&mut self, generation: u64);
+    fn finish_gateway_dns_reload(
+        &mut self,
+        generation: u64,
+        fingerprint: [u8; 32],
+    ) -> std::io::Result<bool>;
+    fn degrade_gateway_dns(&mut self);
+}
+
 pub struct UserspaceBackend {
     policy: PolicyState,
     admission: Arc<AtomicBool>,
@@ -56,17 +75,18 @@ impl UserspaceBackend {
     pub(crate) fn gateway(&self) -> Option<&Arc<GatewayPublisher>> {
         self.gateway.as_ref()
     }
+}
 
-    #[cfg(target_os = "linux")]
-    pub(crate) fn pause_gateway_auxiliary(&mut self) {
+#[cfg(target_os = "linux")]
+impl GatewayReload for UserspaceBackend {
+    fn pause_gateway_auxiliary(&mut self) {
         self.auxiliary_fenced = true;
         if let Some(publisher) = &self.gateway {
             publisher.pause_auxiliary();
         }
     }
 
-    #[cfg(target_os = "linux")]
-    pub(crate) fn restore_gateway_auxiliary(&mut self) -> std::io::Result<()> {
+    fn restore_gateway_auxiliary(&mut self) -> std::io::Result<()> {
         if self.auxiliary_fenced
             && let Some(publisher) = &self.gateway
         {
@@ -76,8 +96,7 @@ impl UserspaceBackend {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
-    pub(crate) fn verify_gateway_auxiliary(
+    fn verify_gateway_auxiliary(
         &self,
         fingerprint: [u8; 32],
         generation: u64,
@@ -100,8 +119,7 @@ impl UserspaceBackend {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
-    pub(crate) fn stage_gateway_dns_reload(&mut self, generation: u64) {
+    fn stage_gateway_dns_reload(&mut self, generation: u64) {
         // Capture can register after canonical commit releases the backend lock.
         if self.gateway_dns_reload != GatewayDnsReload::Closed {
             self.gateway_dns_reload = GatewayDnsReload::Pending(generation);
@@ -111,8 +129,7 @@ impl UserspaceBackend {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    pub(crate) fn finish_gateway_dns_reload(
+    fn finish_gateway_dns_reload(
         &mut self,
         generation: u64,
         fingerprint: [u8; 32],
@@ -130,8 +147,7 @@ impl UserspaceBackend {
         Ok(true)
     }
 
-    #[cfg(target_os = "linux")]
-    pub(crate) fn degrade_gateway_dns(&mut self) {
+    fn degrade_gateway_dns(&mut self) {
         if self.gateway_dns_reload != GatewayDnsReload::Closed {
             self.gateway_dns_reload = GatewayDnsReload::Degraded;
             if let Some(publisher) = &self.gateway {
@@ -156,6 +172,12 @@ impl DomainProjectionSink for UserspaceBackend {
 
 #[async_trait]
 impl PolicyBackend for UserspaceBackend {
+    #[cfg(target_os = "linux")]
+    fn gateway_reload(&mut self) -> Option<&mut dyn GatewayReload> {
+        Some(self)
+    }
+
+    #[cfg(test)]
     fn userspace_mut(&mut self) -> anyhow::Result<&mut UserspaceBackend> {
         Ok(self)
     }

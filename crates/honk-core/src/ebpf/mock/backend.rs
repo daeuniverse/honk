@@ -228,6 +228,20 @@ impl PolicyBackend for MockEbpfBackend {
         self.policy.next_generation
     }
 
+    #[cfg(feature = "native-api")]
+    fn bind_kernel_trace_dictionary(
+        &mut self,
+        dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
+    ) {
+        if let Some(owner) = &self.policy.routing_generation {
+            self.trace_dictionaries.bind(
+                self.policy.descriptor.trace_policy,
+                owner.fingerprint,
+                dictionary,
+            );
+        }
+    }
+
     fn active_routing_slot(&self) -> anyhow::Result<u32> {
         Ok(self.policy.active_slot)
     }
@@ -703,20 +717,6 @@ impl EbpfBackend for MockEbpfBackend {
         self.redirect_tracks
             .insert(Self::redirect_tuple_bytes(key), *entry);
         Ok(())
-    }
-
-    #[cfg(feature = "native-api")]
-    fn bind_kernel_trace_dictionary(
-        &mut self,
-        dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
-    ) {
-        if let Some(owner) = &self.policy.routing_generation {
-            self.trace_dictionaries.bind(
-                self.policy.descriptor.trace_policy,
-                owner.fingerprint,
-                dictionary,
-            );
-        }
     }
 
     #[cfg(feature = "native-api")]

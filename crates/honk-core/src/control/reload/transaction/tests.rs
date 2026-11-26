@@ -1,6 +1,24 @@
 use super::*;
 mod chain_membership;
 
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_gateway_reload_capability_fails_required_auxiliary() {
+    let mut backend = crate::ebpf::mock::MockEbpfBackend::new();
+    let mut datapath = DatapathReloadTx {
+        backend: &mut backend,
+    };
+    let fingerprint = [0; 32];
+    let verdict = CommittedDatapath::Activate {
+        generation: 1,
+        fingerprint,
+    };
+
+    assert!(datapath.settle_committed_gateway(&verdict, false));
+    assert!(!datapath.settle_committed_gateway(&verdict, true));
+    assert!(!datapath.restore_rejected_auxiliary(fingerprint, 1));
+}
+
 fn subscription(id: u128, name: &str, ua: Option<&str>) -> honk_config::subscription::Subscription {
     honk_config::subscription::Subscription {
         id: uuid::Uuid::from_u128(id),

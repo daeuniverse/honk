@@ -505,6 +505,12 @@ pub trait PolicyBackend: DomainProjectionSink {
     fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)>;
     fn tc_mut(&mut self) -> anyhow::Result<&mut (dyn EbpfBackend + 'static)>;
 
+    #[cfg(target_os = "linux")]
+    fn gateway_reload(&mut self) -> Option<&mut dyn userspace::GatewayReload> {
+        None
+    }
+
+    #[cfg(test)]
     fn userspace_mut(&mut self) -> anyhow::Result<&mut userspace::UserspaceBackend> {
         anyhow::bail!("policy backend is not the userspace backend")
     }
@@ -629,6 +635,15 @@ pub trait PolicyBackend: DomainProjectionSink {
     ) -> anyhow::Result<()>;
     /// Return the committed compiled-policy generation, not the active slot.
     fn routing_policy_generation(&self) -> u64;
+
+    /// Bind a dictionary to the current routing owner. Packet backends have no kernel witnesses.
+    #[cfg(feature = "native-api")]
+    fn bind_kernel_trace_dictionary(
+        &mut self,
+        _dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
+    ) {
+    }
+
     /// Return the slot currently selected by the stable policy root.
     fn active_routing_slot(&self) -> anyhow::Result<u32> {
         Ok(0)
@@ -890,13 +905,6 @@ pub trait EbpfBackend: PolicyBackend {
         _entry: &RedirectEntry,
     ) -> anyhow::Result<()> {
         anyhow::bail!("raw redirect-track fixture writes are unsupported")
-    }
-
-    #[cfg(feature = "native-api")]
-    fn bind_kernel_trace_dictionary(
-        &mut self,
-        _dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
-    ) {
     }
 
     #[cfg(feature = "native-api")]

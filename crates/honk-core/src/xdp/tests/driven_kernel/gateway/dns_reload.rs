@@ -7,7 +7,7 @@ mod quic_udp;
 use super::{Config, ControlPlane, Fixture};
 use crate::{
     control::{ControlCommand, ReloadOutcome, ReloadReply, routing_matcher::RoutingPushPlan},
-    ebpf::PolicyBackend,
+    ebpf::{PolicyBackend, userspace::GatewayReload},
     routing::Router,
 };
 use anyhow::{Context, ensure};

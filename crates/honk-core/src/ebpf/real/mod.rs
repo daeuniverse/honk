@@ -629,6 +629,17 @@ impl PolicyBackend for RealEbpfBackend {
         self.routing_generation_counter
     }
 
+    #[cfg(feature = "native-api")]
+    fn bind_kernel_trace_dictionary(
+        &mut self,
+        dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
+    ) {
+        if let Some(owner) = &self.routing_generation {
+            self.trace_dictionaries
+                .bind(owner.trace_policy, owner.fingerprint, dictionary);
+        }
+    }
+
     fn active_routing_slot(&self) -> anyhow::Result<u32> {
         Ok(self.routing_slot)
     }
@@ -917,17 +928,6 @@ impl EbpfBackend for RealEbpfBackend {
     #[cfg(test)]
     fn redirect_track_store(&mut self, k: &RedirectTuple, e: &RedirectEntry) -> anyhow::Result<()> {
         self.flow_insert("REDIRECT_TRACK", k, e)
-    }
-
-    #[cfg(feature = "native-api")]
-    fn bind_kernel_trace_dictionary(
-        &mut self,
-        dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
-    ) {
-        if let Some(owner) = &self.routing_generation {
-            self.trace_dictionaries
-                .bind(owner.trace_policy, owner.fingerprint, dictionary);
-        }
     }
 
     #[cfg(feature = "native-api")]
