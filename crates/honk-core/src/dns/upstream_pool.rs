@@ -341,6 +341,16 @@ struct AdmissionPause {
 }
 
 impl UpstreamPool {
+    pub(crate) fn with_endpoint_bootstrap(
+        self,
+        resolver: Arc<dyn crate::dns::endpoint::EndpointBootstrap>,
+    ) -> Self {
+        for entry in self.entries.values() {
+            let _ = entry.endpoint.imported_bootstrap.set(Arc::clone(&resolver));
+        }
+        self
+    }
+
     pub fn new(upstreams: &[DnsUpstream], router: Arc<DnsRouter>) -> anyhow::Result<Self> {
         Self::new_with_proxy(upstreams, router, None, Vec::new(), Vec::new())
     }

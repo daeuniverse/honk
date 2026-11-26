@@ -35,7 +35,34 @@ fn normalize_reload_metadata(current: &Config, candidate: &mut Config) {
         subscription.created_at = current.created_at;
         subscription.last_updated = current.last_updated;
         subscription.node_count = current.node_count;
+        if subscription.imported_dns == current.imported_dns {
+            subscription.accepted_dns_source = current.accepted_dns_source.clone();
+        }
     }
+}
+
+pub(in crate::control) fn capture_accepted_dns_sources(
+    config: &Config,
+) -> Vec<Option<std::sync::Arc<serde_yaml::Value>>> {
+    config
+        .subscriptions
+        .iter()
+        .map(|subscription| subscription.accepted_dns_source.clone())
+        .collect()
+}
+
+pub(in crate::control) fn restore_accepted_dns_sources(
+    config: &mut Config,
+    incoming: Vec<Option<std::sync::Arc<serde_yaml::Value>>>,
+) -> bool {
+    let mut changed = false;
+    for (subscription, source) in config.subscriptions.iter_mut().zip(incoming) {
+        if subscription.accepted_dns_source != source {
+            subscription.accepted_dns_source = source;
+            changed = true;
+        }
+    }
+    changed
 }
 
 pub(in crate::control) fn effective_config_unchanged(
@@ -174,6 +201,12 @@ mod tests {
         candidate.subscriptions[0].created_at += chrono::Duration::seconds(1);
         candidate.subscriptions[0].last_updated = Some(chrono::Utc::now());
         candidate.subscriptions[0].node_count += 1;
+        current.subscriptions[0].accepted_dns_source = Some(std::sync::Arc::new(
+            serde_yaml::from_str("nameserver: 192.0.2.1").unwrap(),
+        ));
+        candidate.subscriptions[0].accepted_dns_source = Some(std::sync::Arc::new(
+            serde_yaml::from_str("nameserver: 192.0.2.2").unwrap(),
+        ));
         assert!(effective_config_unchanged(&current, &mut candidate));
 
         candidate.nodes[0].shadowsocks_mut().unwrap().password = Some("changed".into());

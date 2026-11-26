@@ -5,6 +5,102 @@ use std::future::ready;
 use std::sync::atomic::AtomicUsize;
 
 #[tokio::test]
+async fn captured_node_dns_keeps_source_and_generation_in_background_work() {
+    struct Resolver(std::net::IpAddr, uuid::Uuid);
+    impl crate::bootstrap::NodeHostResolver for Resolver {
+        fn lookup(&self, _: &str) -> Option<crate::bootstrap::NodeHostLookup> {
+            None
+        }
+        fn lookup_node(
+            &self,
+            node: uuid::Uuid,
+            host: &str,
+        ) -> Option<crate::bootstrap::NodeHostLookup> {
+            assert!(node == uuid::Uuid::from_u128(41) || node == self.1);
+            assert!(matches!(host, "node.test" | "download.node.test"));
+            let address = self.0;
+            Some(Box::pin(async move { Ok(vec![address]) }))
+        }
+    }
+    let anytls = honk_config::node::Node::from_share_link("anytls://secret@node.test:443").unwrap();
+    let old = OutboundRuntimeRegistry::build(&[]).unwrap();
+    let new = OutboundRuntimeRegistry::build(std::slice::from_ref(&anytls)).unwrap();
+    new.activate_background_dial_admission();
+    old.bind_node_resolver(Arc::new(Resolver("192.0.2.41".parse().unwrap(), anytls.id)));
+    new.bind_node_resolver(Arc::new(Resolver("192.0.2.42".parse().unwrap(), anytls.id)));
+    let captured = old
+        .scope_node_dials(uuid::Uuid::from_u128(41), async {
+            capture_dial_admission()
+        })
+        .await;
+    let result =
+        tokio::spawn(captured.scope(async { crate::bootstrap::resolve_node("node.test").await }))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(result, ["192.0.2.41".parse::<std::net::IpAddr>().unwrap()]);
+    #[cfg(feature = "owned-tasks")]
+    {
+        let captured = old
+            .scope_node_dials(
+                uuid::Uuid::from_u128(41),
+                old.scope_pinned_dials("node.test", "192.0.2.99".parse().unwrap(), async {
+                    capture_dial_admission()
+                }),
+            )
+            .await;
+        let (main, download) = tokio::spawn(captured.scope(async {
+            (
+                crate::bootstrap::resolve_node("node.test").await.unwrap(),
+                crate::bootstrap::resolve_node("download.node.test")
+                    .await
+                    .unwrap(),
+            )
+        }))
+        .await
+        .unwrap();
+        assert_eq!(main, ["192.0.2.99".parse::<std::net::IpAddr>().unwrap()]);
+        assert_eq!(
+            download,
+            ["192.0.2.41".parse::<std::net::IpAddr>().unwrap()]
+        );
+    }
+    let result = new
+        .scope_node_dials(
+            uuid::Uuid::from_u128(41),
+            crate::bootstrap::resolve_node("node.test"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, ["192.0.2.42".parse::<std::net::IpAddr>().unwrap()]);
+    let fork = old.fork_for_dns().unwrap();
+    let result = fork
+        .scope_node_dials(
+            uuid::Uuid::from_u128(41),
+            crate::bootstrap::resolve_node("node.test"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, ["192.0.2.41".parse::<std::net::IpAddr>().unwrap()]);
+
+    let bg_admission = new
+        .get(&anytls.id)
+        .unwrap()
+        .anytls_pool()
+        .unwrap()
+        .dial_admission()
+        .expect("activate_background_dial_admission bound pool admission");
+    let bg_resolved = tokio::spawn(bg_admission.scope(crate::bootstrap::resolve_node("node.test")))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        bg_resolved,
+        ["192.0.2.42".parse::<std::net::IpAddr>().unwrap()]
+    );
+}
+
+#[tokio::test]
 async fn cancelled_parallel_waits_preserve_siblings_without_sticky_capacity() {
     let (predecessor, _) =
         OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, false, None)

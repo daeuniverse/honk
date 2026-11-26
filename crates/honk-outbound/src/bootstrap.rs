@@ -75,6 +75,60 @@ pub trait NodeHostResolver: Send + Sync {
     /// `None` leaves `host` to the bootstrap resolver. A returned lookup is
     /// authoritative: its failure is the dial's failure.
     fn lookup(&self, host: &str) -> Option<NodeHostLookup>;
+
+    /// Resolve an endpoint using its owning node's subscription and generation.
+    fn lookup_node(&self, _node: uuid::Uuid, host: &str) -> Option<NodeHostLookup> {
+        self.lookup(host)
+    }
+
+    /// Generation-captured numeric bootstrap resolver when `lookup_node` declines `host`.
+    fn fallback_bootstrap(&self) -> Option<BootstrapResolver> {
+        None
+    }
+
+    /// Whether this is the daemon's process-wide `NodeHostRouting` compatibility hook.
+    fn is_process_subtag_fallback(&self) -> bool {
+        false
+    }
+}
+
+impl std::fmt::Debug for dyn NodeHostResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NodeHostResolver")
+    }
+}
+
+/// Lookup through an explicitly installed non-daemon `NodeHostResolver`.
+pub fn lookup_custom_hook(host: &str) -> Option<NodeHostLookup> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let resolver = NODE_HOSTS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    resolver
+        .filter(|resolver| !resolver.is_process_subtag_fallback())
+        .and_then(|resolver| resolver.lookup(bare))
+}
+
+/// Resolve a physical node endpoint in the captured outbound generation.
+pub async fn resolve_node(host: &str) -> io::Result<Vec<IpAddr>> {
+    let bare = host.trim_matches(['[', ']']);
+    if let Some(address) = crate::runtime::pinned_server_address(bare) {
+        return Ok(vec![address]);
+    }
+    if let Ok(address) = bare.parse() {
+        return Ok(vec![address]);
+    }
+    if let Some((resolver, node)) = crate::runtime::node_host_resolver() {
+        if let Some(lookup) = resolver.lookup_node(node, host) {
+            return lookup.await;
+        }
+        if let Some(lookup) = lookup_custom_hook(bare) {
+            return lookup.await;
+        }
+        return resolve_with(resolver.fallback_bootstrap().or_else(global), host).await;
+    }
+    resolve(host).await
 }
 
 static NODE_HOSTS: RwLock<Option<Arc<dyn NodeHostResolver>>> = RwLock::new(None);
@@ -112,7 +166,7 @@ pub fn resolve_with<'a>(
     resolver: Option<BootstrapResolver>,
     host: &'a str,
 ) -> impl Future<Output = io::Result<Vec<IpAddr>>> + Send + use<'a> {
-    resolve_with_inner(resolver, host, None, || std::future::ready(Ok(())))
+    resolve_with_inner(resolver, host, None, true, || std::future::ready(Ok(())))
 }
 
 /// Resolve with socket admission only around configured or system DNS queries.
@@ -127,13 +181,28 @@ where
     Admit: FnMut() -> Admission,
     Admission: Future<Output = io::Result<Guard>>,
 {
-    resolve_with_inner(resolver, host, Some(deadline), admit)
+    resolve_with_inner(resolver, host, Some(deadline), true, admit)
+}
+
+/// Bootstrap a DNS upstream independently of any pinned proxy-node address.
+pub fn resolve_upstream_with_admission<'a, Admit, Admission, Guard>(
+    resolver: Option<BootstrapResolver>,
+    host: &'a str,
+    deadline: tokio::time::Instant,
+    admit: Admit,
+) -> impl Future<Output = io::Result<Vec<IpAddr>>> + use<'a, Admit, Admission, Guard>
+where
+    Admit: FnMut() -> Admission,
+    Admission: Future<Output = io::Result<Guard>>,
+{
+    resolve_with_inner(resolver, host, Some(deadline), false, admit)
 }
 
 async fn resolve_with_inner<Admit, Admission, Guard>(
     resolver: Option<BootstrapResolver>,
     host: &str,
     deadline: Option<tokio::time::Instant>,
+    use_node_pin: bool,
     mut admit: Admit,
 ) -> io::Result<Vec<IpAddr>>
 where
@@ -141,7 +210,7 @@ where
     Admission: Future<Output = io::Result<Guard>>,
 {
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    if let Some(ip) = crate::runtime::pinned_server_address(host) {
+    if use_node_pin && let Some(ip) = crate::runtime::pinned_server_address(host) {
         return Ok(vec![ip]);
     }
     if let Ok(ip) = host.parse::<IpAddr>() {

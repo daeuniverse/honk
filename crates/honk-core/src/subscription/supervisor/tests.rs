@@ -440,7 +440,10 @@ fn shutdown_joins_queued_blocking_persistence() {
             }
             FetchCompletion {
                 authorized: fetched,
-                result: Some(Ok((Vec::new(), SubscriptionUserinfo::default()))),
+                result: Some(Ok((
+                    super::super::SubscriptionContent::default(),
+                    SubscriptionUserinfo::default(),
+                ))),
                 diagnostics,
             }
         });
@@ -758,12 +761,12 @@ async fn deferred_provider_survives_same_revision_reconcile_until_replaced() {
         panic!("expected replacement publication");
     };
     assert_eq!(revision, 2);
-    assert_eq!(nodes[0].name, "replacement");
+    assert_eq!(nodes.nodes[0].name, "replacement");
     assert!(handle.deferred_subscriptions().await.unwrap().is_empty());
     result
         .send(SubscriptionMergeReply {
             outcome: ReloadOutcome::Committed { generation: 2 },
-            node_count: nodes.len(),
+            node_count: nodes.nodes.len(),
             authorized: vec![provider.clone()],
             rejection: None,
         })
@@ -973,5 +976,91 @@ async fn startup_fetch_replaces_the_providers_own_nodes() {
     assert!(load.updated_at.is_some());
     assert!(!load.cached);
     assert_eq!((load.error, load.rejection), (None, None));
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn startup_restores_and_fetches_imported_dns_while_rejecting_duplicate_provider_dns() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SubscriptionStore::in_dir(temp.path());
+    let idle_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let live_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cached_provider = authorized(
+        uuid::Uuid::new_v4(),
+        1,
+        format!("http://{}/cached", idle_listener.local_addr().unwrap()),
+    );
+    cached_provider.subscription.import_dns = true;
+    store
+        .store_content(
+            &cached_provider.subscription,
+            "proxies:\n - {name: cached, type: socks5, server: cached.example, port: 1080}\ndns:\n nameserver: 192.0.2.10\n"
+                .into(),
+        )
+        .await
+        .unwrap();
+
+    let mut fetched_provider = authorized(
+        uuid::Uuid::new_v4(),
+        1,
+        format!("http://{}/fetched", live_listener.local_addr().unwrap()),
+    );
+    fetched_provider.subscription.import_dns = true;
+    let server = tokio::spawn(serve_once(
+        live_listener,
+        "proxies:\n - {name: fetched, type: socks5, server: fetched.example, port: 1081}\ndns:\n nameserver: 192.0.2.20\n",
+    ));
+
+    let mut dup_provider = authorized(
+        uuid::Uuid::new_v4(),
+        1,
+        format!("http://{}/dup", idle_listener.local_addr().unwrap()),
+    );
+    dup_provider.subscription.import_dns = true;
+    store
+        .store_content(
+            &dup_provider.subscription,
+            "proxies:\n - {name: dup, type: socks5, server: 127.0.0.1, port: 1099}\ndns:\n nameserver: 192.0.2.99\n"
+                .into(),
+        )
+        .await
+        .unwrap();
+
+    let mut config = Config {
+        nodes: inline("socks5://127.0.0.1:1099#inline"),
+        subscriptions: vec![
+            cached_provider.subscription.clone(),
+            fetched_provider.subscription.clone(),
+            dup_provider.subscription.clone(),
+        ],
+        ..Default::default()
+    };
+    let mut state =
+        SupervisorState::new(Arc::new(SubscriptionManager::new().unwrap()), Some(store));
+    state.reconcile(vec![cached_provider, fetched_provider, dup_provider]);
+
+    state.prepare_startup(&mut config, Vec::new()).await;
+    server.await.unwrap();
+
+    assert_eq!(
+        config.subscriptions[0]
+            .imported_dns
+            .as_ref()
+            .unwrap()
+            .nameservers[0]
+            .address,
+        "192.0.2.10"
+    );
+    assert_eq!(
+        config.subscriptions[1]
+            .imported_dns
+            .as_ref()
+            .unwrap()
+            .nameservers[0]
+            .address,
+        "192.0.2.20"
+    );
+    assert!(config.subscriptions[2].imported_dns.is_none());
+    assert!(config.subscriptions[2].accepted_dns_source.is_none());
     state.shutdown().await.unwrap();
 }

@@ -408,12 +408,15 @@ impl Tunnel<'_> {
                     return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
                 }
                 self.generation
-                    .scope_dials(tcp.dial_runtime(
-                        std::sync::Arc::clone(runtime),
-                        self.addr,
-                        self.domain.as_deref(),
-                        self.connect_timeout,
-                    ))
+                    .scope_node_dials(
+                        runtime.node.id,
+                        tcp.dial_runtime(
+                            std::sync::Arc::clone(runtime),
+                            self.addr,
+                            self.domain.as_deref(),
+                            self.connect_timeout,
+                        ),
+                    )
                     .await
             }
             TunnelVia::Route { registry, route } => {

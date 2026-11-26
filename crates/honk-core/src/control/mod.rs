@@ -523,3 +523,6 @@ pub(crate) fn direct_check_addr(bootstrap_resolver: &str) -> String {
 
 #[cfg(test)]
 use preconnect::preconnect_candidates;
+
+#[cfg(test)]
+mod subscription_dns_tests;

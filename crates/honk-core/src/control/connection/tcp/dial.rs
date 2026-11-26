@@ -434,10 +434,10 @@ impl ControlPlaneHandle {
                         ))
                     });
                     match generation
-                        .scope_dials(honk_outbound::util::connect_outbound(
-                            &node_addr,
-                            connect_timeout,
-                        ))
+                        .scope_node_dials(
+                            node.id,
+                            honk_outbound::util::connect_outbound(&node_addr, connect_timeout),
+                        )
                         .await
                     {
                         Ok(stream) => {
@@ -447,7 +447,13 @@ impl ControlPlaneHandle {
                                 }
                                 return;
                             }
-                            if pool.deposit_tcp(&node_addr, stream).await {
+                            if pool
+                                .deposit_tcp(
+                                    &ConnectionPool::bare_key(generation.generation(), &node),
+                                    stream,
+                                )
+                                .await
+                            {
                                 if let Some(reporter) = &pool_reporter {
                                     reporter.setup_succeeded();
                                     reporter.finish_setup_only();
@@ -637,10 +643,10 @@ impl ControlPlaneHandle {
                 ))
             });
             match generation
-                .scope_dials(honk_outbound::util::connect_outbound(
-                    &node_addr,
-                    connect_timeout,
-                ))
+                .scope_node_dials(
+                    node.id,
+                    honk_outbound::util::connect_outbound(&node_addr, connect_timeout),
+                )
                 .await
             {
                 Ok(stream) => {
@@ -650,7 +656,13 @@ impl ControlPlaneHandle {
                         }
                         return;
                     }
-                    if pool.deposit_tcp(&node_addr, stream).await {
+                    if pool
+                        .deposit_tcp(
+                            &ConnectionPool::bare_key(generation.generation(), &node),
+                            stream,
+                        )
+                        .await
+                    {
                         if let Some(reporter) = &pool_reporter {
                             reporter.setup_succeeded();
                             reporter.finish_setup_only();
@@ -809,7 +821,9 @@ impl ControlPlaneHandle {
             // protocols opt out because their node runtime owns the transport.
             if !pool_disabled
                 && (entry.descriptor.pool_bare_tcp)(node)
-                && let Some(tcp) = pool.acquire_tcp(&addr).await
+                && let Some(tcp) = pool
+                    .acquire_tcp(&ConnectionPool::bare_key(generation.generation(), node))
+                    .await
             {
                 scope.start();
                 tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);

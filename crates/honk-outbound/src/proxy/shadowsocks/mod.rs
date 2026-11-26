@@ -523,7 +523,7 @@ impl ShadowsocksHandler {
         // connected, which also pins the reply peer.
         let lookup = format!("{}:{}", node.host(), node.port);
         let server_addr = tokio::time::timeout(connect_timeout, async {
-            let resolution = crate::bootstrap::resolve(node.host());
+            let resolution = crate::bootstrap::resolve_node(node.host());
             let (resolution, selection) =
                 crate::runtime::flow_observation::observe_resolution(resolution).await;
             let ip = resolution?.into_iter().next().ok_or_else(|| {

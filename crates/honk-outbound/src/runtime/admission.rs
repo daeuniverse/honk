@@ -50,6 +50,8 @@ struct DialAdmission {
     generation: Arc<tokio::sync::Semaphore>,
     process: Arc<tokio::sync::Semaphore>,
     endpoints: PinnedServers,
+    node: Option<uuid::Uuid>,
+    resolver: Arc<std::sync::OnceLock<Arc<dyn crate::bootstrap::NodeHostResolver>>>,
 }
 
 impl DialAdmission {
@@ -58,6 +60,8 @@ impl DialAdmission {
             generation: Arc::clone(&registry.dial_semaphore),
             process: Arc::clone(&registry.dial_ceiling_semaphore),
             endpoints: PinnedServers::default(),
+            node: None,
+            resolver: Arc::clone(&registry.node_resolver),
         }
     }
 
@@ -94,6 +98,8 @@ static STANDALONE_DIAL_ADMISSION: LazyLock<DialAdmission> = LazyLock::new(|| Dia
         tokio::sync::Semaphore::MAX_PERMITS,
     )),
     endpoints: PinnedServers::default(),
+    node: None,
+    resolver: Arc::new(std::sync::OnceLock::new()),
 });
 
 #[derive(Default)]
@@ -112,7 +118,7 @@ struct Progress {
 /// One logical dial's physical admission, retained permits, and start boundary.
 pub struct DialScope {
     admission: DialAdmission,
-    permits: parking_lot::Mutex<DialPermits>,
+    permits: Arc<parking_lot::Mutex<DialPermits>>,
     progress: Arc<parking_lot::Mutex<Progress>>,
 }
 
@@ -120,7 +126,7 @@ impl DialScope {
     fn new(admission: DialAdmission, on_start: Option<Box<dyn FnOnce() + Send>>) -> Arc<Self> {
         Arc::new(Self {
             admission,
-            permits: parking_lot::Mutex::new(DialPermits::default()),
+            permits: Arc::new(parking_lot::Mutex::new(DialPermits::default())),
             progress: Arc::new(parking_lot::Mutex::new(Progress {
                 on_start,
                 ..Default::default()
@@ -240,7 +246,7 @@ impl CapturedDialScope {
         Self(
             Arc::new(DialScope {
                 admission: self.0.admission.clone(),
-                permits: parking_lot::Mutex::new(DialPermits::default()),
+                permits: Arc::new(parking_lot::Mutex::new(DialPermits::default())),
                 progress: Arc::clone(&self.0.progress),
             }),
             self.1.clone(),
@@ -350,6 +356,38 @@ pub(crate) fn capture_dial_admission() -> CapturedDialAdmission {
     try_capture_dial_admission().unwrap_or_else(CapturedDialAdmission::standalone)
 }
 
+pub(crate) fn node_host_resolver()
+-> Option<(Arc<dyn crate::bootstrap::NodeHostResolver>, uuid::Uuid)> {
+    DIAL_SCOPE
+        .try_with(|scope| {
+            Some((
+                Arc::clone(scope.admission.resolver.get()?),
+                scope.admission.node?,
+            ))
+        })
+        .ok()
+        .flatten()
+}
+
+pub(crate) async fn scope_node<F: Future>(node: uuid::Uuid, future: F) -> F::Output {
+    let future = std::pin::pin!(future);
+    let scope = DIAL_SCOPE
+        .try_with(|parent| {
+            let mut admission = parent.admission.clone();
+            admission.node = Some(node);
+            Arc::new(DialScope {
+                admission,
+                permits: Arc::clone(&parent.permits),
+                progress: Arc::clone(&parent.progress),
+            })
+        })
+        .ok();
+    match scope {
+        Some(scope) => DIAL_SCOPE.scope(scope, future).await,
+        None => future.await,
+    }
+}
+
 pub(crate) fn pinned_server_address(host: &str) -> Option<IpAddr> {
     DIAL_SCOPE
         .try_with(|scope| {
@@ -411,6 +449,41 @@ pub(crate) fn start_scoped_dial() {
 }
 
 impl OutboundRuntimeRegistry {
+    /// Carry this physical endpoint's node identity through captured dial factories.
+    pub async fn scope_node_dials<F: Future>(&self, node: uuid::Uuid, future: F) -> F::Output {
+        let future = std::pin::pin!(future);
+        if DIAL_SCOPE
+            .try_with(|scope| scope.admission.matches_registry(self))
+            .unwrap_or(false)
+        {
+            return scope_node(node, future).await;
+        }
+        let mut admission = DialAdmission::for_registry(self);
+        admission.node = Some(node);
+        DIAL_SCOPE
+            .scope(DialScope::new(admission, None), future)
+            .await
+    }
+
+    /// Bind this physical entry's node identity and pre-resolved addresses to one scope.
+    #[cfg(feature = "owned-tasks")]
+    pub async fn scope_node_server_pins<F>(
+        &self,
+        node: uuid::Uuid,
+        pins: PinnedServers,
+        future: F,
+    ) -> F::Output
+    where
+        F: Future,
+    {
+        let mut admission = DialAdmission::for_registry(self);
+        admission.node = Some(node);
+        admission.endpoints = pins;
+        DIAL_SCOPE
+            .scope(DialScope::new(admission, None), future)
+            .await
+    }
+
     /// Configured admission ceiling for this immutable generation.
     pub fn dial_limit(&self) -> usize {
         self.dial_limit
@@ -442,6 +515,16 @@ impl OutboundRuntimeRegistry {
             return self.scope_dials(future).await;
         }
         let mut admission = DialAdmission::for_registry(self);
+        admission.node = DIAL_SCOPE
+            .try_with(|scope| {
+                scope
+                    .admission
+                    .matches_registry(self)
+                    .then_some(scope.admission.node)
+                    .flatten()
+            })
+            .ok()
+            .flatten();
         admission.endpoints = pins;
         DIAL_SCOPE
             .scope(DialScope::new(admission, None), future)
@@ -479,8 +562,10 @@ impl OutboundRuntimeRegistry {
     pub fn activate_background_dial_admission(&self) {
         let admission = DialAdmission::for_registry(self);
         for runtime in self.nodes.values() {
+            let mut admission = admission.clone();
+            admission.node = Some(runtime.node.id);
             runtime.bind_dial_admission(&CapturedDialAdmission(
-                admission.clone(),
+                admission,
                 #[cfg(feature = "owned-tasks")]
                 runtime.task_owner.as_ref().map(Arc::downgrade),
             ));

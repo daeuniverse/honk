@@ -1,6 +1,64 @@
 use super::*;
 mod chain_membership;
 
+#[test]
+fn subscription_rebase_uses_dns_accepted_with_live_nodes_and_locates_subscription_index() {
+    let mut first = subscription(10, "first", Some("ua-1"));
+    first.accepted_dns_source = Some(Arc::new(
+        serde_yaml::from_str("nameserver: 192.0.2.10").unwrap(),
+    ));
+    let mut live = subscription(1, "provider", None);
+    live.accepted_dns_source = Some(Arc::new(
+        serde_yaml::from_str("nameserver: 192.0.2.1").unwrap(),
+    ));
+    let current = Config {
+        subscriptions: vec![first.clone(), live],
+        nodes: vec![subscription_node("first", 10), subscription_node("live", 1)],
+        ..Default::default()
+    };
+    let incoming_first = subscription(20, "first", Some("ua-1"));
+    let mut incoming = subscription(2, "provider", None);
+    incoming.import_dns = true;
+    incoming.accepted_dns_source = Some(Arc::new(
+        serde_yaml::from_str("nameserver: 192.0.2.2").unwrap(),
+    ));
+    let mut candidate = Config {
+        subscriptions: vec![incoming_first, incoming],
+        nodes: vec![subscription_node("cached", 2)],
+        ..Default::default()
+    };
+    rebase_subscription_nodes(&current, &mut candidate);
+    crate::subscription::compile_imported_dns(&mut candidate).unwrap();
+    assert!(candidate.nodes.iter().any(|n| n.name == "live"));
+    assert!(candidate.subscriptions[0].imported_dns.is_none());
+    assert_eq!(
+        candidate.subscriptions[1]
+            .imported_dns
+            .as_ref()
+            .unwrap()
+            .nameservers[0]
+            .address,
+        "192.0.2.1"
+    );
+    candidate.subscriptions[1].import_dns = false;
+    crate::subscription::compile_imported_dns(&mut candidate).unwrap();
+    assert!(candidate.subscriptions[1].imported_dns.is_none());
+    assert!(candidate.subscriptions[1].accepted_dns_source.is_some());
+    candidate.subscriptions[1].import_dns = true;
+    candidate.subscriptions[1].accepted_dns_source = Some(Arc::new(
+        serde_yaml::from_str("nameserver: {invalid: true}").unwrap(),
+    ));
+    let err = crate::subscription::compile_imported_dns(&mut candidate).unwrap_err();
+    assert!(
+        err.diagnostic
+            .setting
+            .to_string()
+            .starts_with("subscriptions[2].dns"),
+        "expected 1-based subscription ordinal in diagnostic setting, got {}",
+        err.diagnostic.setting
+    );
+}
+
 fn subscription(id: u128, name: &str, ua: Option<&str>) -> honk_config::subscription::Subscription {
     honk_config::subscription::Subscription {
         id: uuid::Uuid::from_u128(id),

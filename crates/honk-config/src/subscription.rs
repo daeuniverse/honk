@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use crate::diagnostic::SourceRef;
 use crate::types::SubscriptionType;
 
+pub mod dns;
+
 /// A proxy subscription (e.g., subscription link).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subscription {
@@ -25,6 +27,13 @@ pub struct Subscription {
     /// Keep the fetched body for offline startup; only with `global.store_subscribe`.
     #[serde(default = "crate::types::default_true")]
     pub cache: bool,
+    /// Import DNS for this subscription's node endpoints only.
+    #[serde(default)]
+    pub import_dns: bool,
+    #[serde(skip)]
+    pub accepted_dns_source: Option<std::sync::Arc<serde_yaml::Value>>,
+    #[serde(skip)]
+    pub imported_dns: Option<std::sync::Arc<dns::SubscriptionDns>>,
     /// How the fetch leaves: empty or `routing` follows the routing rules,
     /// `direct` goes straight to the host, anything else names a group.
     #[serde(default)]
@@ -72,6 +81,9 @@ impl Default for Subscription {
             headers: Vec::new(),
             enabled: true,
             cache: true,
+            import_dns: false,
+            accepted_dns_source: None,
+            imported_dns: None,
             download_detour: String::new(),
             last_updated: None,
             node_count: 0,

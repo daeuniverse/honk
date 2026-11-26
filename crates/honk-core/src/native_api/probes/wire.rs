@@ -241,59 +241,68 @@ async fn attempt_wire(
         return AttemptOutcome::refused();
     };
     let runtime = ephemeral.runtime();
-    let operation = async {
-        if plan.spec.kind == Kind::Http {
-            let timeout = deadline.saturating_duration_since(Instant::now());
-            bounded(
-                deadline,
-                cancel.clone(),
-                honk_outbound::urltest::measure_pinned_http_probe(
-                    &runtime,
-                    entry.tcp.as_ref(),
-                    plan.http.as_ref().expect("HTTP plan"),
-                    addr,
-                    plan.spec.warmth == Warmth::Cold,
-                    timeout,
-                ),
-            )
-            .await?
-        } else {
-            bounded(deadline, cancel.clone(), async {
-                let connect_timeout = Duration::from_millis(plan.config.global.connect_timeout_ms)
-                    .min(deadline.saturating_duration_since(Instant::now()));
-                match candidate.transport {
-                    Transport::Tcp => {
-                        let mut proxy = entry
-                            .tcp
-                            .dial_runtime(Arc::clone(&runtime), addr, None, connect_timeout)
-                            .await?;
-                        tcp_dns(&mut proxy.stream).await
+    let entry_id = runtime
+        .chain_entry_node()
+        .map_or(runtime.node.id, |entry| entry.id);
+    let result = {
+        let operation = std::pin::pin!(async {
+            if plan.spec.kind == Kind::Http {
+                let timeout = deadline.saturating_duration_since(Instant::now());
+                bounded(
+                    deadline,
+                    cancel.clone(),
+                    honk_outbound::urltest::measure_pinned_http_probe(
+                        &runtime,
+                        entry.tcp.as_ref(),
+                        plan.http.as_ref().expect("HTTP plan"),
+                        addr,
+                        plan.spec.warmth == Warmth::Cold,
+                        timeout,
+                    ),
+                )
+                .await?
+            } else {
+                bounded(deadline, cancel.clone(), async {
+                    let connect_timeout =
+                        Duration::from_millis(plan.config.global.connect_timeout_ms)
+                            .min(deadline.saturating_duration_since(Instant::now()));
+                    match candidate.transport {
+                        Transport::Tcp => {
+                            let mut proxy = entry
+                                .tcp
+                                .dial_runtime(Arc::clone(&runtime), addr, None, connect_timeout)
+                                .await?;
+                            tcp_dns(&mut proxy.stream).await
+                        }
+                        Transport::Udp => {
+                            let packet = entry.packet.as_ref().ok_or(
+                                honk_outbound::proxy::MissingProtocolHandler(
+                                    candidate.node.protocol(),
+                                ),
+                            )?;
+                            let transport = packet
+                                .dial_udp_transport_runtime(
+                                    Arc::clone(&runtime),
+                                    addr,
+                                    None,
+                                    connect_timeout,
+                                )
+                                .await?;
+                            crate::dns::forwarder::udp_dns_probe(transport.as_ref()).await
+                        }
                     }
-                    Transport::Udp => {
-                        let packet = entry.packet.as_ref().ok_or(
-                            honk_outbound::proxy::MissingProtocolHandler(candidate.node.protocol()),
-                        )?;
-                        let transport = packet
-                            .dial_udp_transport_runtime(
-                                Arc::clone(&runtime),
-                                addr,
-                                None,
-                                connect_timeout,
-                            )
-                            .await?;
-                        crate::dns::forwarder::udp_dns_probe(transport.as_ref()).await
-                    }
-                }
-            })
-            .await?
-        }
+                })
+                .await?
+            }
+        });
+        runtime
+            .scope_tasks(plan.registry.scope_node_server_pins(
+                entry_id,
+                attempt.servers.clone(),
+                operation,
+            ))
+            .await
     };
-    let result = runtime
-        .scope_tasks(
-            plan.registry
-                .scope_server_pins(attempt.servers.clone(), operation),
-        )
-        .await;
     let mut outcome = AttemptOutcome::completed(result, deadline, &cancel);
     drop(runtime);
     // Never cancel this owner boundary: close must drain every factory/driver

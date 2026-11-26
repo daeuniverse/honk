@@ -2022,6 +2022,18 @@ dae = "reject"
 honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
+reason = "Per-subscription import_dns blocks and -> direct upstream routing are honk extensions."
+
+[[case]]
+id = "honk-doc-en-reference-subscription-03"
+source = { file = "doc/en/reference/subscription.md", fence = 3 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "reject"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
 reason = "Per-subscription route blocks are a honk extension."
 
 [[case]]
@@ -2479,6 +2491,18 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 [[case]]
 id = "honk-doc-zh-reference-subscription-02"
 source = { file = "doc/zh/reference/subscription.md", fence = 2 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "reject"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+reason = "Per-subscription import_dns blocks and -> direct upstream routing are honk extensions."
+
+[[case]]
+id = "honk-doc-zh-reference-subscription-03"
+source = { file = "doc/zh/reference/subscription.md", fence = 3 }
 wrap = ""
 layer = "structure"
 honk = "accept"

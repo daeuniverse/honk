@@ -58,6 +58,11 @@ pub struct DohClient {
 }
 
 impl DohClient {
+    #[cfg(test)]
+    pub(crate) fn set_test_connector(&mut self, connector: TlsConnector) {
+        self.connector = connector;
+    }
+
     pub fn new(dial: DialContext) -> anyhow::Result<Arc<Self>> {
         Self::new_tracked(dial, Arc::new(AtomicUsize::new(0)))
     }

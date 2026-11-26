@@ -156,7 +156,8 @@ impl ChainHandler {
         let (first, rest) = hops.split_first().expect("a chain has at least two hops");
         let (server, server_domain) = server_target(&rest[0].node);
         let dial = handlers[0].dial_runtime(Arc::clone(first), server, server_domain, budget());
-        let entry = hop_scope(first, without_target_milestones(dial)).await;
+        let entry_dial = std::pin::pin!(hop_scope(first, without_target_milestones(dial)));
+        let entry = crate::runtime::scope_node(first.node.id, entry_dial).await;
         let located = purpose != DialPurpose::ConfiguredTcp;
         let mut carrier = intermediate_carrier(0, entry, located)?;
         for (index, (hop, handler)) in rest.iter().zip(&handlers[1..]).enumerate() {

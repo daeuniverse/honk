@@ -183,6 +183,13 @@ impl DnsRuntime {
         &self.parts.forwarder
     }
 
+    #[cfg(feature = "native-api")]
+    pub(crate) fn outbound_runtime(
+        &self,
+    ) -> Option<&Arc<honk_outbound::runtime::OutboundRuntimeRegistry>> {
+        self.parts.outbound_runtime.as_ref()
+    }
+
     pub(crate) fn routing_projection(&self) -> &Arc<RoutingProjectionSnapshot> {
         &self.parts.routing_projection
     }
@@ -195,11 +202,30 @@ impl DnsRuntime {
         self.parts.forwarder.cache()
     }
 
-    fn acquire(runtime: &Arc<Self>) -> RuntimeLease {
+    pub(crate) fn acquire(runtime: &Arc<Self>) -> RuntimeLease {
         runtime.leases.fetch_add(1, Ordering::AcqRel);
         RuntimeLease {
             runtime: Arc::clone(runtime),
         }
+    }
+
+    pub(crate) fn try_acquire_active_or_leased(runtime: &Arc<Self>) -> Option<RuntimeLease> {
+        let previous = runtime.leases.fetch_add(1, Ordering::AcqRel);
+        let lease = RuntimeLease {
+            runtime: Arc::clone(runtime),
+        };
+        let state = runtime.state();
+        if runtime.cancellation_requested.load(Ordering::Acquire)
+            || match state {
+                RuntimeState::Active => false,
+                RuntimeState::Draining => previous == 0,
+                RuntimeState::Closing | RuntimeState::Closed => true,
+            }
+        {
+            drop(lease);
+            return None;
+        }
+        Some(lease)
     }
 
     fn start_draining(&self) {

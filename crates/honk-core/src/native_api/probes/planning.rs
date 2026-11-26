@@ -426,7 +426,8 @@ pub(super) fn selections(
 #[derive(Default)]
 struct ResolvedHosts {
     ordinary: HashMap<String, Vec<IpAddr>>,
-    physical: HashMap<String, Option<IpAddr>>,
+    node_claimed: HashMap<(uuid::Uuid, String), Vec<IpAddr>>,
+    physical: HashMap<(uuid::Uuid, String), Option<IpAddr>>,
 }
 
 pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
@@ -467,7 +468,25 @@ pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
                 json!({"check":"port"}),
             ));
         }
-        let ips = resolve_destination(&context.dns, &mut resolved, host).await?;
+        let ips = if context.spec.kind == Kind::TcpConnect {
+            match resolve_claimed_node(
+                &context.registry,
+                &mut resolved.node_claimed,
+                candidate.node.id,
+                host,
+            )
+            .await?
+            {
+                Some(ips) => ips.to_vec(),
+                None => resolve_destination(&context.dns, &mut resolved, host)
+                    .await?
+                    .to_vec(),
+            }
+        } else {
+            resolve_destination(&context.dns, &mut resolved, host)
+                .await?
+                .to_vec()
+        };
         let addr = ips
             .iter()
             .copied()
@@ -493,7 +512,7 @@ pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
                 Some(chain) => chain.chain_entry_node().ok_or_else(missing_entry)?,
                 None => &candidate.node,
             };
-            resolve_servers(&context.dns, &mut resolved, entry).await?
+            resolve_servers(&context.registry, &context.dns, &mut resolved, entry).await?
         } else {
             Some(PinnedServers::default())
         };
@@ -525,12 +544,13 @@ fn missing_entry() -> ApiError {
 }
 
 async fn resolve_servers(
+    registry: &Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
     dns: &PinnedNameResolver,
     resolved: &mut ResolvedHosts,
     entry: &Node,
 ) -> Result<Option<PinnedServers>, ApiError> {
     let upload = entry.host();
-    let upload_ip = resolve_server(dns, resolved, upload).await?;
+    let upload_ip = resolve_server(registry, dns, resolved, entry.id, upload).await?;
     let download = entry.xhttp_download().map(|peer| peer.address.as_str());
     // Physical server families are chosen by the resolver, independently of the
     // requested application destination family and of one another.
@@ -543,7 +563,7 @@ async fn resolve_servers(
             upload_ip.map(|ip| (host, ip))
         }
         Some(host) => {
-            let Some(ip) = resolve_server(dns, resolved, host).await? else {
+            let Some(ip) = resolve_server(registry, dns, resolved, entry.id, host).await? else {
                 return Ok(None);
             };
             Some((host, ip))
@@ -564,7 +584,7 @@ async fn resolve_destination<'a>(
         } else {
             resolution_result(
                 host,
-                dns.resolve_node_server(host).await,
+                dns.resolve(host).await,
                 "Resolving the probe destination was refused locally",
             )?
         };
@@ -580,24 +600,66 @@ async fn resolve_destination<'a>(
 }
 
 async fn resolve_server(
+    registry: &Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
     dns: &PinnedNameResolver,
     resolved: &mut ResolvedHosts,
+    entry_id: uuid::Uuid,
     host: &str,
 ) -> Result<Option<IpAddr>, ApiError> {
-    if let Some(&ip) = resolved.physical.get(host) {
+    let key = (entry_id, host.to_owned());
+    if let Some(&ip) = resolved.physical.get(&key) {
+        return Ok(ip);
+    }
+    if let Some(ips) =
+        resolve_claimed_node(registry, &mut resolved.node_claimed, entry_id, host).await?
+    {
+        let ip = ips.first().copied();
+        resolved.physical.insert(key, ip);
         return Ok(ip);
     }
     let destination_ip = resolved
         .ordinary
         .get(host)
         .and_then(|ips| ips.first().copied());
+    let raw = if dns.shares_node_resolver(registry) {
+        dns.resolve_unclaimed_server(host, destination_ip).await
+    } else {
+        dns.resolve_physical_server(host, destination_ip).await
+    };
     let ip = resolution_result(
         host,
-        dns.resolve_physical_server(host, destination_ip).await,
+        raw,
         "Resolving the probed node's server was refused locally",
     )?;
-    resolved.physical.insert(host.to_owned(), ip);
+    resolved.physical.insert(key, ip);
     Ok(ip)
+}
+
+async fn resolve_claimed_node<'a>(
+    registry: &honk_outbound::runtime::OutboundRuntimeRegistry,
+    resolved: &'a mut HashMap<(uuid::Uuid, String), Vec<IpAddr>>,
+    node: uuid::Uuid,
+    host: &str,
+) -> Result<Option<&'a [IpAddr]>, ApiError> {
+    let key = (node, host.to_owned());
+    if !resolved.contains_key(&key) {
+        let Some(lookup) = registry.lookup_node_host(node, host) else {
+            return Ok(None);
+        };
+        let addresses = resolution_result(
+            host,
+            lookup.await.map_err(anyhow::Error::new),
+            "Resolving the probed node's server was refused locally",
+        )?;
+        let mut unique = Vec::with_capacity(addresses.len());
+        for ip in addresses.into_iter().map(|ip| ip.to_canonical()) {
+            if !unique.contains(&ip) {
+                unique.push(ip);
+            }
+        }
+        resolved.insert(key.clone(), unique);
+    }
+    Ok(Some(&resolved[&key]))
 }
 
 fn resolution_result<T: Default>(

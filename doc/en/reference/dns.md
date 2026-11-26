@@ -282,7 +282,7 @@ DNS `sip()` and `ip()` share one IP-or-CIDR decoder. Bare IPv4 and IPv6 addresse
 
 ### Node server hosts
 
-Node server hosts resolve through `global.bootstrap_resolver`, then `/etc/hosts` and the system nameserver, not through DNS routing. A request rule containing `subtag(...)` instead claims the server hosts, including XHTTP download hosts, of nodes from matching subscriptions:
+Node server hosts use local explicit overrides, then an enabled [subscription DNS import](./subscription.md#dns-import), then `global.bootstrap_resolver`, `/etc/hosts` and the system nameserver. A request rule containing `subtag(...)` claims the server hosts, including XHTTP download hosts, of nodes from matching subscriptions:
 
 ```dae
 dns {
@@ -299,16 +299,16 @@ dns {
 }
 ```
 
-- A chain has no server hostname of its own. Its physical hops keep their own subscription tags.
-- Only `subtag()` rules are evaluated for node hosts; ordinary rules, the fallback and unmatched hosts still use the bootstrap resolver. Other queries carry no subscription, so `subtag()` and `!subtag()` are false for them.
+- A chain has no server hostname of its own. Its physical hops keep their own subscription tags; dialing a chain or group exit resolves the entry hop under its own subscription policy.
+- Only `subtag()` rules are evaluated for node hosts; ordinary rules and application fallback do not claim them. Unmatched nodes use their imported DNS when enabled, then bootstrap. Other queries carry no subscription, so `subtag()` and `!subtag()` are false for them.
 - A claimed lookup queries only the selected upstream, honors `strategy` and `use_host`, and skips the cache and response rules. It never falls back, so its failure fails the physical node or probe connection.
 - A claim applies to the hostname. It is not an end-to-end policy for the download destination. A download's preliminary URL lookup for routing is best effort; proxied URL domains are still resolved by the proxy, while that proxy's own node-server lookup obeys the rule. Downloads using an explicit bootstrap resolver bypass the hook.
-- Tags attach to the hostname, not the node. Nodes from different subscriptions that share a hostname share the union of their tags, so the first matching rule picks one upstream for that hostname.
+- Node endpoint lookups carry node identity and subscription provenance. Nodes from different subscriptions that share a hostname retain separate policies; tags are not merged across those lookups.
 - The rule may combine only with `qname()` and must select an upstream whose every declaration is `-> direct`. Otherwise validation fails with `subtag-dns-condition`, `subtag-dns-action` or `subtag-dns-upstream-route`.
 - The upstream's own hostname, ECH discovery and the offline `delay` subcommand still use the bootstrap resolver.
-- A host matching a `use_host` [alias](#hosts-snapshot-use_host) resolves to its target instead. If the alias chain ends at an address entry, it resolves to those addresses. Otherwise it resolves as a node host with that name would: through a `subtag()` rule claiming the target, or else bootstrap. A direct address entry matching the original hostname does not claim it through this hook. An address entry at the end of an alias chain is used. Every claimed lookup, including a local address result or a bootstrap target, obeys DNS runtime admission and cancellation. Once the target/subtag path is selected, its failure is authoritative. A reload that removes the alias before the lookup runs resolves the original host as if it had no alias.
+- A host matching a `use_host` [alias](#hosts-snapshot-use_host) resolves to its target instead. If the alias chain ends at an address entry, it resolves to those addresses (filtered and ordered by `strategy`). Otherwise it resolves as a node host with that name would: through a `subtag()` rule claiming the target, enabled subscription-imported DNS, or else bootstrap. A direct address entry matching the original hostname does not claim it through this hook. An address entry at the end of an alias chain is used. Every claimed lookup, including a local address result or a bootstrap target, obeys DNS runtime admission and cancellation. Once the target/subtag/imported-DNS path is selected, its failure is authoritative. A reload that removes the alias before the lookup runs resolves the original host as if it had no alias.
 - Aliases are matched against every hostname that reaches the bootstrap resolver, not only node server hosts. That includes the URL host of a subscription, geodata or external UI download that names no explicit bootstrap resolver. It also includes a SOCKS5 node's UDP relay host, and the bootstrap fallback of health checks, latency tests, connectivity probes and internal name resolution. DNS upstream hostnames and ECH discovery do not reach the hook.
-- Each DNS generation precomputes node-host policy outcomes, including nonmatching hosts, from the subscription tags and ordered rules. Native flow traces report `partial` with `not_instrumented` when consuming these outcomes. The node-host rule decision is not captured.
+- Native flow traces report `partial` with `not_instrumented` when node-host resolution evaluates `subtag()` rules or subscription-imported DNS (including nonmatching evaluations) or resolves to a local `use_host` alias-address entry without a wire lookup. Those node-host policy and local alias decisions are not captured as structured DNS rule steps.
 
 ### Request actions
 

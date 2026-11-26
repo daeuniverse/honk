@@ -199,8 +199,8 @@ pub(in crate::control) async fn warm_selector_candidate(
         // Purge a moved endpoint before redial: failure must not keep the old
         // socket pinned under a stable node ID.
         let descriptor = honk_outbound::descriptor::descriptor(node.protocol());
-        let bare_addr =
-            (descriptor.pool_bare_tcp)(&node).then(|| format!("{}:{}", node.host(), node.port));
+        let bare_addr = (descriptor.pool_bare_tcp)(&node)
+            .then(|| ConnectionPool::bare_key(generation.generation(), &node));
         let stale = {
             let mut retained = bare_warm.lock();
             match (retained.get(&node.id), bare_addr.as_ref()) {
@@ -287,10 +287,13 @@ pub(in crate::control) async fn warm_selector_candidate(
                         .start()
                 });
             let stream = match generation
-                .scope_dials(honk_outbound::util::connect_outbound(
-                    &addr,
-                    connect_timeout,
-                ))
+                .scope_node_dials(
+                    node.id,
+                    honk_outbound::util::connect_outbound(
+                        &format!("{}:{}", node.host(), node.port),
+                        connect_timeout,
+                    ),
+                )
                 .await
             {
                 Ok(_) if generation.is_shutdown() => {

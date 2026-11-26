@@ -145,7 +145,7 @@ impl PinnedNameResolver {
     }
 
     /// One captured generation owns the lookup through any bootstrap fallback.
-    pub(crate) async fn resolve_node_server(&self, host: &str) -> anyhow::Result<Vec<IpAddr>> {
+    pub(crate) async fn resolve(&self, host: &str) -> anyhow::Result<Vec<IpAddr>> {
         let domain = normalize_domain(host)?;
         if let Ok(ip) = domain.parse::<IpAddr>() {
             return Ok(vec![ip]);
@@ -153,10 +153,39 @@ impl PinnedNameResolver {
         self.resolve_domain(&domain, false).await
     }
 
+    pub(crate) fn shares_node_resolver(
+        &self,
+        registry: &Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    ) -> bool {
+        registry.has_node_resolver()
+            && self
+                .runtime
+                .as_ref()
+                .and_then(|lease| lease.runtime().outbound_runtime())
+                .is_some_and(|bound| Arc::ptr_eq(bound, registry))
+    }
+
     pub(crate) async fn resolve_physical_server(
         &self,
         host: &str,
         destination_ip: Option<IpAddr>,
+    ) -> anyhow::Result<Option<IpAddr>> {
+        self.resolve_server_inner(host, destination_ip, true).await
+    }
+
+    pub(crate) async fn resolve_unclaimed_server(
+        &self,
+        host: &str,
+        destination_ip: Option<IpAddr>,
+    ) -> anyhow::Result<Option<IpAddr>> {
+        self.resolve_server_inner(host, destination_ip, false).await
+    }
+
+    async fn resolve_server_inner(
+        &self,
+        host: &str,
+        destination_ip: Option<IpAddr>,
+        alias_first: bool,
     ) -> anyhow::Result<Option<IpAddr>> {
         if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
             return Ok(Some(ip.to_canonical()));
@@ -164,7 +193,7 @@ impl PinnedNameResolver {
         // Only a hosts alias can give a shared hostname different DNS authority
         // from its lookup as a destination.
         if let Some(ip) = destination_ip
-            && !self.forwarder.has_hosts_aliases()
+            && (!alias_first || !self.forwarder.has_hosts_aliases())
         {
             return Ok(Some(ip));
         }
@@ -173,30 +202,27 @@ impl PinnedNameResolver {
             return Ok(Some(ip.to_canonical()));
         }
         if let Some(ip) = destination_ip
-            && !self.forwarder.is_hosts_alias(&domain)
+            && (!alias_first || !self.forwarder.is_hosts_alias(&domain))
         {
             return Ok(Some(ip));
         }
-        let addresses = self.resolve_domain(&domain, true).await?;
+        let addresses = self.resolve_domain(&domain, alias_first).await?;
         Ok(addresses.first().map(IpAddr::to_canonical))
     }
 
     async fn resolve_domain(&self, domain: &str, alias_first: bool) -> anyhow::Result<Vec<IpAddr>> {
         let mut operation = self.service.operation();
-        let claim = || claimed_upstream(&self.forwarder, domain);
-        // Destinations select before admission; a physical alias selects its own target instead.
-        let destination_claim = (!alias_first).then(claim);
         let lookup = std::pin::pin!(async {
-            if alias_first && let Some(alias) = self.forwarder.node_host_alias(domain)? {
-                let addresses = self.resolve_pinned_alias(alias).await?;
-                return self.select_fallback_families(domain, addresses);
-            }
-            match destination_claim.unwrap_or_else(claim) {
-                Some(upstream) => {
-                    resolve_claimed(&self.service, &self.forwarder, domain, upstream).await
+            if alias_first {
+                if let Some(alias) = self.forwarder.node_host_alias(domain)? {
+                    let addresses = self.resolve_pinned_alias(alias).await?;
+                    return self.select_fallback_families(domain, addresses);
                 }
-                None => self.resolve_unclaimed(domain).await,
+                if let Some(upstream) = claimed_upstream(&self.forwarder, domain) {
+                    return resolve_claimed(&self.service, &self.forwarder, domain, upstream).await;
+                }
             }
+            self.resolve_unclaimed(domain).await
         });
         let resolve = std::pin::pin!(operation.run(lookup));
         match &self.runtime {
@@ -258,7 +284,7 @@ impl DnsService {
 
     pub(crate) async fn resolve_name(&self, domain: &str) -> anyhow::Result<ResolvedAddr> {
         self.resolve_name_with_fallback(domain, |name| async move {
-            honk_outbound::bootstrap::resolve(&name)
+            honk_outbound::bootstrap::resolve_with(honk_outbound::bootstrap::global(), &name)
                 .await
                 .map_err(anyhow::Error::from)
         })

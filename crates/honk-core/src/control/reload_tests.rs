@@ -2088,7 +2088,8 @@ async fn reload_dispatch_assigns_worker_revision_and_accepts_only_that_revision(
                     name: "stale".into(),
                     subscription_id: Some(subscription_id),
                     ..Default::default()
-                }],
+                }]
+                .into(),
                 diagnostics: Vec::new(),
                 result: tokio::sync::oneshot::channel().0,
             },
@@ -3500,6 +3501,8 @@ async fn selector_choice_switch_replaces_bare_tcp_pin_immediately() {
 
     cp.start_selector_warm_coordinator(Arc::clone(&generation))
         .await;
+    let first_addr = ConnectionPool::bare_key(generation.generation(), &first);
+    let second_addr = ConnectionPool::bare_key(generation.generation(), &second);
     let (first_server, _) = tokio::time::timeout(Duration::from_secs(1), first_listener.accept())
         .await
         .expect("first selector must preconnect")
@@ -3568,6 +3571,7 @@ async fn changed_selector_bare_endpoint_is_purged_before_failed_replacement() {
     };
 
     warm_selector_candidate(node.clone(), resources.clone(), Duration::from_secs(1)).await;
+    let old_addr = ConnectionPool::bare_key(generation.generation(), &node);
     let (old_server, _) = tokio::time::timeout(Duration::from_secs(1), old_listener.accept())
         .await
         .expect("initial selector must preconnect")
@@ -4564,7 +4568,7 @@ async fn subscription_refresh_duplicate_static_node_reports_one_safe_rejection()
     let command = ControlCommand::MergeSubscription {
         subscription_id: subscription.id,
         revision: authorizations.revision(subscription.id).unwrap(),
-        nodes,
+        nodes: nodes.into(),
         diagnostics: Vec::new(),
         result,
     };

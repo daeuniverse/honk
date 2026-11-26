@@ -50,6 +50,68 @@ const MAX_SUBSCRIPTION_REDIRECTS: usize = 5;
 /// How long a whole subscription fetch, its redirects included, may take.
 const SUBSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// One accepted body, kept together through cache restoration and publication.
+#[derive(Debug, Clone, Default)]
+pub struct SubscriptionContent {
+    pub nodes: Vec<Node>,
+    pub accepted_dns_source: Option<std::sync::Arc<serde_yaml::Value>>,
+    pub imported_dns: Option<std::sync::Arc<honk_config::subscription::dns::SubscriptionDns>>,
+}
+
+impl From<Vec<Node>> for SubscriptionContent {
+    fn from(nodes: Vec<Node>) -> Self {
+        Self {
+            nodes,
+            ..Self::default()
+        }
+    }
+}
+
+impl SubscriptionContent {
+    pub(crate) fn publish_dns(&self, subscription: &mut Subscription) {
+        subscription.accepted_dns_source = self.accepted_dns_source.clone();
+        subscription.imported_dns = self.imported_dns.clone();
+    }
+}
+
+pub(crate) fn compile_imported_dns(
+    config: &mut honk_config::Config,
+) -> Result<(), DetailedConfigError> {
+    compile_imported_dns_for_sources(config, |subscription| {
+        subscription.source.as_ref().map_or_else(
+            || DiagnosticSources::new(None).root(),
+            |source| source.0.clone(),
+        )
+    })
+}
+
+pub(crate) fn compile_imported_dns_for_sources(
+    config: &mut honk_config::Config,
+    mut source_for: impl FnMut(&Subscription) -> honk_config::diagnostic::SourceRef,
+) -> Result<(), DetailedConfigError> {
+    for (index, subscription) in config.subscriptions.iter_mut().enumerate() {
+        let source = source_for(subscription);
+        subscription.imported_dns = if subscription.enabled && subscription.import_dns {
+            subscription
+                .accepted_dns_source
+                .as_deref()
+                .map(|dns| {
+                    honk_config::subscription::dns::SubscriptionDns::parse_indexed(index + 1, dns)
+                })
+                .transpose()
+                .map_err(|mut error| {
+                    error.diagnostic.source = source;
+                    error
+                })?
+                .flatten()
+                .map(std::sync::Arc::new)
+        } else {
+            None
+        };
+    }
+    Ok(())
+}
+
 /// One source entry retained only until the common admission pass consumes it.
 #[derive(Debug)]
 struct IndexedOutcome {
@@ -558,16 +620,16 @@ impl SubscriptionManager {
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> anyhow::Result<Vec<Node>> {
         let start = diagnostics.len();
-        let (nodes, content, _) = self.fetch_content(sub, diagnostics).await?;
+        let (body, content, _) = self.fetch_content(sub, diagnostics).await?;
         Self::persist_content(sub, store, content, diagnostics, start).await;
-        Ok(nodes)
+        Ok(body.nodes)
     }
 
-    async fn fetch_content(
+    pub(crate) async fn fetch_content(
         &self,
         sub: &Subscription,
         diagnostics: &mut Vec<DetailedDiagnostic>,
-    ) -> anyhow::Result<(Vec<Node>, String, SubscriptionUserinfo)> {
+    ) -> anyhow::Result<(SubscriptionContent, String, SubscriptionUserinfo)> {
         let (body, userinfo) = if route::direct(sub) {
             match &self.http {
                 SubscriptionHttp::Shared(client) => fetch_body(client, sub).await?,
@@ -593,7 +655,7 @@ impl SubscriptionManager {
             }),
             diagnostics,
         )?;
-        let nodes = parse_subscription_content_with_diagnostics(sub, &content, diagnostics)?;
+        let nodes = parse_subscription_body_with_diagnostics(sub, &content, diagnostics)?;
         Ok((nodes, content, userinfo))
     }
 
@@ -636,6 +698,15 @@ pub fn parse_subscription_content_with_diagnostics(
     content: &str,
     diagnostics: &mut Vec<DetailedDiagnostic>,
 ) -> Result<Vec<Node>, DetailedConfigError> {
+    parse_subscription_body_with_diagnostics(sub, content, diagnostics).map(|body| body.nodes)
+}
+
+/// Parse nodes and their accompanying DNS from the same body.
+pub fn parse_subscription_body_with_diagnostics(
+    sub: &Subscription,
+    content: &str,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+) -> Result<SubscriptionContent, DetailedConfigError> {
     let source = DiagnosticSources::new(None).root();
     let result = parse_subscription_content_attempt(sub, content, &source, diagnostics);
     finish_attempt(result, diagnostics)
@@ -646,7 +717,7 @@ fn parse_subscription_content_attempt(
     content: &str,
     source: &honk_config::diagnostic::SourceRef,
     diagnostics: &mut Vec<DetailedDiagnostic>,
-) -> Result<Vec<Node>, DetailedConfigError> {
+) -> Result<SubscriptionContent, DetailedConfigError> {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let decoded = if matches!(
         sub.sub_type,
@@ -671,6 +742,7 @@ fn parse_subscription_content_attempt(
     let result = match sub.sub_type {
         SubscriptionType::Sip008 => {
             parse_sip008_subscription(content, Some(sub.id), |outcome| owner.emit(outcome))
+                .map(|()| None)
         }
         SubscriptionType::Clash => {
             parse_clash_subscription(content, Some(sub.id), |outcome| owner.emit(outcome))
@@ -679,11 +751,30 @@ fn parse_subscription_content_attempt(
             parse_auto_subscription(content, Some(sub.id), |outcome| owner.emit(outcome))
         }
     };
-    if result.is_err() {
+    let Ok(accepted_dns_source) = result else {
         owner.finish_diagnostics();
         return Err(subscription_error(source, "invalid-subscription-body"));
-    }
-    owner.finish()
+    };
+    let nodes = owner.finish()?;
+    let imported_dns = if sub.import_dns {
+        accepted_dns_source
+            .as_deref()
+            .map(honk_config::subscription::dns::SubscriptionDns::parse)
+            .transpose()
+            .map_err(|mut error| {
+                error.diagnostic.source = source.clone();
+                error
+            })?
+            .flatten()
+            .map(std::sync::Arc::new)
+    } else {
+        None
+    };
+    Ok(SubscriptionContent {
+        nodes,
+        accepted_dns_source,
+        imported_dns,
+    })
 }
 
 fn subscription_error(
@@ -751,12 +842,12 @@ fn parse_auto_subscription(
     text: &str,
     subscription_id: Option<uuid::Uuid>,
     mut emit: impl FnMut(IndexedOutcome),
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<std::sync::Arc<serde_yaml::Value>>> {
     if text.trim().is_empty() {
         anyhow::bail!("empty subscription body");
     }
-    if parse_structured_subscription(text, subscription_id, &mut emit)? {
-        return Ok(());
+    if let Some(dns) = parse_structured_subscription(text, subscription_id, &mut emit)? {
+        return Ok(dns);
     }
     let has_uri = text.lines().map(str::trim).any(|line| {
         line.split_once("://").is_some_and(|(scheme, _)| {
@@ -767,17 +858,18 @@ fn parse_auto_subscription(
         })
     });
     if has_uri {
-        parse_uri_subscription(text, subscription_id, emit)
+        parse_uri_subscription(text, subscription_id, emit)?;
     } else {
-        records::parse_record_subscription(text, subscription_id, emit)
+        records::parse_record_subscription(text, subscription_id, emit)?;
     }
+    Ok(None)
 }
 
 fn parse_structured_subscription(
     text: &str,
     subscription_id: Option<uuid::Uuid>,
     emit: &mut impl FnMut(IndexedOutcome),
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<Option<std::sync::Arc<serde_yaml::Value>>>> {
     let Ok(value) = parse_structured_value(text) else {
         let first = text
             .lines()
@@ -803,20 +895,24 @@ fn parse_structured_subscription(
         {
             anyhow::bail!("malformed structured subscription");
         }
-        return Ok(false);
+        return Ok(None);
     };
     if let serde_yaml::Value::Mapping(root) = &value
         && let Some(proxies) = yaml_value(root, "proxies").and_then(serde_yaml::Value::as_sequence)
     {
         emit_clash_proxies(proxies, subscription_id, &mut *emit);
-        return Ok(true);
+        let dns = yaml_value(root, "dns")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .map(std::sync::Arc::new);
+        return Ok(Some(dns));
     }
     match value {
         serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_) => {
             json::emit_json_subscription(value, subscription_id, &mut *emit)?;
-            Ok(true)
+            Ok(Some(None))
         }
-        _ => Ok(false),
+        _ => Ok(None),
     }
 }
 fn parse_uri_subscription(
@@ -961,14 +1057,20 @@ fn parse_clash_subscription(
     content: &str,
     subscription_id: Option<uuid::Uuid>,
     emit: impl FnMut(IndexedOutcome),
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<std::sync::Arc<serde_yaml::Value>>> {
     let yaml = parse_structured_value(content)?;
     let proxies = yaml
         .get("proxies")
         .and_then(serde_yaml::Value::as_sequence)
         .ok_or_else(|| anyhow::anyhow!("no 'proxies' array found in Clash YAML"))?;
     emit_clash_proxies(proxies, subscription_id, emit);
-    Ok(())
+    let dns = yaml
+        .as_mapping()
+        .and_then(|root| yaml_value(root, "dns"))
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(std::sync::Arc::new);
+    Ok(dns)
 }
 
 #[cfg(test)]

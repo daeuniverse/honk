@@ -396,6 +396,16 @@ pub type ResolveHook = Arc<
         + Sync,
 >;
 
+pub type NodeResolveHook = Arc<
+    dyn Fn(
+            Uuid,
+            String,
+            u16,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<SocketAddr>>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Isolates hot lock words and atomics onto dedicated 64-byte cache lines so
 /// concurrent readers do not self-invalidate adjacent map metadata or atomics.
 #[repr(align(64))]
@@ -487,6 +497,7 @@ pub struct AliveDialerSet {
     outbound_resolver: RwLock<Option<OutboundIdResolver>>,
     /// DNS resolver for check targets (system lookup when unset).
     resolver: RwLock<Option<ResolveHook>>,
+    node_resolver: RwLock<Option<NodeResolveHook>>,
     /// Monotonic origin for exact sub-second per-group activity timestamps.
     started_at: Instant,
     /// Monotonic coarse origin (Linux `CLOCK_MONOTONIC_COARSE`, ns) for `>= 1s`
@@ -564,6 +575,7 @@ impl AliveDialerSet {
             routed_udp_death_callback: RwLock::default(),
             routed_udp_connectivity_callback: RwLock::default(),
             resolver: RwLock::new(None),
+            node_resolver: RwLock::new(None),
             base_cooldown: Duration::from_secs(5),
             max_cooldown: Duration::from_secs(300),
             trigger_tx: tx,
@@ -681,6 +693,28 @@ impl AliveDialerSet {
 
     /// Resolve `host` via the installed hook. Typed local refusal is returned;
     /// ordinary empty or failed hook results retain marked bootstrap/system fallback.
+    pub fn set_node_resolver(&self, hook: NodeResolveHook) {
+        *self.node_resolver.write() = Some(hook);
+    }
+
+    async fn resolve_node_endpoint(
+        &self,
+        node: Uuid,
+        host: &str,
+        port: u16,
+    ) -> anyhow::Result<Vec<SocketAddr>> {
+        let resolver = self.node_resolver.read().clone();
+        if let Some(resolver) = resolver {
+            let permit = self.acquire_health_probe()?;
+            let cancel = permit.cancellation();
+            return cancel
+                .run(cancel.scope_resolution(resolver(node, host.to_owned(), port)))
+                .await
+                .ok_or(HealthCheckError::Stopped)?;
+        }
+        self.resolve_host(host, port).await
+    }
+
     pub async fn resolve_host(&self, host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
         let permit = self.acquire_health_probe()?;
         let cancel = permit.cancellation();
@@ -711,12 +745,14 @@ impl AliveDialerSet {
                 }
             }
         }
-        Ok(crate::bootstrap::resolve(host)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|ip| SocketAddr::new(ip, port))
-            .collect())
+        Ok(
+            crate::bootstrap::resolve_with(crate::bootstrap::global(), host)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect(),
+        )
     }
 
     /// Refresh the cached check URL IPs.  Called at the start of each full

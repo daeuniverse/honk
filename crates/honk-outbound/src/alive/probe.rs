@@ -614,7 +614,7 @@ impl AliveDialerSet {
             Some((host, port)) => port.parse::<u16>().map_or((addr, 80), |port| (host, port)),
             None => (addr, 80),
         };
-        let addrs = match self.resolve_host(host, port).await {
+        let addrs = match self.resolve_node_endpoint(node_id, host, port).await {
             Ok(addrs) if !addrs.is_empty() => addrs,
             Ok(_) => {
                 tracing::debug!(
@@ -638,11 +638,36 @@ impl AliveDialerSet {
                 );
                 return false;
             }
-            Err(_) => {
+            Err(error)
+                if crate::proxy::is_packet_rejection(&error)
+                    || error.downcast_ref::<HealthCheckError>().is_some() =>
+            {
                 tracing::debug!(
                     "Health check target resolution was locally refused for node '{}' ({})",
                     node_name,
                     addr
+                );
+                return false;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    node = node_name,
+                    %error,
+                    "node DNS resolution failed during TCP health check"
+                );
+                self.apply_probe_result(
+                    node_id,
+                    registration,
+                    ProbeDomain::Tcp,
+                    IpVersion::V4,
+                    None,
+                );
+                self.apply_probe_result(
+                    node_id,
+                    registration,
+                    ProbeDomain::Tcp,
+                    IpVersion::V6,
+                    None,
                 );
                 return false;
             }

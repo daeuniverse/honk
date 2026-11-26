@@ -336,7 +336,7 @@ impl Socks5Handler {
                         domain_and_port[domain_len + 1],
                     ]);
                     let domain = std::str::from_utf8(&domain_and_port[..domain_len])?;
-                    let resolution = crate::bootstrap::resolve(domain);
+                    let resolution = crate::bootstrap::resolve_node(domain);
                     let (resolution, selection) =
                         crate::runtime::flow_observation::observe_resolution(resolution).await;
                     let ip = resolution?.into_iter().next().ok_or_else(|| {

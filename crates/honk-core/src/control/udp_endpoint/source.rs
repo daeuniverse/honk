@@ -898,7 +898,10 @@ impl UdpEndpointPool {
                     }
                 });
                 generation
-                    .scope_dials(runtime.scope_tasks(runtime.transport_quality().scope(operation)))
+                    .scope_node_dials(
+                        runtime.node.id,
+                        runtime.scope_tasks(runtime.transport_quality().scope(operation)),
+                    )
                     .await?
             };
             if generation.is_shutdown() {

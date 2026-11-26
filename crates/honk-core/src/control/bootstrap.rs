@@ -153,6 +153,20 @@ impl ControlPlane {
             .bind_transport_quality(&runtime_registry);
         runtime_registry.activate_background_dial_admission();
         let runtime_registry = runtime_registry.into_shared();
+        {
+            let registry = Arc::clone(&runtime_registry);
+            alive_set.set_node_resolver(Arc::new(move |node, host, port| {
+                let generation = registry.read().clone();
+                Box::pin(async move {
+                    Ok(generation
+                        .resolve_node_host(node, &host)
+                        .await?
+                        .into_iter()
+                        .map(|ip| std::net::SocketAddr::new(ip, port))
+                        .collect())
+                })
+            }));
+        }
         info!(
             nofile = resource_budget.effective_nofile,
             fixed = resource_budget.fixed_reserve,
@@ -192,6 +206,12 @@ impl ControlPlane {
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
         let interrupt_groups = config.groups.clone();
+        let scoped_dns = crate::dns::node_host::prepare(
+            &config,
+            Arc::clone(&dns_upstream_pool),
+            dns_forwarder.routing_snapshot(),
+            &dns_socket_budget,
+        )?;
         let config = Arc::new(config);
         let initial_routing_plan = routing_matcher::ActiveRoutingPlan::new(
             initial_routing_plan,
@@ -208,9 +228,10 @@ impl ControlPlane {
                     0,
                     pinned_router,
                 )),
-                outbound_runtime: Some(outbound_runtime),
-                transport: dns_upstream_pool,
+                outbound_runtime: Some(Arc::clone(&outbound_runtime)),
+                transport: scoped_dns.clone(),
             });
+        crate::dns::node_host::bind(&outbound_runtime, &initial_runtime, scoped_dns);
         let runtime_provider = Arc::new(crate::dns::runtime::DnsServiceProvider::new(
             initial_runtime,
         ));

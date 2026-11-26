@@ -14,6 +14,12 @@ struct FullConeSocks5Server {
 }
 
 async fn run_full_cone_socks5_server() -> FullConeSocks5Server {
+    run_full_cone_socks5_server_with_reply_domain(None).await
+}
+
+async fn run_full_cone_socks5_server_with_reply_domain(
+    reply_domain: Option<&str>,
+) -> FullConeSocks5Server {
     use std::sync::atomic::AtomicUsize;
     use tokio::net::UdpSocket;
 
@@ -22,7 +28,16 @@ async fn run_full_cone_socks5_server() -> FullConeSocks5Server {
     let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let egress = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let egress_addr = egress.local_addr().unwrap();
-    let relay_reply = socks5_udp_associate_reply(relay.local_addr().unwrap());
+    let relay_addr = relay.local_addr().unwrap();
+    let relay_reply = match reply_domain {
+        Some(domain) => {
+            let mut reply = vec![SOCKS5_VERSION, 0x00, 0x00, ATYP_DOMAIN, domain.len() as u8];
+            reply.extend_from_slice(domain.as_bytes());
+            reply.extend_from_slice(&relay_addr.port().to_be_bytes());
+            reply
+        }
+        None => socks5_udp_associate_reply(relay_addr),
+    };
     let associates = Arc::new(AtomicUsize::new(0));
     let released = Arc::new(AtomicUsize::new(0));
     let (close_controls, close_rx) = tokio::sync::watch::channel(false);
@@ -354,4 +369,79 @@ async fn socks5_checked_send_admits_the_addressed_datagram() {
         expected_socks5_udp_datagram(target, None, 0, b"addressed")
     );
     server.close_control();
+}
+
+#[tokio::test]
+async fn shared_udp_hostname_uses_its_node_resolver_before_socks_association() {
+    struct Resolver {
+        node: uuid::Uuid,
+        address: std::net::IpAddr,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::bootstrap::NodeHostResolver for Resolver {
+        fn lookup(&self, _: &str) -> Option<crate::bootstrap::NodeHostLookup> {
+            panic!("shared UDP endpoint resolution lost its node context")
+        }
+        fn lookup_node(
+            &self,
+            node: uuid::Uuid,
+            host: &str,
+        ) -> Option<crate::bootstrap::NodeHostLookup> {
+            assert_eq!(node, self.node);
+            assert!(matches!(host, "shared.socks.test" | "relay.socks.test"));
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let address = self.address;
+            Some(Box::pin(async move { Ok(vec![address]) }))
+        }
+    }
+    let server = run_full_cone_socks5_server_with_reply_domain(Some("relay.socks.test")).await;
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = peer.local_addr().unwrap();
+    let node = Node::from_share_link(&format!(
+        "socks5://shared.socks.test:{}",
+        server.proxy_addr.port()
+    ))
+    .unwrap();
+    let registry =
+        crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    registry.bind_node_resolver(Arc::new(Resolver {
+        node: node.id,
+        address: server.proxy_addr.ip(),
+        calls: Arc::clone(&calls),
+    }));
+    let proxy = crate::proxy::ProxyRegistry::default_resolver().unwrap();
+    let transport = registry
+        .scope_node_dials(node.id, async {
+            proxy
+                .prepare_shared_source(
+                    registry.get(&node.id).unwrap(),
+                    target,
+                    None,
+                    std::time::Duration::from_secs(2),
+                    true,
+                )
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap()
+        })
+        .await;
+    transport.send_packet(b"scoped-request").await.unwrap();
+    assert_eq!(
+        peer_recv(&peer).await,
+        (b"scoped-request".to_vec(), server.egress_addr)
+    );
+    peer.send_to(b"scoped-reply", server.egress_addr)
+        .await
+        .unwrap();
+    assert_eq!(
+        recv_within(&transport).await,
+        (b"scoped-reply".to_vec(), target)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(server.associates.load(Ordering::SeqCst), 1);
+    drop(transport);
+    registry.shutdown().await;
 }

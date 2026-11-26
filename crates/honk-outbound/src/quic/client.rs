@@ -238,7 +238,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         state.conn = None;
 
         let host = format!("{}:{}", self.server_host, self.server_port);
-        let resolution = crate::bootstrap::resolve(&self.server_host);
+        let resolution = crate::bootstrap::resolve_node(&self.server_host);
         let (resolved, selection) =
             crate::runtime::flow_observation::observe_resolution(resolution).await;
         let addrs: Vec<SocketAddr> = resolved

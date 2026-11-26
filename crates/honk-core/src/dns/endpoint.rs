@@ -18,6 +18,13 @@ use super::transport::DnsSocketBudget;
 /// Default DoH / DoH3 request path (RFC 8484).
 pub const DEFAULT_DOH_PATH: &str = "/dns-query";
 
+pub(crate) trait EndpointBootstrap: std::fmt::Debug + Send + Sync {
+    fn resolve<'a>(
+        &'a self,
+        host: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<IpAddr>>> + Send + 'a>>;
+}
+
 /// Parsed upstream endpoint used by the encrypted DNS transports.
 #[derive(Debug, Clone)]
 pub struct DnsEndpoint {
@@ -30,6 +37,8 @@ pub struct DnsEndpoint {
     bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
     resolved_addr: Option<SocketAddr>,
     strategy: DnsStrategy,
+    pub(crate) imported_bootstrap:
+        std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn EndpointBootstrap>>>,
 }
 
 impl DnsEndpoint {
@@ -89,6 +98,7 @@ impl DnsEndpoint {
             bootstrap_resolver,
             resolved_addr: None,
             strategy,
+            imported_bootstrap: Default::default(),
         })
     }
     pub(crate) fn with_resolved_addr(mut self, address: SocketAddr) -> Self {
@@ -118,8 +128,14 @@ impl DnsEndpoint {
         }
         let ips = if let Ok(ip) = self.host.parse::<IpAddr>() {
             vec![ip]
+        } else if let Some(bootstrap) = self.imported_bootstrap.get() {
+            let ips = bootstrap.resolve(&self.host).await?;
+            if ips.is_empty() {
+                anyhow::bail!("bootstrap resolve '{}' returned no addresses", self.host);
+            }
+            ips
         } else {
-            let ips = honk_outbound::bootstrap::resolve_with_admission(
+            let ips = honk_outbound::bootstrap::resolve_upstream_with_admission(
                 self.bootstrap_resolver,
                 &self.host,
                 deadline,

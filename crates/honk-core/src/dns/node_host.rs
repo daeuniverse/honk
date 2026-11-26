@@ -10,6 +10,9 @@ use honk_config::dns::DnsCond;
 
 use super::DnsService;
 
+mod scoped;
+pub(crate) use scoped::{bind, prepare, resolution_changed};
+
 /// Lowercase node server host to the tags of every subscription serving it.
 pub(crate) type NodeHosts = HashMap<String, Vec<String>>;
 
@@ -63,6 +66,10 @@ pub(crate) fn resolver(
 }
 
 impl honk_outbound::bootstrap::NodeHostResolver for NodeHostRouting {
+    fn is_process_subtag_fallback(&self) -> bool {
+        true
+    }
+
     fn lookup(&self, host: &str) -> Option<honk_outbound::bootstrap::NodeHostLookup> {
         if !self.0.claims_node_host(host) {
             return None;

@@ -152,7 +152,7 @@ waiter 克隆的是原始 causal chain，不是从 display 文本重建的。已
 
 只有 IN class 的 A 和 AAAA 查询会用到这个快照。地址条目缺少请求的地址族时返回 `NOERROR`/NODATA，绝不泄漏给上游。本地地址记录和生成的别名 CNAME 用 60 秒 TTL；复制的目标记录保留目标自己的 TTL 策略。Hosts 应答绕过正缓存和负缓存的复用；嵌套的别名目标查询保留调用者的缓存策略。合成结果仍经过正常的路由投影。别名合成会保留目标最终应答的 `TC` 和完整 RCODE；非 EDNS 客户端无法表示的扩展错误，变成不带记录的 `SERVFAIL`。派生查询只接受一个问题、空的 answer 和 authority section，以及至多一个 additional OPT；它保留 ID、全部 flags、type、class，以及精确的 OPT class/TTL/选项，并单独编码那个根名称 owner。不支持的 section 在目标 I/O 之前就失败，不会丢记录，也不会回退到原始名称。快照在自己的 generation 内不可变；改了来源就发 SIGHUP 来发布替换项。加载或解析失败会让启动失败，或者在发布前中止 reload。
 
-Bootstrap hook 通过别名或选中的 `subtag()` 规则接管原始域名。直接地址条目本身不会接管这个域名，但别名链终止于地址条目时，会使用这些地址。被接管的本地地址、bootstrap 目标和 subtag 查询，共用 DNS 运行时的 admission 和取消机制。一旦选定解析路径，它的失败就是最终结果。hook 的使用方和排除范围见[节点域名参考](../reference/dns.md#节点服务器域名)。
+节点端点查询捕获 `NodeId` 和出站代际的 resolver，按节点真实订阅身份及端点集合选择策略：hosts 别名、显式 `subtag()`、订阅导入 DNS，最后是本地 bootstrap。直接地址条目本身不接管名称，别名链终止于地址条目时则使用这些地址。导入上游池在 DNS 代际内按订阅去重并独占，使用直连 socket、共享 socket 预算、查询 admission 和取消机制。上游域名的 bootstrap 绕过节点解析，也不会使用代理节点的固定地址。Resolver 绑定对 DNS 资源使用弱引用，代际退役时关闭池，不保留引用环。使用方和排除范围见[节点域名参考](../reference/dns.md#节点服务器域名)。
 
 ### 地址族策略
 

@@ -345,6 +345,7 @@ struct SubscriptionFields<'d, 'a> {
     user_agent: Option<Text<'d, 'a>>,
     interval: Option<Text<'d, 'a>>,
     cache: Option<Text<'d, 'a>>,
+    import_dns: Option<Text<'d, 'a>>,
     route: Option<Text<'d, 'a>>,
     download_detour: Option<Text<'d, 'a>>,
 }
@@ -386,6 +387,7 @@ fn collect_subscription_fields<'d, 'a>(
                 "ua" => fields.user_agent = Some(value),
                 "interval" => fields.interval = Some(value),
                 "cache" => fields.cache = Some(value),
+                "import_dns" => fields.import_dns = Some(value),
                 "route" => fields.route = Some(value),
                 "download_detour" if legacy => fields.download_detour = Some(value),
                 _ if super::read::block_header(&child).is_none() => key.notice(
@@ -480,6 +482,24 @@ fn parse_subscription_block<'d, 'a>(
                 message: "value is not a boolean; using fallback true".to_string(),
             },
         );
+    }
+    if let Some(value) = fields.import_dns {
+        subscription.import_dns = super::scalars::strict_bool(value.raw()).ok_or_else(|| {
+            let (line, column) = value.source.location(value.span.start);
+            let mut error = crate::error::DetailedConfigError::new(
+                crate::error::ErrorCategory::Parse,
+                "invalid-subscription-import-dns",
+                value.source.reference(),
+                crate::diagnostic::SettingPath::new("subscriptions")
+                    .index(index)
+                    .field("import_dns"),
+                "subscription import_dns must be a boolean",
+            );
+            error.diagnostic.line = Some(line);
+            error.diagnostic.byte_column = Some(column);
+            error.diagnostic.span = Some(value.span.start..value.span.end);
+            super::ParseFailure::Detailed(error)
+        })?;
     }
     Ok(subscription)
 }

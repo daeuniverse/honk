@@ -1,4 +1,5 @@
 use super::*;
+use crate::subscription::parse_subscription_content_with_diagnostics;
 use std::collections::HashMap;
 
 fn fixture(directory: &Path, extra: &str) -> LoadedConfig {
@@ -545,6 +546,64 @@ fn cache_body(
         .block_on(store.store_content(subscription, body.into()))
         .unwrap();
     store
+}
+
+#[test]
+fn imported_dns_reload_uses_live_source_and_validates_duplicate_or_cached_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut loaded = fixture(
+        temp.path(),
+        "subscription {\n first: 'https://example.invalid/sub' {\n import_dns: false\n }\n second: 'https://example.invalid/sub' {\n import_dns: true\n }\n}\n",
+    );
+    let subscription = loaded.config.subscriptions[0].clone();
+    let body = crate::subscription::parse_subscription_body_with_diagnostics(
+        &subscription,
+        "proxies:\n - {name: live, type: socks5, server: node.example, port: 1080}\ndns:\n nameserver: 192.0.2.1\n",
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let mut active = loaded.config.clone();
+    body.publish_dns(&mut active.subscriptions[0]);
+    let mut second_body = body.clone();
+    second_body.nodes[0].name = "live-second".into();
+    second_body.nodes[0].port = 1081;
+    second_body.nodes[0].address = "node.example:1081".into();
+    second_body.nodes[0].id = second_body.nodes[0].derive_id();
+    second_body.nodes[0].subscription_id = Some(active.subscriptions[1].id);
+    second_body.publish_dns(&mut active.subscriptions[1]);
+    active.nodes = vec![body.nodes[0].clone(), second_body.nodes[0].clone()];
+    let _cache = cache_body(
+        Path::new(&active.global.data_dir),
+        &subscription,
+        "proxies:\n - {name: cached, type: socks5, server: node.example, port: 1080}\ndns:\n nameserver: {invalid: true}\n",
+    );
+    loaded.config.subscriptions[0].id = uuid::Uuid::new_v4();
+    loaded.config.subscriptions[1].id = uuid::Uuid::new_v4();
+    let admitted = admit(loaded, &active).unwrap();
+    assert!(admitted.config.nodes.iter().any(|node| node.name == "live"));
+    assert!(admitted.config.subscriptions[0].imported_dns.is_none());
+    assert_eq!(
+        admitted.config.subscriptions[1]
+            .imported_dns
+            .as_ref()
+            .unwrap()
+            .nameservers[0]
+            .address,
+        "192.0.2.1"
+    );
+
+    let fresh = fixture(
+        temp.path(),
+        "subscription {\n fresh: 'https://fresh.invalid/sub' {\n import_dns: true\n }\n}\n",
+    );
+    let _fresh_cache = cache_body(
+        Path::new(&active.global.data_dir),
+        &fresh.config.subscriptions[0],
+        "proxies:\n - {name: cached, type: socks5, server: node.example, port: 1082}\ndns:\n nameserver: ['https://secret.example/dns-query#PROXY']\n",
+    );
+    let err = admit(fresh, &active).err().unwrap();
+    assert_eq!(err.diagnostic.code, "invalid-offline-dependency");
+    assert!(!err.to_string().contains("secret.example"));
 }
 
 #[test]

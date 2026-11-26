@@ -282,7 +282,7 @@ DNS 的 `sip()` 和 `ip()` 共用同一個 IP/CIDR 解碼器。裸 IPv4 和 IPv6
 
 ### 節點伺服器網域
 
-節點伺服器網域經 `global.bootstrap_resolver`、`/etc/hosts` 和系統 nameserver 解析，不走 DNS 路由。含 `subtag(...)` 的 request 規則會接管匹配訂閱裡節點的伺服器網域，XHTTP 下載網域也包括在內：
+節點伺服器網域依序使用本機明確覆寫、已啟用的[訂閱 DNS 匯入](./subscription.md#匯入節點-dns)、`global.bootstrap_resolver`、`/etc/hosts` 和系統 nameserver。含 `subtag(...)` 的 request 規則會接管符合訂閱裡節點的伺服器網域，XHTTP 下載網域也包括在內：
 
 ```dae
 dns {
@@ -299,16 +299,16 @@ dns {
 }
 ```
 
-- 代理鏈本身沒有伺服器網域；各實體節點的網域保留各自的訂閱標籤。
-- 節點網域只匹配含 `subtag()` 的規則；普通規則、fallback 和沒匹配上的網域仍走 bootstrap 解析。其他查詢不帶訂閱，對它們來說 `subtag()` 和 `!subtag()` 都是 false。
+- 代理鏈本身沒有伺服器網域；各實體節點保留各自的訂閱標籤，撥號代理鏈或群組出口時依入口跳點自身的訂閱策略解析。
+- 節點網域只比對含 `subtag()` 的規則；一般規則和業務 fallback 不接管節點解析。未符合的節點先使用已啟用的訂閱 DNS，再走 bootstrap。其他查詢不帶訂閱，對它們來說 `subtag()` 和 `!subtag()` 都是 false。
 - 被接管的查詢只發往選中的上游，遵守 `strategy` 和 `use_host`，不走快取和 response 規則，也不回退：查詢失敗就表示實體節點連線或探測連線失敗。
 - 接管按網域生效，不是端到端的下載目標解析策略。下載時為選路而預先解析 URL 網域，只是盡力而為；代理下載的 URL 網域仍由代理解析，而承載代理自身的節點伺服器解析遵守這條規則。明確使用 bootstrap 解析器的下載繞過這個 hook。
-- tag 屬於主機名，不屬於節點：不同訂閱裡共用同一主機名的節點，各自的 tag 會合併，所以第一條匹配的規則就為這個主機名選定一個上游。
+- 節點端點查詢攜帶節點身分和訂閱來源；不同訂閱的同名入口保留各自策略，不合併這些查詢的 tag。
 - 這條規則只能和 `qname()` 組合，而且所選上游的每條宣告都必須是 `-> direct`，否則驗證報錯：`subtag-dns-condition`、`subtag-dns-action` 或 `subtag-dns-upstream-route`。
 - 上游自身的網域、ECH 發現和離線 `delay` 子命令仍使用 bootstrap 解析器。
-- 網域匹配到 `use_host` 中的[別名](#hosts-快照use_host)時，honk 改為解析別名目標。別名鏈停在位址條目上，就直接用這些位址；否則把目標網域當作節點網域解析，也就是交給接管該目標的 `subtag()` 規則，沒有接管就走 bootstrap。直接匹配原始網域的位址條目不會經這個 hook 接管；honk 用的是別名鏈終點的位址條目。所有被接管的查詢，包括本機位址結果和 bootstrap 目標，都遵守 DNS 執行時 admission 與取消機制。目標或 subtag 路徑一旦選定，該路徑失敗就是最終結果。查詢執行前 reload 刪掉了這個別名時，原網域按沒有別名的情況解析。
+- 網域匹配到 `use_host` 中的[別名](#hosts-快照use_host)時，honk 改為解析別名目標。別名鏈停在位址條目上，就依 `strategy` 過濾與排序後使用這些位址；否則把目標網域當作節點網域解析，依序交給接管該目標的 `subtag()` 規則、已啟用的訂閱匯入 DNS，都沒有接管再走 bootstrap。直接匹配原始網域的位址條目不會經這個 hook 接管；honk 用的是別名鏈終點的位址條目。所有被接管的查詢，包括本機位址結果和 bootstrap 目標，都遵守 DNS 執行時 admission 與取消機制。目標、`subtag()` 或訂閱 DNS 路徑一旦選定，該路徑失敗就是最終結果。查詢執行前 reload 刪掉了這個別名時，原網域按沒有別名的情況解析。
 - 別名匹配所有交給 bootstrap 解析器的網域，不限於節點伺服器網域：沒有指定明確 bootstrap 解析器的訂閱、Geo 資料和外部 UI 下載的 URL 網域，SOCKS5 節點的 UDP 中繼網域，以及健康檢查、延遲測試、連通性探測和內部解析回退到 bootstrap 時的網域。DNS 上游自身的網域和 ECH 發現不走這個 hook。
-- 每個 DNS generation 根據訂閱 tag 和有序規則，預先算出節點網域的策略結果，包括沒匹配上的結果。用到這些結果時，原生流追蹤會以 `not_instrumented` 標成 `partial`：節點網域的規則決策證據還沒有收集。
+- 節點網域解析評估 `subtag()` 規則或訂閱匯入 DNS（含未命中的評估），或者命中 `use_host` 別名位址條目而未發起網路查詢時，原生流追蹤會以 `not_instrumented` 標成 `partial`：節點網域的策略與本機別名決策還沒有收集為結構化 DNS 規則步驟。
 
 ### Request 動作
 

@@ -190,7 +190,8 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 .map(|feedback| feedback.with_source(ScoreSource::Warmup))
             };
             let warm = cancel
-                .run(runtime.scope_tasks(generation.scope_dials(
+                .run(runtime.scope_tasks(generation.scope_node_dials(
+                    runtime.node.id,
                     honk_outbound::urltest::warm_http_probe(
                         &runtime,
                         entry.warmable.as_deref(),
@@ -225,7 +226,8 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 )
                 .map(|feedback| feedback.with_probe_interval(probe_interval));
             let result = cancel
-                .run(runtime.scope_tasks(generation.scope_dials(
+                .run(runtime.scope_tasks(generation.scope_node_dials(
+                    runtime.node.id,
                     honk_outbound::urltest::measure_http_probe(
                         &runtime,
                         entry.tcp.as_ref(),

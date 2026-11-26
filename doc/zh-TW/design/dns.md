@@ -162,7 +162,7 @@ waiter 複製的是原始 causal chain，不是從 display 文字重建的。已
 
 只有 IN class 的 A 和 AAAA 查詢會用到這個快照。位址條目缺少請求的位址族時傳回 `NOERROR`/NODATA，絕不洩漏給上游。本機位址記錄和生成的別名 CNAME 用 60 秒 TTL；複製的目標記錄保留目標自己的 TTL 策略。Hosts 應答繞過正快取和負快取的重用；巢狀的別名目標查詢保留呼叫者的快取策略。合成結果仍經過正常的路由投影。別名合成會保留目標最終應答的 `TC` 和完整 RCODE；非 EDNS 用戶端無法表示的擴充錯誤，變成不帶記錄的 `SERVFAIL`。派生查詢只接受一個問題、空的 answer 和 authority section，以及至多一個 additional OPT；它保留 ID、全部 flags、type、class，以及精確的 OPT class/TTL/選項，並單獨編碼那個根名稱 owner。不支援的 section 在目標 I/O 之前就失敗，不會丟記錄，也不會回退到原始名稱。快照在自己的 generation 內不可變；改了來源就送 SIGHUP 來發布替換項。載入或解析失敗會讓啟動失敗，或者在發布前中止 reload。
 
-Bootstrap hook 透過別名或選中的 `subtag()` 規則接管原始網域。直接位址條目本身不會接管這個網域，但別名鏈終止於位址條目時，會使用這些位址。被接管的本機位址、bootstrap 目標和 subtag 查詢，共用 DNS 執行時的 admission 和取消機制。一旦選定解析路徑，它的失敗就是最終結果。hook 的使用方和排除範圍見[節點網域參考](../reference/dns.md#節點伺服器網域)。
+節點端點查詢捕獲 `NodeId` 和出站世代的 resolver，依節點實際訂閱身分及端點集合選擇策略：hosts 別名、明確的 `subtag()`、訂閱匯入 DNS，最後是本機 bootstrap。直接位址條目本身不接管名稱，別名鏈終止於位址條目時則使用這些位址。匯入上游池在 DNS 世代內依訂閱去重並獨占，使用直連 socket、共用 socket 預算、查詢 admission 和取消機制。上游網域的 bootstrap 繞過節點解析，也不會使用代理節點的固定位址。Resolver 繫結對 DNS 資源使用弱引用，世代退役時關閉池，不保留循環引用。使用方和排除範圍見[節點網域參考](../reference/dns.md#節點伺服器網域)。
 
 ### 位址族策略
 

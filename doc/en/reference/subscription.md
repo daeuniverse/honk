@@ -17,7 +17,7 @@ subscription {
 
 ## Fields
 
-To set options for one subscription, add a block after the quoted URL, one key per line. None is required. An omitted option takes the matching `assets.subscription` default, or `assets.route` for `route`, before the built-in default. See the [assets reference](./assets.md).
+To set options for one subscription, add a block after the quoted URL, one key per line. None is required. An omitted download option takes the matching `assets.subscription` default, or `assets.route` for `route`, before the built-in default. `import_dns` always defaults to `false`. See the [assets reference](./assets.md).
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -25,6 +25,77 @@ To set options for one subscription, add a block after the quoted URL, one key p
 | `interval` | `86400s` | Set the periodic refresh interval; see [`interval`](#interval). |
 | `cache` | `true` | Keep this subscription's body in the subscription store; see [`cache`](#cache). |
 | `route` | `routing` | Select the fetch route; see [`route`](#route). |
+| `import_dns` | `false` | Import this subscription's node-server DNS; see [DNS import](#dns-import). No assets-level default applies. |
+
+## DNS import
+
+`import_dns: true` imports DNS settings from a Clash subscription for that subscription's node server hosts, including XHTTP download hosts. It does not change application DNS, even when an application asks for the same hostname. Different subscriptions can resolve the same server hostname through different upstreams. Node identity and duplicate-node ownership remain unchanged.
+
+```dae
+global {
+    wan_interface: auto
+    log_level: info
+    bootstrap_resolver: 'udp://223.5.5.5:53'
+    store_subscribe: true
+}
+subscription {
+    primary: 'https://subscription-a.example/config' {
+        import_dns: true
+        interval: 6h
+        route: direct
+    }
+    secondary: 'https://subscription-b.example/config' {
+        import_dns: false
+        route: direct
+    }
+}
+group {
+    proxy {
+        filter: subtag(primary, secondary)
+        policy: fixed(0)
+    }
+}
+routing {
+    fallback: proxy
+}
+dns {
+    upstream {
+        ordinary: 'udp://223.5.5.5:53'
+        override: 'tcp://119.29.29.29:53' -> direct
+    }
+    routing {
+        request {
+            subtag(primary) && qname(suffix: override.example) -> override
+            fallback: ordinary
+        }
+    }
+}
+```
+
+Replace the example subscription URLs with your own. Local hosts aliases and explicit `subtag()` DNS rules take precedence over imported DNS. Imported DNS takes precedence over the normal node bootstrap path. An application DNS fallback does not override imported DNS. Node connections, health checks and latency tests use the node's source; their ordinary test destinations retain application DNS.
+
+| Clash field | Imported behavior |
+| --- | --- |
+| `proxy-server-nameserver` | A nonempty list selects the dedicated node resolver branch. |
+| `proxy-server-nameserver-policy` | Overrides that branch for matching hosts; requires a nonempty `proxy-server-nameserver`. |
+| `nameserver-policy` | Matches node hosts when the dedicated branch is absent. |
+| `nameserver` | Default for the ordinary branch. With policy alone, unmatched hosts retain local bootstrap. |
+| `default-nameserver` | Resolves DNS upstream hostnames only. Explicit entries must have IP hosts and the list must be nonempty. Omission uses local bootstrap. |
+| `ipv6` | Explicit `false` disables imported AAAA queries; `true` does not override local address-family restrictions. |
+
+Upstreams accept a string or a list: bare IP, UDP, TCP, TLS, HTTPS, HTTP/3 (`h3://` or `http3://`) and QUIC URLs, with case-insensitive schemes. HTTPS and HTTP/3 retain their port, path and query string. Domain policy keys support exact names, `+.example.com` (apex and descendants), `.example.com` (descendants), and `*.example.com` (one label). Literal labels take precedence over single-label wildcards and suffix matches. Upstream lists race concurrently: the first valid non-truncated NOERROR or NXDOMAIN response wins. NXDOMAIN and empty answers do not retry through another policy.
+
+Imported DNS uses direct, bypass-marked sockets. `default-nameserver` resolves upstream hosts without passing through node DNS or proxies, and an explicitly selected bootstrap list never falls back to the system resolver. A selected node DNS policy's failure fails the node lookup rather than silently selecting local DNS.
+
+Successful refreshes publish nodes and DNS together, including DNS-only changes. A valid body without DNS clears earlier imported DNS. Download, parsing or publication failure keeps the active nodes and DNS. Startup re-parses the cached full body with the same parser. Reload retains the DNS source accepted with the active nodes; enabling import compiles that source, and disabling it removes the imported policy. An invalid source rejects enablement. Changing this option does not require restarting the daemon.
+
+### Import limits
+
+This is partial DNS import, not full Clash configuration loading. Listener, FakeIP, TUN, proxy groups and traffic rules are not imported. Full Mihomo configuration loading and proxy-provider refresh are distinct operations; provider refresh does not merge global DNS.
+
+Each server list accepts at most 8 upstreams, each subscription accepts at most 512 policy entries and 64 unique upstream servers, and duplicate upstream declarations share one transport pool per subscription. Unsupported active DNS semantics reject the subscription candidate with a field/index diagnostic: geosite/rule-set policies, userinfo, DNS URL fragments (including `#skip-cert-verify=true` or proxy selectors), port `0`, `respect-rules: true`, and ordinary-branch `fallback`/`fallback-filter`. The dedicated node branch does not inherit ordinary fallback. There is no timeout-only approximation of Mihomo fallback filtering. Missing, null or empty DNS contributes no policy. Non-Clash subscriptions retain their existing behavior.
+
+The import switch accepts the normal boolean literals; invalid values reject configuration. When disabled, DNS is retained as source metadata without validation or execution. Diagnostics do not print complete upstream URLs or credentials.
 
 ### `ua`
 
@@ -114,6 +185,7 @@ Quote-error and block rules are listed in the [dialect reference](./dialect.md).
 | `download_detour` | string | `""` | Yes, as `route` | Fetch route; see [`route`](#route). |
 | `enabled` | bool | `true` | No | Disabled subscriptions are not restored, fetched, or refreshed. |
 | `cache` | bool | `true` | Yes, as `cache` | Body caching for offline startup; see [`cache`](#cache). |
+| `import_dns` | bool | `false` | Yes | Import supported Clash DNS for this subscription's node endpoints. |
 | `last_updated` | datetime or null | null | No | Model metadata; the current core runtime does not update it. |
 | `node_count` | u32 | `0` | No | Model metadata; the current core runtime does not update it. |
 | `created_at` | datetime | construction time | No | Model construction time. |
@@ -221,7 +293,7 @@ subscription {
 
 ## Subscription body formats
 
-All accepted nodes receive the subscription ID. Duplicate derived node IDs retain the first usable occurrence; rejected entries do not reserve an identity. Later duplicates report both original indices. Array indices are one-based before normalization; URI and record indices are physical lines, including blanks and comments. Decoded Base64 has a child source referring to its original body, not fabricated encoded-byte offsets. Importing a full client profile extracts its nodes, not its DNS, routing, groups, or remote-provider configuration.
+All accepted nodes receive the subscription ID. Duplicate derived node IDs retain the first usable occurrence; rejected entries do not reserve an identity. Later duplicates report both original indices. Array indices are one-based before normalization; URI and record indices are physical lines, including blanks and comments. Decoded Base64 has a child source referring to its original body, not fabricated encoded-byte offsets. Importing a full client profile extracts its nodes and, with `import_dns: true`, supported Clash node DNS. Routing, groups and remote-provider configuration are not imported.
 
 Normalized entries are admitted incrementally, without retaining a body-sized list of outcomes. Each body retains at most 128 nonterminal diagnostics, followed by one `subscription-diagnostics-truncated` summary with the omitted count. A terminal body failure is retained separately. The caller's existing diagnostic prefix is untouched and does not consume this budget. The limit applies to structured, URI and record imports, including decoded Base64 and restored bodies. It never stops valid-node admission or changes first-usable duplicate selection.
 

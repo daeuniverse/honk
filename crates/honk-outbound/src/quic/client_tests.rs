@@ -276,6 +276,96 @@ fn spawn_accept_loop(endpoint: Endpoint) {
 }
 
 #[tokio::test]
+async fn node_hostname_scope_reaches_the_selected_quic_peer() {
+    struct Resolver {
+        first: uuid::Uuid,
+        second: uuid::Uuid,
+        calls: Arc<parking_lot::Mutex<Vec<uuid::Uuid>>>,
+    }
+    impl crate::bootstrap::NodeHostResolver for Resolver {
+        fn lookup(&self, _: &str) -> Option<crate::bootstrap::NodeHostLookup> {
+            panic!("QUIC endpoint resolution lost its node context")
+        }
+        fn lookup_node(
+            &self,
+            node: uuid::Uuid,
+            host: &str,
+        ) -> Option<crate::bootstrap::NodeHostLookup> {
+            assert_eq!(host, "shared.quic.test");
+            self.calls.lock().push(node);
+            let address = if node == self.first {
+                "127.0.0.2"
+            } else {
+                assert_eq!(node, self.second);
+                "127.0.0.3"
+            }
+            .parse()
+            .unwrap();
+            Some(Box::pin(async move { Ok(vec![address]) }))
+        }
+    }
+    let first = Endpoint::server(
+        testutil::server_config(&[b"h3"], true).unwrap(),
+        "127.0.0.2:0".parse().unwrap(),
+    )
+    .unwrap();
+    let port = first.local_addr().unwrap().port();
+    let second = Endpoint::server(
+        testutil::server_config(&[b"h3"], true).unwrap(),
+        format!("127.0.0.3:{port}").parse().unwrap(),
+    )
+    .unwrap();
+    let node_ids = [uuid::Uuid::from_u128(101), uuid::Uuid::from_u128(102)];
+    let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let registry = crate::runtime::OutboundRuntimeRegistry::build(&[]).unwrap();
+    registry.bind_node_resolver(Arc::new(Resolver {
+        first: node_ids[0],
+        second: node_ids[1],
+        calls: Arc::clone(&calls),
+    }));
+    let config = client_config(&skip_verify_node(), &[b"h3"], QuicClientOptions::default())
+        .await
+        .unwrap();
+    for (index, endpoint) in [first, second].into_iter().enumerate() {
+        let expected = endpoint.local_addr().unwrap();
+        let payload = bytes::Bytes::from_static(if index == 0 { b"first" } else { b"second" });
+        let peer = tokio::spawn(async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            connection.send_datagram(payload).unwrap();
+            connection.closed().await;
+            endpoint.close(VarInt::from_u32(0), b"test complete");
+        });
+        let client = QuicClient::<()>::new("shared.quic.test", port, "localhost", config.clone());
+        let (connection, _) = registry
+            .scope_node_dials(
+                node_ids[index],
+                client.connection_with(Duration::from_secs(2), |_| async { Ok(()) }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(connection.remote_address(), expected);
+        let response = tokio::time::timeout(Duration::from_secs(2), connection.read_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.as_ref(),
+            if index == 0 {
+                b"first".as_slice()
+            } else {
+                b"second".as_slice()
+            }
+        );
+        client.force_close().await;
+        tokio::time::timeout(Duration::from_secs(2), peer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(*calls.lock(), node_ids);
+}
+
+#[tokio::test]
 async fn adaptive_profile_updates_live_connection_windows() {
     const MIB: u64 = 1 << 20;
     let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();

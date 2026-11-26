@@ -206,6 +206,42 @@ impl PooledTransport {
 }
 
 impl UpstreamPool {
+    #[cfg(test)]
+    pub(crate) async fn seed_test_doh_connector(
+        &self,
+        upstream: &str,
+        target: std::net::SocketAddr,
+        connector: honk_outbound::tls::TlsConnector,
+    ) {
+        let entry = &self.entries[upstream];
+        assert_eq!(entry.protocol, DnsProtocol::Https);
+        let dial = self.dial_context(entry, None, target).unwrap();
+        let mut client =
+            DohClient::new_tracked(dial, Arc::clone(&self.active_transport_tasks)).unwrap();
+        Arc::get_mut(&mut client)
+            .unwrap()
+            .set_test_connector(connector);
+        let slot = Arc::new(LifecycleSlot::new());
+        slot.acquire(|| std::future::ready(Ok(PooledTransport::Doh(client))))
+            .await
+            .unwrap();
+        assert!(
+            entry
+                .transports
+                .lock()
+                .slots
+                .insert(
+                    TransportKey {
+                        dialed: None,
+                        collapse: ExitCollapse::None,
+                        target,
+                    },
+                    slot,
+                )
+                .is_none()
+        );
+    }
+
     pub(super) fn dial_context(
         &self,
         entry: &UpstreamEntry,

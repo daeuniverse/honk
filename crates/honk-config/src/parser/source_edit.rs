@@ -250,6 +250,7 @@ pub struct SubscriptionOptions<'a> {
     pub update_interval: Option<u64>,
     pub user_agent: Option<&'a str>,
     pub cache: Option<bool>,
+    pub import_dns: Option<bool>,
 }
 
 /// Append an unfetched HTTP(S) subscription, rejecting duplicate source names.
@@ -271,6 +272,9 @@ pub fn append_subscription_source(
     if let Some(cache) = options.cache {
         fields.push(format!("cache: {cache}"));
     }
+    if let Some(import_dns) = options.import_dns {
+        fields.push(format!("import_dns: {import_dns}"));
+    }
     let (entry, config) = managed_entry("subscription", name, url, &fields)?;
     let [subscription] = config.subscriptions.as_slice() else {
         return Err(SourceEditError::default());
@@ -282,6 +286,7 @@ pub fn append_subscription_source(
         || subscription.update_interval
             != options.update_interval.unwrap_or(defaults.update_interval)
         || subscription.cache != options.cache.unwrap_or(defaults.cache)
+        || subscription.import_dns != options.import_dns.unwrap_or(defaults.import_dns)
         || url::Url::parse(url)
             .ok()
             .is_none_or(|url| url.host_str().is_none())

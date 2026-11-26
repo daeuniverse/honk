@@ -94,14 +94,20 @@ impl ControlPlane {
                             .start()
                     });
                     match generation
-                        .scope_dials(honk_outbound::util::connect_outbound(
-                            &addr,
-                            connect_timeout,
-                        ))
+                        .scope_node_dials(
+                            node.id,
+                            honk_outbound::util::connect_outbound(&addr, connect_timeout),
+                        )
                         .await
                     {
                         Ok(stream) => {
-                            if pool.deposit_tcp(&addr, stream).await {
+                            if pool
+                                .deposit_tcp(
+                                    &ConnectionPool::bare_key(generation.generation(), &node),
+                                    stream,
+                                )
+                                .await
+                            {
                                 if let Some(reporter) = &reporter {
                                     reporter.setup_succeeded();
                                 }

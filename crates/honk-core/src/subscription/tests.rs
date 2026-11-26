@@ -5,6 +5,7 @@ use sha2::{Digest as _, Sha256};
 
 mod admission;
 mod clash;
+mod dns_import;
 
 fn parse_clash_subscription(
     content: &str,

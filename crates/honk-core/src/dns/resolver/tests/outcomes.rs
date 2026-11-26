@@ -546,14 +546,10 @@ async fn node_host_lookup_uses_its_subtag_upstream_without_response_requery_or_c
     #[cfg(feature = "native-api")]
     {
         assert_eq!(
-            pinned
-                .resolve_node_server("node.private.example")
-                .await
-                .unwrap()
-                .len(),
+            pinned.resolve("node.private.example").await.unwrap().len(),
             1
         );
-        assert_eq!(pool.0.lock().unwrap().last().unwrap(), "providerdoh");
+        assert_eq!(pool.0.lock().unwrap().last().unwrap(), "ordinary");
         drop(pinned);
     }
     provider.shutdown().await;

@@ -393,8 +393,11 @@ async fn marked_direct_dial_skips_bare_pool_and_rejects_retired_completion() {
         .unwrap();
     let (_peer, _) = listener.accept().await.unwrap();
     assert!(
-        pool.deposit_tcp(&format!("{}:{}", node.host(), node.port), unmarked)
-            .await
+        pool.deposit_tcp(
+            &ConnectionPool::bare_key(generation.generation(), &node),
+            unmarked
+        )
+        .await
     );
     let scope = generation.dial_scope(|| {});
 

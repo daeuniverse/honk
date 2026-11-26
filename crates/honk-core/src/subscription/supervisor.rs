@@ -91,6 +91,7 @@ pub(crate) fn same_subscription_source_spec(left: &Subscription, right: &Subscri
         && left.headers == right.headers
         && left.enabled == right.enabled
         && left.cache == right.cache
+        && left.import_dns == right.import_dns
         && left.download_detour == right.download_detour
 }
 
@@ -231,7 +232,7 @@ pub(crate) fn drop_nodes_published_elsewhere(
 
 struct FetchCompletion {
     authorized: AuthorizedSubscription,
-    result: Option<anyhow::Result<(Vec<Node>, SubscriptionUserinfo)>>,
+    result: Option<anyhow::Result<(super::SubscriptionContent, SubscriptionUserinfo)>>,
     diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
 }
 

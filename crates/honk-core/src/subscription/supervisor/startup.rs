@@ -11,14 +11,14 @@ impl SupervisorState {
             providers: Vec::new(),
         };
         let mut requires_network = HashSet::new();
-        for subscription in config.subscriptions.iter().filter(|s| s.enabled) {
+        for subscription in config.subscriptions.clone().iter().filter(|s| s.enabled) {
             let Some(store) = self.store.as_ref() else {
                 requires_network.insert(subscription.id);
                 continue;
             };
             let mut diagnostics = Vec::new();
             match store
-                .load_nodes_with_diagnostics(subscription, &mut diagnostics)
+                .load_body_with_diagnostics(subscription, &mut diagnostics)
                 .await
             {
                 Ok(Some(nodes)) => {
@@ -27,12 +27,19 @@ impl SupervisorState {
                         &mut config.nodes,
                         &config.subscriptions,
                         subscription,
-                        nodes,
+                        nodes.nodes.clone(),
                         true,
                         SubscriptionUserinfo::default(),
                     ) else {
                         continue;
                     };
+                    nodes.publish_dns(
+                        config
+                            .subscriptions
+                            .iter_mut()
+                            .find(|sub| sub.id == subscription.id)
+                            .unwrap(),
+                    );
                     crate::config_diagnostics::declare_provider_diagnostics(
                         subscription,
                         &mut diagnostics,
@@ -107,7 +114,21 @@ impl SupervisorState {
                         let subscription = authorized.subscription;
                         match result {
                             Some(Ok((nodes, userinfo))) => {
-                                if let Some(count) = self.add_startup_nodes(&mut config.nodes, &config.subscriptions, &subscription, nodes, false, userinfo) {
+                                if let Some(count) = self.add_startup_nodes(
+                                    &mut config.nodes,
+                                    &config.subscriptions,
+                                    &subscription,
+                                    nodes.nodes.clone(),
+                                    false,
+                                    userinfo,
+                                ) {
+                                    nodes.publish_dns(
+                                        config
+                                            .subscriptions
+                                            .iter_mut()
+                                            .find(|sub| sub.id == subscription.id)
+                                            .unwrap(),
+                                    );
                                     startup_diagnostics
                                         .replace_provider(subscription.id, diagnostics);
                                     info!(

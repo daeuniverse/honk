@@ -21,7 +21,7 @@ use nix::sys::stat::Mode;
 use rusqlite::{Connection, MAIN_DB, OptionalExtension as _, TransactionBehavior, params};
 use sha2::{Digest as _, Sha256};
 
-use super::{SUBSCRIPTION_STORE_DIR, parse_subscription_content_with_diagnostics};
+use super::SUBSCRIPTION_STORE_DIR;
 use crate::state::{StateDb, effective_uid};
 
 /// All stored bodies together.
@@ -83,6 +83,16 @@ impl SubscriptionStore {
         sub: &Subscription,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> anyhow::Result<Option<Vec<Node>>> {
+        self.load_body_with_diagnostics(sub, diagnostics)
+            .await
+            .map(|body| body.map(|body| body.nodes))
+    }
+
+    pub(crate) async fn load_body_with_diagnostics(
+        &self,
+        sub: &Subscription,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+    ) -> anyhow::Result<Option<super::SubscriptionContent>> {
         if !sub.cache {
             return Ok(None);
         }
@@ -95,7 +105,7 @@ impl SubscriptionStore {
             return Ok(None);
         };
         let content = String::from_utf8(body).context("stored subscription body is not UTF-8")?;
-        parse_subscription_content_with_diagnostics(sub, &content, diagnostics)
+        super::parse_subscription_body_with_diagnostics(sub, &content, diagnostics)
             .map(Some)
             .map_err(|error| anyhow::anyhow!(error.to_string()))
     }

@@ -238,7 +238,7 @@ async fn resolve_urltest_address(host: &str, port: u16) -> anyhow::Result<Socket
             .next()
             .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"));
     }
-    crate::bootstrap::resolve(host)
+    crate::bootstrap::resolve_with(crate::bootstrap::global(), host)
         .await
         .with_context(|| format!("failed to resolve '{host}:{port}'"))?
         .into_iter()
@@ -389,10 +389,13 @@ async fn urltest_node_in_generation_impl(
         })
     };
     let result = cancel
-        .run(runtime.scope_tasks(generation.scope_dials(Box::pin(async {
-            warm_http_probe(&runtime, warmable, timeout, timeout, warm_feedback).await?;
-            urltest_request_impl(&runtime, handler, &request, timeout, &cancel).await
-        }))))
+        .run(runtime.scope_tasks(generation.scope_node_dials(
+            node.id,
+            Box::pin(async {
+                warm_http_probe(&runtime, warmable, timeout, timeout, warm_feedback).await?;
+                urltest_request_impl(&runtime, handler, &request, timeout, &cancel).await
+            }),
+        )))
         .await
         .unwrap_or_else(|| Err(crate::proxy::PacketRejection::Cancelled.into()));
     if let Some(mut guard) = guard

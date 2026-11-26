@@ -27,10 +27,10 @@ mod vless;
 
 #[cfg(feature = "owned-tasks")]
 pub use admission::PinnedServers;
-pub(crate) use admission::pinned_server_address;
 pub(crate) use admission::{
     CapturedDialAdmission, admit_physical_dial, admit_replacement_dial, capture_dial_admission,
-    capture_dial_scope, start_scoped_dial, try_capture_dial_admission,
+    capture_dial_scope, node_host_resolver, pinned_server_address, scope_node, start_scoped_dial,
+    try_capture_dial_admission,
 };
 pub use admission::{DialPermit, DialScope};
 #[cfg(any(feature = "rprx", test))]
@@ -833,6 +833,7 @@ pub enum RuntimeRegistryError {
 /// through to a newer generation.
 #[derive(Debug)]
 pub struct OutboundRuntimeRegistry {
+    node_resolver: Arc<std::sync::OnceLock<Arc<dyn crate::bootstrap::NodeHostResolver>>>,
     generation: u64,
     nodes: HashMap<uuid::Uuid, Arc<NodeRuntime>>,
     terminal: AtomicBool,
@@ -864,6 +865,54 @@ pub struct OutboundRuntimeRegistry {
 pub type SharedRuntimeRegistry = Arc<parking_lot::RwLock<Arc<OutboundRuntimeRegistry>>>;
 
 impl OutboundRuntimeRegistry {
+    /// Bind this generation's resolver before admitting physical node dials.
+    pub fn bind_node_resolver(&self, resolver: Arc<dyn crate::bootstrap::NodeHostResolver>) {
+        assert!(
+            self.node_resolver.set(resolver).is_ok(),
+            "node resolver already bound"
+        );
+    }
+
+    pub fn has_node_resolver(&self) -> bool {
+        self.node_resolver.get().is_some()
+    }
+
+    /// Claimed node-specific lookup (`hosts` alias, `subtag()`, or imported DNS),
+    /// or `None` when the node endpoint has no node-scoped claim.
+    pub fn lookup_node_host(
+        &self,
+        node: uuid::Uuid,
+        host: &str,
+    ) -> Option<crate::bootstrap::NodeHostLookup> {
+        self.node_resolver
+            .get()
+            .and_then(|resolver| resolver.lookup_node(node, host))
+    }
+
+    /// Resolve a node endpoint without entering the business-target resolver.
+    pub async fn resolve_node_host(
+        &self,
+        node: uuid::Uuid,
+        host: &str,
+    ) -> std::io::Result<Vec<std::net::IpAddr>> {
+        if let Some(resolver) = self.node_resolver.get() {
+            if let Some(lookup) = resolver.lookup_node(node, host) {
+                return lookup.await;
+            }
+            if let Some(lookup) = crate::bootstrap::lookup_custom_hook(host) {
+                return lookup.await;
+            }
+            return crate::bootstrap::resolve_with(
+                resolver
+                    .fallback_bootstrap()
+                    .or_else(crate::bootstrap::global),
+                host,
+            )
+            .await;
+        }
+        crate::bootstrap::resolve(host).await
+    }
+
     /// Build and validate a registry from the generation's node set.
     pub fn build(nodes: &[Node]) -> Result<Self, RuntimeRegistryError> {
         Self::build_reusing(
@@ -989,6 +1038,7 @@ impl OutboundRuntimeRegistry {
             None,
         )?;
         fork.dial_semaphore = Arc::clone(&self.dial_semaphore);
+        fork.node_resolver = Arc::clone(&self.node_resolver);
         Ok(fork)
     }
 
@@ -1002,6 +1052,27 @@ impl OutboundRuntimeRegistry {
         startup_vless_carrier_ceiling: usize,
         own_tasks: bool,
         previous: Option<&Self>,
+    ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
+        Self::build_reusing_with_dns_changes(
+            nodes,
+            max_concurrent_dials,
+            startup_dial_ceiling,
+            startup_vless_carrier_ceiling,
+            own_tasks,
+            previous,
+            &HashSet::new(),
+        )
+    }
+
+    /// Replace session runtimes whose endpoint resolution changed, keeping process budgets shared.
+    pub fn build_reusing_with_dns_changes(
+        nodes: &[Node],
+        max_concurrent_dials: usize,
+        startup_dial_ceiling: usize,
+        startup_vless_carrier_ceiling: usize,
+        own_tasks: bool,
+        previous: Option<&Self>,
+        changed: &HashSet<uuid::Uuid>,
     ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
         let (dial_ceiling_semaphore, dial_ceiling_limit) = match previous {
             Some(previous) => (
@@ -1020,7 +1091,7 @@ impl OutboundRuntimeRegistry {
         );
         #[cfg(not(any(feature = "rprx", test)))]
         let _ = startup_vless_carrier_ceiling;
-        Self::build_reusing_with_admission(
+        Self::build_reusing_with_admission_and_changes(
             nodes,
             max_concurrent_dials,
             dial_ceiling_semaphore,
@@ -1029,6 +1100,7 @@ impl OutboundRuntimeRegistry {
             vless_carrier_semaphore,
             own_tasks,
             previous,
+            changed,
         )
     }
 
@@ -1040,6 +1112,30 @@ impl OutboundRuntimeRegistry {
         #[cfg(any(feature = "rprx", test))] vless_carrier_semaphore: Arc<tokio::sync::Semaphore>,
         own_tasks: bool,
         previous: Option<&Self>,
+    ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
+        Self::build_reusing_with_admission_and_changes(
+            nodes,
+            max_concurrent_dials,
+            dial_ceiling_semaphore,
+            dial_ceiling_limit,
+            #[cfg(any(feature = "rprx", test))]
+            vless_carrier_semaphore,
+            own_tasks,
+            previous,
+            &HashSet::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_reusing_with_admission_and_changes(
+        nodes: &[Node],
+        max_concurrent_dials: usize,
+        dial_ceiling_semaphore: Arc<tokio::sync::Semaphore>,
+        dial_ceiling_limit: usize,
+        #[cfg(any(feature = "rprx", test))] vless_carrier_semaphore: Arc<tokio::sync::Semaphore>,
+        own_tasks: bool,
+        previous: Option<&Self>,
+        changed: &HashSet<uuid::Uuid>,
     ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
         honk_config::node::validate_node_collection(nodes)
             .map_err(RuntimeRegistryError::Admission)?;
@@ -1063,7 +1159,10 @@ impl OutboundRuntimeRegistry {
                 })?;
             }
             let reused_runtime = previous.and_then(|previous| {
-                if previous.is_shutdown() || previous.owns_tasks() != own_tasks {
+                if changed.contains(&node.id)
+                    || previous.is_shutdown()
+                    || previous.owns_tasks() != own_tasks
+                {
                     return None;
                 }
                 let runtime = previous.get(&node.id)?;
@@ -1114,6 +1213,7 @@ impl OutboundRuntimeRegistry {
         }
         Ok((
             Self {
+                node_resolver: Arc::new(std::sync::OnceLock::new()),
                 generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
                 nodes: map,
                 terminal: AtomicBool::new(false),

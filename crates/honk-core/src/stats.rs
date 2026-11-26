@@ -564,8 +564,10 @@ impl StatsManager {
         for runtime in generation.values() {
             let counts = runtime.warm_counts();
             snap.add_protocol_counts(runtime.node.protocol(), counts);
-            let bare =
-                pool.has_live_bare_entry(&format!("{}:{}", runtime.node.host(), runtime.node.port));
+            let bare = pool.has_live_bare_entry(&crate::pool::ConnectionPool::bare_key(
+                generation.generation(),
+                &runtime.node,
+            ));
             // An unknown QUIC client count (map locked by an in-flight
             // build) is warm, not cold: pruning here would drop the node's
             // attribution and re-report it as traffic next sample.
@@ -1262,7 +1264,11 @@ mod tests {
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let _accepted = listener.accept().await.unwrap();
-        pool.deposit_tcp(&addr.to_string(), stream).await;
+        pool.deposit_tcp(
+            &crate::pool::ConnectionPool::bare_key(generation.generation(), &node),
+            stream,
+        )
+        .await;
 
         let unmarked = stats.warm_snapshot(&generation, &pool);
         assert_eq!(unmarked.traffic_nodes, 1);
@@ -1281,7 +1287,11 @@ mod tests {
             WarmSnapshot::default()
         );
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        pool.deposit_tcp(&addr.to_string(), stream).await;
+        pool.deposit_tcp(
+            &crate::pool::ConnectionPool::bare_key(generation.generation(), &node),
+            stream,
+        )
+        .await;
         let rewarmed = stats.warm_snapshot(&generation, &pool);
         assert_eq!(rewarmed.traffic_nodes, 1);
         assert_eq!(rewarmed.preconnect_nodes, 0);

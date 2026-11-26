@@ -89,6 +89,12 @@ impl HostsSnapshot {
     pub(crate) fn fingerprint(&self) -> [u8; 32] {
         self.fingerprint
     }
+
+    pub(crate) fn is_alias(&self, domain: &str) -> bool {
+        self.hosts.as_deref().is_some_and(|hosts| {
+            hosts.has_aliases && matches!(hosts.target_for(domain), Some(HostsTarget::Alias(_)))
+        })
+    }
 }
 
 impl HostsSourceSet {

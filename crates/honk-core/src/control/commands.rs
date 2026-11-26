@@ -1,4 +1,4 @@
-use honk_config::{Config, node::Node};
+use honk_config::Config;
 
 use crate::subscription::AuthorizedSubscription;
 
@@ -65,7 +65,7 @@ pub(crate) enum ControlCommand {
     MergeSubscription {
         subscription_id: uuid::Uuid,
         revision: u64,
-        nodes: Vec<Node>,
+        nodes: crate::subscription::SubscriptionContent,
         diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
         result: tokio::sync::oneshot::Sender<crate::subscription::SubscriptionMergeReply>,
     },

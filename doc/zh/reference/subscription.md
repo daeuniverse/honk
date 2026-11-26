@@ -17,7 +17,7 @@ subscription {
 
 ## 字段
 
-给单个订阅设置选项时，在带引号的 URL 后面追加一个块，每行一个 key。四个选项都可省略。省略的选项先取 `assets.subscription` 里对应的默认值（`route` 取 `assets.route`），再取内置默认值。见 [Assets 配置参考](./assets.md)。
+给单个订阅设置选项时，在带引号的 URL 后面追加一个块，每行一个 key。所有选项都可省略。省略的下载选项先取 `assets.subscription` 里对应的默认值（`route` 取 `assets.route`），再取内置默认值。`import_dns` 始终默认 `false`。见 [Assets 配置参考](./assets.md)。
 
 | Key | 默认值 | 含义 |
 | --- | --- | --- |
@@ -25,6 +25,77 @@ subscription {
 | `interval` | `86400s` | 设置定期刷新间隔；见 [`interval`](#interval)。 |
 | `cache` | `true` | 把该订阅的正文保存在订阅存储中；见 [`cache`](#cache)。 |
 | `route` | `routing` | 选择拉取出口；见 [`route`](#route)。 |
+| `import_dns` | `false` | 导入该订阅的节点 DNS；见[导入节点 DNS](#导入节点-dns)。此选项没有 assets 级默认值。 |
+
+## 导入节点 DNS
+
+在订阅 URL 后的选项块中设置 `import_dns: true`，即可导入 Clash 正文中适用于该订阅节点服务器域名的 DNS，包括 XHTTP 下载端点。普通应用查询同一个域名时仍使用本地业务 DNS；不同订阅的同名入口可以使用各自的上游。节点身份和重复节点归属规则保持不变。
+
+```dae
+global {
+    wan_interface: auto
+    log_level: info
+    bootstrap_resolver: 'udp://223.5.5.5:53'
+    store_subscribe: true
+}
+subscription {
+    primary: 'https://subscription-a.example/config' {
+        import_dns: true
+        interval: 6h
+        route: direct
+    }
+    secondary: 'https://subscription-b.example/config' {
+        import_dns: false
+        route: direct
+    }
+}
+group {
+    proxy {
+        filter: subtag(primary, secondary)
+        policy: fixed(0)
+    }
+}
+routing {
+    fallback: proxy
+}
+dns {
+    upstream {
+        ordinary: 'udp://223.5.5.5:53'
+        override: 'tcp://119.29.29.29:53' -> direct
+    }
+    routing {
+        request {
+            subtag(primary) && qname(suffix: override.example) -> override
+            fallback: ordinary
+        }
+    }
+}
+```
+
+将示例订阅 URL 换成自己的地址。优先级为本地 hosts 别名与显式 `subtag()` DNS 规则、订阅导入策略、原有节点 bootstrap。业务 DNS 的通用 fallback 不会覆盖订阅策略。节点连接、健康检查和延迟测试的节点端点均携带订阅来源；探测目标仍走业务 DNS。
+
+| Clash 字段 | 导入行为 |
+| --- | --- |
+| `proxy-server-nameserver` | 非空时选择节点专用解析分支。 |
+| `proxy-server-nameserver-policy` | 优先匹配专用分支中的节点域名；必须同时配置非空专用上游列表。 |
+| `nameserver-policy` | 没有专用分支时匹配节点域名。 |
+| `nameserver` | 普通分支默认上游；只有 policy 时，未匹配节点沿用本地 bootstrap。 |
+| `default-nameserver` | 只解析 DNS 上游自身的域名。显式列表必须非空，端点主机必须为 IP；省略时沿用本地 bootstrap。 |
+| `ipv6` | 显式 `false` 禁用导入策略的 AAAA 查询；`true` 不越过本地地址族限制。 |
+
+上游接受字符串或列表，支持裸 IP 及大小写不敏感的 UDP、TCP、TLS、HTTPS、HTTP/3（`h3://` 或 `http3://`）和 QUIC URL。HTTPS 与 HTTP/3 保留端口、路径和查询字符串。域名键支持精确匹配、`+.example.com`（自身和所有子域）、`.example.com`（子域）及 `*.example.com`（单层子域）；字面标签优先于单层通配，单层通配优先于后缀。列表并发查询，首个未截断的有效 NOERROR 或 NXDOMAIN 响应胜出；NXDOMAIN 和空答案不会改走另一套策略。
+
+导入上游通过带 bypass mark 的直连 socket 访问。`default-nameserver` 不经过节点解析器或代理；显式选择它之后，失败不会转投系统 DNS。节点策略一旦选中，解析失败就使该节点连接失败。
+
+成功刷新将节点和 DNS 一起发布，包括仅 DNS 变化的情况。有效新正文没有 DNS 时清除旧策略；下载、解析或发布失败则保留当前节点与 DNS。启动从完整缓存正文恢复，使用相同解析器。重载采用当前已接受节点携带的 DNS 来源；开启导入时编译该来源，来源无效则拒绝重载，关闭时撤销策略，无需重启。
+
+### 支持边界
+
+此功能只导入节点 DNS，不加载完整 Clash 配置。监听、FakeIP、TUN、代理组和全局流量规则不导入。Mihomo 的完整配置加载和 proxy-provider 刷新是不同操作，后者不会合并全局 DNS。
+
+每个上游列表最多接受 8 个条目，单个订阅最多接受 512 条策略规则和 64 个唯一上游服务器，重复声明的上游在同一订阅内共享传输池。不支持的有效 DNS 语义会以字段路径和列表序号诊断拒绝候选：geosite/rule-set policy、URL userinfo、DNS URL fragment（包括 `#skip-cert-verify=true` 或代理选择）、端口 `0`、`respect-rules: true`，以及普通分支中的 `fallback`/`fallback-filter`。专用分支不继承普通 fallback，也不会把过滤语义简化为超时备用。缺少 DNS、null 或空块表示没有导入策略。非 Clash 订阅保持原行为。
+
+`import_dns` 接受现有布尔字面量，无效值拒绝配置。关闭时只保留 DNS 来源元数据，不校验也不执行。诊断不输出完整上游 URL 或凭据。
 
 ### `ua`
 
@@ -120,6 +191,7 @@ URL 带引号时，紧贴结束引号或完整 `(UA)` 后缀的 `#` 会被当作
 | `download_detour` | string | `""` | 是，对应 `route` | 拉取的出口；见 [`route`](#route)。 |
 | `enabled` | bool | `true` | 否 | 禁用的订阅不恢复、不拉取、不刷新。 |
 | `cache` | bool | `true` | 是，对应 `cache` | 正文缓存，供离线启动恢复；见 [`cache`](#cache)。 |
+| `import_dns` | bool | `false` | 是 | 为该订阅的节点端点导入支持的 Clash DNS。 |
 | `last_updated` | datetime 或 null | null | 否 | 模型元数据；当前 core 运行时不会更新该字段。 |
 | `node_count` | u32 | `0` | 否 | 模型元数据；当前 core 运行时不会更新该字段。 |
 | `created_at` | datetime | 构造时间 | 否 | 模型构造时间。 |
@@ -228,7 +300,7 @@ subscription {
 
 ## 订阅正文格式
 
-所有被接受的节点都会获得订阅 ID。派生出的节点 ID 重复时，保留第一个可用条目；被拒绝的条目不占身份。后续重复条目的诊断会同时记下两个原始索引。数组索引从 1 开始，在规范化前确定；URI 和记录索引用物理行号，空行和注释也算在内。解码后的 Base64 带一个指向原始正文的子来源，不虚构编码字节偏移。导入完整客户端配置时只取节点，其中的 DNS、路由、组和远程订阅配置都不导入。
+所有被接受的节点都会获得订阅 ID。派生出的节点 ID 重复时，保留第一个可用条目；被拒绝的条目不占身份。后续重复条目的诊断会同时记下两个原始索引。数组索引从 1 开始，在规范化前确定；URI 和记录索引用物理行号，空行和注释也算在内。解码后的 Base64 带一个指向原始正文的子来源，不虚构编码字节偏移。导入完整客户端配置时提取节点；启用 `import_dns: true` 后还会提取支持的 Clash 节点 DNS。路由、组和远程订阅配置不导入。
 
 规范化后的条目逐个进入 admission 流程，不保留一个和正文条目数一样大的中间结果列表。每份正文最多保留 128 条非终止诊断；超出时追加一条 `subscription-diagnostics-truncated` 摘要，记下省略了多少条。导致正文失败的终止错误单独保留。调用方原有的诊断不变，也不占这个限额。结构化导入、URI 导入、记录导入都用同一限额，Base64 解码和持久化正文恢复也不例外；达到限额不会中断有效节点的 admission，也不改变重复节点保留第一个可用条目的规则。
 

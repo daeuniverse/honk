@@ -239,6 +239,7 @@ fn managed_subscription_options_write_a_block_that_reads_back_and_deletes_whole(
             update_interval: Some(3600),
             user_agent: Some("east's agent/1.0"),
             cache: Some(false),
+            import_dns: Some(true),
         };
         let edited =
             append_subscription_source(&loaded.sources[0], "b", "https://example.test/b", &options)
@@ -248,7 +249,7 @@ fn managed_subscription_options_write_a_block_that_reads_back_and_deletes_whole(
             text.replace(
                 "a'",
                 &format!(
-                    "a'{newline}    b: 'https://example.test/b' {{{newline}        ua: \"east's agent/1.0\"{newline}        interval: 3600s{newline}        cache: false{newline}    }}"
+                    "a'{newline}    b: 'https://example.test/b' {{{newline}        ua: \"east's agent/1.0\"{newline}        interval: 3600s{newline}        cache: false{newline}        import_dns: true{newline}    }}"
                 )
             )
         );
@@ -263,6 +264,7 @@ fn managed_subscription_options_write_a_block_that_reads_back_and_deletes_whole(
         assert_eq!(added.user_agent.as_deref(), Some("east's agent/1.0"));
         assert_eq!(added.update_interval, 3600);
         assert!(!added.cache);
+        assert!(added.import_dns);
         let removed = remove_subscription_source(&loaded.sources[0], added, &loaded.config.assets)
             .unwrap()
             .unwrap();
@@ -298,6 +300,7 @@ fn managed_subscription_options_equal_to_built_in_defaults_override_assets() {
         update_interval: Some(86400),
         user_agent: None,
         cache: Some(true),
+        import_dns: None,
     };
     let edited =
         append_subscription_source(&loaded.sources[0], "b", "https://example.test/b", &options)

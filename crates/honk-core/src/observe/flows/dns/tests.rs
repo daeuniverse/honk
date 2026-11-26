@@ -195,16 +195,12 @@ async fn node_subtag_selection_marks_only_executed_predicates_partial() {
                     }
                 }
                 "pinned" => {
-                    assert!(
-                        observation
-                            .scope(pinned.resolve_node_server(host))
-                            .await
-                            .is_err()
-                    );
+                    assert!(observation.scope(pinned.resolve(host)).await.is_err());
                 }
                 _ => unreachable!(),
             }
             let view = detail(&store, &flow);
+            let evaluated = evaluated && path != "pinned";
             let expected = if evaluated { "partial" } else { "complete" };
             assert_eq!(view["trace_status"], expected, "{host} {path}: {view:#}");
             assert_eq!(view["trace"]["status"], expected);

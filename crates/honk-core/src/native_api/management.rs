@@ -41,6 +41,7 @@ impl ProviderCreate {
             update_interval: self.update_interval,
             user_agent: self.user_agent.as_deref(),
             cache: self.cache,
+            import_dns: None,
         }
     }
 }

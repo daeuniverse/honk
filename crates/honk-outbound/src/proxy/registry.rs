@@ -542,7 +542,7 @@ impl ProxyRegistry {
         let quality = runtime.transport_quality();
         let dial = dial(Arc::clone(&runtime), entry)?;
         let result = generation
-            .scope_dials(runtime.scope_tasks(quality.scope(dial)))
+            .scope_node_dials(node_id, runtime.scope_tasks(quality.scope(dial)))
             .await?;
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation shut down during dial");
@@ -579,11 +579,14 @@ impl ProxyRegistry {
         }
         let attempt = runtime.retain_warm(reason).await;
         if let Err(error) = generation
-            .scope_dials(runtime.scope_tasks(warmable.warm(
-                Arc::clone(&runtime),
-                connect_timeout,
-                requirement,
-            )))
+            .scope_node_dials(
+                node_id,
+                runtime.scope_tasks(warmable.warm(
+                    Arc::clone(&runtime),
+                    connect_timeout,
+                    requirement,
+                )),
+            )
             .await
         {
             attempt.rollback().await;
@@ -753,14 +756,17 @@ impl ProxyRegistry {
     ) -> anyhow::Result<PreparedUdpTransport> {
         let (runtime, packet) = self.packet_runtime(&generation, node_id, target.port())?;
         let prepared = generation
-            .scope_dials(runtime.scope_tasks(runtime.transport_quality().scope(
-                packet.dial_udp_transport_speculative_runtime(
-                    Arc::clone(&runtime),
-                    target,
-                    target_domain,
-                    connect_timeout,
-                ),
-            )))
+            .scope_node_dials(
+                node_id,
+                runtime.scope_tasks(runtime.transport_quality().scope(
+                    packet.dial_udp_transport_speculative_runtime(
+                        Arc::clone(&runtime),
+                        target,
+                        target_domain,
+                        connect_timeout,
+                    ),
+                )),
+            )
             .await?;
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation shut down during UDP preparation");

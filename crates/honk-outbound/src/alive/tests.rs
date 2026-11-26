@@ -5,6 +5,59 @@ fn id(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
 
+#[tokio::test]
+async fn raw_tcp_probe_uses_node_resolver_and_keeps_selected_failure_authoritative() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let set = AliveDialerSet::new();
+    set.register_node(
+        id(1),
+        "first".into(),
+        Some(format!("node.test:{}", address.port())),
+    );
+    set.set_resolver(Arc::new(|_, _| {
+        Box::pin(async { panic!("raw endpoint used business DNS") })
+    }));
+    set.set_node_resolver(Arc::new(move |node, host, port| {
+        assert_eq!(node, id(1));
+        assert_eq!(host, "node.test");
+        assert_eq!(port, address.port());
+        Box::pin(async move { Ok(vec![address]) })
+    }));
+    assert!(set.probe_node(id(1), Duration::from_secs(1)).await);
+    tokio::time::timeout(Duration::from_secs(1), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    set.set_node_resolver(Arc::new(|_, _, _| {
+        Box::pin(async { anyhow::bail!("selected resolver unavailable") })
+    }));
+    set.node_registered_at
+        .write()
+        .insert(id(1), Instant::now() - Duration::from_secs(60));
+    assert!(!set.probe_node(id(1), Duration::from_secs(1)).await);
+    let index = alive_index(ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(
+        set.states.read()[&id(1)][index].consecutive_failures,
+        1,
+        "ordinary DNS failure must count as a failed probe"
+    );
+    set.set_node_resolver(Arc::new(|_, _, _| {
+        Box::pin(async { Err(crate::proxy::PacketRejection::Capacity.into()) })
+    }));
+    assert!(!set.probe_node(id(1), Duration::from_secs(1)).await);
+    assert_eq!(
+        set.states.read()[&id(1)][index].consecutive_failures,
+        1,
+        "local admission refusal is health-neutral"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
 #[test]
 fn test_parse_check_literals() {
     let lits = AliveDialerSet::parse_check_literals(

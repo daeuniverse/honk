@@ -209,7 +209,7 @@ async fn connect_marked_inner(
     let port: u16 = port
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad port"))?;
-    let resolution = crate::bootstrap::resolve(host);
+    let resolution = crate::bootstrap::resolve_node(host);
     // Lookup observation enlarges the resolver future embedded by every dial
     // wrapper above this one; inert builds keep their unboxed resolver.
     #[cfg(feature = "flow-observation")]

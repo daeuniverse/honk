@@ -3,7 +3,7 @@
 //! Two entry kinds, both capped at 8 per key and 300s max age:
 //!
 //! - **Bare** — a silent pre-handshake `TcpStream` to the proxy server (60s
-//!   idle TTL), keyed by the server's `"host:port"` and reused via
+//!   idle TTL), keyed by generation, node identity and server address, reused via
 //!   `TcpOutbound::dial_with_tcp`. Saves the TCP connect RTT only; any queued
 //!   server byte makes it unsafe to present as a fresh protocol transport.
 //! - **Ready** — a fully-dialed `ProxyStream` whose protocol handshake is
@@ -14,8 +14,8 @@
 //!   tunnels sooner.
 //!
 //! Ready keys are namespaced (`ready|<generation>|<node-id>|<target>`) so they
-//! can never collide with bare `"host:port"` keys (`|` cannot appear in a
-//! host:port pair). The key binds the proxy generation and node identity as
+//! cannot collide with bare keys (`bare|<generation>|<node-id>|<host:port>`).
+//! The key binds the proxy generation and node identity as
 //! well as the target because the completed handshake committed the stream
 //! to that exact credential/configuration.
 //!
@@ -33,7 +33,7 @@
 //! target, warm-claim and hotness changes are synchronous transactions; the
 //! lock is never held across an await. Removed streams are dropped after
 //! unlocking, so socket teardown cannot extend the critical section.
-//! Retiring a generation removes its ready namespace, target budget, warm
+//! Retiring a generation removes its bare and ready namespaces, target budget, warm
 //! claims and hotness under that same lock; the successor starts empty and
 //! late writes for the retired generation are refused. The retired-generation
 //! set grows by one entry per retired generation and is never reclaimed.
@@ -76,8 +76,8 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const READY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_AGE: Duration = Duration::from_secs(300);
 
-/// A pooled connection. Each key's list holds exactly one kind: the key
-/// namespaces (`"host:port"` vs `ready|...`) make mixing impossible.
+/// A pooled connection. Each key's list holds one kind: bare keys use
+/// `"host:port"` or `bare|...`, and ready keys use `ready|...`.
 enum PooledStream {
     /// Pre-handshake TCP to the proxy server; reused via `dial_with_tcp`.
     Bare(TcpStream),
@@ -314,6 +314,16 @@ impl ConnectionPool {
         }
     }
 
+    /// Bind pre-handshake sockets to the node's DNS generation and identity.
+    pub(crate) fn bare_key(generation: u64, node: &honk_config::node::Node) -> String {
+        format!(
+            "bare|{generation}|{}|{}:{}",
+            node.id,
+            node.host(),
+            node.port
+        )
+    }
+
     pub(crate) async fn acquire_tcp(&self, addr: &str) -> Option<TcpStream> {
         match self.acquire_entry(addr, false).await {
             Some(PooledStream::Bare(tcp)) => Some(tcp),
@@ -383,13 +393,17 @@ impl ConnectionPool {
         if !is_bare_tcp_stream_usable(&stream) {
             return false;
         }
-        self.deposit_entry(addr, PooledStream::Bare(stream), None)
+        let generation = addr
+            .strip_prefix("bare|")
+            .and_then(|key| key.split_once('|'))
+            .and_then(|(generation, _)| generation.parse().ok());
+        self.deposit_entry(addr, PooledStream::Bare(stream), generation)
             .await;
         true
     }
 
     /// Whether a live, unexpired bare-TCP entry exists for `addr`
-    /// (`host:port`) — the preconnect warm gauge behind `/stats`. Dead and
+    /// — the preconnect warm gauge behind `/stats`. Dead and
     /// expired entries are removed here so a long-lived warm owner can
     /// replace them instead of eventually filling the per-host vector.
     pub(crate) fn has_live_bare_entry(&self, addr: &str) -> bool {
@@ -516,10 +530,15 @@ impl ConnectionPool {
     /// Called when the node flips alive→dead.
     pub(crate) fn purge_node(&self, node_addr: Option<&str>, generation: u64, node_id: Uuid) {
         let ready_prefix = format!("ready|{generation}|{node_id}|");
+        let bare_prefix = format!("bare|{generation}|{node_id}|");
         let mut removed = Vec::new();
         let mut state = self.state.lock();
         state.remove_matching(
-            |key| node_addr.is_some_and(|addr| key == addr) || key.starts_with(&ready_prefix),
+            |key| {
+                node_addr.is_some_and(|addr| key == addr)
+                    || key.starts_with(&ready_prefix)
+                    || key.starts_with(&bare_prefix)
+            },
             &mut removed,
         );
         drop(state);
@@ -531,14 +550,18 @@ impl ConnectionPool {
         drop(removed);
     }
 
-    /// Retire all ready-pool state for a generation. Ready streams are
+    /// Retire all pooled state for a generation. Streams are
     /// collected and destroyed after releasing the state lock.
     pub(crate) fn retire_generation(&self, generation: u64) {
         let ready_prefix = format!("ready|{generation}|");
+        let bare_prefix = format!("bare|{generation}|");
         let mut removed = Vec::new();
         let mut state = self.state.lock();
         state.retired.insert(generation);
-        state.remove_matching(|key| key.starts_with(&ready_prefix), &mut removed);
+        state.remove_matching(
+            |key| key.starts_with(&ready_prefix) || key.starts_with(&bare_prefix),
+            &mut removed,
+        );
         state
             .warm_dials
             .retain(|key| !key.starts_with(&ready_prefix));
@@ -728,6 +751,38 @@ impl Default for ConnectionPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bare_connections_are_isolated_by_node_and_dns_generation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let first =
+            honk_config::node::Node::from_share_link("socks5://a:password@same.test:1080").unwrap();
+        let second =
+            honk_config::node::Node::from_share_link("socks5://b:password@same.test:1080").unwrap();
+        let pool = super::ConnectionPool::new();
+        let key = super::ConnectionPool::bare_key(1, &first);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _accepted = listener.accept().await.unwrap();
+        assert!(pool.deposit_tcp(&key, stream).await);
+        assert!(
+            pool.acquire_tcp(&super::ConnectionPool::bare_key(1, &second))
+                .await
+                .is_none()
+        );
+        assert!(
+            pool.acquire_tcp(&super::ConnectionPool::bare_key(2, &first))
+                .await
+                .is_none()
+        );
+        assert!(pool.has_live_bare_entry(&key));
+        pool.retire_generation(1);
+        assert!(!pool.has_live_bare_entry(&key));
+        let late = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _late_peer = listener.accept().await.unwrap();
+        pool.deposit_tcp(&key, late).await;
+        assert!(pool.acquire_tcp(&key).await.is_none());
+    }
     use honk_config::node::Node;
     use honk_outbound::proxy::TcpOutbound;
     use honk_outbound::proxy::socks5::Socks5Handler;

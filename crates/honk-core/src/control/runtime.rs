@@ -438,7 +438,7 @@ impl ControlPlane {
                 result,
             } => {
                 debug!(
-                    nodes = nodes.len(),
+                    nodes = nodes.nodes.len(),
                     message = "Publishing accepted subscription body"
                 );
                 let (outcome, rejection) = match self

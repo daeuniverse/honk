@@ -46,6 +46,8 @@ pub(crate) fn rebase_subscription_nodes(
                 .iter()
                 .filter(|node| node.subscription_id == Some(previous.id));
             if current_nodes.clone().next().is_some() {
+                subscription.accepted_dns_source = previous.accepted_dns_source.clone();
+                subscription.imported_dns = previous.imported_dns.clone();
                 retained_providers.insert(previous.id);
                 static_nodes.extend(current_nodes.cloned());
                 continue;
@@ -133,6 +135,7 @@ impl ControlPlane {
         let current_guard = self.config.read().await;
         let current = Arc::clone(&current_guard);
         let retained_providers = rebase_subscription_nodes(&current, &mut new_config);
+        crate::subscription::compile_imported_dns(&mut new_config)?;
         drop(current_guard);
         // The previous subnet only lets ECS log a change rather than every re-resolution.
         new_config.dns.resolved_client_subnet = current.dns.resolved_client_subnet;
@@ -228,6 +231,12 @@ impl ControlPlane {
             return Ok(ReloadOutcome::Rejected);
         }
         self.startup_downgrades.apply(&mut new_config);
+        if !matches!(
+            &diagnostic_update,
+            DiagnosticUpdate::ReplaceProvider { .. } | DiagnosticUpdate::Rebase { .. }
+        ) {
+            crate::subscription::compile_imported_dns(&mut new_config)?;
+        }
         let current_router = self.router.read().await.clone();
         let current_config = self.config.read().await.clone();
         let admitted_udp_check_dns = self.alive_set.admitted_udp_check_dns();
@@ -282,7 +291,10 @@ impl ControlPlane {
             }
         }
 
+        let incoming_dns_sources = super::fingerprint::capture_accepted_dns_sources(&new_config);
         let config_unchanged = effective_config_unchanged(current_config.as_ref(), &mut new_config);
+        let dns_sources_replaced =
+            super::fingerprint::restore_accepted_dns_sources(&mut new_config, incoming_dns_sources);
         let group_slots_reusable = old_plan.matches_group_slots(&new_config.groups);
         let prepare_manager = |config: &Config| {
             let score = self.group_manager.read().score_state();
@@ -399,10 +411,10 @@ impl ControlPlane {
                 }
                 let sources_replaced =
                     declaring_sources_replaced(current_config.as_ref(), &new_config);
-                if sources_replaced {
+                if sources_replaced || dns_sources_replaced {
                     *config = Arc::new(new_config);
                 }
-                if sources_replaced || !manager_matches_config {
+                if sources_replaced || dns_sources_replaced || !manager_matches_config {
                     self.active_routing_plan
                         .write()
                         .note_manager_config(&config);
@@ -526,17 +538,32 @@ impl ControlPlane {
         // current generation's runtime (live sessions stay up); the
         // transfer is recorded on the old generation only at the commit
         // point below, so an aborted build leaves its ownership untouched.
+        let current_hosts_snapshot = current_dns_forwarder.hosts_snapshot();
+        let current_hosts_fingerprint = current_hosts_snapshot.fingerprint();
+        let Some(hosts_snapshot) =
+            super::dns::reuse_or_parse_hosts(hosts_sources, current_hosts_snapshot)
+        else {
+            self.stop_reload_rejection_if_healthy(drain);
+            return Ok(ReloadOutcome::Rejected);
+        };
         let dial_limit = self
             .resource_budget
             .clamp_dials(new_config.global.max_concurrent_dials);
+        let node_dns_changed = crate::dns::node_host::resolution_changed(
+            &current_config,
+            &new_config,
+            hosts_snapshot.fingerprint() != current_hosts_fingerprint,
+        );
+        let previous_registry = self.runtime_registry.read().clone();
         let (new_runtime_registry, reused_runtime_ids) =
-            match honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+            match honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing_with_dns_changes(
                 &new_config.nodes,
                 dial_limit,
                 self.resource_budget.transient_dials,
                 self.resource_budget.vless_carriers,
                 new_config.experimental.native_api.enabled,
-                Some(&self.runtime_registry.read()),
+                Some(previous_registry.as_ref()),
+                &node_dns_changed,
             ) {
                 Ok((registry, reused)) => (Arc::new(registry), reused),
                 Err(e) => {
@@ -554,12 +581,6 @@ impl ControlPlane {
             geo_sources,
             &mut shared,
         ) else {
-            self.stop_reload_rejection_if_healthy(drain);
-            return Ok(ReloadOutcome::Rejected);
-        };
-        let Some(hosts_snapshot) =
-            super::dns::reuse_or_parse_hosts(hosts_sources, current_dns_forwarder.hosts_snapshot())
-        else {
             self.stop_reload_rejection_if_healthy(drain);
             return Ok(ReloadOutcome::Rejected);
         };
@@ -629,14 +650,28 @@ impl ControlPlane {
             generation.get(),
             Arc::clone(&pinned_router),
         ));
+        let scoped_dns = match crate::dns::node_host::prepare(
+            &new_config,
+            Arc::clone(&new_upstream_pool),
+            new_dns_forwarder.routing_snapshot(),
+            &self.dns_socket_budget,
+        ) {
+            Ok(dns) => dns,
+            Err(error) => {
+                warn!(%error, "Failed to prepare subscription DNS");
+                self.stop_reload_rejection_if_healthy(drain);
+                return Ok(ReloadOutcome::Rejected);
+            }
+        };
         let new_runtime =
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
                 generation,
                 forwarder: Arc::clone(&new_dns_forwarder),
                 routing_projection: Arc::clone(&projection_snapshot),
                 outbound_runtime: Some(Arc::clone(&new_runtime_registry)),
-                transport: new_upstream_pool,
+                transport: scoped_dns.clone(),
             });
+        crate::dns::node_host::bind(&new_runtime_registry, &new_runtime, scoped_dns);
         #[cfg(feature = "native-api")]
         if let Some(identity) = &prepared_catalog {
             new_runtime.bind_flow_catalog(Arc::clone(identity));

@@ -17,7 +17,7 @@ subscription {
 
 ## 欄位
 
-要為單一訂閱設定選項時，在帶引號的 URL 後面追加一個區塊，每行一個 key。四個選項都可省略。省略的選項先取 `assets.subscription` 裡對應的預設值（`route` 取 `assets.route`），再取內建預設值。見 [Assets 設定參考](./assets.md)。
+要為單一訂閱設定選項時，在帶引號的 URL 後面追加一個區塊，每行一個 key。所有選項都可省略。省略的下載選項先取 `assets.subscription` 裡對應的預設值（`route` 取 `assets.route`），再取內建預設值。`import_dns` 一律預設為 `false`。見 [Assets 設定參考](./assets.md)。
 
 | Key | 預設值 | 意義 |
 | --- | --- | --- |
@@ -25,6 +25,77 @@ subscription {
 | `interval` | `86400s` | 設定定期重新整理間隔；見 [`interval`](#interval)。 |
 | `cache` | `true` | 把該訂閱的正文儲存在訂閱儲存中；見 [`cache`](#cache)。 |
 | `route` | `routing` | 選擇抓取出口；見 [`route`](#route)。 |
+| `import_dns` | `false` | 匯入此訂閱的節點 DNS；見[匯入節點 DNS](#匯入節點-dns)。此選項沒有 assets 層級預設值。 |
+
+## 匯入節點 DNS
+
+在訂閱 URL 後的選項區塊設定 `import_dns: true`，即可匯入 Clash 本文中適用於此訂閱節點伺服器網域的 DNS，包括 XHTTP 下載端點。一般應用程式查詢相同網域時仍使用本機業務 DNS；不同訂閱的同名入口可以使用各自的上游。節點身分和重複節點歸屬規則維持不變。
+
+```dae
+global {
+    wan_interface: auto
+    log_level: info
+    bootstrap_resolver: 'udp://223.5.5.5:53'
+    store_subscribe: true
+}
+subscription {
+    primary: 'https://subscription-a.example/config' {
+        import_dns: true
+        interval: 6h
+        route: direct
+    }
+    secondary: 'https://subscription-b.example/config' {
+        import_dns: false
+        route: direct
+    }
+}
+group {
+    proxy {
+        filter: subtag(primary, secondary)
+        policy: fixed(0)
+    }
+}
+routing {
+    fallback: proxy
+}
+dns {
+    upstream {
+        ordinary: 'udp://223.5.5.5:53'
+        override: 'tcp://119.29.29.29:53' -> direct
+    }
+    routing {
+        request {
+            subtag(primary) && qname(suffix: override.example) -> override
+            fallback: ordinary
+        }
+    }
+}
+```
+
+將範例訂閱 URL 換成自己的位址。優先順序為本機 hosts 別名與明確的 `subtag()` DNS 規則、訂閱匯入策略、原有節點 bootstrap。業務 DNS 的通用 fallback 不會覆蓋訂閱策略。節點連線、健康檢查和延遲測試的節點端點均攜帶訂閱來源；探測目標仍走業務 DNS。
+
+| Clash 欄位 | 匯入行為 |
+| --- | --- |
+| `proxy-server-nameserver` | 非空時選擇節點專用解析分支。 |
+| `proxy-server-nameserver-policy` | 優先比對專用分支的節點網域；必須同時設定非空專用上游清單。 |
+| `nameserver-policy` | 沒有專用分支時比對節點網域。 |
+| `nameserver` | 一般分支預設上游；只有 policy 時，未符合的節點沿用本機 bootstrap。 |
+| `default-nameserver` | 只解析 DNS 上游本身的網域。明確設定的清單必須非空，端點主機必須為 IP；省略時沿用本機 bootstrap。 |
+| `ipv6` | 明確的 `false` 停用匯入策略的 AAAA 查詢；`true` 不越過本機位址族限制。 |
+
+上游接受字串或清單，支援裸 IP 及大小寫不敏感的 UDP、TCP、TLS、HTTPS、HTTP/3（`h3://` 或 `http3://`）與 QUIC URL。HTTPS 與 HTTP/3 保留連接埠、路徑和查詢字串。網域鍵支援精確比對、`+.example.com`（本身和所有子網域）、`.example.com`（子網域）及 `*.example.com`（單層子網域）；字面標籤優先於單層萬用字元，後者優先於字尾。清單並行查詢，首個未截斷的有效 NOERROR 或 NXDOMAIN 回應勝出；NXDOMAIN 和空答案不會改用另一套策略。
+
+匯入上游透過帶 bypass mark 的直連 socket 存取。`default-nameserver` 不經節點解析器或代理；明確選擇它之後，失敗不會轉用系統 DNS。節點策略一旦選定，解析失敗就使該節點連線失敗。
+
+成功重新整理將節點和 DNS 一起發布，包括只有 DNS 變更的情況。有效新本文沒有 DNS 時清除舊策略；下載、解析或發布失敗則保留目前節點與 DNS。啟動從完整快取本文復原，使用相同解析器。重新載入採用目前已接受節點攜帶的 DNS 來源；開啟匯入時編譯此來源，來源無效則拒絕重新載入，關閉時撤銷策略，不需重新啟動。
+
+### 支援範圍
+
+此功能只匯入節點 DNS，不載入完整 Clash 設定。監聽、FakeIP、TUN、代理群組和全域流量規則不匯入。Mihomo 的完整設定載入和 proxy-provider 重新整理是不同操作，後者不會合併全域 DNS。
+
+每個上游清單最多接受 8 個項目，單一訂閱最多接受 512 條策略規則和 64 個唯一上游伺服器，重複宣告的上游在同一訂閱內共用傳輸池。不支援的有效 DNS 語義會以欄位路徑和清單序號診斷拒絕候選：geosite/rule-set policy、URL userinfo、DNS URL fragment（包括 `#skip-cert-verify=true` 或代理選擇）、連接埠 `0`、`respect-rules: true`，以及一般分支中的 `fallback`/`fallback-filter`。專用分支不繼承一般 fallback，也不會把過濾語義簡化為逾時備援。缺少 DNS、null 或空區塊表示沒有匯入策略。非 Clash 訂閱維持原有行為。
+
+`import_dns` 接受現有布林字面值，無效值拒絕設定。關閉時只保留 DNS 來源中繼資料，不驗證也不執行。診斷不輸出完整上游 URL 或憑證資料。
 
 ### `ua`
 
@@ -120,6 +191,7 @@ URL 帶引號時，緊貼結束引號或完整 `(UA)` 字尾的 `#` 會被當作
 | `download_detour` | string | `""` | 是，對應 `route` | 抓取的出口；見 [`route`](#route)。 |
 | `enabled` | bool | `true` | 否 | 停用的訂閱不恢復、不抓取、不重新整理。 |
 | `cache` | bool | `true` | 是，對應 `cache` | 正文快取，供離線啟動恢復；見 [`cache`](#cache)。 |
+| `import_dns` | bool | `false` | 是 | 為此訂閱的節點端點匯入支援的 Clash DNS。 |
 | `last_updated` | datetime 或 null | null | 否 | 模型中繼資料；目前 core 執行時不會更新該欄位。 |
 | `node_count` | u32 | `0` | 否 | 模型中繼資料；目前 core 執行時不會更新該欄位。 |
 | `created_at` | datetime | 構造時間 | 否 | 模型構造時間。 |
@@ -228,7 +300,7 @@ subscription {
 
 ## 訂閱正文格式
 
-所有被接受的節點都會獲得訂閱 ID。派生出的節點 ID 重複時，保留第一個可用條目；被拒絕的條目不佔身分。後續重複條目的診斷會同時記下兩個原始索引。陣列索引從 1 開始，在正規化前確定；URI 和記錄索引用實體行號，空行和註釋也算在內。解碼後的 Base64 帶一個指向原始正文的子來源，不虛構編碼位元組偏移。匯入完整用戶端設定時只取節點，其中的 DNS、路由、群組和遠端訂閱設定都不匯入。
+所有被接受的節點都會獲得訂閱 ID。派生出的節點 ID 重複時，保留第一個可用條目；被拒絕的條目不佔身分。後續重複條目的診斷會同時記下兩個原始索引。陣列索引從 1 開始，在正規化前確定；URI 和記錄索引用實體行號，空行和註釋也算在內。解碼後的 Base64 帶一個指向原始正文的子來源，不虛構編碼位元組偏移。匯入完整用戶端設定時擷取節點；啟用 `import_dns: true` 後也會擷取支援的 Clash 節點 DNS。路由、群組和遠端訂閱設定不匯入。
 
 正規化後的條目逐個進入 admission 流程，不保留一個和正文條目數一樣大的中間結果清單。每份正文最多保留 128 條非終止診斷；超出時追加一條 `subscription-diagnostics-truncated` 摘要，記下省略了多少條。導致正文失敗的終止錯誤單獨保留。呼叫方原有的診斷不變，也不佔這個限額。結構化匯入、URI 匯入、記錄匯入都用同一限額，Base64 解碼和持久化正文恢復也不例外；達到限額不會中斷有效節點的 admission，也不改變重複節點保留第一個可用條目的規則。
 

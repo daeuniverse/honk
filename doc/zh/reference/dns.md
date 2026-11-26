@@ -282,7 +282,7 @@ DNS 的 `sip()` 和 `ip()` 共用同一个 IP/CIDR 解码器。裸 IPv4 和 IPv6
 
 ### 节点服务器域名
 
-节点服务器域名经 `global.bootstrap_resolver`、`/etc/hosts` 和系统 nameserver 解析，不走 DNS 路由。含 `subtag(...)` 的 request 规则会接管匹配订阅里节点的服务器域名，XHTTP 下载域名也包括在内：
+节点服务器域名依次使用本地显式覆盖、启用的[订阅 DNS 导入](./subscription.md#导入节点-dns)、`global.bootstrap_resolver`、`/etc/hosts` 和系统 nameserver。含 `subtag(...)` 的 request 规则会接管匹配订阅里节点的服务器域名，XHTTP 下载域名也包括在内：
 
 ```dae
 dns {
@@ -299,16 +299,16 @@ dns {
 }
 ```
 
-- 代理链本身没有服务器域名；各物理节点的域名保留各自的订阅标签。
-- 节点域名只匹配含 `subtag()` 的规则；普通规则、fallback 和没匹配上的域名仍走 bootstrap 解析。其他查询不带订阅，对它们来说 `subtag()` 和 `!subtag()` 都是 false。
+- 代理链本身没有服务器域名；各物理节点保留各自的订阅标签，拨号代理链或组出口时按入口跳点自身的订阅策略解析。
+- 节点域名只匹配含 `subtag()` 的规则；普通规则和业务 fallback 不接管节点解析。未匹配节点先使用已启用的订阅 DNS，再走 bootstrap。其他查询不带订阅，对它们来说 `subtag()` 和 `!subtag()` 都是 false。
 - 被接管的查询只发往选中的上游，遵守 `strategy` 和 `use_host`，不走缓存和 response 规则，也不回退：查询失败就表示物理节点连接或探测连接失败。
 - 接管按域名生效，不是端到端的下载目标解析策略。下载时为选路而预先解析 URL 域名，只是尽力而为；代理下载的 URL 域名仍由代理解析，而承载代理自身的节点服务器解析遵守这条规则。显式使用 bootstrap 解析器的下载绕过这个 hook。
-- tag 属于主机名，不属于节点：不同订阅里共用同一主机名的节点，各自的 tag 会合并，所以第一条匹配的规则就为这个主机名选定一个上游。
+- 节点端点查询携带节点身份和订阅来源；不同订阅的同名入口保留各自策略，不合并这些查询的 tag。
 - 这条规则只能和 `qname()` 组合，而且所选上游的每条声明都必须是 `-> direct`，否则校验报错：`subtag-dns-condition`、`subtag-dns-action` 或 `subtag-dns-upstream-route`。
 - 上游自身的域名、ECH 发现和离线 `delay` 子命令仍使用 bootstrap 解析器。
-- 域名匹配到 `use_host` 中的[别名](#hosts-快照use_host)时，honk 改为解析别名目标。别名链停在地址条目上，就直接用这些地址；否则把目标域名当作节点域名解析，也就是交给接管该目标的 `subtag()` 规则，没有接管就走 bootstrap。直接匹配原始域名的地址条目不会经这个 hook 接管；honk 用的是别名链终点的地址条目。所有被接管的查询，包括本地地址结果和 bootstrap 目标，都遵守 DNS 运行时 admission 与取消机制。目标或 subtag 路径一旦选定，该路径失败就是最终结果。查询执行前 reload 删掉了这个别名时，原域名按没有别名的情况解析。
+- 域名匹配到 `use_host` 中的[别名](#hosts-快照use_host)时，honk 改为解析别名目标。别名链停在地址条目上，就按 `strategy` 过滤和排序后使用这些地址；否则把目标域名当作节点域名解析，依次交给接管该目标的 `subtag()` 规则、已启用的订阅导入 DNS，都没有接管再走 bootstrap。直接匹配原始域名的地址条目不会经这个 hook 接管；honk 用的是别名链终点的地址条目。所有被接管的查询，包括本地地址结果和 bootstrap 目标，都遵守 DNS 运行时 admission 与取消机制。目标、`subtag()` 或订阅 DNS 路径一旦选定，该路径失败就是最终结果。查询执行前 reload 删掉了这个别名时，原域名按没有别名的情况解析。
 - 别名匹配所有交给 bootstrap 解析器的域名，不限于节点服务器域名：没有指定显式 bootstrap 解析器的订阅、Geo 数据和外部 UI 下载的 URL 域名，SOCKS5 节点的 UDP 中继域名，以及健康检查、延迟测试、连通性探测和内部解析回退到 bootstrap 时的域名。DNS 上游自身的域名和 ECH 发现不走这个 hook。
-- 每个 DNS generation 根据订阅 tag 和有序规则，预先算出节点域名的策略结果，包括没匹配上的结果。用到这些结果时，原生流追踪会以 `not_instrumented` 标成 `partial`：节点域名的规则决策证据还没有采集。
+- 节点域名解析评估 `subtag()` 规则或订阅导入 DNS（含未命中的评估），或者命中 `use_host` 别名地址条目而未发起网络查询时，原生流追踪会以 `not_instrumented` 标成 `partial`：节点域名的策略和本地别名决策还没有采集为结构化 DNS 规则步骤。
 
 ### Request 动作
 

@@ -405,12 +405,15 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                 let mut measurement = HealthMeasurement::Mixed;
                 let attempt = async {
                     let transport = runtime
-                        .scope_tasks(generation.scope_dials(packet.dial_udp_transport_runtime(
-                            Arc::clone(&runtime),
-                            *dns_target,
-                            None,
-                            connect_timeout,
-                        )))
+                        .scope_tasks(generation.scope_node_dials(
+                            runtime.node.id,
+                            packet.dial_udp_transport_runtime(
+                                Arc::clone(&runtime),
+                                *dns_target,
+                                None,
+                                connect_timeout,
+                            ),
+                        ))
                         .await?;
                     measurement = HealthMeasurement::DnsRoundTrip;
                     let elapsed = crate::dns::forwarder::udp_dns_probe(&*transport).await?;
@@ -548,12 +551,15 @@ async fn score_quic_probe(
         let Some(transport) = cancel
             .run(tokio::time::timeout_at(
                 deadline,
-                runtime.scope_tasks(generation.scope_dials(packet.dial_udp_transport_runtime(
-                    Arc::clone(&runtime),
-                    target.addr,
-                    target_domain,
-                    connect_timeout,
-                ))),
+                runtime.scope_tasks(generation.scope_node_dials(
+                    runtime.node.id,
+                    packet.dial_udp_transport_runtime(
+                        Arc::clone(&runtime),
+                        target.addr,
+                        target_domain,
+                        connect_timeout,
+                    ),
+                )),
             ))
             .await
         else {

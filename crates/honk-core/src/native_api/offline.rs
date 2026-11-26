@@ -21,7 +21,7 @@ use crate::dns::forwarder::HostsSourceSet;
 use crate::dns::policy::PolicyId;
 use crate::dns::routing::DnsRouter;
 use crate::routing::{GeoRequirements, GeoSourceSet, Router};
-use crate::subscription::{StoredBodies, parse_subscription_content_with_diagnostics};
+use crate::subscription::{StoredBodies, parse_subscription_body_with_diagnostics};
 
 /// Upper bound for one standard asset read during offline validation. A
 /// `geoip.dat` is tens of megabytes; this only guards against a runaway file.
@@ -183,13 +183,28 @@ fn capture_inner(
         // No state db yet means no subscription has ever been fetched on this host.
         let store = StoredBodies::open(&capture.data_dir)
             .map_err(|cause| dependency_error(source, "subscription", cause))?;
+        let mut matched_previous = std::collections::HashSet::new();
         for (index, subscription) in config
             .subscriptions
-            .iter()
+            .iter_mut()
             .enumerate()
             .filter(|(_, sub)| sub.enabled)
         {
             let declared = declaring_source(&sources, subscription).unwrap_or(source);
+            let rebased_from_active = active
+                .subscriptions
+                .iter()
+                .find(|previous| {
+                    crate::subscription::same_subscription_fetch_identity(previous, subscription)
+                        && !matched_previous.contains(&previous.id)
+                })
+                .is_some_and(|previous| {
+                    matched_previous.insert(previous.id);
+                    active
+                        .nodes
+                        .iter()
+                        .any(|node| node.subscription_id == Some(previous.id))
+                });
             if deferred.iter().any(|owner| {
                 crate::subscription::same_subscription_source_spec(owner, subscription)
             }) {
@@ -228,8 +243,15 @@ fn capture_inner(
                 )
             })?;
             let mut notices = Vec::new();
-            let nodes =
-                parse_subscription_content_with_diagnostics(subscription, contents, &mut notices);
+            let mut cached_subscription = subscription.clone();
+            if rebased_from_active {
+                cached_subscription.import_dns = false;
+            }
+            let nodes = parse_subscription_body_with_diagnostics(
+                &cached_subscription,
+                contents,
+                &mut notices,
+            );
             // Decoded-provider coordinates are not coordinates in the referring dae document.
             for mut notice in notices.into_iter().filter(|notice| !notice.terminal) {
                 crate::config_diagnostics::declare_diagnostics(
@@ -241,18 +263,25 @@ fn capture_inner(
                 notice.related_indices.clear();
                 diagnostics.push(notice);
             }
-            config.nodes.extend(nodes.map_err(|_| {
+            let body = nodes.map_err(|_| {
                 error(
                     declared,
                     "subscription",
                     "invalid-offline-dependency",
                     "cached subscription contains no usable configuration",
                 )
-            })?);
+            })?;
+            body.publish_dns(subscription);
+            config.nodes.extend(body.nodes);
         }
     }
     // Match the runtime's exact choice: same-fetch active nodes win over cached candidates.
     crate::control::reload::rebase_subscription_nodes(active, &mut config);
+    crate::subscription::compile_imported_dns_for_sources(&mut config, |subscription| {
+        declaring_source(&sources, subscription)
+            .unwrap_or(source)
+            .clone()
+    })?;
     let config = config
         .assemble(honk_config::parser::resolve_group_filters)
         .map_err(|mut error| {

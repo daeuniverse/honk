@@ -330,7 +330,7 @@ async fn pinned_probe_fallback_ends_when_its_dns_lease_is_cancelled() {
             .try_acquire_many(current.query_limit.available_permits() as u32)
             .unwrap();
         let error = pinned
-            .resolve_node_server("bootstrap-alias.example")
+            .resolve_physical_server("bootstrap-alias.example", None)
             .await
             .unwrap_err();
         assert_eq!(
@@ -342,10 +342,11 @@ async fn pinned_probe_fallback_ends_when_its_dns_lease_is_cancelled() {
             std::io::ErrorKind::WouldBlock
         );
         drop(held);
-        let query =
-            tokio::spawn(
-                async move { pinned.resolve_node_server("bootstrap-alias.example").await },
-            );
+        let query = tokio::spawn(async move {
+            pinned
+                .resolve_physical_server("bootstrap-alias.example", None)
+                .await
+        });
         for _ in 0..2 {
             let mut wire = [0; 512];
             let (n, _) = server.recv_from(&mut wire).await.unwrap();
