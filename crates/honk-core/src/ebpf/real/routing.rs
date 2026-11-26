@@ -162,6 +162,55 @@ fn validate_routing_decision_abi(data: &[u8], slot: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+fn routing_input_layout(btf: &btf::Btf, input: usize) -> Option<()> {
+    let fields = [
+        ("src_ip", offset_of!(RoutingInput, src_ip), 16),
+        ("dst_ip", offset_of!(RoutingInput, dst_ip), 16),
+        ("mac", offset_of!(RoutingInput, mac), 16),
+        (
+            "pname",
+            offset_of!(RoutingInput, pname),
+            ROUTING_PROCESS_MAX_LEN as u32,
+        ),
+        ("src_port", offset_of!(RoutingInput, src_port), 0),
+        ("dst_port", offset_of!(RoutingInput, dst_port), 0),
+        ("l4proto", offset_of!(RoutingInput, l4proto), 0),
+        ("ip_version", offset_of!(RoutingInput, ip_version), 0),
+        ("dscp", offset_of!(RoutingInput, dscp), 0),
+        ("is_wan", offset_of!(RoutingInput, is_wan), 0),
+        ("pname_len", offset_of!(RoutingInput, pname_len), 0),
+        ("flags", offset_of!(RoutingInput, flags), 0),
+    ];
+    if btf.u32_at(input + 4)? != (4 << 24) | fields.len() as u32
+        || btf.u32_at(input + 8)? != size_of::<RoutingInput>() as u32
+    {
+        return None;
+    }
+    for (i, (name, offset, count)) in fields.into_iter().enumerate() {
+        let member = input + 12 + i * 12;
+        if btf.string(btf.u32_at(member)?) != Some(name)
+            || btf.u32_at(member + 8)? != offset as u32 * 8
+        {
+            return None;
+        }
+        let ty = btf.u32_at(member + 4)?;
+        if count == 0 {
+            if !btf.unsigned_integer_width(ty, 4) {
+                return None;
+            }
+        } else {
+            let array = btf.resolve_modifiers(ty)?;
+            if btf.kind(array)? != 3
+                || btf.u32_at(array + 20)? != count
+                || !btf.unsigned_integer_width(btf.u32_at(array + 12)?, 1)
+            {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
 fn routing_decision_layout(btf: &btf::Btf, slot: &str) -> Option<()> {
     let read = |offset| btf.u32_at(offset);
     let prototype = btf.type_by_id(read(btf.find_type(12, slot)? + 8)?)?;
@@ -208,24 +257,10 @@ fn routing_decision_layout(btf: &btf::Btf, slot: &str) -> Option<()> {
         }
         if name == "input" {
             let input = btf.resolve_composite(read(member + 4)?)?;
-            if input != signature_input
-                || btf.kind(input)? != 4
-                || read(input + 8)? != size_of::<RoutingInput>() as u32
-            {
+            if input != signature_input {
                 return None;
             }
-            let flags = (0..read(input + 4)? & 0xffff).find_map(|index| {
-                let field = input + 12 + index as usize * 12;
-                (btf.string(read(field)?) == Some("flags")).then_some(field)
-            })?;
-            let flags_type = btf.resolve_modifiers(read(flags + 4)?)?;
-            if read(flags + 8)? != offset_of!(RoutingInput, flags) as u32 * 8
-                || btf.kind(flags_type)? != 1
-                || read(flags_type + 8)? != 4
-                || read(flags_type + 12)? & 0x00ff_ffff != 32
-            {
-                return None;
-            }
+            routing_input_layout(btf, input)?;
         }
     }
     let structure = btf.resolve_composite(read(output + 16)?)?;
@@ -314,6 +349,22 @@ fn line_info(
     records.sort_by_key(|record| record.insn_off);
     records.dedup_by_key(|record| record.insn_off);
     Ok(records)
+}
+
+fn load_routing_candidate(
+    targets: &[Target],
+    slot_name: &str,
+    plan: &crate::control::routing_matcher::RoutingPushPlan,
+    learned_domains: &[(LpmKey, DomainRouting)],
+) -> anyhow::Result<(RoutingMaps, OwnedFd, OwnedFd)> {
+    let first = targets
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no routing target for {slot_name}"))?;
+    let maps = create_maps(&plan.facts, learned_domains)?;
+    let bytecode =
+        crate::control::routing_matcher::codegen::emit_routing_program(plan, maps.fds())?;
+    let (btf, program) = load_extension(first, slot_name, &bytecode)?;
+    Ok((maps, btf, program))
 }
 
 fn load_extension(
@@ -579,10 +630,8 @@ impl RealEbpfBackend {
         let slot = active ^ 1;
         let slot_name = ROUTING_SLOT_NAMES[slot as usize];
         let targets = self.routing_targets(slot as usize)?;
-        let maps = create_maps(&plan.facts, learned_domains)?;
-        let bytecode =
-            crate::control::routing_matcher::codegen::emit_routing_program(plan, maps.fds())?;
-        let (btf, program) = load_extension(&targets[0], slot_name, &bytecode)?;
+        let (maps, btf, program) =
+            load_routing_candidate(&targets, slot_name, plan, learned_domains)?;
         let mut links = Vec::with_capacity(targets.len());
         for target in &targets {
             links.push(attach_extension(&program, target)?);

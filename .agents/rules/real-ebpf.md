@@ -6,7 +6,7 @@ backend lock; commit installs the current routing extension before bindability.
 Attempt every independent variant after individual load or extension errors. Keep
 original relocation map FDs alive through every verifier job, including after logger
 or event-consumer cancellation; consumers use duplicate handles. Routing publication
-uses committed target metadata, and receive-trace preparation cannot wait for the
+requires a committed target and validates every field of the 128-byte RoutingInput, and receive-trace preparation cannot wait for the
 program-loader mutex while holding backend ownership.
 
 Read with: `AGENTS.md` (Technology stack, Current validation guidance); `datapath.md` for the ABI and runtime invariants; `configuration.md` for NFQUEUE activation; `test-locations.md` for where the real-kernel tests live; the VM procedure is `.github/workflows/ci.yml` and skill `honk-real-ebpf-tests`.

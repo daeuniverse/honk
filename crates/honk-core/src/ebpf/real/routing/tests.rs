@@ -793,6 +793,19 @@ fn predicate_bits_and_capacity_limits() {
 }
 
 #[test]
+fn empty_target_set_refuses_before_candidate_map_creation() {
+    let router = Router::new(&[], "direct").unwrap();
+    let plan = RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::Ip).unwrap();
+    let error = load_routing_candidate(&[], ROUTING_SLOT_NAMES[1], &plan, &[])
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.to_string(),
+        format!("no routing target for {}", ROUTING_SLOT_NAMES[1])
+    );
+}
+
+#[test]
 fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
     let mut strings = vec![0];
     let mut name = |value: &str| {
@@ -806,7 +819,6 @@ fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
     let structure = name("RoutingDecision");
     let slot = name("honk_route_slot0");
     let input_structure = name("RoutingInput");
-    let input_flags = name("flags");
     let old_mac_present = name("mac_present");
     let old_padding = name("padding");
     let fields = [
@@ -843,12 +855,25 @@ fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
     let input_offset = types.len();
     types.extend([
         input_structure,
-        (4 << 24) | 1,
+        (4 << 24) | 12,
         size_of::<RoutingInput>() as u32,
-        input_flags,
-        1,
-        offset_of!(RoutingInput, flags) as u32 * 8,
     ]);
+    for (field, ty, offset) in [
+        ("src_ip", 11, 0),
+        ("dst_ip", 11, 16),
+        ("mac", 11, 32),
+        ("pname", 12, 48),
+        ("src_port", 1, 96),
+        ("dst_port", 1, 100),
+        ("l4proto", 1, 104),
+        ("ip_version", 1, 108),
+        ("dscp", 1, 112),
+        ("is_wan", 1, 116),
+        ("pname_len", 1, 120),
+        ("flags", 1, 124),
+    ] {
+        types.extend([name(field), ty, offset * 8]);
+    }
     let output_offset = types.len();
     types.extend([
         output,
@@ -871,6 +896,10 @@ fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
     // IDs 9/10 model the rejected old padding ABI.
     types.extend([byte_integer, 1 << 24, 1, 8]);
     types.extend([0, 3 << 24, 0, 9, 1, 4]);
+    types.extend([0, 3 << 24, 0, 9, 1, 16]);
+    types.extend([0, 3 << 24, 0, 9, 1, 48]);
+    types.extend([0, 3 << 24, 0, 1, 1, 4]); // 16 bytes in four u32 elements
+    types.extend([integer, 1 << 24, 4, (1 << 24) | 32]); // signed, ID 14
     let encode = |types: &[u32]| {
         let mut bytes = vec![0x9f, 0xeb, 1, 0];
         for word in [
@@ -889,13 +918,19 @@ fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
         bytes
     };
     validate_routing_decision_abi(&encode(&types), "honk_route_slot0").unwrap();
+    let flags_offset = input_offset + 3 + 11 * 3;
+    let mut swapped = types.clone();
+    swapped.swap(input_offset + 3, input_offset + 6);
+    assert!(validate_routing_decision_abi(&encode(&swapped), "honk_route_slot0").is_err());
     for (word, replacement) in [
+        (input_offset + 4, 13),
+        (input_offset + 4 + 4 * 3, 14),
         (structure_offset + 2, 20),
         (structure_offset + 3 + 5 * 3 + 2, 128),
         (input_offset + 2, 124),
-        (input_offset + 3, old_mac_present),
-        (input_offset + 5, 120 * 8),
-        (input_offset + 4, 2),
+        (flags_offset, old_mac_present),
+        (flags_offset + 2, 120 * 8),
+        (flags_offset + 1, 2),
         (output_offset + 2, 264),
         (output_offset + 3 + 2, 32),
         (output_offset + 3 + 1, 1),

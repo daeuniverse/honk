@@ -166,6 +166,34 @@ fn publication_failure_recovery_and_frozen_root() {
     };
     let recovery_router = Router::new(std::slice::from_ref(&recovery_rule), "direct").unwrap();
     let recovery = RoutingPushPlan::compile(&recovery_router, &ids, DialMode::Ip).unwrap();
+    let descriptor = published_descriptor(&backend);
+    let link_fds = |backend: &RealEbpfBackend| {
+        backend
+            .routing_generation
+            .as_ref()
+            .unwrap()
+            .links
+            .iter()
+            .map(AsRawFd::as_raw_fd)
+            .collect::<Vec<_>>()
+    };
+    let active_links = link_fds(&backend);
+    assert!(!active_links.is_empty());
+    let bindings = std::mem::take(&mut backend.bindings);
+    let test_targets = backend.routing_test_targets.take();
+    let error = backend.publish_routing_plan(&recovery, &[]).unwrap_err();
+    assert!(error.to_string().contains("no routing target"));
+    assert_eq!(published_descriptor(&backend), descriptor);
+    assert_eq!(backend.active_routing_slot().unwrap(), old_slot);
+    assert_eq!(link_fds(&backend), active_links);
+    backend.bindings = bindings;
+    backend.routing_test_targets = test_targets;
+    assert_route(
+        &mut backend,
+        "empty target set preserves active route",
+        &active_hit,
+        active_hit_decision,
+    );
     let mut map_fill_candidate = recovery.clone();
     map_fill_candidate
         .facts
