@@ -19,6 +19,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+mod wire;
+
+pub use wire::qtype_name;
+use wire::{
+    QTYPE_HTTPS, answers_query, build_query, merge_min_ttl, parse_answers, parse_https_rr_ech,
+};
+
 /// A direct DNS server used to resolve proxy-server hostnames.
 #[derive(Debug, Clone, Copy)]
 pub struct BootstrapResolver {
@@ -104,84 +111,162 @@ pub async fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
     resolve_with(global(), host).await
 }
 
+/// Address families requested from a bootstrap DNS lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryFamilies {
+    /// Query A and AAAA concurrently; `prefer_v6` selects which family gets the
+    /// longer completion window when the other answers first.
+    Both { prefer_v6: bool },
+    /// Query only IPv4 (A) records.
+    Ipv4Only,
+    /// Query only IPv6 (AAAA) records.
+    Ipv6Only,
+}
+
+impl QueryFamilies {
+    fn matches(self, ip: IpAddr) -> bool {
+        match self {
+            Self::Both { .. } => true,
+            Self::Ipv4Only => ip.is_ipv4(),
+            Self::Ipv6Only => ip.is_ipv6(),
+        }
+    }
+}
+
+/// Addresses and minimum answer TTL returned by a bootstrap lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRecords {
+    pub ips: Vec<IpAddr>,
+    pub min_ttl: Option<u32>,
+}
+
 /// Resolve with an explicit resolver snapshot.
 ///
 /// Generation-owned callers use this path so a later [`set_global`] cannot
 /// change the resolver selected by an in-flight or lazily initialized dial.
-pub fn resolve_with<'a>(
+pub async fn resolve_with(
     resolver: Option<BootstrapResolver>,
-    host: &'a str,
-) -> impl Future<Output = io::Result<Vec<IpAddr>>> + Send + use<'a> {
-    resolve_with_inner(resolver, host, None, || std::future::ready(Ok(())))
+    host: &str,
+) -> io::Result<Vec<IpAddr>> {
+    Ok(resolve_with_inner(
+        resolver,
+        host,
+        QueryFamilies::Both { prefer_v6: false },
+        None,
+        || std::future::ready(Ok(())),
+    )
+    .await?
+    .ips)
 }
 
-/// Resolve with socket admission only around configured or system DNS queries.
+/// Resolve with socket admission, explicit address families, and minimum answer TTL.
 /// Local answers need no guard; admission errors never trigger resolver fallback.
-pub fn resolve_with_admission<'a, Admit, Admission, Guard>(
+pub fn resolve_records_with_admission<'a, Admit, Admission, Guard>(
     resolver: Option<BootstrapResolver>,
     host: &'a str,
+    families: QueryFamilies,
     deadline: tokio::time::Instant,
     admit: Admit,
-) -> impl Future<Output = io::Result<Vec<IpAddr>>> + use<'a, Admit, Admission, Guard>
+) -> impl Future<Output = io::Result<ResolvedRecords>> + use<'a, Admit, Admission, Guard>
 where
     Admit: FnMut() -> Admission,
     Admission: Future<Output = io::Result<Guard>>,
 {
-    resolve_with_inner(resolver, host, Some(deadline), admit)
+    resolve_with_inner(resolver, host, families, Some(deadline), admit)
 }
 
 async fn resolve_with_inner<Admit, Admission, Guard>(
     resolver: Option<BootstrapResolver>,
     host: &str,
+    families: QueryFamilies,
     deadline: Option<tokio::time::Instant>,
     mut admit: Admit,
-) -> io::Result<Vec<IpAddr>>
+) -> io::Result<ResolvedRecords>
 where
     Admit: FnMut() -> Admission,
     Admission: Future<Output = io::Result<Guard>>,
 {
     let host = host.trim_start_matches('[').trim_end_matches(']');
     if let Some(ip) = crate::runtime::pinned_server_address(host) {
-        return Ok(vec![ip]);
+        return Ok(ResolvedRecords {
+            ips: vec![ip],
+            min_ttl: None,
+        });
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(vec![ip]);
+        return Ok(ResolvedRecords {
+            ips: vec![ip],
+            min_ttl: None,
+        });
     }
+    let mut configured_error: Option<io::Error> = None;
     if let Some(resolver) = resolver {
         let result = {
             let _guard = admit().await?;
-            resolver.query_with_deadline(host, deadline).await
+            resolver.query_records(host, families, deadline).await
         };
         match result {
-            Ok(ips) if !ips.is_empty() => return Ok(ips),
+            Ok(records) if !records.ips.is_empty() => return Ok(records),
             Ok(_) => tracing::debug!("bootstrap resolver returned no records for '{}'", host),
-            Err(e) => tracing::debug!("bootstrap resolution of '{}' failed: {}", host, e),
+            Err(e) => {
+                tracing::debug!("bootstrap resolution of '{}' failed: {}", host, e);
+                configured_error = Some(e);
+            }
         }
     }
     if let Ok(contents) = tokio::fs::read_to_string("/etc/hosts").await {
-        let addrs = hosts_addresses(&contents, host);
+        let mut addrs = hosts_addresses(&contents, host);
+        addrs.retain(|ip| families.matches(*ip));
         if !addrs.is_empty() {
             if let Some(mut observation) =
                 LookupObservation::start(host, "UNKNOWN", LookupOrigin::Hosts)
             {
                 observation.finish(Ok::<_, &io::Error>(addrs.iter().copied()));
             }
-            return Ok(addrs);
+            return Ok(ResolvedRecords {
+                ips: addrs,
+                min_ttl: None,
+            });
         }
     }
-    let server = system_nameserver().ok_or_else(|| {
+    // Short-circuit after local /etc/hosts lookup and again after reading
+    // /etc/resolv.conf so an expired deadline never invokes admit() -> Capacity.
+    if let Some(err) = deadline_expired_error(deadline, &mut configured_error) {
+        return Err(err);
+    }
+    let server = system_nameserver().await.ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "no numeric system DNS nameserver")
     })?;
+    if let Some(err) = deadline_expired_error(deadline, &mut configured_error) {
+        return Err(err);
+    }
     let resolver = BootstrapResolver {
         server,
         use_tcp: false,
     };
     let _guard = admit().await?;
-    let addrs = resolver.query_with_deadline(host, deadline).await?;
-    if addrs.is_empty() {
+    let records = resolver.query_records(host, families, deadline).await?;
+    if records.ips.is_empty() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "no DNS addresses"));
     }
-    Ok(addrs)
+    Ok(records)
+}
+
+fn deadline_expired_error(
+    deadline: Option<tokio::time::Instant>,
+    configured_error: &mut Option<io::Error>,
+) -> Option<io::Error> {
+    let deadline = deadline?;
+    if tokio::time::Instant::now() < deadline {
+        return None;
+    }
+    Some(match configured_error.take() {
+        Some(err) if err.kind() == io::ErrorKind::TimedOut => err,
+        _ => io::Error::new(
+            io::ErrorKind::TimedOut,
+            "bootstrap DNS resolution timed out",
+        ),
+    })
 }
 
 fn hosts_addresses(contents: &str, host: &str) -> Vec<IpAddr> {
@@ -207,37 +292,110 @@ fn hosts_addresses(contents: &str, host: &str) -> Vec<IpAddr> {
 
 /// Budget for one address family's exchange, connect included.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+/// Stepped UDP retransmit offsets from the initial send (3 sends total).
+/// The 400 ms initial wait clears typical WAN RTTs before resending.
+const UDP_RETRANSMIT_OFFSETS: [Duration; 2] =
+    [Duration::from_millis(400), Duration::from_millis(1200)];
+/// Completion cap for the non-preferred family after the preferred family returns IPs.
+const PREFERRED_FIRST_COMPLETION_WINDOW: Duration = Duration::from_millis(500);
+/// Completion cap for the preferred family after the non-preferred family returns IPs
+/// (wide enough to cover the first 400ms UDP retransmit plus RTT).
+const SECONDARY_FIRST_COMPLETION_WINDOW: Duration = Duration::from_millis(1000);
 
 impl BootstrapResolver {
-    async fn query_with_deadline(
+    /// Boxed on the network path so callers embedding `bootstrap::resolve`
+    /// do not carry dual-stack and retry future state on their own stack frames.
+    fn query_records<'a>(
+        &'a self,
+        host: &'a str,
+        families: QueryFamilies,
+        deadline: Option<tokio::time::Instant>,
+    ) -> futures_util::future::BoxFuture<'a, io::Result<ResolvedRecords>> {
+        let now = tokio::time::Instant::now();
+        if let Some(deadline) = deadline
+            && now >= deadline
+        {
+            return Box::pin(std::future::ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "bootstrap DNS resolution timed out",
+            ))));
+        }
+        let cap = match deadline {
+            Some(deadline) => deadline.min(now + QUERY_TIMEOUT),
+            None => now + QUERY_TIMEOUT,
+        };
+        match families {
+            QueryFamilies::Both { prefer_v6 } => Box::pin(self.query_both(host, prefer_v6, cap)),
+            QueryFamilies::Ipv4Only => Box::pin(self.query_family(host, 1, cap)),
+            QueryFamilies::Ipv6Only => Box::pin(self.query_family(host, 28, cap)),
+        }
+    }
+
+    async fn query_both(
         &self,
         host: &str,
-        deadline: Option<tokio::time::Instant>,
-    ) -> io::Result<Vec<IpAddr>> {
-        match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, self.query(host))
-                .await
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "bootstrap DNS resolution timed out",
-                    )
-                })?,
-            None => self.query(host).await,
+        prefer_v6: bool,
+        cap: tokio::time::Instant,
+    ) -> io::Result<ResolvedRecords> {
+        let (preferred_qtype, secondary_qtype) = if prefer_v6 { (28, 1) } else { (1, 28) };
+        let preferred = self.query_family(host, preferred_qtype, cap);
+        let secondary = self.query_family(host, secondary_qtype, cap);
+        tokio::pin!(preferred);
+        tokio::pin!(secondary);
+
+        enum First {
+            Preferred(io::Result<ResolvedRecords>),
+            Secondary(io::Result<ResolvedRecords>),
         }
+
+        let first = tokio::select! {
+            res = &mut preferred => First::Preferred(res),
+            res = &mut secondary => First::Secondary(res),
+        };
+
+        // Drive both families without an outer timeout_at so a non-empty answer
+        // from either family is never discarded if the other stalls until deadline.
+        let (pref_res, sec_res) = match first {
+            First::Preferred(pref_res) => {
+                let sec_res = wait_remaining_family(
+                    &pref_res,
+                    secondary,
+                    cap,
+                    PREFERRED_FIRST_COMPLETION_WINDOW,
+                )
+                .await;
+                (pref_res, sec_res)
+            }
+            First::Secondary(sec_res) => {
+                let pref_res = wait_remaining_family(
+                    &sec_res,
+                    preferred,
+                    cap,
+                    SECONDARY_FIRST_COMPLETION_WINDOW,
+                )
+                .await;
+                (pref_res, sec_res)
+            }
+        };
+
+        merge_family_results(pref_res, sec_res)
     }
 
     /// Query A and AAAA records for `host` directly from the configured
     /// server over bypass-marked sockets, without a system-resolver fallback.
     pub async fn query(&self, host: &str) -> io::Result<Vec<IpAddr>> {
-        // Separate budgets: a stalled or failing family must not discard the other's answer.
-        match tokio::join!(self.query_family(host, 1), self.query_family(host, 28)) {
-            (Err(e), Err(_)) => Err(e),
-            (a, aaaa) => Ok([a.unwrap_or_default(), aaaa.unwrap_or_default()].concat()),
-        }
+        Ok(self
+            .query_records(host, QueryFamilies::Both { prefer_v6: false }, None)
+            .await?
+            .ips)
     }
 
-    async fn query_family(&self, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
+    async fn query_family(
+        &self,
+        host: &str,
+        qtype: u16,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<ResolvedRecords> {
         let mut observation = LookupObservation::start(
             host,
             qtype_name(qtype),
@@ -245,14 +403,9 @@ impl BootstrapResolver {
         );
         let child = observation.as_ref().map(LookupObservation::child);
         let result = async {
-            let msg = tokio::time::timeout(
-                QUERY_TIMEOUT,
-                self.query_raw(host, qtype, observation.as_mut()),
-            )
-            .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "bootstrap DNS query timed out")
-            })??;
+            let msg = self
+                .query_raw(host, qtype, deadline, observation.as_mut())
+                .await?;
             parse_answers(&msg, qtype)
         };
         let result = match child {
@@ -260,39 +413,55 @@ impl BootstrapResolver {
             None => result.await,
         };
         if let Some(observation) = &mut observation {
-            observation.finish(result.as_ref().map(|addresses| addresses.iter().copied()));
+            observation.finish(result.as_ref().map(|records| records.ips.iter().copied()));
         }
         result
     }
 
-    /// Send a single query and return the raw response that answers it.
+    /// Send a single query bounded by `deadline` and return the matching raw response.
     async fn query_raw(
         &self,
         host: &str,
         qtype: u16,
+        deadline: tokio::time::Instant,
         observation: Option<&mut LookupObservation>,
     ) -> io::Result<Vec<u8>> {
         let query = build_query(host, qtype);
-        if !self.use_tcp {
-            let response = self.exchange_udp(&query).await?;
-            // A truncated answer may omit records; libc's resolver retries it over TCP.
-            if response[2] & 0x02 == 0 {
-                return Ok(response);
+        tokio::time::timeout_at(deadline, async {
+            if !self.use_tcp {
+                let response = self.exchange_udp(&query).await?;
+                // A truncated answer may omit records; libc's resolver retries it over TCP.
+                if response[2] & 0x02 == 0 {
+                    return Ok(response);
+                }
+                if let Some(observation) = observation {
+                    observation.data.upstream_transport = Some("tcp");
+                    observation.data.carrier_transport = Some("tcp");
+                }
             }
-            if let Some(observation) = observation {
-                observation.data.upstream_transport = Some("tcp");
-                observation.data.carrier_transport = Some("tcp");
-            }
-        }
-        self.exchange_tcp(&query).await
+            self.exchange_tcp(&query, deadline).await
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "bootstrap DNS query timed out"))?
     }
 
-    async fn exchange_tcp(&self, query: &[u8]) -> io::Result<Vec<u8>> {
+    async fn exchange_tcp(
+        &self,
+        query: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> io::Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "bootstrap DNS query timed out",
+            ));
+        }
         let mut stream = crate::util::connect_marked_addr(
             self.server,
             Some(crate::util::bypass_mark()),
-            QUERY_TIMEOUT,
+            remaining,
         )
         .await?;
         stream
@@ -321,38 +490,81 @@ impl BootstrapResolver {
         };
         let socket = crate::util::udp_marked_bind(bind).await?;
         socket.connect(self.server).await?;
+        let started = tokio::time::Instant::now();
         socket.send(query).await?;
-        let mut buf = [0u8; 1500];
-        // Stray and off-path spoofed datagrams are skipped; the caller's deadline bounds the wait.
+        let mut buf = vec![0u8; 1500];
+        let mut retry_idx = 0usize;
+        // Fixed absolute deadline outside the recv loop so spoofed/mismatched
+        // datagrams skipped by recv never reset or starve retransmits.
+        let retransmit = tokio::time::sleep_until(started + UDP_RETRANSMIT_OFFSETS[0]);
+        tokio::pin!(retransmit);
         loop {
-            let n = socket.recv(&mut buf).await?;
-            if answers_query(query, &buf[..n]) {
-                return Ok(buf[..n].to_vec());
+            tokio::select! {
+                biased;
+                () = &mut retransmit, if retry_idx < UDP_RETRANSMIT_OFFSETS.len() => {
+                    socket.send(query).await?;
+                    retry_idx += 1;
+                    if let Some(&offset) = UDP_RETRANSMIT_OFFSETS.get(retry_idx) {
+                        retransmit.as_mut().reset(started + offset);
+                    }
+                }
+                res = socket.recv(&mut buf) => {
+                    let n = res?;
+                    if answers_query(query, &buf[..n]) {
+                        buf.truncate(n);
+                        return Ok(buf);
+                    }
+                }
             }
         }
     }
 }
 
-/// Whether `resp` answers `query` (as built by [`build_query`]): same ID, QR
-/// set, same opcode and exactly the sent question. Names are case-insensitive
-/// in DNS, so only the name ignores ASCII case; type and class must match exactly.
-fn answers_query(query: &[u8], resp: &[u8]) -> bool {
-    let (name, type_class) = query[12..].split_at(query.len() - 16);
-    resp.len() >= 12
-        && resp[..2] == query[..2]
-        && resp[2] & 0x80 != 0
-        && (resp[2] ^ query[2]) & 0x78 == 0
-        && resp[4..6] == [0, 1]
-        && resp
-            .get(12..12 + name.len())
-            .is_some_and(|n| n.eq_ignore_ascii_case(name))
-        && resp.get(12 + name.len()..query.len()) == Some(type_class)
+async fn wait_remaining_family<F>(
+    first: &io::Result<ResolvedRecords>,
+    remaining: F,
+    cap: tokio::time::Instant,
+    window: Duration,
+) -> io::Result<ResolvedRecords>
+where
+    F: Future<Output = io::Result<ResolvedRecords>>,
+{
+    match first {
+        Ok(rec) if !rec.ips.is_empty() => {
+            let wait_until = cap.min(tokio::time::Instant::now() + window);
+            tokio::time::timeout_at(wait_until, remaining)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "bootstrap DNS completion window elapsed",
+                    ))
+                })
+        }
+        _ => remaining.await,
+    }
+}
+
+fn merge_family_results(
+    preferred: io::Result<ResolvedRecords>,
+    secondary: io::Result<ResolvedRecords>,
+) -> io::Result<ResolvedRecords> {
+    match (preferred, secondary) {
+        (Ok(mut pref), Ok(sec)) => {
+            pref.ips.extend(sec.ips);
+            pref.min_ttl = merge_min_ttl(pref.min_ttl, sec.min_ttl);
+            Ok(pref)
+        }
+        (Ok(pref), Err(_)) if !pref.ips.is_empty() => Ok(pref),
+        (Err(_), Ok(sec)) if !sec.ips.is_empty() => Ok(sec),
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    }
 }
 
 /// First nameserver from /etc/resolv.conf (UDP, port 53). Used for record
 /// lookups (e.g. ECH discovery) when no `bootstrap_resolver` is configured.
-fn system_nameserver() -> Option<SocketAddr> {
-    let contents = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+async fn system_nameserver() -> Option<SocketAddr> {
+    let contents = tokio::fs::read_to_string("/etc/resolv.conf").await.ok()?;
     for line in contents.lines() {
         let mut fields = line.split_ascii_whitespace();
         if fields.next() == Some("nameserver")
@@ -363,11 +575,6 @@ fn system_nameserver() -> Option<SocketAddr> {
     }
     None
 }
-
-/// DNS qtype for HTTPS service-binding records (RFC 9460).
-const QTYPE_HTTPS: u16 = 65;
-/// SVCB SvcParam key carrying the ECHConfigList.
-const SVCB_KEY_ECH: u16 = 5;
 
 /// Look up the ECHConfigList for `host` via DNS HTTPS records (RFC 9460).
 ///
@@ -382,7 +589,7 @@ pub async fn query_ech_config(host: &str) -> io::Result<Option<(Vec<u8>, u32)>> 
     let resolver = match global() {
         Some(r) => r,
         None => {
-            let Some(server) = system_nameserver() else {
+            let Some(server) = system_nameserver().await else {
                 return Ok(None);
             };
             BootstrapResolver {
@@ -400,7 +607,8 @@ pub async fn query_ech_config(host: &str) -> io::Result<Option<(Vec<u8>, u32)>> 
         ),
     );
     let child = observation.as_ref().map(LookupObservation::child);
-    let operation = resolver.query_raw(host, QTYPE_HTTPS, observation.as_mut());
+    let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
+    let operation = resolver.query_raw(host, QTYPE_HTTPS, deadline, observation.as_mut());
     let result = match child {
         Some(child) => child.scope(operation).await,
         None => operation.await,
@@ -409,175 +617,6 @@ pub async fn query_ech_config(host: &str) -> io::Result<Option<(Vec<u8>, u32)>> 
         observation.finish(result.as_ref().map(|_| std::iter::empty()));
     }
     Ok(parse_https_rr_ech(&result?))
-}
-
-/// Extract the ECHConfigList and TTL from the first ServiceMode HTTPS RR in
-/// a DNS response. AliasMode records (priority != 0) carry no SvcParams and
-/// are skipped.
-fn parse_https_rr_ech(msg: &[u8]) -> Option<(Vec<u8>, u32)> {
-    if msg.len() < 12 {
-        return None;
-    }
-    let qd = u16::from_be_bytes([msg[4], msg[5]]) as usize;
-    let an = u16::from_be_bytes([msg[6], msg[7]]) as usize;
-    let mut pos = 12;
-    for _ in 0..qd {
-        pos = skip_name(msg, pos).ok()?;
-        pos = pos.checked_add(4)?;
-    }
-    for _ in 0..an {
-        pos = skip_name(msg, pos).ok()?;
-        if pos + 10 > msg.len() {
-            return None;
-        }
-        let rtype = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
-        let ttl = u32::from_be_bytes([msg[pos + 4], msg[pos + 5], msg[pos + 6], msg[pos + 7]]);
-        let rdlen = u16::from_be_bytes([msg[pos + 8], msg[pos + 9]]) as usize;
-        pos += 10;
-        if pos + rdlen > msg.len() {
-            return None;
-        }
-        if rtype == QTYPE_HTTPS
-            && rdlen >= 3
-            && let Some(ech) = parse_svcb_ech_param(&msg[pos..pos + rdlen])
-        {
-            return Some((ech, ttl));
-        }
-        pos += rdlen;
-    }
-    None
-}
-
-/// Parse SVCB/HTTPS RDATA for the `ech` SvcParam (key 5). Only ServiceMode
-/// records (SvcPriority >= 1) carry SvcParams; AliasMode (priority 0) has
-/// just a TargetName and is skipped.
-fn parse_svcb_ech_param(rdata: &[u8]) -> Option<Vec<u8>> {
-    let priority = u16::from_be_bytes([rdata[0], rdata[1]]);
-    if priority == 0 {
-        return None; // AliasMode has no SvcParams
-    }
-    let mut pos = skip_name(rdata, 2).ok()?;
-    while pos + 4 <= rdata.len() {
-        let key = u16::from_be_bytes([rdata[pos], rdata[pos + 1]]);
-        let len = u16::from_be_bytes([rdata[pos + 2], rdata[pos + 3]]) as usize;
-        pos += 4;
-        if pos + len > rdata.len() {
-            return None;
-        }
-        if key == SVCB_KEY_ECH {
-            return Some(rdata[pos..pos + len].to_vec());
-        }
-        pos += len;
-    }
-    None
-}
-
-/// Build a minimal DNS query (RD set, single question).
-fn build_query(host: &str, qtype: u16) -> Vec<u8> {
-    let mut q = Vec::with_capacity(host.len() + 18);
-    q.extend_from_slice(&rand::random::<u16>().to_be_bytes()); // id
-    q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
-    q.extend_from_slice(&1u16.to_be_bytes()); // qdcount
-    q.extend_from_slice(&[0; 6]); // an/ns/ar = 0
-    for label in host.trim_end_matches('.').split('.') {
-        q.push(label.len() as u8);
-        q.extend_from_slice(label.as_bytes());
-    }
-    q.push(0);
-    q.extend_from_slice(&qtype.to_be_bytes());
-    q.extend_from_slice(&1u16.to_be_bytes()); // IN
-    q
-}
-
-/// Extract A/AAAA answer addresses from a DNS response.
-fn parse_answers(msg: &[u8], qtype: u16) -> io::Result<Vec<IpAddr>> {
-    if msg.len() < 12 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "short DNS message",
-        ));
-    }
-    let qd = u16::from_be_bytes([msg[4], msg[5]]) as usize;
-    let an = u16::from_be_bytes([msg[6], msg[7]]) as usize;
-    let mut pos = 12;
-    for _ in 0..qd {
-        pos = skip_name(msg, pos)?;
-        pos = pos.checked_add(4).ok_or_else(bad)?; // qtype + qclass
-    }
-    let mut ips = Vec::new();
-    for _ in 0..an {
-        pos = skip_name(msg, pos)?;
-        if pos + 10 > msg.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated answer",
-            ));
-        }
-        let rtype = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
-        let rdlen = u16::from_be_bytes([msg[pos + 8], msg[pos + 9]]) as usize;
-        pos += 10;
-        if pos + rdlen > msg.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated rdata",
-            ));
-        }
-        if rtype == qtype {
-            match (rtype, rdlen) {
-                (1, 4) => ips.push(IpAddr::V4(Ipv4Addr::new(
-                    msg[pos],
-                    msg[pos + 1],
-                    msg[pos + 2],
-                    msg[pos + 3],
-                ))),
-                (28, 16) => {
-                    let mut octets = [0u8; 16];
-                    octets.copy_from_slice(&msg[pos..pos + 16]);
-                    ips.push(IpAddr::V6(Ipv6Addr::from(octets)));
-                }
-                _ => {}
-            }
-        }
-        pos += rdlen;
-    }
-    Ok(ips)
-}
-
-fn bad() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "bad DNS message")
-}
-
-/// Skip a (possibly compressed) domain name, returning the offset after it.
-fn skip_name(msg: &[u8], mut pos: usize) -> io::Result<usize> {
-    loop {
-        let Some(&len) = msg.get(pos) else {
-            return Err(bad());
-        };
-        if len & 0xC0 == 0xC0 {
-            return Ok(pos + 2);
-        }
-        if len == 0 {
-            return Ok(pos + 1);
-        }
-        pos += 1 + len as usize;
-        if pos > msg.len() {
-            return Err(bad());
-        }
-    }
-}
-
-/// Human-readable qtype name for logs and flow observations.
-pub fn qtype_name(qtype: u16) -> &'static str {
-    match qtype {
-        1 => "A",
-        2 => "NS",
-        5 => "CNAME",
-        15 => "MX",
-        16 => "TXT",
-        28 => "AAAA",
-        65 => "HTTPS",
-        _ => "UNKNOWN",
-    }
 }
 
 /// Where an observed lookup's answer comes from.
