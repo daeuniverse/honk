@@ -304,22 +304,16 @@ impl UpstreamPool {
         exchange.await
     }
 
+    #[cfg(test)]
     pub(super) async fn resolve_addrs(
         &self,
         entry: &UpstreamEntry,
     ) -> anyhow::Result<Vec<SocketAddr>> {
-        entry.check_explicit_block()?;
-        entry
-            .endpoint
-            .resolve_addrs_budgeted(
-                &self.socket_budget,
-                tokio::time::Instant::now() + self.dns_dial_timeout,
-            )
-            .await
+        self.resolve_observed_addrs(entry).await.0
     }
 
-    /// Boxed so a direct UDP query, which normally reuses its current
-    /// address, does not reserve the resolver's state in its future.
+    /// Cold hostname resolution is boxed so direct UDP hits and cached hostname
+    /// lookups do not reserve the resolver's state in their futures.
     async fn resolve_observed_addrs(
         &self,
         entry: &UpstreamEntry,
@@ -327,13 +321,35 @@ impl UpstreamPool {
         anyhow::Result<Vec<SocketAddr>>,
         Option<honk_outbound::runtime::flow_observation::LookupSelection>,
     ) {
-        Box::pin(async {
-            let resolve = honk_outbound::runtime::flow_observation::observe_resolution(
-                self.resolve_addrs(entry),
+        if let Err(error) = entry.check_explicit_block() {
+            return (Err(error), None);
+        }
+        let bootstrap_deadline = tokio::time::Instant::now() + self.dns_dial_timeout;
+        if entry.endpoint.is_literal_or_pinned() {
+            return (
+                entry
+                    .endpoint
+                    .resolve_addrs_budgeted(&self.socket_budget, bootstrap_deadline)
+                    .await,
+                None,
             );
-            crate::observe::scope_pin!(resolve);
-            crate::observe::flows::dns::scope_purpose("proxy_server", resolve).await
-        })
+        }
+        if let Some(cached) = entry.bootstrap.lookup_live() {
+            return (cached, None);
+        }
+        Box::pin(entry.bootstrap.resolve_or_coalesce(
+            &entry.endpoint.host,
+            bootstrap_deadline,
+            || async {
+                let resolve = honk_outbound::runtime::flow_observation::observe_resolution(
+                    entry
+                        .endpoint
+                        .resolve_addrs_budgeted(&self.socket_budget, bootstrap_deadline),
+                );
+                crate::observe::scope_pin!(resolve);
+                crate::observe::flows::dns::scope_purpose("proxy_server", resolve).await
+            },
+        ))
         .await
     }
 
@@ -495,19 +511,22 @@ impl UpstreamPool {
         let current = { entry.udp.lock().current_address() };
         let has_traffic_router =
             self.traffic_router_snapshot.read().is_some() || self.traffic_router.read().is_some();
+        let mut prefetched = None;
         let initial_route = if current.is_none() && entry.outbound.is_none() && has_traffic_router {
             let (targets, witness) = self.resolve_observed_addrs(entry).await;
-            let target = targets?
-                .into_iter()
-                .next()
+            let targets = targets?;
+            let target = targets
+                .first()
+                .copied()
                 .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))?;
-            if let Some(witness) = witness {
+            if let Some(witness) = &witness {
                 witness.selected_ip(target.ip());
             }
-            Some(
-                self.resolve_dial_route_for_address(entry, target, original_business.as_ref())
-                    .await?,
-            )
+            let route = self
+                .resolve_dial_route_for_address(entry, target, original_business.as_ref())
+                .await?;
+            prefetched = Some((targets, witness));
+            Some(route)
         } else {
             None
         };
@@ -554,8 +573,13 @@ impl UpstreamPool {
             None
         };
 
-        let (addresses, witness) = self.resolve_observed_addrs(entry).await;
-        let addresses = addresses?;
+        let (addresses, witness) = match prefetched {
+            Some(resolved) => resolved,
+            None => {
+                let (addresses, witness) = self.resolve_observed_addrs(entry).await;
+                (addresses?, witness)
+            }
+        };
         let (first, first_error, retry) = if let Some((failed_address, first_error)) = failed {
             let [first, retry] = udp_attempt_addresses(&addresses, Some(failed_address))
                 .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))?;
@@ -568,7 +592,9 @@ impl UpstreamPool {
         } else {
             let [first, retry] = udp_attempt_addresses(&addresses, None)
                 .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))?;
-            if let Some(witness) = &witness {
+            if initial_route.is_none()
+                && let Some(witness) = &witness
+            {
                 witness.selected_ip(first.ip());
             }
             let route = match initial_route {

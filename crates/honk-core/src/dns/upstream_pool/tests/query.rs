@@ -291,7 +291,7 @@ async fn udp_cold_retry_rechecks_route_for_alternate_address() {
         stream.write_all(&response).await.unwrap();
         query
     });
-    let (bootstrap_address, bootstrap_task) = spawn_dual_stack_bootstrap(4).await;
+    let (bootstrap_address, bootstrap_task) = spawn_dual_stack_bootstrap(2).await;
     let resolver =
         honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{bootstrap_address}"));
     let node = Node {
@@ -939,4 +939,267 @@ fn parses_encrypted_upstream_at_construction() {
     ];
     let pool = UpstreamPool::new(&upstreams, make_router()).unwrap();
     assert_eq!(pool.upstream_count(), 4);
+}
+
+async fn spawn_counting_bootstrap_server(
+    ipv4s: Vec<[u8; 4]>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = server.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&count);
+    let task = tokio::spawn(async move {
+        let mut query = [0_u8; 512];
+        while let Ok((length, peer)) = server.recv_from(&mut query).await {
+            observed.fetch_add(1, Ordering::SeqCst);
+            let qtype = u16::from_be_bytes([query[length - 4], query[length - 3]]);
+            let mut response = query[..length].to_vec();
+            if fail.load(Ordering::SeqCst) {
+                response[2..4].copy_from_slice(&0x8183_u16.to_be_bytes());
+                let _ = server.send_to(&response, peer).await;
+                continue;
+            }
+            response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+            if qtype == 1 {
+                response[6..8].copy_from_slice(&(ipv4s.len() as u16).to_be_bytes());
+                for ip in &ipv4s {
+                    response.extend_from_slice(&[
+                        0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04,
+                    ]);
+                    response.extend_from_slice(ip);
+                }
+            } else {
+                response[6..8].copy_from_slice(&0_u16.to_be_bytes());
+            }
+            let _ = server.send_to(&response, peer).await;
+        }
+    });
+    (address, count, task)
+}
+
+async fn spawn_tcp_dns_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                loop {
+                    let mut len_buf = [0_u8; 2];
+                    if stream.read_exact(&mut len_buf).await.is_err() {
+                        break;
+                    }
+                    let len = usize::from(u16::from_be_bytes(len_buf));
+                    let mut req = vec![0_u8; len];
+                    if stream.read_exact(&mut req).await.is_err() {
+                        break;
+                    }
+                    let resp = mock_dns_response(u16::from_be_bytes([req[0], req[1]]));
+                    let resp_len = (resp.len() as u16).to_be_bytes();
+                    if stream.write_all(&resp_len).await.is_err()
+                        || stream.write_all(&resp).await.is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (address, task)
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_and_proxied_udp_reuse_cached_bootstrap_until_ttl_and_across_generations() {
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (bootstrap_addr, bootstrap_packets, bootstrap_task) =
+        spawn_counting_bootstrap_server(vec![[127, 0, 0, 1]], fail).await;
+    let (tcp_addr, tcp_task) = spawn_tcp_dns_server().await;
+    let resolver =
+        honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{bootstrap_addr}"));
+    let proxy_node = Node {
+        outbound: honk_config::node::OutboundConfig::from_protocol(
+            honk_config::types::NodeProtocol::Direct,
+        ),
+        ..test_node("cached-proxy")
+    };
+    let tcp_upstream = make_upstream(
+        "cached-tcp",
+        &format!("cached-tcp.test:{}", tcp_addr.port()),
+        DnsProtocol::Tcp,
+    );
+    let proxied_udp = DnsUpstream {
+        outbound: Some(proxy_node.name.clone()),
+        ..make_upstream(
+            "cached-proxied-udp",
+            &format!("cached-proxied.test:{}", tcp_addr.port()),
+            DnsProtocol::Udp,
+        )
+    };
+    let pool = UpstreamPool::new_with_proxy_and_bootstrap(
+        &[tcp_upstream.clone(), proxied_udp],
+        make_router(),
+        Some(Arc::new(
+            crate::proxy::ProxyRegistry::default_resolver().expect("proxy registry"),
+        )),
+        vec![proxy_node],
+        Vec::new(),
+        resolver,
+        DnsStrategy::PreferIpv4,
+    )
+    .unwrap();
+
+    for txid in [0x1111, 0x1112, 0x1113] {
+        let resp = pool
+            .query("cached-tcp", &mock_dns_query(txid))
+            .await
+            .unwrap();
+        assert_eq!(resp, mock_dns_response(txid));
+    }
+    assert_eq!(
+        bootstrap_packets.load(Ordering::SeqCst),
+        2,
+        "warm stream queries must reuse cached bootstrap addresses"
+    );
+
+    for txid in [0x2111, 0x2112, 0x2113] {
+        let resp = pool
+            .query("cached-proxied-udp", &mock_dns_query(txid))
+            .await
+            .unwrap();
+        assert_eq!(resp, mock_dns_response(txid));
+    }
+    assert_eq!(
+        bootstrap_packets.load(Ordering::SeqCst),
+        4,
+        "proxied UDP queries must reuse cached bootstrap addresses"
+    );
+
+    tokio::time::advance(Duration::from_secs(61)).await;
+    let resp = pool
+        .query("cached-tcp", &mock_dns_query(0x1114))
+        .await
+        .unwrap();
+    assert_eq!(resp, mock_dns_response(0x1114));
+    assert_eq!(
+        bootstrap_packets.load(Ordering::SeqCst),
+        6,
+        "expired positive bootstrap cache must refresh once"
+    );
+
+    let next_generation = UpstreamPool::new_with_proxy_and_bootstrap(
+        &[tcp_upstream],
+        make_router(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        resolver,
+        DnsStrategy::PreferIpv4,
+    )
+    .unwrap();
+    let resp = next_generation
+        .query("cached-tcp", &mock_dns_query(0x3111))
+        .await
+        .unwrap();
+    assert_eq!(resp, mock_dns_response(0x3111));
+    assert_eq!(
+        bootstrap_packets.load(Ordering::SeqCst),
+        8,
+        "a replacement generation must not inherit old bootstrap cache state"
+    );
+
+    pool.close().await;
+    next_generation.close().await;
+    bootstrap_task.abort();
+    tcp_task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn upstream_bootstrap_negative_backoff_and_capacity_exemption() {
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (bootstrap_addr, bootstrap_packets, bootstrap_task) =
+        spawn_counting_bootstrap_server(vec![[127, 0, 0, 1]], Arc::clone(&fail)).await;
+    let (tcp_addr, tcp_task) = spawn_tcp_dns_server().await;
+    let resolver =
+        honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{bootstrap_addr}"));
+    let upstream = make_upstream(
+        "backoff-tcp",
+        &format!("backoff.test:{}", tcp_addr.port()),
+        DnsProtocol::Tcp,
+    );
+    let pool = UpstreamPool::new_with_proxy_and_bootstrap(
+        std::slice::from_ref(&upstream),
+        make_router(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        resolver,
+        DnsStrategy::PreferIpv4,
+    )
+    .unwrap();
+
+    assert!(
+        pool.query("backoff-tcp", &mock_dns_query(0x4001))
+            .await
+            .is_err()
+    );
+    assert_eq!(bootstrap_packets.load(Ordering::SeqCst), 2);
+
+    fail.store(false, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_millis(100)).await;
+    assert!(
+        pool.query("backoff-tcp", &mock_dns_query(0x4002))
+            .await
+            .is_err(),
+        "negative bootstrap backoff must suppress immediate retry"
+    );
+    assert_eq!(bootstrap_packets.load(Ordering::SeqCst), 2);
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let recovered = pool
+        .query("backoff-tcp", &mock_dns_query(0x4003))
+        .await
+        .expect("bootstrap recovers after negative backoff expires");
+    assert_eq!(recovered, mock_dns_response(0x4003));
+    assert_eq!(bootstrap_packets.load(Ordering::SeqCst), 4);
+
+    let budget = crate::dns::transport::DnsSocketBudget::new(2);
+    let held = budget
+        .acquire_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    let constrained = UpstreamPool::new_with_proxy_and_bootstrap(
+        &[upstream],
+        make_router(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        resolver,
+        DnsStrategy::PreferIpv4,
+    )
+    .unwrap()
+    .with_socket_budget(budget)
+    .with_timeouts(Duration::from_millis(200), Duration::from_millis(50));
+
+    let error = constrained
+        .query("backoff-tcp", &mock_dns_query(0x4004))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        honk_outbound::proxy::packet_rejection(&error),
+        Some(honk_outbound::proxy::PacketRejection::Capacity)
+    );
+    assert_eq!(bootstrap_packets.load(Ordering::SeqCst), 4);
+
+    drop(held);
+    let immediate = constrained
+        .query("backoff-tcp", &mock_dns_query(0x4005))
+        .await
+        .expect("capacity refusal must not leave a negative bootstrap backoff");
+    assert_eq!(immediate, mock_dns_response(0x4005));
+    assert_eq!(bootstrap_packets.load(Ordering::SeqCst), 6);
+
+    pool.close().await;
+    constrained.close().await;
+    bootstrap_task.abort();
+    tcp_task.abort();
 }

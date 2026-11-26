@@ -96,6 +96,10 @@ impl DnsEndpoint {
         self
     }
 
+    pub(crate) fn is_literal_or_pinned(&self) -> bool {
+        self.resolved_addr.is_some() || self.host.parse::<IpAddr>().is_ok()
+    }
+
     /// Resolve host to every allowed candidate, preferred family first.
     ///
     /// Dialers iterate this list so failure in the preferred family can fall

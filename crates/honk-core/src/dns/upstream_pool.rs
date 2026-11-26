@@ -146,14 +146,222 @@ mod admission {
 mod entries {
     use super::MAX_UDP_SHARDS;
     use std::collections::HashMap;
+    use std::future::Future;
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use honk_config::dns::{DnsStrategy, DnsUpstream};
+    use honk_outbound::SharedError;
 
     use super::transports::TransportSlots;
     use crate::dns::endpoint::DnsEndpoint;
     use crate::dns::transport::UdpPool;
+
+    const BOOTSTRAP_POSITIVE_TTL: Duration = Duration::from_secs(60);
+    const BOOTSTRAP_NEGATIVE_TTL: Duration = Duration::from_secs(1);
+
+    enum CachedBootstrap {
+        Empty,
+        Positive {
+            addresses: Arc<[SocketAddr]>,
+            expires_at: tokio::time::Instant,
+        },
+        Negative {
+            error: SharedError,
+            retry_after: tokio::time::Instant,
+        },
+    }
+
+    struct TransientBootstrapFailure {
+        generation: u64,
+        error: SharedError,
+    }
+
+    struct BootstrapState {
+        cached: CachedBootstrap,
+        resolving: Option<u64>,
+        generation: u64,
+        last_failure: Option<TransientBootstrapFailure>,
+    }
+
+    pub(super) struct BootstrapCache {
+        state: parking_lot::Mutex<BootstrapState>,
+        changed: tokio::sync::Notify,
+    }
+
+    struct BootstrapLeaderGuard<'a> {
+        cache: &'a BootstrapCache,
+        generation: u64,
+        armed: bool,
+    }
+
+    impl Drop for BootstrapLeaderGuard<'_> {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            let cleared = {
+                let mut state = self.cache.state.lock();
+                if state.resolving == Some(self.generation) {
+                    state.resolving = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if cleared {
+                self.cache.changed.notify_waiters();
+            }
+        }
+    }
+
+    impl Default for BootstrapCache {
+        fn default() -> Self {
+            Self {
+                state: parking_lot::Mutex::new(BootstrapState {
+                    cached: CachedBootstrap::Empty,
+                    resolving: None,
+                    generation: 0,
+                    last_failure: None,
+                }),
+                changed: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    impl BootstrapCache {
+        pub(super) fn lookup_live(&self) -> Option<anyhow::Result<Vec<SocketAddr>>> {
+            let now = tokio::time::Instant::now();
+            let state = self.state.lock();
+            match &state.cached {
+                CachedBootstrap::Positive {
+                    addresses,
+                    expires_at,
+                } if now < *expires_at => Some(Ok(addresses.to_vec())),
+                CachedBootstrap::Negative { error, retry_after } if now < *retry_after => {
+                    Some(Err(anyhow::Error::new(error.clone())))
+                }
+                _ => None,
+            }
+        }
+
+        pub(super) async fn resolve_or_coalesce<W, F, Fut>(
+            &self,
+            host: &str,
+            wait_deadline: tokio::time::Instant,
+            resolve: F,
+        ) -> (anyhow::Result<Vec<SocketAddr>>, Option<W>)
+        where
+            F: FnOnce() -> Fut,
+            Fut: Future<Output = (anyhow::Result<Vec<SocketAddr>>, Option<W>)>,
+        {
+            let mut resolve = Some(resolve);
+            let mut waited_generation = None;
+            loop {
+                let notified = self.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let leader_generation = {
+                    let mut state = self.state.lock();
+                    if let Some(generation) = waited_generation
+                        && let Some(failure) = &state.last_failure
+                        && failure.generation == generation
+                    {
+                        return (Err(anyhow::Error::new(failure.error.clone())), None);
+                    }
+                    let now = tokio::time::Instant::now();
+                    match &state.cached {
+                        CachedBootstrap::Positive {
+                            addresses,
+                            expires_at,
+                        } if now < *expires_at => return (Ok(addresses.to_vec()), None),
+                        CachedBootstrap::Negative { error, retry_after } if now < *retry_after => {
+                            return (Err(anyhow::Error::new(error.clone())), None);
+                        }
+                        _ => {}
+                    }
+                    if let Some(generation) = state.resolving {
+                        waited_generation = Some(generation);
+                        None
+                    } else {
+                        state.generation = state.generation.wrapping_add(1);
+                        let generation = state.generation;
+                        state.resolving = Some(generation);
+                        Some(generation)
+                    }
+                };
+
+                let Some(generation) = leader_generation else {
+                    if tokio::time::timeout_at(wait_deadline, notified)
+                        .await
+                        .is_err()
+                    {
+                        return (
+                            Err(anyhow::anyhow!("bootstrap resolve '{host}' timed out")),
+                            None,
+                        );
+                    }
+                    continue;
+                };
+
+                let mut guard = BootstrapLeaderGuard {
+                    cache: self,
+                    generation,
+                    armed: true,
+                };
+                let Some(run) = resolve.take() else {
+                    return (
+                        Err(anyhow::anyhow!(
+                            "bootstrap resolve '{host}' leader retried without initializer"
+                        )),
+                        None,
+                    );
+                };
+                let (result, witness) = run().await;
+                let outcome = match result {
+                    Ok(addresses) => {
+                        let shared: Arc<[SocketAddr]> = Arc::from(addresses.as_slice());
+                        {
+                            let mut state = self.state.lock();
+                            state.resolving = None;
+                            state.last_failure = None;
+                            state.cached = CachedBootstrap::Positive {
+                                addresses: shared,
+                                expires_at: tokio::time::Instant::now() + BOOTSTRAP_POSITIVE_TTL,
+                            };
+                        }
+                        guard.armed = false;
+                        self.changed.notify_waiters();
+                        Ok(addresses)
+                    }
+                    Err(error) => {
+                        let is_rejection = honk_outbound::proxy::is_packet_rejection(&error);
+                        let shared = SharedError::fanout(error);
+                        {
+                            let mut state = self.state.lock();
+                            state.resolving = None;
+                            state.last_failure = Some(TransientBootstrapFailure {
+                                generation,
+                                error: shared.clone(),
+                            });
+                            if !is_rejection {
+                                state.cached = CachedBootstrap::Negative {
+                                    error: shared.clone(),
+                                    retry_after: tokio::time::Instant::now()
+                                        + BOOTSTRAP_NEGATIVE_TTL,
+                                };
+                            }
+                        }
+                        guard.armed = false;
+                        self.changed.notify_waiters();
+                        Err(anyhow::Error::new(shared))
+                    }
+                };
+                return (outcome, witness);
+            }
+        }
+    }
 
     pub(super) struct UdpFamily {
         pub(super) address: SocketAddr,
@@ -192,6 +400,7 @@ mod entries {
         pub(super) protocol: honk_config::types::DnsProtocol,
         pub(super) endpoint: DnsEndpoint,
         pub(super) outbound: Option<String>,
+        pub(super) bootstrap: BootstrapCache,
         pub(super) transports: parking_lot::Mutex<TransportSlots>,
         pub(super) udp: parking_lot::Mutex<UdpState>,
         pub(super) udp_creation: [tokio::sync::Mutex<()>; 2],
@@ -224,6 +433,7 @@ mod entries {
                     protocol: upstream.protocol,
                     endpoint,
                     outbound: upstream.outbound.clone(),
+                    bootstrap: BootstrapCache::default(),
                     transports: parking_lot::Mutex::default(),
                     udp: parking_lot::Mutex::new(UdpState::default()),
                     udp_creation: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
