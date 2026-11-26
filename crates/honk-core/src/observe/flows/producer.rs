@@ -29,12 +29,12 @@ impl FlowGuard {
             .inner
             .lock()
             .records
-            .iter()
-            .any(|record| record.id() == self.id && record.ended.is_none())
+            .get(&self.key)
+            .is_some_and(|record| record.ended.is_none())
         {
             return None;
         }
-        let flow_id = self.id.parse().expect("recorder UUID");
+        let flow_id = self.key;
         let weak = Arc::downgrade(self);
         Some(FlowObserver::new(
             FlowContext {
@@ -59,7 +59,7 @@ impl FlowGuard {
             return;
         };
         match event {
-            FlowEvent::Gap(reason) => store.mark_gap(&self.id, reason),
+            FlowEvent::Gap(reason) => store.mark_gap(&self.key, reason),
             FlowEvent::Dns(data) => {
                 if data.attempt_id != context.attempt_id
                     || (context.lookup_id != Some(data.lookup_id)
@@ -69,7 +69,7 @@ impl FlowGuard {
                     self.mark_gap(GapReason::NotInstrumented);
                     return;
                 }
-                store.record_step(&self.id, Some(context.generation), StepData::Dns(data));
+                store.record_step(&self.key, Some(context.generation), StepData::Dns(data));
             }
             FlowEvent::Transport {
                 attempt_id,
@@ -82,7 +82,7 @@ impl FlowGuard {
                     self.mark_gap(GapReason::NotInstrumented);
                     return;
                 }
-                store.record_with(&self.id, Some(context.generation), |record| {
+                store.record_with(&self.key, Some(context.generation), |record| {
                     let parent_id = context.attempt_id.map(|id| id.to_string());
                     let parent = parent_id.as_ref().and_then(|parent| {
                         record.steps.iter().rev().find_map(|step| match &step.data {
@@ -140,7 +140,7 @@ impl FlowGuard {
                 });
             }
             FlowEvent::TransportAttached { server_addr, .. } => {
-                store.record_with(&self.id, Some(context.generation), |record| {
+                store.record_with(&self.key, Some(context.generation), |record| {
                     Some(StepData::Connection {
                         state: record.summary.state,
                         reason: if context.lookup_id.is_some() {
@@ -159,7 +159,7 @@ impl FlowGuard {
                 });
             }
             FlowEvent::Session(event) => {
-                store.record_with(&self.id, Some(context.generation), |record| {
+                store.record_with(&self.key, Some(context.generation), |record| {
                     Some(StepData::Connection {
                         state: record.summary.state,
                         reason: event.reason(),
@@ -182,7 +182,7 @@ impl FlowGuard {
                     (true, Milestone::TargetRequestSent) => "dns_request_sent",
                     (true, Milestone::TargetConfirmed) => "dns_target_confirmed",
                 };
-                store.record_with(&self.id, Some(context.generation), |record| {
+                store.record_with(&self.key, Some(context.generation), |record| {
                     Some(StepData::Connection {
                         state: record.summary.state,
                         reason,
@@ -204,7 +204,7 @@ impl FlowGuard {
             return;
         }
         if let Some(store) = self.store.upgrade() {
-            store.record_with(&self.id, Some(generation), |record| {
+            store.record_with(&self.key, Some(generation), |record| {
                 Some(StepData::Connection {
                     state: record.summary.state,
                     reason: "selection_evaluated",
@@ -225,7 +225,7 @@ impl FlowGuard {
             return;
         }
         if let Some(store) = self.store.upgrade() {
-            store.record_with(&self.id, None, |record| {
+            store.record_with(&self.key, None, |record| {
                 Some(StepData::Connection {
                     state: record.summary.state,
                     reason: "application_send_accepted",
@@ -263,7 +263,7 @@ impl FlowGuard {
         {
             *reply_received |= self.replied.load(Ordering::Relaxed);
         }
-        store.record_step(&self.id, generation, data);
+        store.record_step(&self.key, generation, data);
     }
 
     pub(crate) fn datapath(
@@ -286,7 +286,7 @@ impl FlowGuard {
 
     pub(crate) fn mark_gap(&self, reason: GapReason) {
         if let Some(store) = self.store.upgrade() {
-            store.mark_gap(&self.id, reason);
+            store.mark_gap(&self.key, reason);
         }
     }
 
@@ -296,7 +296,7 @@ impl FlowGuard {
 
     pub(crate) fn select_attempt(&self, attempt: &str) {
         if let Some(store) = self.store.upgrade() {
-            store.mutate(&self.id, |record| {
+            store.mutate(&self.key, |record| {
                 if !safe_text(attempt) {
                     return record.mark_gap(GapReason::Redacted);
                 }
@@ -323,7 +323,7 @@ impl FlowGuard {
         let Some(store) = self.store.upgrade() else {
             return;
         };
-        store.mutate(&self.id, |record| {
+        store.mutate(&self.key, |record| {
             let mut redacted = record.redacted;
             let domain = domain
                 .and_then(|value| bounded_display(value, &mut redacted, &mut record.overflow));
@@ -384,7 +384,7 @@ impl FlowGuard {
         let Some(store) = self.store.upgrade() else {
             return;
         };
-        store.mutate(&self.id, |record| {
+        store.mutate(&self.key, |record| {
             let mut redacted = record.redacted;
             let outbound = bounded_display(outbound, &mut redacted, &mut record.overflow);
             let rule_id = safe_optional(rule_id, &mut redacted);
@@ -445,7 +445,7 @@ impl FlowGuard {
         let Some(store) = self.store.upgrade() else {
             return;
         };
-        store.mutate(&self.id, |record| {
+        store.mutate(&self.key, |record| {
             if chain.len() > MAX_STEPS {
                 return record.mark_gap(GapReason::BufferOverflow);
             }
@@ -468,7 +468,7 @@ impl FlowGuard {
         let Some(store) = self.store.upgrade() else {
             return;
         };
-        store.mutate(&self.id, |record| {
+        store.mutate(&self.key, |record| {
             if !safe_text(id) {
                 return !std::mem::replace(&mut record.redacted, true);
             }
@@ -490,7 +490,7 @@ impl FlowGuard {
         let Some(store) = self.store.upgrade() else {
             return;
         };
-        store.mutate(&self.id, |record| {
+        store.mutate(&self.key, |record| {
             let redacted = !safe_text(reason);
             let reason = if redacted { "redacted" } else { reason };
             let changed = record.summary.state != state

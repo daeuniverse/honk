@@ -39,17 +39,17 @@ fn completeness_tracks_captured_frontier_and_sticky_loss_not_lifecycle_or_popula
 fn rejected_source_writes_never_authorize_causal_references() {
     let store = store();
     let flow = begin(&store, crate::observe::vocab::Network::Udp);
-    assert!(store.record_step(flow.id(), Some(1), dial_mode()));
-    assert!(!store.record_step("foreign-flow", Some(1), dial_mode()));
+    assert!(store.record_step(&flow.key, Some(1), dial_mode()));
+    assert!(!store.record_step(&Uuid::nil(), Some(1), dial_mode()));
     for _ in 0..MAX_STEPS {
         flow.step(None, dial_mode());
     }
-    assert!(!store.record_step(flow.id(), Some(1), dial_mode()));
+    assert!(!store.record_step(&flow.key, Some(1), dial_mode()));
     flow.finish(
         crate::observe::vocab::ConnectionState::Failed,
         "capture_lost",
     );
-    assert!(!store.record_step(flow.id(), Some(1), dial_mode()));
+    assert!(!store.record_step(&flow.key, Some(1), dial_mode()));
     let detail = store.get(flow.id()).unwrap();
     assert!(
         detail["trace"]["missing"]
