@@ -144,7 +144,19 @@ fn test_alive_set_basic() {
     assert!(set.is_alive_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4));
     set.mark_dead_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4);
     assert!(!set.is_alive_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4));
-    set.mark_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V4);
+    set.record_probe_latency(
+        id(1),
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(5),
+    );
+    assert!(!set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V4));
+    set.record_probe_latency(
+        id(1),
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(5),
+    );
     assert!(set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V4));
 }
 
@@ -327,7 +339,11 @@ async fn test_recovery_cycle_probes_due_dead_udp_nodes() {
 
     set.run_recovery_check_cycle_concurrent(Duration::from_secs(1), 1)
         .await;
+    assert!(!set.is_alive_for(node_id, ProbeDomain::DataUdp, IpVersion::V4));
+    assert!(set.is_alive_for(node_id, ProbeDomain::DnsUdp, IpVersion::V6));
 
+    set.run_recovery_check_cycle_concurrent(Duration::from_secs(1), 1)
+        .await;
     assert!(set.is_alive_for(node_id, ProbeDomain::DataUdp, IpVersion::V4));
     assert!(set.is_alive_for(node_id, ProbeDomain::DnsUdp, IpVersion::V6));
 }
@@ -945,7 +961,7 @@ async fn local_carrier_capacity_does_not_demote_or_revive_probe_health() {
     .await;
     set.set_udp_probe(Arc::new(CapacityUdpProber));
     for domain in [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
-        set.mark_alive_for_latency(id(1), domain, IpVersion::V4, Duration::from_millis(7));
+        set.record_probe_latency(id(1), domain, IpVersion::V4, Duration::from_millis(7));
         for _ in 0..3 {
             set.mark_dead_for(id(1), domain, IpVersion::V6);
         }
@@ -1427,11 +1443,119 @@ async fn test_probe_node_udp_failures_kill_udp_domains_only() {
     assert!(set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V6));
     assert!(set.has_udp_state(id(1)));
 
-    // A later success revives both UDP domains immediately.
     set.set_udp_probe(Arc::new(MockUdpProber::ok(Duration::from_millis(10))));
     assert!(set.probe_node_udp(id(1), Duration::from_millis(200)).await);
-    assert!(set.is_alive_for(id(1), ProbeDomain::DataUdp, IpVersion::V4));
-    assert!(set.is_alive_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4));
+    for ipver in [IpVersion::V4, IpVersion::V6] {
+        assert!(!set.is_alive_for(id(1), ProbeDomain::DataUdp, ipver));
+        assert!(!set.is_alive_for(id(1), ProbeDomain::DnsUdp, ipver));
+    }
+    assert!(set.probe_node_udp(id(1), Duration::from_millis(200)).await);
+    for ipver in [IpVersion::V4, IpVersion::V6] {
+        assert!(set.is_alive_for(id(1), ProbeDomain::DataUdp, ipver));
+        assert!(set.is_alive_for(id(1), ProbeDomain::DnsUdp, ipver));
+    }
+}
+
+#[tokio::test]
+async fn test_udp_recovery_hysteresis_is_independent_per_domain_and_preserves_cold_start() {
+    let set = AliveDialerSet::new();
+    let cold = id(11);
+    set.register_node(cold, "cold".into(), Some("127.0.0.1:1".into()));
+    for ipver in [IpVersion::V4, IpVersion::V6] {
+        set.report_unavailable_forced(cold, ProbeDomain::Tcp, ipver);
+    }
+    assert!(!set.has_udp_state(cold));
+    assert!(!set.data_udp_available(cold, IpVersion::V4));
+
+    set.set_udp_probe(Arc::new(MockUdpProber::ok(Duration::from_millis(8))));
+    assert!(set.probe_node_udp(cold, Duration::from_millis(200)).await);
+    assert!(set.has_udp_state(cold));
+    assert!(set.data_udp_available(cold, IpVersion::V4));
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        assert!(set.is_alive_for(cold, domain, IpVersion::V4));
+        assert_eq!(
+            set.get_last_latency(cold, domain, IpVersion::V4),
+            Some(Duration::from_millis(8))
+        );
+    }
+    assert!(!set.is_alive_for(cold, ProbeDomain::Tcp, IpVersion::V4));
+
+    let node = id(12);
+    set.set_udp_probe(Arc::new(MockUdpProber::err("udp down")));
+    for _ in 0..3 {
+        assert!(!set.probe_node_udp(node, Duration::from_millis(200)).await);
+    }
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        assert!(!set.is_alive_for(node, domain, IpVersion::V4));
+    }
+
+    set.set_udp_probe(Arc::new(MockUdpProber::dns_blocked_data_ok(
+        Duration::from_millis(12),
+    )));
+    assert!(set.probe_node_udp(node, Duration::from_millis(200)).await);
+    assert!(!set.is_alive_for(node, ProbeDomain::DataUdp, IpVersion::V4));
+    assert_eq!(
+        set.get_last_latency(node, ProbeDomain::DataUdp, IpVersion::V4),
+        None
+    );
+
+    set.set_udp_probe(Arc::new(MockUdpProber::err("transient drop")));
+    assert!(!set.probe_node_udp(node, Duration::from_millis(200)).await);
+
+    set.set_udp_probe(Arc::new(MockUdpProber::dns_blocked_data_ok(
+        Duration::from_millis(12),
+    )));
+    assert!(set.probe_node_udp(node, Duration::from_millis(200)).await);
+    assert!(!set.is_alive_for(node, ProbeDomain::DataUdp, IpVersion::V4));
+    assert!(set.probe_node_udp(node, Duration::from_millis(200)).await);
+    assert!(set.is_alive_for(node, ProbeDomain::DataUdp, IpVersion::V4));
+    assert!(!set.is_alive_for(node, ProbeDomain::DnsUdp, IpVersion::V4));
+    assert_eq!(
+        set.get_last_latency(node, ProbeDomain::DataUdp, IpVersion::V4),
+        Some(Duration::from_millis(12))
+    );
+
+    set.set_udp_probe(Arc::new(MockUdpProber::ok(Duration::from_millis(9))));
+    assert!(set.probe_node_udp(node, Duration::from_millis(200)).await);
+    assert!(set.is_alive_for(node, ProbeDomain::DataUdp, IpVersion::V4));
+    assert!(!set.is_alive_for(node, ProbeDomain::DnsUdp, IpVersion::V4));
+    assert!(set.probe_node_udp(node, Duration::from_millis(200)).await);
+    assert!(set.is_alive_for(node, ProbeDomain::DnsUdp, IpVersion::V4));
+    assert_eq!(
+        set.get_last_latency(node, ProbeDomain::DnsUdp, IpVersion::V4),
+        Some(Duration::from_millis(9))
+    );
+}
+
+#[tokio::test]
+async fn test_periodic_udp_success_clears_stale_dns_udp_backoff_for_recovery_confirmation() {
+    let set = Arc::new(AliveDialerSet::new());
+    let node = id(13);
+    set.register_node(node, "n13".into(), Some("127.0.0.1:1".into()));
+    set.node_registered_at
+        .write()
+        .insert(node, Instant::now() - GRACE_PERIOD);
+    set.set_udp_probe(Arc::new(MockUdpProber::dns_blocked_data_ok(
+        Duration::from_millis(10),
+    )));
+    for _ in 0..8 {
+        assert!(set.probe_node_udp(node, Duration::from_millis(200)).await);
+    }
+    assert!(set.is_alive_for(node, ProbeDomain::DataUdp, IpVersion::V4));
+    assert!(!set.is_alive_for(node, ProbeDomain::DnsUdp, IpVersion::V4));
+    assert!(!set.should_probe(node, ProbeDomain::DnsUdp, IpVersion::V4));
+
+    set.set_udp_probe(Arc::new(MockUdpProber::ok(Duration::from_millis(6))));
+    set.run_health_check_cycle_concurrent(Duration::from_secs(1), 1)
+        .await;
+    assert!(!set.is_alive_for(node, ProbeDomain::DnsUdp, IpVersion::V4));
+    assert!(set.should_probe(node, ProbeDomain::DnsUdp, IpVersion::V4));
+
+    set.run_recovery_check_cycle_concurrent(Duration::from_secs(1), 1)
+        .await;
+    for ipver in [IpVersion::V4, IpVersion::V6] {
+        assert!(set.is_alive_for(node, ProbeDomain::DnsUdp, ipver));
+    }
 }
 
 #[tokio::test]
@@ -1598,7 +1722,12 @@ fn test_death_callback_skipped_while_udp_sibling_alive() {
         calls2.lock().unwrap().push(node);
     })));
 
-    set.mark_alive_for(id(1), ProbeDomain::DataUdp, IpVersion::V4);
+    set.record_probe_latency(
+        id(1),
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+        Duration::from_millis(5),
+    );
     for _ in 0..3 {
         set.mark_dead_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4);
     }
