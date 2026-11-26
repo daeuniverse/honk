@@ -2122,7 +2122,10 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
     .await?;
 
     let synthetic_now = TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS + stale_timestamp + 1;
-    let janitor = BpfJanitor::new(handle.ebpf.clone(), handle.tcp_flow_pins.clone());
+    let janitor = BpfJanitor::new(
+        handle.tc_kernel.clone().unwrap(),
+        handle.tcp_flow_pins.clone(),
+    );
     assert_eq!(
         janitor.cleanup_conn_state_for_test(synthetic_now).await,
         (0, 1)
@@ -4795,7 +4798,7 @@ async fn retirement_worker_retires_legacy_token_zero_conn_state() {
     let port = Arc::new(RetirementPort::default());
     let removal_task = spawn_retirement_worker(
         Arc::clone(&pool),
-        Arc::clone(&backend),
+        crate::control::TcKernelController::for_test(Arc::clone(&backend)),
         Arc::new(ConnectionTracker::new()),
         fatal_tx,
         Arc::clone(&pins),
@@ -4861,7 +4864,7 @@ async fn retirement_worker_acknowledges_superseding_token() {
     let port = Arc::new(RetirementPort::default());
     let removal_task = spawn_retirement_worker(
         Arc::clone(&pool),
-        Arc::clone(&backend),
+        crate::control::TcKernelController::for_test(Arc::clone(&backend)),
         Arc::new(ConnectionTracker::new()),
         fatal_tx,
         Arc::clone(&pins),
@@ -4938,7 +4941,7 @@ async fn retirement_worker_escalates_auxiliary_token_mismatch() {
     let port = Arc::new(RetirementPort::default());
     let removal_task = spawn_retirement_worker(
         Arc::clone(&pool),
-        Arc::clone(&backend),
+        crate::control::TcKernelController::for_test(Arc::clone(&backend)),
         Arc::new(ConnectionTracker::new()),
         fatal_tx,
         Arc::clone(&pins),
@@ -5305,7 +5308,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             let (removal_fatal_tx, mut removal_fatal_rx) = mpsc::unbounded_channel();
             let removal_task = spawn_retirement_worker(
                 Arc::clone(&control.udp_pool),
-                Arc::clone(&control.ebpf),
+                control.tc_kernel.clone().unwrap(),
                 Arc::clone(&control.connection_tracker),
                 removal_fatal_tx,
                 Arc::clone(&control.tcp_flow_pins),

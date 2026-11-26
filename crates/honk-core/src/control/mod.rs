@@ -49,6 +49,8 @@ use udp_ingress::{
     reserve_udp_slow_path, try_admit_udp_slow_path, udp_fast_path,
 };
 mod retirement_worker;
+mod tc_kernel;
+use tc_kernel::TcKernelController;
 pub mod routing_matcher;
 mod sockets;
 pub mod tcp_sniff;
@@ -227,6 +229,7 @@ pub struct ControlPlane {
     log_files: LogFiles,
     startup_downgrades: StartupDowngrades,
     ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
+    tc_kernel: Option<Arc<TcKernelController>>,
     router: Arc<RwLock<Router>>,
     proxy_registry: Arc<ProxyRegistry>,
     dns_resolver: Arc<DnsResolver>,

@@ -13,20 +13,6 @@ pub(super) fn admission_pressured(active: bool, utilization: f64) -> bool {
         }
 }
 
-pub(super) fn telemetry_sample<T>(signal: &'static str, result: anyhow::Result<T>) -> Option<T> {
-    match result {
-        Ok(sample) => Some(sample),
-        Err(error) => {
-            crate::logging::warn_throttled!(
-                signal,
-                error = %format_args!("{error:#}"),
-                "BPF janitor: telemetry read failed; retaining the previous sample"
-            );
-            None
-        }
-    }
-}
-
 pub(super) struct TickState {
     pub(super) pressure: PressureState,
     pub(super) gauge: OccupancyGauge,
@@ -66,18 +52,9 @@ impl BpfJanitor {
         now_ns: Option<u64>,
     ) -> anyhow::Result<()> {
         let (overflow_delta, overflow_read_ok, utilizations, occ_counters) = {
-            let backend = self.ebpf.read().await;
-            let ebpf = backend.tc()?;
-            let udp = telemetry_sample(
-                BpfStatsKey::UdpConnOverflow.label(),
-                ebpf.get_bpf_stats(BpfStatsKey::UdpConnOverflow as u32)
-                    .map(|value| value.unwrap_or(0)),
-            );
-            let tcp = telemetry_sample(
-                BpfStatsKey::TcpConnOverflow.label(),
-                ebpf.get_bpf_stats(BpfStatsKey::TcpConnOverflow as u32)
-                    .map(|value| value.unwrap_or(0)),
-            );
+            let sample = self.tc.sample_pressure().await?;
+            let udp = sample.udp_overflow;
+            let tcp = sample.tcp_overflow;
             let overflow_read_ok = udp.is_some() && tcp.is_some();
             let udp = udp.unwrap_or(state.pressure.last_udp_overflow);
             let tcp = tcp.unwrap_or(state.pressure.last_tcp_overflow);
@@ -85,19 +62,11 @@ impl BpfJanitor {
                 udp > state.pressure.last_udp_overflow || tcp > state.pressure.last_tcp_overflow;
             state.pressure.last_udp_overflow = udp;
             state.pressure.last_tcp_overflow = tcp;
-            let occ_counters =
-                telemetry_sample("conn-state occupancy", ebpf.conn_state_occupancy()).map(
-                    |counters| {
-                        let userspace_deletes = crate::ebpf::USERSPACE_CONN_STATE_DELETES
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        state.conn_occupancy =
-                            state
-                                .gauge
-                                .estimate(counters.0, counters.1, userspace_deletes);
-                        (counters, userspace_deletes)
-                    },
-                );
-            if let Some(occupancy) = telemetry_sample("auxiliary occupancy", ebpf.aux_occupancy()) {
+            let occ_counters = sample.conn;
+            if let Some(((inserts, deletes), userspace_deletes)) = occ_counters {
+                state.conn_occupancy = state.gauge.estimate(inserts, deletes, userspace_deletes);
+            }
+            if let Some(occupancy) = sample.auxiliary {
                 state.aux_occupancy = occupancy;
             }
             (
@@ -114,11 +83,9 @@ impl BpfJanitor {
         let [conn_utilization, redirect_utilization, handoff_utilization] = utilizations;
         let admission_pressure = admission_pressured(state.admission_pressure, conn_utilization);
         if admission_pressure != state.admission_pressure {
-            self.ebpf
-                .write()
-                .await
-                .tc_mut()?
+            self.tc
                 .set_admission_pressure(admission_pressure)
+                .await
                 .context("publishing reverse UDP admission pressure")?;
             state.admission_pressure = admission_pressure;
         }

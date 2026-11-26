@@ -47,7 +47,7 @@ fn removal_worker(
     let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
     let task = spawn_retirement_worker(
         Arc::clone(&pool),
-        Arc::clone(backend),
+        crate::control::TcKernelController::for_test(Arc::clone(backend)),
         Arc::clone(tracker),
         fatal_tx,
         Arc::clone(pins),
@@ -317,7 +317,7 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
 async fn adoption_retries_a_child_proof_that_is_still_being_published() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let destination = listener.local_addr()?;
-    let retries = ControlPlaneHandle::CHILD_PROOF_RETRIES;
+    let retries = TcKernelController::CHILD_PROOF_RETRIES;
     for (pending, adopted) in [(retries, true), (retries + 1, false)] {
         let mock = MockEbpfBackend::default();
         mock.adopt_proof_pending
@@ -354,7 +354,7 @@ async fn adoption_retries_a_child_proof_that_is_still_being_published() -> anyho
             result.is_ok(),
             adopted,
             "{pending} pending refusals against {} retries",
-            ControlPlaneHandle::CHILD_PROOF_RETRIES
+            TcKernelController::CHILD_PROOF_RETRIES
         );
     }
     Ok(())

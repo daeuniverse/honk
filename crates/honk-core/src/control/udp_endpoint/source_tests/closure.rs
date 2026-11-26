@@ -36,7 +36,7 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
         let port = Arc::new(RetirementPort::default());
         let worker = spawn_retirement_worker(
             Arc::clone(&pool),
-            backend,
+            crate::control::TcKernelController::for_test(backend),
             Arc::clone(&tracker),
             fatal,
             Arc::clone(&pins),

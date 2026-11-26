@@ -108,7 +108,7 @@ impl Fixture {
         let (fatal_tx, removal_errors) = mpsc::unbounded_channel();
         let removals = spawn_retirement_worker(
             Arc::clone(&plane.udp_pool),
-            Arc::clone(&handle.ebpf),
+            handle.tc_kernel.clone().unwrap(),
             Arc::clone(&handle.connection_tracker),
             fatal_tx,
             Arc::clone(&handle.tcp_flow_pins),

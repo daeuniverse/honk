@@ -926,7 +926,7 @@ async fn udp_handoff_revalidates_the_original_group_after_a_mode_replacement() -
     let handle = cp.spawn_handle();
     let capture = async |generation| {
         let backend = handle.ebpf.read().await;
-        handle.capture_udp_group(backend.tc().unwrap(), OWNER_SLOT, generation)
+        handle.capture_udp_group(OWNER_SLOT, generation, backend.routing_policy_generation())
     };
     let revalidate = |proof| handle.revalidate_udp_group(&handle.group_manager.read(), proof);
     let choose = async |proof: &UdpGroupProof| {

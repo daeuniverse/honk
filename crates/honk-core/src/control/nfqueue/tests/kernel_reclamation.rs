@@ -27,6 +27,7 @@ fn kernel_conn(state: UdpDecisionState, token: u32, incarnation: u64) -> ConnSta
 
 struct Fixture {
     backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
+    controller: Arc<crate::control::TcKernelController>,
     endpoints: Arc<UdpEndpointPool>,
     pending: Arc<PendingUdpVerdicts>,
     hints: mpsc::Sender<FlowExpiryHint>,
@@ -40,8 +41,8 @@ impl Fixture {
     }
 
     fn with_backend(mock: MockEbpfBackend) -> Self {
-        let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
-            Arc::new(RwLock::new(Box::new(mock)));
+        let (backend, controller) = crate::control::TcKernelController::share(Box::new(mock));
+        let controller = controller.expect("mock TC capability");
         let endpoints = Arc::new(UdpEndpointPool::new());
         let stats = Arc::new(StatsManager::new());
         let (pending, _) =
@@ -53,7 +54,7 @@ impl Fixture {
         let (fatal_tx, fatal) = mpsc::unbounded_channel();
         let worker = spawn_retirement_worker(
             Arc::clone(&endpoints),
-            Arc::clone(&backend),
+            Arc::clone(&controller),
             Arc::new(ConnectionTracker::new()),
             fatal_tx,
             Arc::new(TcpFlowPins::default()),
@@ -61,6 +62,7 @@ impl Fixture {
         );
         Self {
             backend,
+            controller,
             endpoints,
             pending: Arc::new(pending),
             hints,
@@ -169,7 +171,7 @@ async fn kernel_reclamation_lets_a_staged_successor_initialize() {
                 .unwrap();
         } else {
             BpfJanitor::new(
-                Arc::clone(&fixture.backend),
+                Arc::clone(&fixture.controller),
                 Arc::new(TcpFlowPins::default()),
             )
             .with_udp_pool(Arc::clone(&fixture.endpoints))

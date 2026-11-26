@@ -192,7 +192,7 @@ impl ControlPlane {
         let snapshot = initial_route_connectivity(&initial_routing_plan, &pinned_groups);
         publish_group_connectivity(ebpf.as_mut(), &snapshot)?;
         let initial_generation = ebpf.routing_policy_generation();
-        let ebpf_arc = Arc::new(RwLock::new(ebpf));
+        let (ebpf_arc, tc_kernel) = TcKernelController::share(ebpf);
         let router_arc = Arc::new(RwLock::new(router));
         let interrupt_groups = config.groups.clone();
         #[cfg(target_os = "linux")]
@@ -275,6 +275,7 @@ impl ControlPlane {
             },
             startup_downgrades: StartupDowngrades::default(),
             ebpf: ebpf_arc,
+            tc_kernel,
             router: router_arc,
             proxy_registry,
             dns_resolver,

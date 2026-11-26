@@ -28,7 +28,10 @@ async fn bounded_scans_resume_beyond_a_pinned_prefix() -> anyhow::Result<()> {
     }
     let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
         Arc::new(RwLock::new(Box::new(model)));
-    let janitor = BpfJanitor::new(Arc::clone(&backend), pins);
+    let janitor = BpfJanitor::new(
+        crate::control::TcKernelController::for_test(Arc::clone(&backend)),
+        pins,
+    );
     let tuning = ScanTuning {
         candidates: JANITOR_MAX_CANDIDATES,
         budget: Duration::ZERO,

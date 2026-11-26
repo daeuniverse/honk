@@ -123,7 +123,7 @@ impl HealthUpdates {
 
 impl ControlPlane {
     async fn bind_runtime_listeners(&self) -> anyhow::Result<BoundListeners> {
-        self.ebpf.read().await.tc()?;
+        TcKernelController::require(&self.tc_kernel)?;
         let config = self.config.read().await;
         let tproxy_port = config.global.tproxy_port;
         let tproxy_mark = config.global.tproxy_mark;
@@ -362,11 +362,8 @@ impl ControlPlane {
             .iter()
             .map(|socket| socket.as_raw_fd())
             .collect();
-        self.ebpf
-            .write()
-            .await
-            .tc_mut()?
-            .publish_listener_sockets(tcp4, tcp6, &udp4, &udp6)?;
+        let tc = Arc::clone(TcKernelController::require(&self.tc_kernel)?);
+        tc.publish_listeners(tcp4, tcp6, &udp4, &udp6).await?;
         let (critical_tx, critical_errors) = mpsc::unbounded_channel();
         let (removal_tx, removal_errors) = mpsc::unbounded_channel();
         let (stop, _) = watch::channel(false);
@@ -425,7 +422,7 @@ impl ControlPlane {
                 let mut batch = batch;
                 #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
                 if record_flows
-                    && let Err(error) = enable_receive_trace(&self.ebpf, &mut batch, &socket).await
+                    && let Err(error) = enable_receive_trace(&tc, &mut batch, &socket).await
                 {
                     trace_error.get_or_insert(error);
                     trace_unavailable[usize::from(family == "v6")] = true;
@@ -457,14 +454,14 @@ impl ControlPlane {
             }
             epoch.removals = Some(spawn_retirement_worker(
                 self.udp_pool.clone(),
-                self.ebpf.clone(),
+                Arc::clone(&tc),
                 self.connection_tracker.clone(),
                 removal_tx,
                 self.tcp_flow_pins.clone(),
                 Arc::clone(&self.retirement),
             ));
             epoch.janitor = Some(
-                BpfJanitor::new(self.ebpf.clone(), self.tcp_flow_pins.clone())
+                BpfJanitor::new(tc, self.tcp_flow_pins.clone())
                     .with_udp_pool(self.udp_pool.clone())
                     .spawn_supervised(
                         CriticalTaskExit {
@@ -608,19 +605,17 @@ impl ControlPlane {
 /// the kernel has it, otherwise the eBPF receive trace.
 #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
 async fn enable_receive_trace(
-    ebpf: &RwLock<Box<dyn crate::ebpf::PolicyBackend>>,
+    tc: &TcKernelController,
     batch: &mut sockets::UdpRecvBatch,
     socket: &tokio::net::UdpSocket,
 ) -> std::io::Result<()> {
     if batch.enable_trace(socket, None).is_ok() {
         return Ok(());
     }
-    let prepare = ebpf
-        .read()
+    let prepare = tc
+        .prepare_receive_trace()
         .await
-        .tc()
-        .map_err(std::io::Error::other)?
-        .prepare_receive_trace();
+        .map_err(std::io::Error::other)?;
     let trace = match prepare {
         Some(prepare) => tokio::task::spawn_blocking(prepare)
             .await
@@ -1415,6 +1410,8 @@ mod policy_capability_tests {
             DnsResolver::new(&config.dns)?,
             crate::control::tests::support::test_dns_forwarder(),
         )?;
+        assert!(plane.tc_kernel.is_none());
+        assert!(plane.spawn_handle().tc_kernel.is_none());
         let generation = plane.ebpf.read().await.routing_policy_generation();
         let error = plane
             .bind_runtime_listeners()

@@ -363,11 +363,12 @@ async fn a_socket_without_any_receive_trace_is_untraced() {
     let socket = unsafe { std::net::UdpSocket::from_raw_fd(read.into_raw_fd()) };
     socket.set_nonblocking(true).unwrap();
     let socket = tokio::net::UdpSocket::from_std(socket).unwrap();
-    let ebpf: RwLock<Box<dyn crate::ebpf::PolicyBackend>> =
-        RwLock::new(Box::new(crate::ebpf::mock::MockEbpfBackend::new()));
+    let (_, controller) =
+        TcKernelController::share(Box::new(crate::ebpf::mock::MockEbpfBackend::new()));
+    let tc = controller.unwrap();
     let mut batch = sockets::UdpRecvBatch::new().unwrap();
     assert!(
-        super::enable_receive_trace(&ebpf, &mut batch, &socket)
+        super::enable_receive_trace(&tc, &mut batch, &socket)
             .await
             .is_err()
     );

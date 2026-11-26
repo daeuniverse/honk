@@ -227,7 +227,7 @@ impl Ingress {
 /// Admitted I/O and guards stay with this joined owner after waiter cancellation.
 pub(in crate::control) fn spawn_retirement_worker(
     udp_pool: Arc<UdpEndpointPool>,
-    ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
+    tc: Arc<TcKernelController>,
     tracker: Arc<ConnectionTracker>,
     fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
     tcp_flow_pins: Arc<TcpFlowPins>,
@@ -241,7 +241,7 @@ pub(in crate::control) fn spawn_retirement_worker(
         udp_pool,
         tracker,
         fatal_tx,
-        Some((ebpf, tcp_flow_pins)),
+        Some((tc, tcp_flow_pins)),
         Some(tcp_rx),
         retained_hints,
     )
@@ -255,10 +255,7 @@ pub(in crate::control) fn spawn_packet_retirement_worker(
     spawn_worker(udp_pool, tracker, fatal_tx, None, None, None)
 }
 
-type KernelRetirement = (
-    Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
-    Arc<TcpFlowPins>,
-);
+type KernelRetirement = (Arc<TcKernelController>, Arc<TcpFlowPins>);
 
 fn spawn_worker(
     udp_pool: Arc<UdpEndpointPool>,
@@ -278,8 +275,8 @@ fn spawn_worker(
         };
         let hints = match (retained_hints, kernel.as_ref()) {
             (Some(receiver), _) => Some(receiver),
-            (None, Some((backend, _))) => match backend.write().await.tc_mut() {
-                Ok(tc) => tc.take_expiry_hints(),
+            (None, Some((tc, _))) => match tc.take_expiry_hints().await {
+                Ok(hints) => hints,
                 Err(error) => {
                     let _ = fatal_tx.send(error.context("TC retirement capability unavailable"));
                     None
@@ -305,58 +302,42 @@ fn spawn_worker(
                     let _ = fatal_tx.send(error);
                 }
             }
-            let mut backend = match &kernel {
-                Some((backend, _)) => Some(backend.write().await),
-                None => None,
-            };
-            // Both local and native pins leave under W before checking any
-            // external owner; adoption retains both under continuous backendR.
-            for slot in &mut slots {
-                if let Err(error) = slot.job.release_pins() {
-                    slot.ok = false;
-                    let _ = fatal_tx.send(error.context("TCP retirement pin release failed"));
-                }
-            }
-            let hint_time = if slots
-                .iter()
-                .any(|slot| matches!(slot.job, Retirement::Hint(_)))
-            {
-                match super::janitor::monotonic_now_ns() {
-                    Ok(now) => Some(now),
-                    Err(error) => {
-                        let _ =
-                            fatal_tx.send(error.context("reading flow retirement expiry clock"));
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            for slot in &mut slots {
-                if slot.ok {
-                    if let Some((_, pins)) = &kernel {
-                        slot.request = slot.job.request(pins, hint_time);
-                    } else if !matches!(&slot.job, Retirement::Udp(removal) if !removal.owner.has_kernel_capture())
-                    {
-                        slot.ok = false;
-                        let _ = fatal_tx.send(anyhow::anyhow!(
-                            "packet retirement received kernel-owned work"
-                        ));
-                    }
-                }
-            }
-            requests.extend(slots.iter().filter_map(|slot| slot.request));
-            outcomes[..requests.len()].fill(RetireOutcome::NotRun);
-            let batch_ok = requests.is_empty()
-                || match backend
-                    .as_mut()
-                    .expect("kernel requests require kernel authority")
-                    .tc_mut()
-                    .map_err(|source| crate::ebpf::RetireError {
-                        counts: Default::default(),
-                        source,
+            let batch_ok = if let Some((tc, pins)) = &kernel {
+                match tc
+                    .retire_flows(&mut requests, &mut outcomes, |requests| {
+                        // Both local and native pins leave under W before checking any
+                        // external owner; adoption retains both under continuous backendR.
+                        for slot in slots.iter_mut() {
+                            if let Err(error) = slot.job.release_pins() {
+                                slot.ok = false;
+                                let _ = fatal_tx
+                                    .send(error.context("TCP retirement pin release failed"));
+                            }
+                        }
+                        let hint_time = if slots
+                            .iter()
+                            .any(|slot| matches!(slot.job, Retirement::Hint(_)))
+                        {
+                            match super::janitor::monotonic_now_ns() {
+                                Ok(now) => Some(now),
+                                Err(error) => {
+                                    let _ = fatal_tx.send(
+                                        error.context("reading flow retirement expiry clock"),
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        for slot in slots.iter_mut() {
+                            if slot.ok {
+                                slot.request = slot.job.request(pins, hint_time);
+                            }
+                        }
+                        requests.extend(slots.iter().filter_map(|slot| slot.request));
                     })
-                    .and_then(|tc| tc.retire_batch(&requests, &mut outcomes[..requests.len()]))
+                    .await
                 {
                     Ok(_) => true,
                     Err(error) => {
@@ -365,8 +346,20 @@ fn spawn_worker(
                         );
                         false
                     }
-                };
-            drop(backend);
+                }
+            } else {
+                for slot in &mut slots {
+                    if slot.ok
+                        && !matches!(&slot.job, Retirement::Udp(removal) if !removal.owner.has_kernel_capture())
+                    {
+                        slot.ok = false;
+                        let _ = fatal_tx.send(anyhow::anyhow!(
+                            "packet retirement received kernel-owned work"
+                        ));
+                    }
+                }
+                true
+            };
             for (slot, &outcome) in slots
                 .iter_mut()
                 .filter(|slot| slot.request.is_some())
@@ -454,6 +447,41 @@ mod tests {
             }
             assert_eq!(backend.conn_state_lookup(&key).unwrap().is_some(), !allowed);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn packet_worker_rejects_kernel_owned_udp_removal() {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let (fatal, mut errors) = mpsc::unbounded_channel();
+        let worker = spawn_packet_retirement_worker(
+            Arc::clone(&pool),
+            Arc::new(ConnectionTracker::new()),
+            fatal,
+        );
+        // This TC fixture reserves a kernel-owned token-zero flow.
+        let EndpointReservation::Initializing(lease) = pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            "192.0.2.1:50000".parse().unwrap(),
+            "198.51.100.1:443".parse().unwrap(),
+            b"first datagram",
+            Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap(),
+            &StatsManager::new(),
+        ) else {
+            panic!("expected an initializing lease");
+        };
+        drop(lease);
+        let fatal = tokio::time::timeout(Duration::from_secs(1), errors.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fatal.to_string(),
+            "packet retirement received kernel-owned work"
+        );
+        assert!(!pool.shutdown().await.joined);
+        assert!(worker.await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -567,7 +595,7 @@ mod tests {
         let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
         let worker = spawn_retirement_worker(
             Arc::clone(&pool),
-            Arc::clone(&backend),
+            crate::control::TcKernelController::for_test(Arc::clone(&backend)),
             Arc::clone(&tracker),
             fatal_tx,
             Arc::clone(&pins),
@@ -680,7 +708,7 @@ mod tests {
         let (fatal_tx, _fatal_rx) = mpsc::unbounded_channel();
         let worker = spawn_retirement_worker(
             Arc::clone(&pool),
-            Arc::clone(&backend),
+            crate::control::TcKernelController::for_test(Arc::clone(&backend)),
             Arc::new(ConnectionTracker::new()),
             fatal_tx,
             pins,

@@ -33,7 +33,7 @@ impl TestRetirement {
         let (fatal_tx, fatal) = tokio::sync::mpsc::unbounded_channel();
         let task = crate::control::spawn_retirement_worker(
             Arc::clone(&handle.udp_pool),
-            Arc::clone(&handle.ebpf),
+            handle.tc_kernel.clone().unwrap(),
             Arc::clone(&handle.connection_tracker),
             fatal_tx,
             Arc::clone(&handle.tcp_flow_pins),

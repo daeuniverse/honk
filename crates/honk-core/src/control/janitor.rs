@@ -18,16 +18,21 @@
 //! 85%, and every two-second tick / 4096 candidates under pressure. A bounded
 //! auxiliary scan keeps that aggressive cadence until its backlog is drained.
 
+use super::TcKernelController;
 use super::connection::TcpFlowPins;
 use super::udp_endpoint::UdpEndpointPool;
 #[cfg(test)]
 use crate::ebpf::EbpfBackend;
 use crate::ebpf::RETIRE_BATCH_CAPACITY;
 use health::{AuxMap, HealthLatches};
-use honk_ebpf_common::conn::{BpfStatsKey, MAX_CONN_STATE_NUM};
+#[cfg(test)]
+use honk_ebpf_common::conn::BpfStatsKey;
+use honk_ebpf_common::conn::MAX_CONN_STATE_NUM;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{RwLock, watch};
+#[cfg(test)]
+use tokio::sync::RwLock;
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 /// Janitor tick interval: 2 seconds.
@@ -136,7 +141,7 @@ struct PressureState {
 /// Runs background cleanup of stale eBPF map entries to prevent map overflow
 /// and memory pressure. The janitor adapts its behaviour based on map pressure.
 pub struct BpfJanitor {
-    ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
+    tc: Arc<TcKernelController>,
     tcp_flow_pins: Arc<TcpFlowPins>,
     udp_pool: Option<Arc<UdpEndpointPool>>,
     scan_cursors: [Arc<parking_lot::Mutex<crate::ebpf::FlowScanCursor>>; 3],
@@ -152,12 +157,9 @@ pub struct BpfJanitor {
 
 impl BpfJanitor {
     /// Create a new janitor bound to the given eBPF backend.
-    pub(super) fn new(
-        ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
-        tcp_flow_pins: Arc<TcpFlowPins>,
-    ) -> Self {
+    pub(super) fn new(tc: Arc<TcKernelController>, tcp_flow_pins: Arc<TcpFlowPins>) -> Self {
         Self {
-            ebpf,
+            tc,
             tcp_flow_pins,
             udp_pool: None,
             scan_cursors: std::array::from_fn(|_| Arc::default()),

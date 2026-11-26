@@ -39,7 +39,7 @@ pub(crate) fn build_tuples_key(
 }
 
 /// The original numeric owner survives sniffing and explicitly selected replacements.
-pub(super) struct UdpGroupProof {
+pub(in crate::control) struct UdpGroupProof {
     slot: u8,
     generation: u64,
     plan: Arc<routing_matcher::RoutingPushPlan>,
@@ -113,7 +113,7 @@ impl From<RoutingHandoffEntry> for HandoffResult {
 
 impl HandoffResult {
     #[cfg(feature = "native-api")]
-    fn captured(
+    pub(in crate::control) fn captured(
         backend: &dyn crate::ebpf::EbpfBackend,
         key: &TuplesKey,
         entry: RoutingHandoffEntry,
@@ -508,7 +508,7 @@ impl ControlPlaneHandle {
         supplied: u64,
     ) -> anyhow::Result<String> {
         Ok(self
-            .capture_udp_group(backend, outbound, supplied)?
+            .capture_udp_group(outbound, supplied, backend.routing_policy_generation())?
             .name()
             .to_owned())
     }
@@ -516,13 +516,13 @@ impl ControlPlaneHandle {
     /// Capture the original slot under the backend read that verified the UDP owner.
     pub(super) fn capture_udp_group(
         &self,
-        backend: &dyn crate::ebpf::EbpfBackend,
         slot: u8,
         generation: u64,
+        published: u64,
     ) -> anyhow::Result<UdpGroupProof> {
         let manager = self.group_manager.read();
         let routing = self.active_routing_plan.read();
-        if generation > backend.routing_policy_generation() {
+        if generation > published {
             return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
         }
         check_udp_group(&manager, &routing, slot, generation, None)?;
@@ -586,8 +586,6 @@ impl ControlPlaneHandle {
         }
     }
 
-    /// Read immutable UDP admission metadata without consuming tuple ownership.
-    /// The caller carries its original incarnation through deferred admission.
     pub(super) async fn lookup_udp_handoff(
         &self,
         tuples: &TuplesKey,
@@ -595,40 +593,18 @@ impl ControlPlaneHandle {
         #[cfg(feature = "native-api")] observation: &ConnectionObservation,
         #[cfg(feature = "native-api")] packet_trace_id: Option<u32>,
     ) -> anyhow::Result<(Option<HandoffResult>, Option<UdpGroupProof>)> {
-        let backend = self.ebpf.read().await;
-        let tc = backend.tc()?;
-        let (entry, cached_group) = tc.verify_udp_admission(tuples, owner)?;
-        let entry = entry.filter(|entry| {
-            tuples.dst_port != 53
-                || owner.token != 0
-                || (entry.result.outbound == OutboundIndex::ControlPlaneRouting as u8
-                    && entry.result.must == 0)
-        });
-        let Some(entry) = entry else {
-            // No auxiliary record means no generation proof. Do not manufacture a handoff.
-            let group = cached_group
-                .map(|slot| self.capture_udp_group(tc, slot, 0))
-                .transpose()?;
-            return Ok((None, group));
-        };
-        let group = if (OutboundIndex::UserBase as u8..OutboundIndex::MustRules as u8)
-            .contains(&entry.result.outbound)
-        {
-            Some(self.capture_udp_group(tc, entry.result.outbound, entry.routing_generation)?)
-        } else {
-            None
-        };
-        #[cfg(feature = "native-api")]
-        let handoff = HandoffResult::captured(tc, tuples, entry, observation, packet_trace_id);
-        #[cfg(not(feature = "native-api"))]
-        let handoff = HandoffResult::from(entry);
-        Ok((Some(handoff), group))
+        TcKernelController::require(&self.tc_kernel)?
+            .verify_udp_handoff(
+                tuples,
+                owner,
+                |slot, generation, published| self.capture_udp_group(slot, generation, published),
+                #[cfg(feature = "native-api")]
+                observation,
+                #[cfg(feature = "native-api")]
+                packet_trace_id,
+            )
+            .await
     }
-
-    /// sock_ops publishes a child's proof after the kernel queued it; measured on x86 the gap is
-    /// under 20 us, so a few millisecond-granular retries cover it without delaying a real refusal.
-    const CHILD_PROOF_RETRIES: u32 = 3;
-    const CHILD_PROOF_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
 
     pub(in crate::control) async fn adopt_tcp_flow(
         &self,
@@ -636,43 +612,26 @@ impl ControlPlaneHandle {
         tuples: TuplesKey,
         #[cfg(feature = "native-api")] observation: &ConnectionObservation,
     ) -> anyhow::Result<(TcpFlowGuard, Option<HandoffResult>)> {
-        use std::os::fd::AsFd;
-        let mut retries = Self::CHILD_PROOF_RETRIES;
-        let (backend, adoption) = loop {
-            let backend = self.ebpf.read().await;
-            match backend.tc()?.adopt_tcp(
-                stream.as_fd(),
-                &tuples,
-                Arc::clone(&self.retirement.pin_errors),
-            ) {
-                Err(error) if retries > 0 && error.is::<crate::ebpf::TcpChildProofPending>() => {
-                    retries -= 1;
-                    drop(backend);
-                    tokio::time::sleep(Self::CHILD_PROOF_RETRY_DELAY).await;
-                }
-                result => break (backend, result?),
-            }
-        };
-        // The local pin joins the native pin before releasing backendR.
-        let flow = TcpFlowGuard::new(
-            stream,
-            tuples,
-            adoption.incarnation,
-            Arc::clone(&self.tcp_flow_pins),
-            Arc::clone(&self.connection_tracker),
-            Arc::clone(&self.retirement),
-            adoption.pin,
-        );
-        #[cfg(feature = "native-api")]
-        let tc = backend.tc()?;
-        #[cfg(feature = "native-api")]
-        let handoff = adoption
-            .handoff
-            .map(|entry| HandoffResult::captured(tc, &tuples, entry, observation, None));
-        #[cfg(not(feature = "native-api"))]
-        let handoff = adoption.handoff.map(HandoffResult::from);
-        drop(backend);
-        Ok((flow, handoff))
+        TcKernelController::require(&self.tc_kernel)?
+            .adopt_tcp(
+                stream,
+                tuples,
+                &self.retirement.pin_errors,
+                |stream, incarnation, pin| {
+                    TcpFlowGuard::new(
+                        stream,
+                        tuples,
+                        incarnation,
+                        Arc::clone(&self.tcp_flow_pins),
+                        Arc::clone(&self.connection_tracker),
+                        Arc::clone(&self.retirement),
+                        pin,
+                    )
+                },
+                #[cfg(feature = "native-api")]
+                observation,
+            )
+            .await
     }
 
     pub(super) async fn outbound_index_to_name(&self, index: u8) -> String {

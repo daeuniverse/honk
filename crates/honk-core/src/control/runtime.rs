@@ -555,6 +555,7 @@ impl ControlPlane {
             group_manager: self.group_manager.clone(),
             stats: self.stats.clone(),
             ebpf: self.ebpf.clone(),
+            tc_kernel: self.tc_kernel.clone(),
             active_routing_plan: self.active_routing_plan.clone(),
             udp_pool: self.udp_pool.clone(),
             #[cfg(feature = "ebpf")]

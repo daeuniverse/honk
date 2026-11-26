@@ -335,15 +335,14 @@ impl UdpLoopState {
             None
         };
         let config = self.handle.config.read().await;
-        let backend_guard = self.handle.ebpf.read().await;
-        let backend = match backend_guard.tc() {
-            Ok(backend) => backend,
+        let backend = match self.handle.udp_admission().await {
+            Ok(guard) => guard,
             Err(error) => {
                 debug!(%src_addr, %original_dst, %error, "Dropping routed UDP/53 without TC authority");
                 return UdpSlowPathWork::Done;
             }
         };
-        if backend.routing_policy_generation() != u64::from(route.generation()) {
+        if backend.generation() != u64::from(route.generation()) {
             debug!(%src_addr, %original_dst, packet_generation = route.generation(),
                 "Dropping UDP/53 from a stale routing generation");
             return UdpSlowPathWork::Done;
@@ -385,7 +384,7 @@ impl UdpLoopState {
                 config.experimental.native_api.record_flows && native.flows.recording()
             })
             .map(|_| match packet_priority {
-                Some(trace_id) => backend.capture_kernel_route(
+                Some(trace_id) => backend.capture_route(
                     &crate::control::connection::build_tuples_key(
                         original_dst.ip(),
                         original_dst.port(),
@@ -407,7 +406,7 @@ impl UdpLoopState {
         #[cfg(feature = "native-api")]
         let packet_route =
             move || captured_route.map_or(PacketRouteSlot::ABSENT, PacketRouteSlot::from_capture);
-        drop(backend_guard);
+        drop(backend);
         let validated_dns = raw_dns_route
             .is_none()
             .then(|| validate_exact_dns_query(data.as_slice()))
@@ -511,13 +510,20 @@ impl UdpLoopState {
             return UdpSlowPathWork::Done;
         }
         let expected_epoch = expected_epoch.unwrap_or_else(|| self.udp_pool.initialization_epoch());
-        let backend =
-            if honk_ebpf_common::conn::is_stateless_udp_ports(src_addr.port(), original_dst.port())
-            {
-                None
-            } else {
-                Some(self.handle.ebpf.read().await)
-            };
+        let backend = if honk_ebpf_common::conn::is_stateless_udp_ports(
+            src_addr.port(),
+            original_dst.port(),
+        ) {
+            None
+        } else {
+            match self.handle.udp_admission().await {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    debug!(%src_addr, %original_dst, %error, "Dropping UDP without kernel flow ownership");
+                    return UdpSlowPathWork::Done;
+                }
+            }
+        };
         let owner = if let Some(backend) = backend.as_ref() {
             let key = crate::control::connection::build_tuples_key(
                 original_dst.ip(),
@@ -526,11 +532,7 @@ impl UdpLoopState {
                 src_addr.port(),
                 17,
             );
-            match backend.tc().and_then(|backend| {
-                backend
-                    .conn_state_lookup(&key)
-                    .and_then(|state| backend.udp_flow_owner(0, state))
-            }) {
+            match backend.owner(&key) {
                 Ok(owner) => owner,
                 Err(error) => {
                     debug!(%src_addr, %original_dst, %error, "Dropping UDP without kernel flow ownership");

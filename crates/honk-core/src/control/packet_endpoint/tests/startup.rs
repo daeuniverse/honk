@@ -455,6 +455,7 @@ async fn configured_packet_running_waits_for_actual_capture_activation() {
                     crate::ebpf::PnameSupport::Unavailable,
                 )),
             ));
+            plane.tc_kernel = None;
             let mut phase = plane.observe_phase();
             let (endpoints, owner, drivers) = start_packet(plane, vec![(scope, scope_owner)], 1)
                 .await

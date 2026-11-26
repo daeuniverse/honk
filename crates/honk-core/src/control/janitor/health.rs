@@ -41,19 +41,7 @@ impl BpfJanitor {
         aux_scans: [AuxScanResult; AuxMap::COUNT],
         latches: &mut HealthLatches,
     ) -> anyhow::Result<()> {
-        let backend = self.ebpf.read().await;
-        let ebpf = backend.tc()?;
-        let mut stats = latches.last_failures;
-        for key in BpfStatsKey::ALL {
-            if let Some(value) = super::tick::telemetry_sample(
-                key.label(),
-                ebpf.get_bpf_stats(key as u32)
-                    .map(|value| value.unwrap_or(0)),
-            ) {
-                stats[key as usize] = value;
-            }
-        }
-        drop(backend);
+        let stats = self.tc.sample_failures(latches.last_failures).await?;
         let udp_overflow = stats[BpfStatsKey::UdpConnOverflow as usize];
         let tcp_overflow = stats[BpfStatsKey::TcpConnOverflow as usize];
 

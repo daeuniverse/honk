@@ -40,7 +40,10 @@ fn scan_tuning_grows_with_pressure() {
 async fn blocking_scan_keeps_hot_path_readers_available() {
     let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
         Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
-    let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
+    let janitor = BpfJanitor::new(
+        crate::control::TcKernelController::for_test(Arc::clone(&backend)),
+        Arc::new(TcpFlowPins::default()),
+    );
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let scan = tokio::spawn(async move {
@@ -76,7 +79,10 @@ async fn supervised_stop_retains_blocking_scan_across_cancelled_join() {
         let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
             Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
         let retained_backend = Arc::downgrade(&backend);
-        let mut janitor = BpfJanitor::new(backend, Arc::new(TcpFlowPins::default()));
+        let mut janitor = BpfJanitor::new(
+            crate::control::TcKernelController::for_test(backend),
+            Arc::new(TcpFlowPins::default()),
+        );
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -284,7 +290,10 @@ async fn aux_pressure_detects_bounded_scan_and_recovers() -> anyhow::Result<()> 
         }
     }
 
-    let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
+    let janitor = BpfJanitor::new(
+        crate::control::TcKernelController::for_test(Arc::clone(&backend)),
+        Arc::new(TcpFlowPins::default()),
+    );
     let first = janitor
         .cleanup_redirect_track_at(REDIRECT_TRACK_TIMEOUT_NS + 1, scan_tuning(0.0))
         .await?;
@@ -317,7 +326,10 @@ async fn map_health_warnings_rearm_after_pressure_ends() {
     }
     let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
         Arc::new(RwLock::new(Box::new(model)));
-    let janitor = BpfJanitor::new(backend, Arc::new(TcpFlowPins::default()));
+    let janitor = BpfJanitor::new(
+        crate::control::TcKernelController::for_test(backend),
+        Arc::new(TcpFlowPins::default()),
+    );
     let high = (AUX_MAP_CAPACITY as f64 * AUX_MAP_PRESSURE_WATERMARK) as usize + 1;
     for map in AuxMap::ALL {
         let scans = |scanned, complete| {
@@ -405,7 +417,10 @@ async fn tcp_pin_conn_state_matrix() -> anyhow::Result<()> {
     let pins = Arc::new(TcpFlowPins::default());
     pins.retain_for_test(TcpFlowKey::from_tuples(&pinned_active));
     pins.retain_for_test(TcpFlowKey::from_tuples(&pinned_closing));
-    let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::clone(&pins));
+    let janitor = BpfJanitor::new(
+        crate::control::TcKernelController::for_test(Arc::clone(&backend)),
+        Arc::clone(&pins),
+    );
 
     assert_eq!(janitor.cleanup_conn_state_for_test(now_ns).await, (3, 5));
     {
@@ -463,7 +478,10 @@ async fn tcp_pin_redirect_matrix() -> anyhow::Result<()> {
 
     let pins = Arc::new(TcpFlowPins::default());
     pins.retain_for_test(TcpFlowKey::from_tuples(&pinned_key));
-    let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::clone(&pins));
+    let janitor = BpfJanitor::new(
+        crate::control::TcKernelController::for_test(Arc::clone(&backend)),
+        Arc::clone(&pins),
+    );
 
     assert_eq!(
         janitor.cleanup_redirect_track_for_test(now_ns).await,
@@ -589,7 +607,10 @@ async fn pinned_tcp_prefix_does_not_consume_candidate_budget() -> anyhow::Result
         }
         let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
             Arc::new(RwLock::new(Box::new(model)));
-        let janitor = BpfJanitor::new(Arc::clone(&backend), pins);
+        let janitor = BpfJanitor::new(
+            crate::control::TcKernelController::for_test(Arc::clone(&backend)),
+            pins,
+        );
         let mut gauge = OccupancyGauge::default();
         let tuning = ScanTuning {
             candidates: JANITOR_BASE_CANDIDATES,
@@ -656,7 +677,10 @@ async fn tcp_adoption_after_scan_preserves_current_owner() -> anyhow::Result<()>
         let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
             Arc::new(RwLock::new(Box::new(model)));
         let pins = Arc::new(TcpFlowPins::default());
-        let mut janitor = BpfJanitor::new(Arc::clone(&backend), Arc::clone(&pins));
+        let mut janitor = BpfJanitor::new(
+            crate::control::TcKernelController::for_test(Arc::clone(&backend)),
+            Arc::clone(&pins),
+        );
         let adopt_backend = Arc::clone(&backend);
         let adopt_pins = Arc::clone(&pins);
         janitor.before_delete_hook = Some(Arc::new(move || {
@@ -735,7 +759,10 @@ async fn retirement_error_keeps_actual_partial_map_counts() -> anyhow::Result<()
     model.retire_fault_after = Some(2);
     let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
         Arc::new(RwLock::new(Box::new(model)));
-    let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
+    let janitor = BpfJanitor::new(
+        crate::control::TcKernelController::for_test(Arc::clone(&backend)),
+        Arc::new(TcpFlowPins::default()),
+    );
     let mut gauge = OccupancyGauge::default();
     let error = janitor
         .cleanup_conn_state_at(

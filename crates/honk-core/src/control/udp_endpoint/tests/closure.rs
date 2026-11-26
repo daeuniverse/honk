@@ -51,7 +51,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
             let port = Arc::new(RetirementPort::default());
             let worker = spawn_retirement_worker(
                 Arc::clone(&pool),
-                Arc::clone(&backend),
+                crate::control::TcKernelController::for_test(Arc::clone(&backend)),
                 Arc::clone(&tracker),
                 fatal,
                 Arc::clone(&pins),
@@ -536,7 +536,7 @@ async fn token_zero_endpoint_retirement_cannot_select_recreated_kernel_flow() {
         let port = Arc::new(RetirementPort::default());
         let worker = spawn_retirement_worker(
             Arc::clone(&pool),
-            Arc::clone(&backend),
+            crate::control::TcKernelController::for_test(Arc::clone(&backend)),
             tracker,
             fatal,
             Arc::clone(&pins),

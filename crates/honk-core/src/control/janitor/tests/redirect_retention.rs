@@ -44,7 +44,10 @@ async fn short_auxiliary_deadline_preserves_conn_and_other_udp_redirects() -> an
     }
     let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
         Arc::new(RwLock::new(Box::new(model)));
-    let janitor = BpfJanitor::new(Arc::clone(&backend), pins);
+    let janitor = BpfJanitor::new(
+        crate::control::TcKernelController::for_test(Arc::clone(&backend)),
+        pins,
+    );
     assert_eq!(janitor.cleanup_redirect_track_for_test(deadline).await.0, 0);
     assert_eq!(
         janitor
@@ -80,7 +83,10 @@ async fn redirect_refresh_after_scan_supersedes_short_deadline_candidate() -> an
     model.redirect_track_store(&RedirectTuple::from_tuples(&key), &RedirectEntry::default())?;
     let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
         Arc::new(RwLock::new(Box::new(model)));
-    let mut janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
+    let mut janitor = BpfJanitor::new(
+        crate::control::TcKernelController::for_test(Arc::clone(&backend)),
+        Arc::new(TcpFlowPins::default()),
+    );
     let retained = Arc::clone(&backend);
     janitor.before_delete_hook = Some(Arc::new(move || {
         retained
