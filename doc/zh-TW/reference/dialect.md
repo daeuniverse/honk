@@ -84,6 +84,7 @@ honk 使用 dae 設定語法的一個方言。同一段文字在兩者中解析�
 |---|---|---|---|
 | `group('hk,jp')` | 一個字面值 | 得到兩個子群組標籤，按 `,` 或 `\|` 分割。 | [dialect-groups-01-aggregate](../../../crates/honk-config/conformance/cases/dialect/dialect-groups-01-aggregate.dae), [dialect-groups-01-pipe](../../../crates/honk-config/conformance/cases/dialect/dialect-groups-01-pipe.dae) |
 | `filter: group()` | 無引數的呼叫 | 明確寫 `group()` 不選任何節點，並產生 `empty-subgroup` warning；序列化、反序列化和重新整理之後都保持這個行為。想要全部節點就刪掉這個過濾器。 | [dialect-groups-02-empty](../../../crates/honk-config/conformance/cases/dialect/dialect-groups-02-empty.dae) |
+| 群組內同一行寫兩個設定，`rx { filter: name(a) policy: score }` | 以空白分隔的兩個宣告 | 以帶位置的 `multiple-group-statements` 錯誤拒絕設定。每個群組設定各佔一行。 | [群組語法測試](../../../crates/honk-config/tests/entries.rs) |
 
 ## 設定區段與 include
 

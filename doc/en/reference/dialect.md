@@ -84,6 +84,7 @@ Runtime low-30-bit policy masks, global defaults and restart requirements are in
 |---|---|---|---|
 | `group('hk,jp')` | one literal | Two subgroup tags, split on `,` and `\|`. | [dialect-groups-01-aggregate](../../../crates/honk-config/conformance/cases/dialect/dialect-groups-01-aggregate.dae), [dialect-groups-01-pipe](../../../crates/honk-config/conformance/cases/dialect/dialect-groups-01-pipe.dae) |
 | `filter: group()` | call without parameters | Retained as an explicit empty contribution through serde and refresh, with `empty-subgroup`. Remove the filter for all nodes; explicit `group()` now selects none. | [dialect-groups-02-empty](../../../crates/honk-config/conformance/cases/dialect/dialect-groups-02-empty.dae) |
+| Two settings on one line in a group, `rx { filter: name(a) policy: score }` | two whitespace-separated declarations | Rejected with located `multiple-group-statements`. Put each group setting on its own line. | [group syntax tests](../../../crates/honk-config/tests/entries.rs) |
 
 ## Sections and includes
 

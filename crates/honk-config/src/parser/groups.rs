@@ -70,20 +70,7 @@ pub(super) fn parse_group_section(
                     );
                     continue;
                 };
-                if ![
-                    "filter",
-                    "policy",
-                    "final",
-                    "exit",
-                    "default",
-                    "check_url",
-                    "icon",
-                    "tolerance",
-                    "idle_timeout",
-                    "interrupt_connections",
-                ]
-                .contains(&key.raw())
-                {
+                let Some(&known_key) = GROUP_KEYS.iter().find(|&&k| k == key.raw()) else {
                     key.notice(
                         diagnostics,
                         Severity::Warning,
@@ -91,13 +78,22 @@ pub(super) fn parse_group_section(
                         "unknown scalar key ignored",
                     );
                     continue;
+                };
+                if let Some(swallowed) = swallowed_group_key(value) {
+                    return Err(group_parse_error(
+                        swallowed,
+                        index,
+                        known_key,
+                        "multiple-group-statements",
+                        "put each group setting on its own line",
+                    )
+                    .into());
                 }
-                let key = key.raw().trim();
-                if key == "filter" {
+                if known_key == "filter" {
                     append_filter(&mut group, value.trim(), diagnostics);
                 } else {
-                    diagnostics.register_field(key, value);
-                    fields.insert(key, value.unquote());
+                    diagnostics.register_field(known_key, value);
+                    fields.insert(known_key, value.unquote());
                 }
             }
 
@@ -169,6 +165,19 @@ pub(super) fn parse_group_section(
     Ok(groups)
 }
 
+const GROUP_KEYS: [&str; 10] = [
+    "filter",
+    "policy",
+    "final",
+    "exit",
+    "default",
+    "check_url",
+    "icon",
+    "tolerance",
+    "idle_timeout",
+    "interrupt_connections",
+];
+
 fn group_scalar_error(
     value: Text<'_, '_>,
     index: usize,
@@ -186,6 +195,65 @@ fn group_scalar_error(
     );
     error.diagnostic.line = Some(value.source.location(value.span.start).0);
     error
+}
+
+fn group_parse_error(
+    value: Text<'_, '_>,
+    index: usize,
+    field: &'static str,
+    code: &'static str,
+    message: &'static str,
+) -> crate::error::DetailedConfigError {
+    let mut error = crate::error::DetailedConfigError::new(
+        crate::error::ErrorCategory::Parse,
+        code,
+        value.source.reference(),
+        crate::diagnostic::SettingPath::new("groups")
+            .index(index)
+            .field(field),
+        message,
+    );
+    error.diagnostic.line = Some(value.source.location(value.span.start).0);
+    error.diagnostic.span = Some(value.span.start..value.span.end);
+    error
+}
+
+fn swallowed_group_key<'d, 'a>(value: Text<'d, 'a>) -> Option<Text<'d, 'a>> {
+    if value.has_error() {
+        return None;
+    }
+    let raw = value.raw().as_bytes();
+    let parens: Vec<(usize, u8)> = value.parentheses().collect();
+    for colon_pos in value.delimiter_positions(":") {
+        let colon_offset = colon_pos - value.span.start;
+        if raw[colon_offset + 1..].starts_with(b"//") {
+            continue;
+        }
+        let in_parens = parens
+            .iter()
+            .rfind(|&&(pos, _)| pos < colon_pos)
+            .is_some_and(|&(_, byte)| byte == b'(');
+        if in_parens {
+            continue;
+        }
+        let mut key_end = colon_offset;
+        while key_end > 0 && raw[key_end - 1].is_ascii_whitespace() {
+            key_end -= 1;
+        }
+        if let Some(key) = GROUP_KEYS
+            .into_iter()
+            .find(|candidate| raw[..key_end].ends_with(candidate.as_bytes()))
+        {
+            let key_start = key_end - key.len();
+            if key_start > 0
+                && (raw[key_start - 1].is_ascii_whitespace()
+                    || matches!(raw[key_start - 1], b')' | b'\'' | b'"'))
+            {
+                return Some(value.sub(key_start, key_end));
+            }
+        }
+    }
+    None
 }
 
 fn append_filter(group: &mut Group, filter: Text<'_, '_>, diagnostics: &mut ParserDiagnostics<'_>) {
@@ -263,12 +331,18 @@ fn parse_group_policy(
 ) -> Result<GroupPolicy, ConfigError> {
     let policy = policy.trim();
     let raw = policy.raw();
-    let base = policy
-        .find("(")
-        .map(|offset| policy.sub(0, offset).raw())
-        .unwrap_or(raw)
-        .trim()
-        .to_ascii_lowercase();
+    let base = match policy.find("(") {
+        Some(offset) => {
+            let Some((_, tail)) = policy.sub(offset, raw.len()).parenthesized() else {
+                return Ok(unrecognized_group_policy(policy, group_name, diagnostics));
+            };
+            if !tail.trim().raw().is_empty() {
+                return Ok(unrecognized_group_policy(policy, group_name, diagnostics));
+            }
+            policy.sub(0, offset).raw().trim().to_ascii_lowercase()
+        }
+        None => raw.trim().to_ascii_lowercase(),
+    };
     match base.as_str() {
         "select" | "selector" | "fixed" => Ok(GroupPolicy::Selector),
         "urltest" | "min_moving_avg" | "min_avg10" | "min_last_delay" => Ok(GroupPolicy::URLTest),
@@ -278,16 +352,22 @@ fn parse_group_policy(
         "honk" => Err(ConfigError::UnsupportedPolicy(
             "group policy 'honk' was renamed to 'score'".into(),
         )),
-        _ => {
-            diagnostics.at_text(policy);
-            diagnostics.push(ConfigDiagnostic {
-                setting: format!("group.{group_name}.policy"),
-                value: String::new(),
-                message: "policy is not recognised; using fallback selector".to_string(),
-            });
-            Ok(GroupPolicy::Selector)
-        }
+        _ => Ok(unrecognized_group_policy(policy, group_name, diagnostics)),
     }
+}
+
+fn unrecognized_group_policy(
+    policy: Text<'_, '_>,
+    group_name: &str,
+    diagnostics: &mut ParserDiagnostics<'_>,
+) -> GroupPolicy {
+    diagnostics.at_text(policy);
+    diagnostics.push(ConfigDiagnostic {
+        setting: format!("group.{group_name}.policy"),
+        value: String::new(),
+        message: "policy is not recognised; using fallback selector".to_string(),
+    });
+    GroupPolicy::Selector
 }
 
 /// Resolve source-preserved group filters into concrete node UUIDs.
@@ -491,12 +571,21 @@ fn parse_group_filter_expression(text: Text<'_, '_>) -> Option<Vec<GroupFilterTe
 fn parse_text_filter(text: Text<'_, '_>, function: &str) -> Option<(Regex, Vec<String>)> {
     let text = text.trim();
     let raw = text.raw();
-    let body = raw.strip_prefix(function)?;
-    if !body.starts_with('(') || !body.ends_with(')') {
+    if !raw.strip_prefix(function)?.starts_with('(') {
         return None;
     }
-    // Parentheses inside a regex remain pattern data, including escaped literals.
-    let args = text.sub(function.len() + 1, raw.len() - 1);
+    let body = text.sub(function.len() + 1, raw.len());
+    // First unquoted closer preserves bare regex parentheses while rejecting trailing text.
+    let close = body.find(")")?;
+    if !body
+        .sub(close + 1, body.raw().len())
+        .trim()
+        .raw()
+        .is_empty()
+    {
+        return None;
+    }
+    let args = body.sub(0, close);
     let mut patterns = Vec::new();
     let mut exact = Vec::new();
     for argument in args.split(",") {

@@ -715,4 +715,74 @@ mod group_syntax {
             assert_eq!(&input[diagnostic.span.clone().unwrap()], "'unterminated");
         }
     }
+
+    #[test]
+    fn same_line_group_settings_are_rejected_and_trailing_call_text_is_diagnosed() {
+        for (input, field, swallowed) in [
+            (
+                "node {\n edge: 'socks5://127.0.0.1:1080'\n}\ngroup {\n rx { filter: name(regex: '.') policy: min_moving_avg }\n}",
+                "groups[1].filter",
+                "policy",
+            ),
+            (
+                "node {\n edge: 'socks5://127.0.0.1:1080'\n}\ngroup {\n rx { policy: fixed(0) filter: name(edge) }\n}",
+                "groups[1].policy",
+                "filter",
+            ),
+            (
+                "node {\n edge: 'socks5://127.0.0.1:1080'\n}\ngroup {\n rx { default: edge policy: score }\n}",
+                "groups[1].default",
+                "policy",
+            ),
+        ] {
+            let mut diagnostics = Vec::new();
+            let error = parse_dae_config_with_detailed_diagnostics(input, &mut diagnostics)
+                .expect_err(input);
+            assert_eq!(error.diagnostic.code, "multiple-group-statements");
+            assert_eq!(error.diagnostic.setting.to_string(), field);
+            assert_eq!(
+                &input[error.diagnostic.span.clone().unwrap()],
+                swallowed,
+                "{input}"
+            );
+        }
+
+        let valid = "node {\n quoted: 'socks5://127.0.0.1:1080'\n 'a policy: score': 'socks5://127.0.0.1:1081'\n 'policy:1': 'socks5://127.0.0.1:1082'\n 'paren(node': 'socks5://127.0.0.1:1083'\n}\ngroup {\n rx {\n  filter: name('a policy: score')\n  filter: name(keyword: policy:1)\n  filter: name(regex: [(])\n  filter: name(regex: '^(quoted|backup)$')\n  check_url: https://probe.example:8443/check\n  icon: 'https://cdn.example:8443/icon.svg'\n  policy: min_moving_avg\n }\n}";
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_detailed_diagnostics(valid, &mut diagnostics).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(config.groups[0].nodes.len(), 4);
+        assert_eq!(
+            config.groups[0].policy,
+            honk_config::group::GroupPolicy::URLTest
+        );
+
+        let mut diagnostics = Vec::new();
+        let trailing_filter = parse_dae_config_with_detailed_diagnostics(
+            "node {\n edge: 'socks5://127.0.0.1:1080'\n}\ngroup {\n rx {\n  filter: name(edge)(junk)\n }\n}",
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(trailing_filter.groups[0].nodes.is_empty());
+        assert!(diagnostics.iter().any(|d| {
+            d.code == "legacy-config-warning" && d.setting.to_string() == "groups[1].filter"
+        }));
+
+        for bad_policy in ["fixed(0) junk", "fixed("] {
+            let mut diagnostics = Vec::new();
+            let src = format!("group {{\n rx {{\n  policy: {bad_policy}\n }}\n}}");
+            let parsed =
+                parse_dae_config_with_detailed_diagnostics(&src, &mut diagnostics).unwrap();
+            assert_eq!(
+                parsed.groups[0].policy,
+                honk_config::group::GroupPolicy::Selector
+            );
+            assert!(
+                diagnostics.iter().any(|d| {
+                    d.code == "legacy-config-warning" && d.setting.to_string() == "groups[1].policy"
+                }),
+                "{bad_policy}: {diagnostics:?}"
+            );
+        }
+    }
 }
