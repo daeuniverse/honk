@@ -14,8 +14,7 @@ mod ir;
 mod lan_protection;
 mod lpm;
 
-#[cfg(feature = "native-api")]
-pub(crate) mod native;
+pub mod native;
 pub(crate) use domain::GeositeMatcher;
 use domain::{DomainMatcher, DomainRegistry};
 #[cfg(feature = "native-api")]
@@ -106,16 +105,16 @@ pub struct ConnectionInfo {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct PredicateInput<'a> {
-    pub(crate) domain: Option<&'a str>,
-    pub(crate) dst_ip: Option<IpAddr>,
-    pub(crate) dst_port: Option<u16>,
-    pub(crate) src_ip: Option<IpAddr>,
-    pub(crate) src_port: Option<u16>,
-    pub(crate) protocol: &'a str,
-    pub(crate) process_name: Option<&'a str>,
-    pub(crate) mac: Option<&'a str>,
-    pub(crate) dscp: Option<u8>,
+pub struct PredicateInput<'a> {
+    pub domain: Option<&'a str>,
+    pub dst_ip: Option<IpAddr>,
+    pub dst_port: Option<u16>,
+    pub src_ip: Option<IpAddr>,
+    pub src_port: Option<u16>,
+    pub protocol: &'a str,
+    pub process_name: Option<&'a str>,
+    pub mac: Option<&'a str>,
+    pub dscp: Option<u8>,
 }
 
 /// Human-readable connection identity for routing debug logs.
@@ -215,6 +214,15 @@ impl Router {
 
     pub fn from_config(routing: &RoutingConfig) -> anyhow::Result<Self> {
         let sources = GeoSourceSet::load(&GeoRequirements::for_traffic(&routing.rules));
+        Self::from_config_with_geo_sources(routing, &sources)
+    }
+
+    pub fn from_config_in_data_dir(
+        routing: &RoutingConfig,
+        data_dir: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        let sources =
+            GeoSourceSet::load_from(&GeoRequirements::for_traffic(&routing.rules), data_dir);
         Self::from_config_with_geo_sources(routing, &sources)
     }
 

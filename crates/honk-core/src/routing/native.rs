@@ -2,13 +2,12 @@
 
 use std::{fmt::Write, time::Instant};
 
-use super::{
-    CompiledCondition, CompiledPredicate, ConnectionInfo, DomainRouting, PredicateInput,
-    RouteMatch, Router,
-};
+use super::{CompiledCondition, CompiledPredicate, PredicateInput, Router};
+#[cfg(feature = "native-api")]
+use super::{ConnectionInfo, DomainRouting, RouteMatch};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MatchResult {
+pub enum MatchResult {
     Matched,
     NotMatched,
     Indeterminate,
@@ -16,16 +15,17 @@ pub(crate) enum MatchResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct EvaluatedRule {
-    pub(crate) result: MatchResult,
-    pub(crate) conditions: Vec<MatchResult>,
+pub struct EvaluatedRule {
+    pub result: MatchResult,
+    pub conditions: Vec<MatchResult>,
 }
 
-pub(crate) struct Evaluation<'a> {
-    pub(crate) outbound: Option<&'a str>,
-    pub(crate) rules: Vec<EvaluatedRule>,
+pub struct Evaluation<'a> {
+    pub outbound: Option<&'a str>,
+    pub rules: Vec<EvaluatedRule>,
 }
 
+#[cfg(feature = "native-api")]
 #[derive(Clone, Debug)]
 pub(crate) struct ObservedRoute<'a> {
     pub(crate) matched: Option<RouteMatch<'a>>,
@@ -34,12 +34,13 @@ pub(crate) struct ObservedRoute<'a> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TraceError {
+pub enum TraceError {
     Steps,
     Deadline,
 }
 
 impl Router {
+    #[cfg(feature = "native-api")]
     pub(crate) fn route_full_observed(
         &self,
         conn: &ConnectionInfo,
@@ -108,7 +109,7 @@ impl Router {
         }
     }
 
-    pub(crate) fn condition_display(
+    pub fn condition_display(
         &self,
         compiled: &CompiledCondition,
         configured: &honk_config::routing::RoutingCondition,
@@ -184,7 +185,7 @@ pub(super) fn condition_display(
 }
 
 impl Router {
-    pub(crate) fn configured_rule_expression(
+    pub fn configured_rule_expression(
         &self,
         conditions: &[CompiledCondition],
         configured: &honk_config::routing::RoutingCondition,
@@ -193,7 +194,7 @@ impl Router {
     }
 
     /// Steps `simulate` charges for the whole policy: the fallback plus every route and its conditions.
-    pub(crate) fn trace_steps(&self) -> usize {
+    pub fn trace_steps(&self) -> usize {
         1 + self
             .routes
             .iter()
@@ -201,7 +202,7 @@ impl Router {
             .sum::<usize>()
     }
 
-    pub(crate) fn simulate(
+    pub fn simulate(
         &self,
         input: PredicateInput<'_>,
         max_steps: usize,
@@ -287,7 +288,7 @@ fn add_candidate<'a>(candidate: &mut Option<&'a str>, disagreement: &mut bool, n
     }
 }
 
-pub(crate) fn check_deadline(deadline: Instant) -> Result<(), TraceError> {
+pub fn check_deadline(deadline: Instant) -> Result<(), TraceError> {
     if Instant::now() >= deadline {
         Err(TraceError::Deadline)
     } else {
@@ -295,7 +296,7 @@ pub(crate) fn check_deadline(deadline: Instant) -> Result<(), TraceError> {
     }
 }
 
-pub(crate) fn missing_input(predicate: &CompiledPredicate) -> &'static str {
+pub fn missing_input(predicate: &CompiledPredicate) -> &'static str {
     match predicate {
         CompiledPredicate::Domain(_) => "domain",
         CompiledPredicate::DestinationIp(_) | CompiledPredicate::IpVersion(_) => "dst_ip",

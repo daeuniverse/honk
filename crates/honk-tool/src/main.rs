@@ -3,12 +3,14 @@
 //! honk-tool — CLI toolbox for honk diagnostics.
 //!
 //! Currently implemented: `sub` (subscription availability check),
-//! `bpf` (pinned-map quick reads), `diagnose` (one-shot health check),
-//! `geosite` / `geoip` (dat file content search).
+//! `bpf` (pinned-map quick reads), `route` (offline routing policy trace),
+//! `diagnose` (one-shot health check), `geosite` / `geoip` (dat file content search).
 
 mod bpf;
 mod diagnose;
 mod geo;
+mod json;
+mod route;
 mod sub;
 
 use clap::{Parser, Subcommand};
@@ -32,6 +34,8 @@ enum Command {
     Sub(sub::SubArgs),
     /// Quick reads of the running engine's pinned eBPF maps.
     Bpf(bpf::BpfArgs),
+    /// Offline routing policy trace and native eBPF offloadability check.
+    Route(route::RouteArgs),
     /// One-shot health check of a running honk engine.
     Diagnose(diagnose::DiagnoseArgs),
     /// Search geosite.dat: list categories, show entries (with @attr),
@@ -44,6 +48,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
@@ -53,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Sub(args) => sub::run(args).await,
         Command::Bpf(args) => bpf::run(args).await,
+        Command::Route(args) => route::run(args),
         Command::Diagnose(args) => diagnose::run(args).await,
         Command::Geosite(args) => geo::run_geosite(args),
         Command::Geoip(args) => geo::run_geoip(args),

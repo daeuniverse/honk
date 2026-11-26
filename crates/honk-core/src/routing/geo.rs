@@ -187,8 +187,17 @@ impl std::fmt::Debug for GeoSourceSet {
 
 impl GeoSourceSet {
     pub(crate) fn load(requirements: &GeoRequirements) -> Self {
-        let geosite = capture_source(!requirements.geosite_codes.is_empty(), "geosite.dat");
-        let geoip = capture_source(!requirements.geoip_codes.is_empty(), "geoip.dat");
+        Self::load_from(requirements, honk_config::paths::data_dir())
+    }
+
+    pub(crate) fn load_from(requirements: &GeoRequirements, data_dir: &std::path::Path) -> Self {
+        let geosite = capture_source_from(
+            !requirements.geosite_codes.is_empty(),
+            "geosite.dat",
+            data_dir,
+        );
+        let geoip =
+            capture_source_from(!requirements.geoip_codes.is_empty(), "geoip.dat", data_dir);
         Self::from_sources(geosite, geoip)
     }
 
@@ -363,11 +372,16 @@ impl GeoSourceSet {
     }
 }
 
+#[cfg(test)]
 fn capture_source(required: bool, name: &str) -> GeoSource {
+    capture_source_from(required, name, honk_config::paths::data_dir())
+}
+
+fn capture_source_from(required: bool, name: &str, data_dir: &std::path::Path) -> GeoSource {
     if !required {
         return GeoSource::Unused;
     }
-    let Some(path) = find_dat(name) else {
+    let Some(path) = find_dat_from(name, data_dir) else {
         tracing::warn!(
             asset = name,
             "required geo asset not found; dependent geo matchers are unavailable"
