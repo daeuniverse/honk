@@ -205,9 +205,9 @@ Clone the repository, then install its pinned Rust toolchains:
 ```shell
 git clone https://github.com/daeuniverse/honk.git
 cd honk
-rustup toolchain install $(grep -oP '^channel\s*=\s*"\K[^"]+' rust-toolchain.toml) \
+rustup toolchain install $(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml) \
   --profile minimal --component rustfmt --component clippy
-rustup toolchain install $(grep -oP '^channel\s*=\s*"\K[^"]+' crates/honk-ebpf/rust-toolchain.toml) \
+rustup toolchain install $(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' crates/honk-ebpf/rust-toolchain.toml) \
   --profile minimal --component rust-src --component llvm-tools
 source .github/ci/pins.env
 cargo install bpf-linker --version "$BPF_LINKER_VERSION"
