@@ -120,6 +120,26 @@ pub(crate) struct RequestRoute {
     pub(crate) rule: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct DnsOutcomeTrace {
+    #[cfg(feature = "native-api")]
+    request_route: RequestRoute,
+    #[cfg(feature = "native-api")]
+    cache_entry_id: Option<String>,
+}
+
+#[cfg(not(feature = "native-api"))]
+const _: () = assert!(std::mem::size_of::<DnsOutcomeTrace>() == 0);
+
+impl DnsOutcomeTrace {
+    fn record_request(&mut self, _prepared: &super::engine::PreparedQuery) {
+        #[cfg(feature = "native-api")]
+        {
+            self.request_route.source = _prepared.request_source();
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DnsOutcome {
     status: OutcomeStatus,
@@ -137,10 +157,7 @@ pub struct DnsOutcome {
     rendered: Vec<u8>,
     template: Option<ResponseTemplate>,
     policy_id: Option<PolicyId>,
-    #[cfg(feature = "native-api")]
-    request_route: RequestRoute,
-    #[cfg(feature = "native-api")]
-    cache_entry_id: Option<String>,
+    trace: DnsOutcomeTrace,
 }
 
 pub(crate) struct OutcomeParts {
@@ -160,8 +177,8 @@ pub(crate) struct OutcomeParts {
     pub policy_id: Option<PolicyId>,
 }
 
+#[cfg(feature = "native-api")]
 impl DnsOutcome {
-    #[cfg(feature = "native-api")]
     pub(crate) fn client_error(
         query: &[u8],
         ingress: super::query::IngressProfile,
@@ -196,6 +213,31 @@ impl DnsOutcome {
         .with_route(source))
     }
 
+    pub(crate) fn request_route(&self) -> &RequestRoute {
+        &self.trace.request_route
+    }
+
+    pub(crate) fn cache_entry_id(&self) -> Option<&str> {
+        self.trace.cache_entry_id.as_deref()
+    }
+
+    fn with_route(mut self, source: RouteSource) -> Self {
+        self.trace.request_route.source = source;
+        self
+    }
+
+    pub(crate) fn with_cache_entry_id(mut self, id: Option<String>) -> Self {
+        self.trace.cache_entry_id = id;
+        self
+    }
+}
+
+impl DnsOutcome {
+    pub(super) fn with_request_route(mut self, prepared: &super::engine::PreparedQuery) -> Self {
+        self.trace.record_request(prepared);
+        self
+    }
+
     pub(crate) fn new(parts: OutcomeParts) -> Self {
         Self {
             status: parts.status,
@@ -213,33 +255,8 @@ impl DnsOutcome {
             rendered: parts.rendered,
             template: parts.template,
             policy_id: parts.policy_id,
-            #[cfg(feature = "native-api")]
-            request_route: RequestRoute::default(),
-            #[cfg(feature = "native-api")]
-            cache_entry_id: None,
+            trace: DnsOutcomeTrace::default(),
         }
-    }
-
-    #[cfg(feature = "native-api")]
-    pub(crate) fn request_route(&self) -> &RequestRoute {
-        &self.request_route
-    }
-
-    #[cfg(feature = "native-api")]
-    pub(crate) fn cache_entry_id(&self) -> Option<&str> {
-        self.cache_entry_id.as_deref()
-    }
-
-    #[cfg(feature = "native-api")]
-    pub(crate) fn with_route(mut self, source: RouteSource) -> Self {
-        self.request_route.source = source;
-        self
-    }
-
-    #[cfg(feature = "native-api")]
-    pub(crate) fn with_cache_entry_id(mut self, id: Option<String>) -> Self {
-        self.cache_entry_id = id;
-        self
     }
 
     /// Carry the target verdict and exchange facts into a local alias answer,

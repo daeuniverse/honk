@@ -76,9 +76,7 @@ impl DnsForwarder {
             requery_history,
             mode,
         )?;
-        #[cfg(feature = "native-api")]
-        let outcome = outcome.with_route(prepared.request_source());
-        Ok(outcome)
+        Ok(outcome.with_request_route(prepared))
     }
 
     pub(crate) fn local_outcome_from_wire(
