@@ -259,8 +259,7 @@ async fn client_reset_preserves_score_availability_but_upstream_reset_revokes_ta
             let progress = relay::RelayProgress {
                 upload: Arc::new(AtomicU64::new(0)),
                 download: Arc::new(AtomicU64::new(0)),
-                outbound_upload: None,
-                outbound_download: None,
+                outbound: None,
                 first_response: Some(Arc::new({
                     let reporter = reporter.clone();
                     move || reporter.first_response()

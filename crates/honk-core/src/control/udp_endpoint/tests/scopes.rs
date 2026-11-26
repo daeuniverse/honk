@@ -14,7 +14,7 @@ async fn first_send_accounts_unexpected_exit_but_not_auxiliary_pause() {
         driver.resume_auxiliary(1500, || true).unwrap();
         let pool = Arc::new(UdpEndpointPool::with_capacity_limit(1));
         let stats = Arc::new(StatsManager::new());
-        let outbound = OutboundTracker::new();
+        let outbound = Arc::new(OutboundTracker::new());
         let client = make_addr("192.0.2.1", 40000);
         let target = make_addr("198.51.100.1", 443);
         let work = scope.hold_source(client.ip()).unwrap();
@@ -175,7 +175,10 @@ async fn tracker_close_keeps_its_scope_after_tuple_reuse() {
     let (removed_tx, mut removed_rx) = mpsc::channel(8);
     pool.set_remove_sink(removed_tx);
     let mut endpoints = Vec::new();
-    for (scope, id) in scopes.into_iter().zip(["scope-a", "scope-b"]) {
+    for (scope, id) in scopes.into_iter().zip([
+        "00000000-0000-0000-0000-00000000000e",
+        "00000000-0000-0000-0000-00000000000f",
+    ]) {
         let EndpointReservation::Initializing(mut lease) = pool.reserve_owned_or_enqueue(
             scope,
             client,
@@ -209,7 +212,7 @@ async fn tracker_close_keeps_its_scope_after_tuple_reuse() {
         .unwrap();
         endpoints.push(endpoint);
     }
-    let mut close = Box::pin(tracker.close_id("scope-a"));
+    let mut close = Box::pin(tracker.close_id("00000000-0000-0000-0000-00000000000e"));
     assert!(futures::poll!(&mut close).is_pending());
     let old = removed_rx.try_recv().unwrap();
     assert_eq!(old.scope, scopes[0]);
@@ -231,7 +234,12 @@ async fn tracker_close_keeps_its_scope_after_tuple_reuse() {
     ) else {
         panic!("closed scope must permit a new incarnation");
     };
-    assert_eq!(tracker.close_id("scope-a").await, CloseOutcome::Closed);
+    assert_eq!(
+        tracker
+            .close_id("00000000-0000-0000-0000-00000000000e")
+            .await,
+        CloseOutcome::Closed
+    );
     assert!(replacement.still_initializing());
     assert!(pool.get(scopes[1], client, dst).is_some());
     pool.remove(scopes[1], client, dst);
@@ -304,7 +312,10 @@ async fn host_lineage_fences_followers_tracker_close_and_retirement() {
     assert!(queue_b.try_recv().is_err());
     assert_eq!(a.packet_source().unwrap().context(), first.context());
     let mut endpoints = Vec::new();
-    for (lease, source, id) in [(&mut a, &first, "host-a"), (&mut b, &other, "host-b")] {
+    for (lease, source, id) in [
+        (&mut a, &first, "00000000-0000-0000-0000-000000000010"),
+        (&mut b, &other, "00000000-0000-0000-0000-000000000011"),
+    ] {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let mut endpoint =
             UdpEndpoint::new(transport(socket, target), target, uuid::Uuid::new_v4());
@@ -326,7 +337,7 @@ async fn host_lineage_fences_followers_tracker_close_and_retirement() {
         endpoints.push(endpoint);
     }
     assert!(!pool.close_exact(scope.scope(), client, target, 0, a.generation(), None));
-    let mut closed = Box::pin(tracker.close_id("host-a"));
+    let mut closed = Box::pin(tracker.close_id("00000000-0000-0000-0000-000000000010"));
     assert!(futures::poll!(&mut closed).is_pending());
     let removal = removed_rx.try_recv().unwrap();
     assert_eq!(removal.packet_lineage, Some(first.context().lineage));

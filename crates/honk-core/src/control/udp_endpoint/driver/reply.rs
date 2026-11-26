@@ -23,7 +23,7 @@ pub(super) async fn receive_loop(
     client_dst: SocketAddr,
     alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
     stats: Arc<StatsManager>,
-    outbound_tracker: OutboundTracker,
+    outbound_tracker: Arc<OutboundTracker>,
 ) -> io::Result<()> {
     let ipver = endpoint.health_family;
     let transport = endpoint

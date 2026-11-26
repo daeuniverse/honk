@@ -71,9 +71,9 @@ async fn stop_removals(
 
 fn tracked_entry(id: &str) -> ConnectionEntry {
     ConnectionEntry {
-        id: id.to_string(),
-        source: "192.0.2.1:50000".to_string(),
-        destination: "203.0.113.2:443".to_string(),
+        id: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, id.as_bytes()),
+        source: "192.0.2.1:50000".parse().unwrap(),
+        destination: "203.0.113.2:443".parse().unwrap(),
         proxy: "direct".to_string(),
         #[cfg(feature = "native-api")]
         routed_outbound: None,
@@ -86,7 +86,7 @@ fn tracked_entry(id: &str) -> ConnectionEntry {
         download: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         start_time: std::time::Instant::now(),
         domain: None,
-        network: "tcp".to_string(),
+        network: "tcp",
         process: None,
         process_path: None,
     }

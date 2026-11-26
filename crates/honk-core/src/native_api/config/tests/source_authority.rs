@@ -585,9 +585,9 @@ async fn connection_projection_masks_listener_values_without_losing_flow_referen
         crate::observe::vocab::RoutingSource::Evaluation,
     );
     state.tracker.register(ConnectionEntry {
-        id: "connection-visible-id".into(),
-        source: "192.0.2.1:31000".into(),
-        destination: "198.51.100.1:443".into(),
+        id: uuid::uuid!("00000000-0000-0000-0000-000000000013"),
+        source: "192.0.2.1:31000".parse().unwrap(),
+        destination: "198.51.100.1:443".parse().unwrap(),
         proxy: "leaf".into(),
         routed_outbound: Some("group/name@host".into()),
         native_flow_id: Some(flow.id().into()),
@@ -598,13 +598,13 @@ async fn connection_projection_masks_listener_values_without_losing_flow_referen
         download: Arc::new(AtomicU64::new(0)),
         start_time: Instant::now(),
         domain: None,
-        network: "tcp".into(),
+        network: "tcp",
         process: Some("/usr/bin/user@host".into()),
         process_path: None,
     });
     let value = fixture.get("/api/v1/connections?detail=full").await;
     let row = &value["tcp"][0];
-    assert_eq!(row["id"], "connection-visible-id");
+    assert_eq!(row["id"], "00000000-0000-0000-0000-000000000013");
     assert_eq!(row["flow_id"], flow.id());
     assert_eq!(row["rule_id"], rule_id);
     assert_eq!(row["outbound"], "group/name@host");

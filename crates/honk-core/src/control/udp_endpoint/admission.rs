@@ -389,7 +389,7 @@ impl EndpointEntry {
         self.generation() == generation && self.owner().token == token
     }
 
-    pub(super) fn retire(&self, fence_peer: bool) -> Option<String> {
+    pub(super) fn retire(&self, fence_peer: bool) -> Option<uuid::Uuid> {
         match self {
             Self::Initializing(_) => None,
             Self::Ready(entry) => {

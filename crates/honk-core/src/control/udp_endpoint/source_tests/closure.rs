@@ -85,7 +85,13 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
                 &endpoint_a,
                 &tracker,
                 vec!["captured-group".into()],
-                || tracked_entry("source-view", client_addr, target_a),
+                || {
+                    tracked_entry(
+                        "00000000-0000-0000-0000-000000000012",
+                        client_addr,
+                        target_a,
+                    )
+                },
             )
             .unwrap()
             .unwrap();
@@ -109,7 +115,8 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
             .unwrap();
         let close = tracker.start_close(selected);
         drop(endpoint_a);
-        let mut duplicate = Box::pin(tracker.close_id(&id));
+        let wire_id = id.to_string();
+        let mut duplicate = Box::pin(tracker.close_id(&wire_id));
         assert!(futures::poll!(&mut duplicate).is_pending());
         admitted_send.await.unwrap();
         let frame = next_data_frame(&mut events, &mut replies).await;

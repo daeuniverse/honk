@@ -97,7 +97,7 @@ impl Retirement {
     ) {
         match self {
             Self::Udp(removal) => {
-                if ok && let Some(id) = removal.conn_id.as_deref() {
+                if ok && let Some(id) = removal.conn_id.as_ref() {
                     tracker.remove(id);
                 }
                 pool.finish_removal(&removal, ok);
@@ -542,9 +542,9 @@ mod tests {
         };
         let close = CloseRequest::Pending(signal);
         flow.track(ConnectionEntry {
-            id: "admitted-cancellation".to_string(),
-            source: client.to_string(),
-            destination: destination.to_string(),
+            id: uuid::Uuid::new_v4(),
+            source: client,
+            destination,
             proxy: "direct".to_string(),
             #[cfg(feature = "native-api")]
             routed_outbound: None,
@@ -557,7 +557,7 @@ mod tests {
             download: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             start_time: std::time::Instant::now(),
             domain: None,
-            network: "tcp".to_string(),
+            network: "tcp",
             process: None,
             process_path: None,
         });

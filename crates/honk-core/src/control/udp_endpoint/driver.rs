@@ -239,7 +239,7 @@ pub(super) struct UdpDriverContext {
     pub(super) client_dst: SocketAddr,
     pub(super) alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
     pub(super) stats: Arc<StatsManager>,
-    pub(super) outbound_tracker: OutboundTracker,
+    pub(super) outbound_tracker: Arc<OutboundTracker>,
     pub(super) health_family: honk_outbound::alive::IpVersion,
 }
 
@@ -447,7 +447,7 @@ impl UdpEndpointPool {
         reply_socket: impl Into<DriverReplySocket>,
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
         stats: Arc<StatsManager>,
-        outbound_tracker: OutboundTracker,
+        outbound_tracker: Arc<OutboundTracker>,
     ) -> UdpDriverHandle {
         let reply_socket = reply_socket.into().into_socket(scope);
         let key = EndpointKey::new(
@@ -730,7 +730,7 @@ async fn send_followers(
     endpoint: Arc<UdpEndpoint>,
     mut queue_rx: mpsc::Receiver<QueuedDatagram>,
     stats: Arc<StatsManager>,
-    outbound_tracker: OutboundTracker,
+    outbound_tracker: Arc<OutboundTracker>,
     mut send_timeout: std::pin::Pin<&mut tokio::time::Sleep>,
 ) -> io::Result<()> {
     while let Some(packet) = queue_rx.recv().await {
@@ -765,7 +765,7 @@ async fn send_source_followers(
     endpoint: Arc<UdpEndpoint>,
     mut queue_rx: mpsc::Receiver<QueuedDatagram>,
     stats: Arc<StatsManager>,
-    outbound_tracker: OutboundTracker,
+    outbound_tracker: Arc<OutboundTracker>,
     mut send_timeout: std::pin::Pin<&mut tokio::time::Sleep>,
 ) -> io::Result<()> {
     let mut reply_epoch = endpoint.reply_epoch.load(Ordering::Acquire);

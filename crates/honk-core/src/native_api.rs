@@ -522,12 +522,12 @@ fn connection(state: &NativeState, entry: &ConnectionEntry, full: bool) -> Conne
         .as_deref()
         .and_then(|id| state.observation.core.flows.connection_evidence(id));
     Connection {
-        id: entry.id.clone(),
+        id: entry.id.to_string(),
         flow_id: entry.native_flow_id.clone(),
         pname: entry.process.clone(),
         state: "active",
-        src: full.then(|| entry.source.clone()),
-        dst: full.then(|| entry.destination.clone()),
+        src: full.then(|| entry.source.to_string()),
+        dst: full.then(|| entry.destination.to_string()),
         domain: full.then(|| entry.domain.clone()),
         outbound: entry.routed_outbound.clone(),
         chain: evidence
@@ -574,20 +574,13 @@ fn connections(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respons
     let mut total_udp = 0;
     let mut selected: BinaryHeap<Candidate> = BinaryHeap::with_capacity(limit);
     state.tracker.visit(|entry| {
-        let tcp = match entry.network.as_str() {
+        let tcp = match entry.network {
             "tcp" => true,
             "udp" => false,
             _ => return,
         };
         if (kind != "all" && kind != entry.network)
-            || source.is_some_and(|ip| {
-                entry
-                    .source
-                    .parse::<SocketAddr>()
-                    .ok()
-                    .map(|addr| addr.ip().to_canonical())
-                    != Some(ip)
-            })
+            || source.is_some_and(|ip| entry.source.ip().to_canonical() != ip)
         {
             return;
         }
@@ -599,7 +592,13 @@ fn connections(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respons
         if selected.len() == limit {
             let worst = selected.peek().expect("nonzero limit");
             if entry.start_time < worst.observed
-                || (entry.start_time == worst.observed && entry.id >= worst.value.id)
+                || (entry.start_time == worst.observed
+                    && entry
+                        .id
+                        .as_hyphenated()
+                        .encode_lower(&mut uuid::Uuid::encode_buffer())
+                        .as_bytes()
+                        >= worst.value.id.as_bytes())
             {
                 return;
             }
@@ -845,17 +844,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn native_sampler_reset_and_overflow_are_unknown() {
         let state = state().await;
-        let (upload, _) = state
+        let tracker = state
             .stats
-            .byte_counters("first", crate::stats::OutboundKind::Node);
-        upload.store(100, Ordering::Relaxed);
+            .outbound_tracker("first", crate::stats::OutboundKind::Node);
+        tracker.tx_bytes.store(100, Ordering::Relaxed);
         let (stop, receiver) = watch::channel(false);
         let sampler = tokio::spawn(sample_traffic(state.clone(), receiver));
         while state.sample.read().is_none() {
             tokio::task::yield_now().await;
         }
         assert!(state.sample.read().as_ref().unwrap().rates.is_none());
-        upload.store(50, Ordering::Relaxed);
+        tracker.tx_bytes.store(50, Ordering::Relaxed);
         tokio::time::advance(Duration::from_secs(1)).await;
         while state
             .sample

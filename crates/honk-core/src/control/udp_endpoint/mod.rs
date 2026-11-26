@@ -235,7 +235,7 @@ pub struct UdpEndpoint {
     evidence: Option<Arc<UdpTrafficEvidence>>,
     #[cfg(test)]
     source_reply_hook: Mutex<Option<Arc<source::ReplyAdmissionHook>>>,
-    tracker_id: Mutex<Option<String>>,
+    tracker_id: Mutex<Option<uuid::Uuid>>,
     pub(in crate::control) native: observation::EndpointObservation,
     retirement: EndpointIoGuard,
 }
@@ -280,7 +280,7 @@ impl UdpEndpoint {
         target: SocketAddr,
         target_domain: Option<&str>,
         reply_socket: Arc<ReplySocket>,
-        flow_tracker: OutboundTracker,
+        flow_tracker: Arc<OutboundTracker>,
         node_id: uuid::Uuid,
         health_family: honk_outbound::alive::IpVersion,
         score_reporter: Option<ScoreReporter>,
@@ -408,7 +408,7 @@ impl UdpEndpoint {
 
     /// Bind the clash-API tracker entry to this endpoint: the entry shares
     /// the endpoint's atomic counters, and `conn_id` is stored for removal.
-    pub fn set_tracker(&self, conn_id: String) {
+    pub fn set_tracker(&self, conn_id: uuid::Uuid) {
         *self.tracker_id.lock() = Some(conn_id);
     }
 
@@ -473,7 +473,7 @@ impl UdpEndpoint {
     }
 
     /// Take the tracker connection id (on endpoint removal).
-    pub fn take_tracker_id(&self) -> Option<String> {
+    pub fn take_tracker_id(&self) -> Option<uuid::Uuid> {
         self.tracker_id.lock().take()
     }
 

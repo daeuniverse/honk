@@ -92,7 +92,7 @@ pub(crate) struct EndpointRemoval {
     pub(crate) dst: SocketAddr,
     pub(in crate::control) owner: UdpFlowOwner,
     pub(crate) generation: u64,
-    pub(crate) conn_id: Option<String>,
+    pub(crate) conn_id: Option<uuid::Uuid>,
     pub(crate) reason: RemovalReason,
 }
 
@@ -116,7 +116,7 @@ impl UdpEndpointPool {
         tracker: &crate::connection_tracker::ConnectionTracker,
         groups: Vec<String>,
         make_entry: impl FnOnce() -> crate::connection_tracker::ConnectionEntry,
-    ) -> Result<Option<String>, ()> {
+    ) -> Result<Option<uuid::Uuid>, ()> {
         let entry = self
             .endpoints
             .get(&EndpointKey::new(
@@ -139,8 +139,8 @@ impl UdpEndpointPool {
             return Ok(None);
         }
         let tracked = make_entry();
-        let id = tracked.id.clone();
-        endpoint.set_tracker(id.clone());
+        let id = tracked.id;
+        endpoint.set_tracker(id);
         tracker.register_owned(
             tracked,
             crate::connection_tracker::ConnectionOwner {

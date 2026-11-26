@@ -151,8 +151,7 @@ pub struct RelayStats {
 pub struct RelayProgress {
     pub upload: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub download: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub outbound_upload: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
-    pub outbound_download: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    pub outbound: Option<std::sync::Arc<crate::stats::OutboundTracker>>,
     /// First nonempty upstream read, independent of client write backpressure.
     pub first_response: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// Accepted destination writes as `(upload_bytes, download_bytes)`.
@@ -165,7 +164,7 @@ pub type OptionalRelayProgress = Option<RelayProgress>;
 pub(crate) struct RelayIo<S> {
     inner: S,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    aggregate: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    aggregate: Option<std::sync::Arc<crate::stats::OutboundTracker>>,
     on_progress: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     on_transfer: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
     write_is_upload: bool,
@@ -175,7 +174,7 @@ impl<S> RelayIo<S> {
     pub(crate) fn wrap(
         inner: S,
         counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        aggregate: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+        aggregate: Option<std::sync::Arc<crate::stats::OutboundTracker>>,
         on_progress: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
         on_transfer: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
         write_is_upload: bool,
@@ -214,7 +213,7 @@ fn relay_io_pair<S1, S2>(
         RelayIo::wrap(
             client,
             progress.upload.clone(),
-            progress.outbound_upload.clone(),
+            progress.outbound.clone(),
             None,
             progress.on_transfer.clone(),
             false,
@@ -222,7 +221,7 @@ fn relay_io_pair<S1, S2>(
         RelayIo::wrap(
             proxy,
             progress.download.clone(),
-            progress.outbound_download.clone(),
+            progress.outbound.clone(),
             progress.first_response.clone(),
             progress.on_transfer.clone(),
             true,
@@ -244,7 +243,12 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for RelayIo<S> {
                 self.counter
                     .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 if let Some(aggregate) = &self.aggregate {
-                    aggregate.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                    let bytes = if self.write_is_upload {
+                        &aggregate.rx_bytes
+                    } else {
+                        &aggregate.tx_bytes
+                    };
+                    bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 if let Some(callback) = self.on_progress.take() {
                     callback();
@@ -1054,8 +1058,7 @@ mod tests {
                         Some(RelayProgress {
                             upload: upload.clone(),
                             download: download.clone(),
-                            outbound_upload: None,
-                            outbound_download: None,
+                            outbound: None,
                             first_response: Some(Arc::new(move || {
                                 first_response.fetch_add(1, Ordering::Relaxed);
                             })),
@@ -1211,12 +1214,12 @@ mod tests {
             let (mut client, relayed_client) = tokio::io::duplex(64);
             let (upstream, mut peer) = tokio::io::duplex(64);
             let upload = Arc::new(AtomicU64::new(0));
-            let aggregate = Arc::new(AtomicU64::new(17));
+            let aggregate = Arc::new(crate::stats::OutboundTracker::new());
+            aggregate.tx_bytes.store(17, Ordering::Relaxed);
             let progress = RelayProgress {
                 upload: upload.clone(),
                 download: Arc::new(AtomicU64::new(0)),
-                outbound_upload: Some(aggregate.clone()),
-                outbound_download: None,
+                outbound: Some(aggregate.clone()),
                 first_response: None,
                 on_transfer: None,
             };
@@ -1244,7 +1247,7 @@ mod tests {
                 assert!(task.await.unwrap().is_err());
             }
             assert_eq!(upload.load(Ordering::Relaxed), 6);
-            assert_eq!(aggregate.load(Ordering::Relaxed), 23);
+            assert_eq!(aggregate.tx_bytes.load(Ordering::Relaxed), 23);
         }
     }
 }

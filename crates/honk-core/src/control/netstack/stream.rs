@@ -20,6 +20,7 @@ pub struct FlowIo {
     peer: SocketAddr,
     dscp: u8,
     open: bool,
+    abort_on_drop: bool,
     routing: Option<crate::control::packet_endpoint::EndpointAdmission>,
     packet_source: Option<super::SourceWork>,
     process: Option<super::ProcessMeta>,
@@ -39,6 +40,7 @@ impl FlowIo {
             peer: syn.client,
             dscp: syn.dscp,
             open: true,
+            abort_on_drop: false,
             routing: None,
             packet_source: None,
             process,
@@ -139,6 +141,11 @@ impl FlowIo {
         }
     }
 
+    /// A core relay owns cancellation until the original protocol and all its output retire.
+    pub(in crate::control) fn arm_retirement(&mut self) {
+        self.abort_on_drop = true;
+    }
+
     /// Install before publishing core registration. Closure backing is charged before boxing;
     /// callers retain their own charges for heap-backed captures. Runs outside the runtime
     /// mutex at exact retirement, including on cancellation.
@@ -191,12 +198,17 @@ impl FlowIo {
     /// Cancellation leaves a runtime-owned callback/alias, not a detached cleanup task.
     pub async fn retire(&mut self) -> io::Result<()> {
         self.close();
-        wait(&self.scope, self.id, self.binding).await
+        wait(&self.scope, self.id, self.binding).await?;
+        self.abort_on_drop = false;
+        Ok(())
     }
 }
 
 impl Drop for FlowIo {
     fn drop(&mut self) {
+        if self.abort_on_drop {
+            abort_retirement(&self.scope, self.id, self.binding);
+        }
         self.close();
     }
 }
@@ -212,17 +224,7 @@ pub struct FlowRetirement {
 
 impl FlowRetirement {
     pub fn abort(&self) {
-        let mut inner = self.scope.0.inner.lock();
-        if self.binding >> 1 != self.scope.binding() >> 1 {
-            return;
-        }
-        if let Some(stack) = &mut inner.stack {
-            stack.tcp_abort(self.id);
-        }
-        let wakers = inner
-            .slot_index(self.id)
-            .map(|index| inner.take_stream_wakers(index, true, true));
-        self.scope.0.finish_with_wakers(inner, wakers);
+        abort_retirement(&self.scope, self.id, self.binding);
     }
 
     pub fn on_retired<F: FnOnce() + Send + 'static>(&self, callback: F) -> io::Result<()> {
@@ -242,6 +244,20 @@ impl Drop for FlowRetirement {
             self.abort();
         }
     }
+}
+
+fn abort_retirement(scope: &PacketScope, id: FlowId, binding: u64) {
+    let mut inner = scope.0.inner.lock();
+    if binding >> 1 != scope.binding() >> 1 {
+        return;
+    }
+    if let Some(stack) = &mut inner.stack {
+        stack.tcp_abort(id);
+    }
+    let wakers = inner
+        .slot_index(id)
+        .map(|index| inner.take_stream_wakers(index, true, true));
+    scope.0.finish_with_wakers(inner, wakers);
 }
 
 fn set_callback<F: FnOnce() + Send + 'static>(

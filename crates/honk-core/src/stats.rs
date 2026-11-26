@@ -52,18 +52,19 @@ pub(crate) struct NativeOutboundCounters {
 }
 
 /// Per-outbound statistics tracked in user-space.
-#[derive(Debug, Clone, Default)]
+#[repr(align(64))]
+#[derive(Debug, Default)]
 pub struct OutboundTracker {
     /// Total connections through this outbound
-    pub total_connections: Arc<AtomicU64>,
+    pub total_connections: AtomicU64,
     /// Active connections currently open
-    pub active_connections: Arc<AtomicU64>,
+    pub active_connections: AtomicU64,
     /// Total bytes transferred (client → proxy)
-    pub tx_bytes: Arc<AtomicU64>,
+    pub tx_bytes: AtomicU64,
     /// Total bytes transferred (proxy → client)
-    pub rx_bytes: Arc<AtomicU64>,
+    pub rx_bytes: AtomicU64,
     /// Failed connection attempts
-    pub errors: Arc<AtomicU64>,
+    pub errors: AtomicU64,
 }
 
 impl OutboundTracker {
@@ -403,7 +404,7 @@ impl UdpStats {
 /// the guard only balances `active_connections`; explicit error paths remain
 /// responsible for recording errors themselves.
 pub struct ActiveConnectionGuard {
-    tracker: OutboundTracker,
+    tracker: Arc<OutboundTracker>,
 }
 
 impl Drop for ActiveConnectionGuard {
@@ -917,7 +918,7 @@ pub(crate) mod xdp {
 /// Statistics manager that tracks per-outbound metrics.
 #[derive(Debug)]
 pub struct StatsManager {
-    trackers: [DashMap<String, OutboundTracker>; 3],
+    trackers: [DashMap<String, Arc<OutboundTracker>>; 3],
     udp: UdpStats,
     tcp: TcpStats,
     #[cfg(target_os = "linux")]
@@ -1125,7 +1126,7 @@ impl StatsManager {
     /// Resolve an outbound tracker once for a long-lived data path. Callers
     /// that already retain the returned value avoid allocating an outbound
     /// name and taking a DashMap shard lock for every packet.
-    pub fn outbound_tracker(&self, outbound: &str, kind: OutboundKind) -> OutboundTracker {
+    pub fn outbound_tracker(&self, outbound: &str, kind: OutboundKind) -> Arc<OutboundTracker> {
         let trackers = &self.trackers[kind as usize];
         if let Some(tracker) = trackers.get(outbound) {
             return tracker.clone();
@@ -1134,7 +1135,7 @@ impl StatsManager {
     }
 
     /// Track one connection using an already-resolved tracker.
-    pub fn track_outbound(&self, tracker: OutboundTracker) -> ActiveConnectionGuard {
+    pub fn track_outbound(&self, tracker: Arc<OutboundTracker>) -> ActiveConnectionGuard {
         tracker.increment_connections();
         ActiveConnectionGuard { tracker }
     }
@@ -1456,19 +1457,6 @@ impl StatsManager {
             .entry(outbound.to_owned())
             .or_default()
             .add_bytes(tx, rx);
-    }
-
-    pub(crate) fn byte_counters(
-        &self,
-        outbound: &str,
-        kind: OutboundKind,
-    ) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
-        let trackers = &self.trackers[kind as usize];
-        if let Some(tracker) = trackers.get(outbound) {
-            return (Arc::clone(&tracker.tx_bytes), Arc::clone(&tracker.rx_bytes));
-        }
-        let tracker = trackers.entry(outbound.to_owned()).or_default();
-        (Arc::clone(&tracker.tx_bytes), Arc::clone(&tracker.rx_bytes))
     }
 
     #[cfg(feature = "native-api")]

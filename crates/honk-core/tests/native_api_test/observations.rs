@@ -6,12 +6,32 @@ async fn connections_filter_before_combined_limit_and_preserve_full_width_live_b
     let tracker = app.control.connection_tracker();
     let now = Instant::now();
     for row in [
-        entry("old", "tcp", "192.0.2.1:4000", now - Duration::from_secs(1)),
-        entry("a", "udp", "[::ffff:192.0.2.1]:4001", now),
-        entry("b", "tcp", "192.0.2.1:4002", now),
-        entry("c", "tcp", "192.0.2.1:4003", now),
         entry(
-            "other-source",
+            "00000000-0000-0000-0000-000000000004",
+            "tcp",
+            "192.0.2.1:4000",
+            now - Duration::from_secs(1),
+        ),
+        entry(
+            "00000000-0000-0000-0000-000000000001",
+            "udp",
+            "[::ffff:192.0.2.1]:4001",
+            now,
+        ),
+        entry(
+            "00000000-0000-0000-0000-000000000002",
+            "tcp",
+            "192.0.2.1:4002",
+            now,
+        ),
+        entry(
+            "00000000-0000-0000-0000-000000000003",
+            "tcp",
+            "192.0.2.1:4003",
+            now,
+        ),
+        entry(
+            "00000000-0000-0000-0000-000000000005",
             "tcp",
             "192.0.2.2:4000",
             now + Duration::from_secs(1),
@@ -20,7 +40,11 @@ async fn connections_filter_before_combined_limit_and_preserve_full_width_live_b
         tracker.register(row);
     }
     let big = u64::from(u32::MAX) + 123;
-    tracker.update_bytes("a", big, u64::MAX);
+    tracker.update_bytes(
+        &uuid::uuid!("00000000-0000-0000-0000-000000000001"),
+        big,
+        u64::MAX,
+    );
     let summary = response_json(
         app.get("/api/v1/connections?src=192.0.2.1&limit=1")
             .send()
@@ -33,7 +57,10 @@ async fn connections_filter_before_combined_limit_and_preserve_full_width_live_b
         (Some(3), Some(1))
     );
     assert_eq!(summary["tcp"], json!([]));
-    assert_eq!(summary["udp"][0]["id"], "a");
+    assert_eq!(
+        summary["udp"][0]["id"],
+        "00000000-0000-0000-0000-000000000001"
+    );
     assert_eq!(summary["truncated"], true);
     assert_eq!(summary["visibility"], "partial");
     let row = &summary["udp"][0];
@@ -75,9 +102,12 @@ async fn connections_filter_before_combined_limit_and_preserve_full_width_live_b
             .iter()
             .map(|row| row["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["b", "c"]
+        [
+            "00000000-0000-0000-0000-000000000002",
+            "00000000-0000-0000-0000-000000000003"
+        ]
     );
-    assert_eq!(full["udp"][0]["id"], "a");
+    assert_eq!(full["udp"][0]["id"], "00000000-0000-0000-0000-000000000001");
     assert_eq!(full["udp"][0]["src"], "[::ffff:192.0.2.1]:4001");
     assert_eq!(full["udp"][0]["dst"], "198.51.100.10:443");
     assert_eq!(full["udp"][0].get("domain"), Some(&Value::Null));
@@ -98,11 +128,18 @@ async fn connections_filter_before_combined_limit_and_preserve_full_width_live_b
             .iter()
             .map(|row| row["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["b", "c", "old"]
+        [
+            "00000000-0000-0000-0000-000000000002",
+            "00000000-0000-0000-0000-000000000003",
+            "00000000-0000-0000-0000-000000000004"
+        ]
     );
     let latest = response_json(app.get("/api/v1/connections?limit=1").send().await.unwrap()).await;
-    assert_eq!(latest["tcp"][0]["id"], "other-source");
-    tracker.remove("a");
+    assert_eq!(
+        latest["tcp"][0]["id"],
+        "00000000-0000-0000-0000-000000000005"
+    );
+    tracker.remove(&uuid::uuid!("00000000-0000-0000-0000-000000000001"));
     let removed = response_json(
         app.get("/api/v1/connections?type=udp")
             .send()

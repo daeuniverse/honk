@@ -18,8 +18,7 @@ fn observed_progress() -> (crate::relay::RelayProgress, Arc<(AtomicU64, AtomicU6
     let progress = crate::relay::RelayProgress {
         upload: Arc::new(AtomicU64::new(0)),
         download: Arc::new(AtomicU64::new(0)),
-        outbound_upload: None,
-        outbound_download: None,
+        outbound: None,
         first_response: None,
         on_transfer: Some(Arc::new(move |up, down| {
             assert!(up == 0 || down == 0);
@@ -298,10 +297,10 @@ async fn test_relay_splice_live_progress_matches_stats() {
         let (up, down) = (progress.upload.clone(), progress.download.clone());
         up.store(11, Ordering::Relaxed);
         down.store(13, Ordering::Relaxed);
-        let aggregate_up = Arc::new(AtomicU64::new(101));
-        let aggregate_down = Arc::new(AtomicU64::new(103));
-        progress.outbound_upload = Some(aggregate_up.clone());
-        progress.outbound_download = Some(aggregate_down.clone());
+        let aggregate = Arc::new(crate::stats::OutboundTracker::new());
+        aggregate.tx_bytes.store(101, Ordering::Relaxed);
+        aggregate.rx_bytes.store(103, Ordering::Relaxed);
+        progress.outbound = Some(aggregate.clone());
         let relay = tokio::spawn(async move {
             let (mut client, client_addr) = listener.accept().await.unwrap();
             let upstream = TcpStream::connect(echo).await.unwrap();
@@ -315,11 +314,11 @@ async fn test_relay_splice_live_progress_matches_stats() {
         assert_eq!(received, payload);
         assert!(!relay.is_finished());
         assert_eq!(
-            aggregate_up.load(Ordering::Relaxed),
+            aggregate.tx_bytes.load(Ordering::Relaxed),
             101 + payload.len() as u64
         );
         assert_eq!(
-            aggregate_down.load(Ordering::Relaxed),
+            aggregate.rx_bytes.load(Ordering::Relaxed),
             103 + payload.len() as u64
         );
         assert_eq!(accepted.0.load(Ordering::Relaxed), payload.len() as u64);
@@ -335,11 +334,11 @@ async fn test_relay_splice_live_progress_matches_stats() {
         assert_eq!(up.load(Ordering::Relaxed), 11 + stats.client_to_proxy);
         assert_eq!(down.load(Ordering::Relaxed), 13 + stats.proxy_to_client);
         assert_eq!(
-            aggregate_up.load(Ordering::Relaxed),
+            aggregate.tx_bytes.load(Ordering::Relaxed),
             101 + stats.client_to_proxy
         );
         assert_eq!(
-            aggregate_down.load(Ordering::Relaxed),
+            aggregate.rx_bytes.load(Ordering::Relaxed),
             103 + stats.proxy_to_client
         );
         assert_eq!(accepted.0.load(Ordering::Relaxed), stats.client_to_proxy);

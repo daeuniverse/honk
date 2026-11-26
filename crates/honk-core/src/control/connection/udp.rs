@@ -1032,14 +1032,14 @@ impl ControlPlaneHandle {
                 &self.connection_tracker,
                 groups,
                 || {
-                    let id = uuid::Uuid::new_v4().to_string();
+                    let id = uuid::Uuid::new_v4();
                     let (rule, rule_payload) =
                         matched_rule.unwrap_or_else(|| ("Fallback".to_string(), String::new()));
                     let (upload, download) = endpoint.byte_counters();
                     crate::connection_tracker::ConnectionEntry {
                         id,
-                        source: client_addr.to_string(),
-                        destination: original_dst.to_string(),
+                        source: client_addr,
+                        destination: original_dst,
                         proxy: node.name.clone(),
                         #[cfg(feature = "native-api")]
                         routed_outbound: self
@@ -1060,7 +1060,7 @@ impl ControlPlaneHandle {
                         download,
                         start_time: std::time::Instant::now(),
                         domain: quic_domain.clone(),
-                        network: "udp".to_string(),
+                        network: "udp",
                         process: match packet_input {
                             Some((process, _)) => process.name(),
                             None => handoff.as_ref().and_then(|ho| ho.process_name()),
@@ -1070,8 +1070,11 @@ impl ControlPlaneHandle {
                 },
             )
             .map_err(|()| anyhow::anyhow!("UDP endpoint retired before tracker publication"))?;
-        if let (Some(flow), Some(id)) = (endpoint.native.flow(), tracker_id.as_deref()) {
-            flow.attach_connection(id);
+        if let (Some(flow), Some(id)) = (endpoint.native.flow(), tracker_id) {
+            flow.attach_connection(
+                id.as_hyphenated()
+                    .encode_lower(&mut uuid::Uuid::encode_buffer()),
+            );
         }
         let first = lease.take_first().ok_or_else(|| {
             if let Some(terminal) = &native_terminal {

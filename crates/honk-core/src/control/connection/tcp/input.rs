@@ -1,5 +1,5 @@
 use super::*;
-use crate::control::netstack::{DirectRelayOwner, FlowIo, FlowRetirement};
+use crate::control::netstack::{DirectRelayOwner, FlowIo};
 use honk_netstack::{MemoryBudget, MemoryReservation};
 use honk_outbound::ProxyStream;
 #[cfg(feature = "native-api")]
@@ -25,7 +25,6 @@ pub(super) enum TcpFlow {
 }
 
 pub(super) struct PacketFlow {
-    retirement: FlowRetirement,
     stream: FlowIo,
     tracker: Arc<ConnectionTracker>,
     tracker_id: Option<uuid::Uuid>,
@@ -40,10 +39,7 @@ struct PacketCompletion {
 impl PacketCompletion {
     fn finish(self) {
         if let Some((tracker, id)) = self.tracked {
-            tracker.remove(
-                id.as_hyphenated()
-                    .encode_lower(&mut uuid::Uuid::encode_buffer()),
-            );
+            tracker.remove(&id);
         }
         finish_packet_ack(self.ack);
     }
@@ -89,9 +85,9 @@ impl PacketFlow {
 }
 
 impl TcpFlow {
-    pub(super) fn packet(stream: FlowIo, tracker: Arc<ConnectionTracker>) -> Self {
+    pub(super) fn packet(mut stream: FlowIo, tracker: Arc<ConnectionTracker>) -> Self {
+        stream.arm_retirement();
         Self::Packet(PacketFlow {
-            retirement: stream.retirement(),
             stream,
             tracker,
             tracker_id: None,
@@ -159,22 +155,17 @@ impl TcpFlow {
 
     pub(super) fn track_if_enabled(
         &mut self,
-        make_entry: impl FnOnce(String) -> crate::connection_tracker::ConnectionEntry,
+        make_entry: impl FnOnce(uuid::Uuid) -> crate::connection_tracker::ConnectionEntry,
         owner: ConnectionOwner,
-    ) -> Option<String> {
+    ) -> Option<uuid::Uuid> {
         match self {
-            Self::Kernel(flow) => {
-                flow.track_if_enabled(|| make_entry(uuid::Uuid::new_v4().to_string()), owner)
-            }
+            Self::Kernel(flow) => flow.track_if_enabled(|| make_entry(uuid::Uuid::new_v4()), owner),
             Self::Packet(flow) => {
                 if !flow.tracker.is_enabled() {
                     return None;
                 }
                 let id = flow.tracker_id?;
-                Some(
-                    flow.tracker
-                        .register_owned(make_entry(id.to_string()), owner),
-                )
+                Some(flow.tracker.register_owned(make_entry(id), owner))
             }
         }
     }
@@ -295,10 +286,6 @@ impl TcpFlow {
                 }
                 if let Err(error) = flow.stream.retire().await {
                     error!(%error, "packet TCP application retirement failed");
-                    return false;
-                }
-                if let Err(error) = flow.retirement.wait().await {
-                    error!(%error, "packet TCP exact retirement failed");
                     return false;
                 }
                 true

@@ -62,8 +62,8 @@ async fn write_prefix(
         result = write_sniff_prefix(stream, &prefix.bytes, |bytes| {
             use std::sync::atomic::Ordering::Relaxed;
             progress.upload.fetch_add(bytes as u64, Relaxed);
-            if let Some(outbound) = &progress.outbound_upload {
-                outbound.fetch_add(bytes as u64, Relaxed);
+            if let Some(outbound) = &progress.outbound {
+                outbound.tx_bytes.fetch_add(bytes as u64, Relaxed);
             }
             #[cfg(feature = "native-api")]
             if let Some(flow) = &prefix.flow {
@@ -972,8 +972,7 @@ impl ControlPlaneHandle {
 
                 let conn_upload = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let conn_download = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let (outbound_upload, outbound_download) =
-                    self.stats.byte_counters(&outbound_name, outbound_kind);
+                let outbound = self.stats.outbound_tracker(&outbound_name, outbound_kind);
                 if let Some(close) = &close_signal {
                     let groups = captured_groups(
                         selection_chains
@@ -999,8 +998,8 @@ impl ControlPlaneHandle {
                                 .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
                             crate::connection_tracker::ConnectionEntry {
                                 id,
-                                source: client_addr.to_string(),
-                                destination: original_dst.to_string(),
+                                source: client_addr,
+                                destination: original_dst,
                                 proxy: node.name.clone(),
                                 #[cfg(feature = "native-api")]
                                 routed_outbound: self
@@ -1021,7 +1020,7 @@ impl ControlPlaneHandle {
                                 download: conn_download.clone(),
                                 start_time: std::time::Instant::now(),
                                 domain: target_domain.clone(),
-                                network: "tcp".to_string(),
+                                network: "tcp",
                                 process: match packet_input {
                                     Some((process, _)) => process.name(),
                                     None => handoff.as_ref().and_then(|ho| ho.process_name()),
@@ -1036,7 +1035,11 @@ impl ControlPlaneHandle {
                         },
                     ) {
                         if let Some(native) = observation.flow() {
-                            native.attach_connection(&conn_id);
+                            native.attach_connection(
+                                conn_id
+                                    .as_hyphenated()
+                                    .encode_lower(&mut uuid::Uuid::encode_buffer()),
+                            );
                         }
                         self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
                     }
@@ -1119,8 +1122,7 @@ impl ControlPlaneHandle {
                 let conn_progress = relay::RelayProgress {
                     upload: conn_upload.clone(),
                     download: conn_download.clone(),
-                    outbound_upload: Some(outbound_upload),
-                    outbound_download: Some(outbound_download),
+                    outbound: Some(outbound),
                     first_response,
                     on_transfer,
                 };

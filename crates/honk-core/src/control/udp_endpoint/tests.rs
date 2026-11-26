@@ -2948,7 +2948,7 @@ async fn udp_endpoint_driver_reply_idle_timeout_cleans_up_once() {
     };
     let transport = Arc::new(ScriptedPacketTransport::new(relay, [DriverSendAction::Ok]));
     let endpoint = driver_test_endpoint(transport, relay);
-    endpoint.set_tracker("idle-tracker".to_owned());
+    endpoint.set_tracker(uuid::Uuid::from_u128(1));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         honk_datapath::ScopeId::HOST,
@@ -2979,7 +2979,7 @@ async fn udp_endpoint_driver_reply_idle_timeout_cleans_up_once() {
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("idle-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(1)),
             reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
@@ -3032,7 +3032,7 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
         [DriverReceiveAction::Pending],
     ));
     let endpoint = driver_test_endpoint(transport, relay);
-    endpoint.set_tracker("shutdown-tracker".to_owned());
+    endpoint.set_tracker(uuid::Uuid::from_u128(2));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         honk_datapath::ScopeId::HOST,
@@ -3089,7 +3089,7 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("shutdown-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(2)),
             reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
@@ -3233,7 +3233,7 @@ async fn udp_endpoint_driver_receive_and_reply_errors_clean_up() {
         };
         let endpoint = driver_test_endpoint(transport, relay);
         endpoint.record_pending_reply_peer(relay);
-        endpoint.set_tracker("receive-tracker".to_owned());
+        endpoint.set_tracker(uuid::Uuid::from_u128(3));
         let queue_rx = lease.take_queue_receiver().unwrap();
         let mut driver = pool.spawn_driver(
             honk_datapath::ScopeId::HOST,
@@ -3262,7 +3262,7 @@ async fn udp_endpoint_driver_receive_and_reply_errors_clean_up() {
                 dst,
                 owner: UdpFlowOwner::new(0, None).unwrap(),
                 generation: 1,
-                conn_id: Some("receive-tracker".to_owned()),
+                conn_id: Some(uuid::Uuid::from_u128(3)),
                 reason: RemovalReason::RawDnsEndpointRetired,
             })
         );
@@ -3329,7 +3329,7 @@ async fn udp_endpoint_receive_failure_cancels_blocked_steady_send_and_releases_p
         ))],
     ));
     let endpoint = driver_test_endpoint(Arc::clone(&transport), relay);
-    endpoint.set_tracker("blocked-receive-tracker".to_owned());
+    endpoint.set_tracker(uuid::Uuid::from_u128(4));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         honk_datapath::ScopeId::HOST,
@@ -3360,7 +3360,7 @@ async fn udp_endpoint_receive_failure_cancels_blocked_steady_send_and_releases_p
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("blocked-receive-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(4)),
             reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
@@ -3557,7 +3557,7 @@ async fn udp_endpoint_worker_failure_removes_tracker_once() {
         [DriverSendAction::Error],
     ));
     let endpoint = driver_test_endpoint(transport, relay);
-    endpoint.set_tracker("worker-tracker".to_owned());
+    endpoint.set_tracker(uuid::Uuid::from_u128(5));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         honk_datapath::ScopeId::HOST,
@@ -3588,7 +3588,7 @@ async fn udp_endpoint_worker_failure_removes_tracker_once() {
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("worker-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(5)),
             reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
@@ -3629,7 +3629,7 @@ async fn udp_endpoint_driver_panic_releases_all_resources_exactly_once() {
         [DriverSendAction::Panic],
     ));
     let endpoint = driver_test_endpoint(transport, relay);
-    endpoint.set_tracker("panic-tracker".to_owned());
+    endpoint.set_tracker(uuid::Uuid::from_u128(6));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         honk_datapath::ScopeId::HOST,
@@ -3661,7 +3661,7 @@ async fn udp_endpoint_driver_panic_releases_all_resources_exactly_once() {
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("panic-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(6)),
             reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
@@ -3709,7 +3709,7 @@ async fn udp_endpoint_driver_abort_releases_ready_mapping_and_allows_reuse() {
     );
     let transport = Arc::new(ScriptedPacketTransport::new(relay, [DriverSendAction::Ok]));
     let endpoint = driver_test_endpoint(transport, relay);
-    endpoint.set_tracker("abort-tracker".to_owned());
+    endpoint.set_tracker(uuid::Uuid::from_u128(7));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         honk_datapath::ScopeId::HOST,
@@ -3742,7 +3742,7 @@ async fn udp_endpoint_driver_abort_releases_ready_mapping_and_allows_reuse() {
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("abort-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(7)),
             reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
@@ -3803,7 +3803,7 @@ async fn udp_endpoint_worker_old_generation_cannot_remove_replacement() {
         [DriverSendAction::WaitThenError(Arc::clone(&release))],
     ));
     let old_endpoint = driver_test_endpoint(old_transport.clone(), relay);
-    old_endpoint.set_tracker("old-tracker".to_owned());
+    old_endpoint.set_tracker(uuid::Uuid::from_u128(8));
     let old_queue_rx = old_lease.take_queue_receiver().unwrap();
     let mut old_driver = pool.spawn_driver(
         honk_datapath::ScopeId::HOST,
@@ -3833,7 +3833,7 @@ async fn udp_endpoint_worker_old_generation_cannot_remove_replacement() {
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("old-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(8)),
             reason: RemovalReason::RawDnsEndpointRetired,
         }
     );
@@ -4097,7 +4097,7 @@ async fn udp_endpoint_node_death_before_driver_start_sends_nothing() {
     let transport = Arc::new(ScriptedPacketTransport::new(relay, [DriverSendAction::Ok]));
     let proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport> = transport.clone();
     let endpoint = Arc::new(UdpEndpoint::new(proxy_socket, relay, DEAD_NODE_ID));
-    endpoint.set_tracker("dead-before-start".to_owned());
+    endpoint.set_tracker(uuid::Uuid::from_u128(9));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         honk_datapath::ScopeId::HOST,
@@ -4125,7 +4125,7 @@ async fn udp_endpoint_node_death_before_driver_start_sends_nothing() {
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("dead-before-start".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(9)),
             reason: RemovalReason::RawDnsEndpointRetired,
         }
     );
@@ -4249,7 +4249,7 @@ async fn udp_endpoint_node_and_janitor_cleanup_notify_tracker_once() {
         relay,
         DEAD_NODE_ID,
     );
-    node_endpoint.set_tracker("node-tracker".to_owned());
+    node_endpoint.set_tracker(uuid::Uuid::from_u128(10));
 
     pool.remove_by_node(DEAD_NODE_ID);
     assert_eq!(
@@ -4261,7 +4261,7 @@ async fn udp_endpoint_node_and_janitor_cleanup_notify_tracker_once() {
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("node-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(10)),
             reason: RemovalReason::RawDnsEndpointRetired,
         }
     );
@@ -4275,7 +4275,7 @@ async fn udp_endpoint_node_and_janitor_cleanup_notify_tracker_once() {
         relay,
         JANITOR_NODE_ID,
     );
-    janitor_endpoint.set_tracker("janitor-tracker".to_owned());
+    janitor_endpoint.set_tracker(uuid::Uuid::from_u128(11));
     janitor_endpoint.release();
     janitor_endpoint
         .expires_at
@@ -4291,7 +4291,7 @@ async fn udp_endpoint_node_and_janitor_cleanup_notify_tracker_once() {
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 2,
-            conn_id: Some("janitor-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(11)),
             reason: RemovalReason::RawDnsEndpointRetired,
         }
     );

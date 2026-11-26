@@ -146,7 +146,7 @@ pub(super) struct SourceOwner {
     node_id: uuid::Uuid,
     health_family: honk_outbound::alive::IpVersion,
     evidence: Option<Arc<UdpTrafficEvidence>>,
-    node_tracker: OutboundTracker,
+    node_tracker: Arc<OutboundTracker>,
     stats: Arc<StatsManager>,
     _source_permit: OwnedSemaphorePermit,
     #[cfg(test)]
@@ -179,7 +179,7 @@ impl SourceOwner {
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
         node_id: uuid::Uuid,
         health_family: honk_outbound::alive::IpVersion,
-        node_tracker: OutboundTracker,
+        node_tracker: Arc<OutboundTracker>,
         stats: Arc<StatsManager>,
         source_permit: OwnedSemaphorePermit,
         packet_source: Option<SourceWork>,
@@ -507,7 +507,7 @@ pub(super) struct SourceEndpoint {
     target: SocketAddr,
     target_domain: Option<Box<str>>,
     reply_socket: Arc<ReplySocket>,
-    flow_tracker: OutboundTracker,
+    flow_tracker: Arc<OutboundTracker>,
     binding: Mutex<SourceEndpointBinding>,
 }
 
@@ -527,7 +527,7 @@ impl SourceEndpoint {
         target: SocketAddr,
         target_domain: Option<&str>,
         reply_socket: Arc<ReplySocket>,
-        flow_tracker: OutboundTracker,
+        flow_tracker: Arc<OutboundTracker>,
     ) -> Self {
         let view = attachment.owner.next_view.fetch_add(1, Ordering::Relaxed);
         Self {

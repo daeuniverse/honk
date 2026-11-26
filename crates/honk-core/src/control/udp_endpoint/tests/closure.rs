@@ -13,9 +13,9 @@ pub(in crate::control::udp_endpoint) fn tracked_entry(
     dst: SocketAddr,
 ) -> ConnectionEntry {
     ConnectionEntry {
-        id: id.to_owned(),
-        source: client.to_string(),
-        destination: dst.to_string(),
+        id: id.parse().unwrap(),
+        source: client,
+        destination: dst,
         proxy: "direct".into(),
         #[cfg(feature = "native-api")]
         routed_outbound: None,
@@ -28,7 +28,7 @@ pub(in crate::control::udp_endpoint) fn tracked_entry(
         download: Arc::new(AtomicU64::new(0)),
         start_time: Instant::now(),
         domain: None,
-        network: "udp".into(),
+        network: "udp",
         process: None,
         process_path: None,
     }
@@ -132,7 +132,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                     &endpoint,
                     &tracker,
                     vec!["captured-parent".into()],
-                    || tracked_entry("owned-udp", source, destination),
+                    || tracked_entry("00000000-0000-0000-0000-00000000000a", source, destination),
                 )
                 .unwrap()
                 .unwrap();
@@ -165,7 +165,8 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                 pool.remove(honk_datapath::ScopeId::HOST, source, destination);
             }
             let pending = tracker.start_close(selected);
-            let mut duplicate = Box::pin(tracker.close_id(&id));
+            let wire_id = id.to_string();
+            let mut duplicate = Box::pin(tracker.close_id(&wire_id));
             assert!(futures::poll!(&mut duplicate).is_pending());
             let mut bulk = Box::pin(tracker.close_matching(Some("udp"), None, 1000));
             assert!(futures::poll!(&mut bulk).is_pending());
@@ -184,7 +185,10 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                 assert_eq!(pending.await, CloseOutcome::Failed);
                 assert_eq!(duplicate.await, CloseOutcome::Failed);
                 assert!(bulk.await.unwrap().failed);
-                assert_eq!(tracker.close_id(&id).await, CloseOutcome::Failed);
+                assert_eq!(
+                    tracker.close_id(&id.to_string()).await,
+                    CloseOutcome::Failed
+                );
                 assert!(failures.recv().await.is_some());
                 assert!(matches!(
                     pool.endpoints
@@ -273,7 +277,7 @@ async fn udp_close_without_exact_pool_owner_completes_all_claims() {
             let source = "127.0.0.1:10001".parse().unwrap();
             let destination = "127.0.0.1:10002".parse().unwrap();
             tracker.register_owned(
-                tracked_entry("missing-owner", source, destination),
+                tracked_entry("00000000-0000-0000-0000-00000000000c", source, destination),
                 ConnectionOwner {
                     signal: Arc::clone(&signal),
                     action: CloseAction::Udp {
@@ -302,7 +306,9 @@ async fn udp_close_without_exact_pool_owner_completes_all_claims() {
             );
             assert_eq!(first.wait().await, CloseOutcome::Failed);
             assert_eq!(
-                tracker.close_id("missing-owner").await,
+                tracker
+                    .close_id("00000000-0000-0000-0000-00000000000c")
+                    .await,
                 CloseOutcome::Failed
             );
             assert!(
@@ -314,12 +320,14 @@ async fn udp_close_without_exact_pool_owner_completes_all_claims() {
             );
             signal.finish(true);
             assert_eq!(
-                tracker.close_id("missing-owner").await,
+                tracker
+                    .close_id("00000000-0000-0000-0000-00000000000c")
+                    .await,
                 CloseOutcome::Failed
             );
             let replacement = CloseSignal::new();
             tracker.register_owned(
-                tracked_entry("missing-owner", source, destination),
+                tracked_entry("00000000-0000-0000-0000-00000000000c", source, destination),
                 ConnectionOwner {
                     signal: Arc::clone(&replacement),
                     action: CloseAction::Tcp,
@@ -329,10 +337,24 @@ async fn udp_close_without_exact_pool_owner_completes_all_claims() {
             assert_eq!(tracker.close_selected(stale).await, CloseOutcome::Gone);
             let mut cancelled = Box::pin(replacement.cancelled());
             assert!(futures::poll!(&mut cancelled).is_pending());
-            tracker.remove("missing-owner");
-            assert_eq!(tracker.close_id("missing-owner").await, CloseOutcome::Gone);
-            tracker.register(tracked_entry("unowned", source, destination));
-            assert_eq!(tracker.close_id("unowned").await, CloseOutcome::NotClosable);
+            tracker.remove(&uuid::uuid!("00000000-0000-0000-0000-00000000000c"));
+            assert_eq!(
+                tracker
+                    .close_id("00000000-0000-0000-0000-00000000000c")
+                    .await,
+                CloseOutcome::Gone
+            );
+            tracker.register(tracked_entry(
+                "00000000-0000-0000-0000-00000000000b",
+                source,
+                destination,
+            ));
+            assert_eq!(
+                tracker
+                    .close_id("00000000-0000-0000-0000-00000000000b")
+                    .await,
+                CloseOutcome::NotClosable
+            );
             drop(retained_pool);
         }
     })
@@ -384,7 +406,7 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
             &endpoint,
             &tracker,
             Vec::new(),
-            || tracked_entry("acknowledged", source, destination),
+            || tracked_entry("00000000-0000-0000-0000-00000000000d", source, destination),
         )
         .unwrap();
         let selected = tracker
@@ -435,7 +457,7 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
             )
             .unwrap();
         assert_eq!(outcomes[0], crate::ebpf::RetireOutcome::ConnRetired);
-        tracker.remove("acknowledged");
+        tracker.remove(&uuid::uuid!("00000000-0000-0000-0000-00000000000d"));
         assert!(pool.complete_removal(
             removal.scope,
             source,
@@ -460,7 +482,12 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
                 .await,
             CloseOutcome::Closed
         );
-        assert_eq!(tracker.close_id("acknowledged").await, CloseOutcome::Gone);
+        assert_eq!(
+            tracker
+                .close_id("00000000-0000-0000-0000-00000000000d")
+                .await,
+            CloseOutcome::Gone
+        );
     })
     .await
     .unwrap();

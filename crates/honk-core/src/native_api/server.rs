@@ -48,7 +48,7 @@ pub(super) async fn sample_traffic(state: Arc<NativeState>, mut stop: watch::Rec
                     Some(TrafficRates { window_seconds: elapsed.as_secs_f64(), upload_bytes_per_second: rate(up), download_bytes_per_second: rate(down) })
                 });
                 let (mut tcp, mut udp) = (0u64, 0u64);
-                state.tracker.visit(|entry| match entry.network.as_str() { "tcp" => tcp += 1, "udp" => udp += 1, _ => {} });
+                state.tracker.visit(|entry| match entry.network { "tcp" => tcp += 1, "udp" => udp += 1, _ => {} });
                 *state.sample.write() = Some(TrafficSummary {
                     scope: "visible", observed_by: "userspace", counter_since: Some(timestamp(state.stats.counter_since())), sampled_at: Some(timestamp(SystemTime::now())),
                     connections: TrafficConnections { tcp: Some(tcp), udp: Some(udp), total: Some(tcp + udp) },

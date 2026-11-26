@@ -362,7 +362,7 @@ pub(in crate::control) struct TcpFlowGuard {
     pin: FlowPin,
     retirement: Arc<crate::control::retirement_worker::RetirementPort>,
     tracker: Arc<ConnectionTracker>,
-    tracker_id: Option<String>,
+    tracker_id: Option<uuid::Uuid>,
     ack: RetireAck,
 }
 
@@ -415,7 +415,7 @@ impl TcpFlowGuard {
         &mut self,
         make_entry: impl FnOnce() -> crate::connection_tracker::ConnectionEntry,
         owner: crate::connection_tracker::ConnectionOwner,
-    ) -> Option<String> {
+    ) -> Option<uuid::Uuid> {
         assert!(
             self.tracker_id.is_none(),
             "TCP flow tracker attached more than once"
@@ -424,7 +424,7 @@ impl TcpFlowGuard {
             return None;
         }
         let id = self.tracker.register_owned(make_entry(), owner);
-        self.tracker_id = Some(id.clone());
+        self.tracker_id = Some(id);
         Some(id)
     }
 
@@ -489,7 +489,7 @@ impl ControlPlaneHandle {
     /// delivery behind the blocking pool used to resolve it.
     pub(super) fn spawn_process_path_enrichment(
         &self,
-        conn_id: String,
+        conn_id: uuid::Uuid,
         handoff: Option<&HandoffResult>,
     ) {
         let Some(handoff) = handoff.filter(|handoff| handoff.pid != 0).cloned() else {
