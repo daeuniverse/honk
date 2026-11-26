@@ -160,7 +160,7 @@ fn fact_readiness_failure_joins_preserve_full_decisions() {
     let mut full = golden::connection();
     full.dst_ip = "192.0.2.10".parse().unwrap();
     full.src_ip = "198.51.100.10".parse().unwrap();
-    full.mac = Some("02:00:00:00:00:0a".into());
+    full.mac = Some([2, 0, 0, 0, 0, 10]);
 
     let mut scalar_miss = full.clone();
     scalar_miss.protocol = "udp";
@@ -169,15 +169,15 @@ fn fact_readiness_failure_joins_preserve_full_decisions() {
     let mut source_miss = full.clone();
     source_miss.src_ip = "198.51.100.11".parse().unwrap();
     let mut mac_miss = full.clone();
-    mac_miss.mac = Some("02:00:00:00:00:0b".into());
+    mac_miss.mac = Some([2, 0, 0, 0, 0, 11]);
     let mut ipv6 = golden::connection();
     ipv6.dst_ip = "2001:db8::10".parse().unwrap();
     ipv6.src_ip = "2001:db8::20".parse().unwrap();
-    ipv6.mac = full.mac.clone();
+    ipv6.mac = full.mac;
     let mut absent_mac = full.clone();
     absent_mac.mac = None;
     let mut zero_mac = full.clone();
-    zero_mac.mac = Some("00:00:00:00:00:00".into());
+    zero_mac.mac = Some([0, 0, 0, 0, 0, 0]);
 
     let positive = decision(2, 0xa01, true, 1, 1);
     assert_route(
@@ -287,7 +287,7 @@ fn fact_readiness_independent_bitmap_states() {
                         }
                         .parse()
                         .unwrap();
-                        connection.mac = Some(format!("02:00:00:00:00:{mac:02x}"));
+                        connection.mac = Some([2, 0, 0, 0, 0, mac as u8]);
                         let common = destination_bits & source_bits & mac_bits;
                         let expected = if tcp && !ipv6 && common & 1 != 0 {
                             decision(0, 0xa00, false, 1, 0)

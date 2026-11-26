@@ -188,21 +188,8 @@ impl HandoffResult {
         .flatten()
     }
 
-    /// Convert the eBPF MAC address to canonical lower-case colon form.
-    pub(super) fn mac_address(&self) -> Option<String> {
-        use std::fmt::Write as _;
-
-        if self.mac == [0u8; 6] {
-            return None;
-        }
-        let mut mac = String::with_capacity(17);
-        write!(
-            mac,
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
-        )
-        .expect("writing to a String cannot fail");
-        Some(mac)
+    pub(super) fn mac_address(&self) -> Option<[u8; 6]> {
+        (self.mac != [0; 6]).then_some(self.mac)
     }
 }
 

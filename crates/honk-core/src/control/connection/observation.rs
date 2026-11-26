@@ -318,7 +318,7 @@ impl ConnectionObservation {
                         domain_source: None,
                         pid: (handoff.pid != 0).then_some(handoff.pid),
                         process_path: (),
-                        src_mac: handoff.mac_address(),
+                        src_mac: handoff.mac_address().map(crate::routing::mac_string),
                         ingress: (),
                         domain_rule_ids: (),
                         dscp: (record.network == Network::Udp || handoff.dscp <= 63)
@@ -839,7 +839,9 @@ fn update_input(
             .and_then(|handoff| handoff.process_name())
             .as_deref(),
         handoff.and_then(|handoff| (handoff.pid != 0).then_some(handoff.pid)),
-        handoff.and_then(|handoff| handoff.mac_address()),
+        handoff
+            .and_then(HandoffResult::mac_address)
+            .map(crate::routing::mac_string),
         handoff.map(|handoff| handoff.dscp),
         handoff.map(|handoff| handoff.mark),
     );

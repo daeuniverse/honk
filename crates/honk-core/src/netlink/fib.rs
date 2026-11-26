@@ -53,6 +53,7 @@ pub(crate) struct LogicalLink {
 }
 #[derive(Clone, Copy)]
 struct Neighbor {
+    dump_order: u16,
     index: u32,
     ip: IpAddr,
     mac: [u8; 6],
@@ -164,6 +165,22 @@ impl Fib {
     pub(crate) fn state(&self) -> FibState {
         self.state
     }
+    fn sort_neighbors(&mut self) {
+        // The first usable row in dump order wins for duplicate keys. Sorting in place
+        // needs no heap scratch beyond the already funded Neighbor array.
+        self.neighbors
+            .sort_unstable_by_key(|n| (n.index, n.ip, !n.usable, n.dump_order));
+    }
+
+    fn neighbor(&self, index: u32, ip: IpAddr) -> Option<&Neighbor> {
+        let at = self
+            .neighbors
+            .partition_point(|n| (n.index, n.ip) < (index, ip));
+        self.neighbors
+            .get(at)
+            .filter(|n| n.index == index && n.ip == ip && n.usable)
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -292,6 +309,7 @@ impl Fib {
                 return self.fail(error);
             }
             if self.generation == generation {
+                self.sort_neighbors();
                 self.addresses.sort_unstable();
                 if self.addresses != self.previous_addresses {
                     self.invalidate_address()?;
@@ -394,13 +412,7 @@ impl Fib {
             return Ok(Resolution::Drop);
         };
         let next_hop = result.gateway.unwrap_or(query.destination);
-        let neighbor = self
-            .neighbors
-            .iter()
-            .find(|neighbor| {
-                neighbor.index == result.ifindex && neighbor.ip == next_hop && neighbor.usable
-            })
-            .copied();
+        let neighbor = self.neighbor(result.ifindex, next_hop);
         let route = Route {
             generation: self.generation,
             ifindex: link.ifindex,
@@ -761,7 +773,9 @@ impl Fib {
                         }
                     }
                     RTM_NEWNEIGH if exchange.dump && kind == RTM_GETNEIGH => {
-                        if let Some(neighbor) = parse_neighbor(payload)? {
+                        if let Some(neighbor) =
+                            parse_neighbor(payload, self.neighbors.len() as u16)?
+                        {
                             if self.neighbors.len() == MAX_NEIGHBORS {
                                 return Err(invalid("FIB neighbor bound exceeded"));
                             }
@@ -1251,7 +1265,7 @@ fn logical_link(links: &[Link], index: u32) -> Option<LogicalLink> {
     })
 }
 
-fn parse_neighbor(bytes: &[u8]) -> io::Result<Option<Neighbor>> {
+fn parse_neighbor(bytes: &[u8], dump_order: u16) -> io::Result<Option<Neighbor>> {
     if bytes.len() < 12 {
         return Err(invalid("short neighbor reply"));
     }
@@ -1272,6 +1286,7 @@ fn parse_neighbor(bytes: &[u8]) -> io::Result<Option<Neighbor>> {
     // STALE must pass through NTF_USE once so native ARP/ND enters DELAY/PROBE;
     // userspace TX itself never updates the kernel neighbor state machine.
     Ok(ip.map(|ip| Neighbor {
+        dump_order,
         index: u32::from_ne_bytes(bytes[4..8].try_into().unwrap()),
         ip,
         mac,
@@ -1579,6 +1594,31 @@ mod tests {
         body
     }
 
+    #[test]
+    fn duplicate_neighbors_keep_first_usable_by_interface_and_dump_order() {
+        let mut fib = ready_fib();
+        let ip = "192.0.2.1".parse().unwrap();
+        for (index, usable, mac) in [
+            (8, false, 1),
+            (9, true, 2),
+            (8, true, 3),
+            (8, true, 4),
+            (10, false, 5),
+        ] {
+            fib.neighbors.push(Neighbor {
+                index,
+                ip,
+                mac: [mac; 6],
+                usable,
+                dump_order: fib.neighbors.len() as u16,
+            });
+        }
+        fib.sort_neighbors();
+        assert_eq!(fib.neighbor(8, ip).unwrap().mac, [3; 6]);
+        assert_eq!(fib.neighbor(9, ip).unwrap().mac, [2; 6]);
+        assert!(fib.neighbor(10, ip).is_none());
+    }
+
     fn forwarding_fib(ipv6: bool) -> Fib {
         let mut fib = ready_fib();
         fib.links
@@ -1589,6 +1629,7 @@ mod tests {
             preferred: true,
         });
         fib.neighbors.push(Neighbor {
+            dump_order: 0,
             index: 9,
             ip: query(&fib, ipv6).destination,
             mac: [4; 6],

@@ -334,10 +334,6 @@ mod linux {
         )?;
         let mut waiting = VecDeque::<Waiting>::with_capacity(64);
         let mut pending = VecDeque::<Pending>::with_capacity(64);
-        let macs = config
-            .devices
-            .each_ref()
-            .map(|device| device.peer_mac.map(|byte| format!("{byte:02x}")).join(":"));
         let mut transmitted = 0u64;
         let mut dropped = 0u64;
         let mut errors = 0u64;
@@ -386,7 +382,7 @@ mod linux {
                 let decision = core.decide(
                     &authority.read_policy().await,
                     work.packet,
-                    Some(&macs[work.owner]),
+                    Some(config.devices[work.owner].peer_mac),
                     now,
                 )?;
                 match decision {

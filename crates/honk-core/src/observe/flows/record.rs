@@ -159,7 +159,7 @@ impl From<&crate::routing::ConnectionInfo> for RouteInput {
             dst_port: input.dst_port,
             domain: input.domain.clone(),
             pname: input.process_name.clone(),
-            src_mac: input.mac.clone(),
+            src_mac: input.mac.map(crate::routing::mac_string),
             dscp: input.dscp,
             mark: (),
             ingress: None,

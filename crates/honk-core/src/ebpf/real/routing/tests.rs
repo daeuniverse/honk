@@ -36,9 +36,7 @@ fn input(connection: &ConnectionInfo) -> RoutingInput {
         input.pname_len = name.len() as u32;
     }
     if let Some(mac) = &connection.mac {
-        for (index, byte) in mac.split(':').enumerate() {
-            input.mac[10 + index] = u8::from_str_radix(byte, 16).unwrap();
-        }
+        input.mac[10..].copy_from_slice(mac);
         input.flags = honk_ebpf_common::ROUTING_INPUT_MAC_PRESENT;
     }
     input
@@ -217,12 +215,12 @@ fn lazy_fact_cache_short_circuit_reuse_and_alternating_inputs() {
     a.domain = Some("a.test".into());
     a.dst_ip = "192.0.2.10".parse().unwrap();
     a.src_ip = "198.51.100.10".parse().unwrap();
-    a.mac = Some("02:00:00:00:00:0a".into());
+    a.mac = Some([0x2, 0x0, 0x0, 0x0, 0x0, 0xa]);
     let mut b = a.clone();
     b.domain = Some("b.test".into());
     b.dst_ip = "192.0.2.20".parse().unwrap();
     b.src_ip = "198.51.100.20".parse().unwrap();
-    b.mac = Some("02:00:00:00:00:14".into());
+    b.mac = Some([0x2, 0x0, 0x0, 0x0, 0x0, 0x14]);
     let learned = [
         domain_entry(&router, &a, "a.test"),
         domain_entry(&router, &b, "b.test"),
@@ -348,7 +346,7 @@ fn lazy_fact_cache_ipv6_host_overlap_and_default_prefix() {
     let mut host = golden::connection();
     host.dst_ip = "2001:db8:1::42".parse().unwrap();
     host.src_ip = "2001:db8:2::7".parse().unwrap();
-    host.mac = Some("02:00:00:00:00:66".into());
+    host.mac = Some([0x2, 0x0, 0x0, 0x0, 0x0, 0x66]);
     assert_route(
         &mut backend,
         "IPv6 /128 lookup reused by overlapping /48",
@@ -419,7 +417,7 @@ fn lazy_fact_cache_null_zero_mac_presence_and_invalid_family() {
     let mut connection = golden::connection();
     connection.dst_ip = "192.0.2.30".parse().unwrap();
     connection.src_ip = "198.51.100.30".parse().unwrap();
-    connection.mac = Some("02:00:00:00:00:1e".into());
+    connection.mac = Some([0x2, 0x0, 0x0, 0x0, 0x0, 0x1e]);
     let mut backend =
         RealEbpfBackend::load_routing_test_fixture(&object(), DaeParam::default()).unwrap();
     for (label, plan) in [
@@ -467,7 +465,7 @@ fn lazy_fact_cache_null_zero_mac_presence_and_invalid_family() {
         .set_datapath_flags(honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT)
         .unwrap();
     let mut zero_mac = golden::connection();
-    zero_mac.mac = Some("00:00:00:00:00:00".into());
+    zero_mac.mac = Some([0x0, 0x0, 0x0, 0x0, 0x0, 0x0]);
     let absent_mac = golden::connection();
     for (label, connection, expected) in [
         (
@@ -744,7 +742,7 @@ fn predicate_bits_and_capacity_limits() {
             } else {
                 connection.dst_ip = format!("192.0.2.{index}").parse().unwrap();
                 connection.src_ip = format!("198.51.100.{index}").parse().unwrap();
-                connection.mac = Some(format!("02:00:00:00:00:{index:02x}"));
+                connection.mac = Some([2, 0, 0, 0, 0, index as u8]);
             }
             preserved_input = input(&connection);
             assert_route(

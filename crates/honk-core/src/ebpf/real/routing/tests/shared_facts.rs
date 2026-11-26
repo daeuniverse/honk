@@ -99,7 +99,7 @@ fn rules_sharing_one_ip_list_exceed_the_per_category_fact_capacity() {
 fn rules_sharing_one_mac_list_exceed_the_per_category_fact_capacity() {
     publish_and_check(
         json!({"mac": ["02:00:00:00:00:01"]}),
-        |c| c.mac = Some("02:00:00:00:00:01".into()),
-        |c| c.mac = Some("02:00:00:00:00:02".into()),
+        |c| c.mac = Some([2, 0, 0, 0, 0, 1]),
+        |c| c.mac = Some([2, 0, 0, 0, 0, 2]),
     );
 }

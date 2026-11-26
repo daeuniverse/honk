@@ -250,7 +250,7 @@ fn sample() -> ConnectionInfo {
         src_port: 12345,
         protocol: "tcp",
         process_name: None,
-        mac: Some("02:00:00:00:00:01".into()),
+        mac: Some([0x2, 0x0, 0x0, 0x0, 0x0, 0x1]),
         dscp: Some(4),
     }
 }
@@ -281,9 +281,7 @@ fn input(connection: &ConnectionInfo, allow: bool) -> RoutingInput {
         input.pname_len = name.len() as u32;
     }
     if let Some(mac) = &connection.mac {
-        for (byte, hex) in input.mac[10..].iter_mut().zip(mac.split(':')) {
-            *byte = u8::from_str_radix(hex, 16).unwrap();
-        }
+        input.mac[10..].copy_from_slice(mac);
         input.flags |= ROUTING_INPUT_MAC_PRESENT;
     }
     input
@@ -462,7 +460,7 @@ fn gateway_full_negation_and_inherited_geoip_prefixes() {
         |c: &mut ConnectionInfo| c.protocol = "udp",
         |c: &mut ConnectionInfo| c.dst_ip = "2001:db8::9".parse().unwrap(),
         |c: &mut ConnectionInfo| c.dscp = Some(8),
-        |c: &mut ConnectionInfo| c.mac = Some("02:00:00:00:00:02".into()),
+        |c: &mut ConnectionInfo| c.mac = Some([0x2, 0x0, 0x0, 0x0, 0x0, 0x2]),
     ];
     for change in changes {
         let mut connection = sample();

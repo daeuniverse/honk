@@ -38,7 +38,7 @@ pub(in crate::control) struct RoutingDecision {
 
 pub(in crate::control) struct PacketRoutingSnapshot {
     pub(in crate::control) source: Option<honk_netstack::SourceContext>,
-    pub(in crate::control) source_mac: Option<String>,
+    pub(in crate::control) source_mac: Option<[u8; 6]>,
     pub(in crate::control) process: Option<crate::control::netstack::ProcessMeta>,
     pub(in crate::control) mode: super::handoff::ModeDecision,
     pub(in crate::control) mode_state: Option<crate::mode::ModeState>,
@@ -315,9 +315,7 @@ impl ControlPlaneHandle {
         input.process_name = process.and_then(|process| process.name());
         #[cfg(target_os = "linux")]
         {
-            input.mac = packet_source
-                .and_then(crate::control::netstack::SourceWork::source_mac)
-                .map(crate::xdp::routing_input::mac_string);
+            input.mac = packet_source.and_then(crate::control::netstack::SourceWork::source_mac);
         }
         let (decision, facts) = {
             let router = self.router.read().await;
@@ -402,7 +400,7 @@ impl ControlPlaneHandle {
             return Ok(());
         }
         let mut conn_info = conn_info.clone();
-        conn_info.mac.clone_from(&snapshot.source_mac);
+        conn_info.mac = snapshot.source_mac;
         conn_info.process_name = snapshot.process.and_then(|process| process.name());
         snapshot.decision = self
             .prepare_routing(
@@ -751,7 +749,7 @@ mod packet_mac_tests {
                 .await
                 .unwrap();
             assert_eq!(snapshot.decision.outbound, "direct");
-            assert_eq!(snapshot.source_mac.as_deref(), Some("02:02:02:02:02:02"));
+            assert_eq!(snapshot.source_mac, Some([2; 6]));
             let input = build_connection_info(
                 Some("example.test".into()),
                 destination,

@@ -1341,8 +1341,7 @@ impl Runtime {
                         let Some(count) = l3_segments(segments, decoded, &mut l3) else { batch.take(); return; };
                         let Ok(view) = PacketView::new(&l3[..count]) else { batch.take(); return; };
                         if let Some(core) = core && !retained_endpoint(endpoints, scope, view) {
-                            let mac = mac_text(decoded.source_mac);
-                            let cached = if queue.id != 0 { Ok(CachedDecision::Cold) } else { core.forward_cached(ingress, view, Some(std::str::from_utf8(&mac).unwrap()), now, |route, output| {
+                            let cached = if queue.id != 0 { Ok(CachedDecision::Cold) } else { core.forward_cached(ingress, view, Some(decoded.source_mac), now, |route, output| {
                                 let header = route.ethernet_header(decoded.ether_type == 0x86dd).map_err(io::Error::other)?;
                                 if !selected_egress(realms, route) { return Ok(None); }
                                 if route.l2.physical_ifindex == ifindex {
@@ -1777,13 +1776,7 @@ impl Runtime {
                 }
                 continue;
             }
-            let mac = mac_text(work.mac);
-            let decision = core.decide(
-                read,
-                work.packet,
-                Some(std::str::from_utf8(&mac).unwrap()),
-                now,
-            )?;
+            let decision = core.decide(read, work.packet, Some(work.mac), now)?;
             current_topology(
                 &mut self.topology,
                 self.gateway.as_deref(),
@@ -2500,16 +2493,6 @@ fn fill_output(output: &mut [&mut [u8]], header: &[u8], packet: &[u8]) -> io::Re
     }
     Ok(())
 }
-fn mac_text(mac: [u8; 6]) -> [u8; 17] {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut bytes = [b':'; 17];
-    for (index, byte) in mac.into_iter().enumerate() {
-        bytes[index * 3] = HEX[(byte >> 4) as usize];
-        bytes[index * 3 + 1] = HEX[(byte & 15) as usize];
-    }
-    bytes
-}
-
 fn check_metadata(
     checked: &mut Instant,
     now: Instant,

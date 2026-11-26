@@ -120,7 +120,7 @@ fn publication_failure_recovery_and_frozen_root() {
     let mut active_hit_connection = golden::connection();
     active_hit_connection.dst_ip = "192.0.2.255".parse().unwrap();
     active_hit_connection.src_ip = "198.51.100.255".parse().unwrap();
-    active_hit_connection.mac = Some("02:00:00:00:00:ff".into());
+    active_hit_connection.mac = Some([0x2, 0x0, 0x0, 0x0, 0x0, 0xff]);
     let active_hit = input(&active_hit_connection);
     let mut active_miss_connection = active_hit_connection.clone();
     active_miss_connection.src_ip = "203.0.113.1".parse().unwrap();

@@ -382,7 +382,7 @@ fn make_conn(process_name: Option<&str>, mac: Option<&str>) -> ConnectionInfo {
         src_port: 12345,
         protocol: "tcp",
         process_name: process_name.map(|s| s.to_string()),
-        mac: mac.map(|s| s.to_string()),
+        mac: mac.and_then(normalize_mac_bytes),
         dscp: None,
     }
 }
@@ -487,26 +487,28 @@ fn test_mac_and_process_name_combined() {
 }
 
 #[test]
-fn test_normalize_mac() {
+fn test_normalize_mac_bytes() {
     assert_eq!(
-        normalize_mac("aa:bb:cc:dd:ee:ff"),
-        Some("aa:bb:cc:dd:ee:ff".into())
+        normalize_mac_bytes("aa:bb:cc:dd:ee:ff"),
+        Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
     );
     assert_eq!(
-        normalize_mac("AA-BB-CC-DD-EE-FF"),
-        Some("aa:bb:cc:dd:ee:ff".into())
+        normalize_mac_bytes("AA-BB-CC-DD-EE-FF"),
+        Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
     );
     assert_eq!(
-        normalize_mac("aabb.ccdd.eeff"),
-        Some("aa:bb:cc:dd:ee:ff".into())
+        normalize_mac_bytes("aabb.ccdd.eeff"),
+        Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
     );
     assert_eq!(
-        normalize_mac("aabbccddeeff"),
-        Some("aa:bb:cc:dd:ee:ff".into())
+        normalize_mac_bytes("aabbccddeeff"),
+        Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
     );
-    assert_eq!(normalize_mac("aa:bb:cc:dd:ee"), None);
-    assert_eq!(normalize_mac("aa:bb:cc:dd:ee:gg"), None);
-    assert_eq!(normalize_mac(""), None);
+    assert_eq!(normalize_mac_bytes("aa:bb:cc:dd:ee"), None);
+    assert_eq!(normalize_mac_bytes("aa:bb:cc:dd:ee:gg"), None);
+    assert_eq!(normalize_mac_bytes(""), None);
+    assert_eq!(normalize_mac_bytes("00:00:00:00:00:00"), Some([0; 6]));
+    assert_eq!(normalize_mac_bytes("é0123456789"), None);
 }
 
 #[test]
@@ -1513,9 +1515,9 @@ mod negation {
     #[test]
     fn test_negated_mac() {
         let mut hit = conn();
-        hit.mac = Some("aa:bb:cc:dd:ee:ff".into());
+        hit.mac = Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
         let mut veto = conn();
-        veto.mac = Some("00:11:22:33:44:55".into());
+        veto.mac = Some([0x0, 0x11, 0x22, 0x33, 0x44, 0x55]);
         check(not(&[("mac", "00:11:22:33:44:55")]), &hit, &veto);
     }
 

@@ -141,7 +141,7 @@ enum Disposition {
 fn route_action<'a>(
     router: &'a crate::routing::Router,
     query: RouteQuery,
-    source_mac: Option<&str>,
+    source_mac: Option<[u8; 6]>,
     bitmap: Option<&DomainRouting>,
 ) -> Option<&'a crate::routing::RouteAction> {
     let protocol = match query.protocol {
@@ -303,7 +303,7 @@ impl RoutingAuthority {
         &self,
         read: &PolicyRead<'_>,
         query: RouteQuery,
-        source_mac: Option<&str>,
+        source_mac: Option<[u8; 6]>,
         bitmap: Option<&DomainRouting>,
         #[cfg(feature = "native-api")] routing_generation: u64,
         mode: super::connection::handoff::ModeDecision,
@@ -321,11 +321,11 @@ impl RoutingAuthority {
             src_port: source_port,
             protocol: if query.protocol == 6 { "tcp" } else { "udp" },
             process_name: None,
-            mac: source_mac.map(str::to_owned),
+            mac: source_mac,
             dscp: Some(query.traffic_class >> 2),
         };
         PacketRoutingSnapshot {
-            source_mac: input.mac.clone(),
+            source_mac,
             process: None,
             decision: RoutingDecision::from_router(
                 &read.router,
@@ -688,7 +688,7 @@ impl RoutedCore {
         &mut self,
         ingress: Ingress,
         view: honk_netstack::wire::PacketView<'a>,
-        source_mac: Option<&str>,
+        source_mac: Option<[u8; 6]>,
         now: Instant,
         submit: impl FnOnce(
             Route,
@@ -843,7 +843,7 @@ impl RoutedCore {
         &mut self,
         read: &PolicyRead<'_>,
         mut packet: Packet,
-        source_mac: Option<&str>,
+        source_mac: Option<[u8; 6]>,
         now: Instant,
     ) -> anyhow::Result<Decision> {
         self.check_policy(read)?;

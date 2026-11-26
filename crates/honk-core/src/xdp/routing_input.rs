@@ -1,11 +1,3 @@
-pub(crate) fn mac_string(mac: [u8; 6]) -> String {
-    let mut text = String::with_capacity(17);
-    for byte in super::mac_text(mac) {
-        text.push(char::from(byte));
-    }
-    text
-}
-
 #[cfg(test)]
 pub(crate) fn test_peer(
     realm: u32,
@@ -76,7 +68,7 @@ mod tests {
             assert_eq!(router.route(&input), expected);
         }
     }
-    use super::mac_string;
+    use crate::routing::mac_string;
 
     #[test]
     fn mac_routing_text_preserves_all_octets() {

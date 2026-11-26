@@ -92,7 +92,7 @@ pub struct ConnectionInfo {
     pub src_port: u16,
     pub protocol: &'static str,
     pub process_name: Option<String>,
-    pub mac: Option<String>,
+    pub mac: Option<[u8; 6]>,
     pub dscp: Option<u8>,
 }
 
@@ -105,7 +105,7 @@ pub(crate) struct PredicateInput<'a> {
     pub(crate) src_port: Option<u16>,
     pub(crate) protocol: &'a str,
     pub(crate) process_name: Option<&'a str>,
-    pub(crate) mac: Option<&'a str>,
+    pub(crate) mac: Option<[u8; 6]>,
     pub(crate) dscp: Option<u8>,
 }
 
@@ -521,8 +521,19 @@ impl Router {
         domain_bitmap: Option<&DomainRouting>,
         mut observe: impl FnMut(usize, Option<usize>, bool),
     ) -> Option<RouteMatch<'a>> {
+        let input = PredicateInput {
+            domain: conn.domain.as_deref(),
+            dst_ip: Some(conn.dst_ip),
+            dst_port: Some(conn.dst_port),
+            src_ip: Some(conn.src_ip),
+            src_port: Some(conn.src_port),
+            protocol: conn.protocol,
+            process_name: conn.process_name.as_deref(),
+            mac: conn.mac,
+            dscp: conn.dscp,
+        };
         self.routes.iter().enumerate().find_map(|(index, route)| {
-            let matched = self.matches_route(route, conn, domain_bitmap, |condition, matched| {
+            let matched = self.matches_input(route, input, domain_bitmap, |condition, matched| {
                 observe(index, Some(condition), matched);
             });
             observe(index, None, matched);
@@ -545,27 +556,6 @@ impl Router {
                 rule_payload: &route.rule_payload,
             })
         })
-    }
-
-    fn matches_route(
-        &self,
-        route: &CompiledRoute,
-        conn: &ConnectionInfo,
-        domain_bitmap: Option<&DomainRouting>,
-        observe: impl FnMut(usize, bool),
-    ) -> bool {
-        let input = PredicateInput {
-            domain: conn.domain.as_deref(),
-            dst_ip: Some(conn.dst_ip),
-            dst_port: Some(conn.dst_port),
-            src_ip: Some(conn.src_ip),
-            src_port: Some(conn.src_port),
-            protocol: conn.protocol,
-            process_name: conn.process_name.as_deref(),
-            mac: conn.mac.as_deref(),
-            dscp: conn.dscp,
-        };
-        self.matches_input(route, input, domain_bitmap, observe)
     }
 
     pub(crate) fn route_input(
@@ -650,11 +640,9 @@ impl Router {
             CompiledPredicate::ProcessName(patterns) => input.process_name.map(|name| {
                 bounded_any::<BOUNDED, _>(patterns, deadline, |pattern| name.contains(pattern))
             }),
-            CompiledPredicate::Mac(macs) => input.mac.map(|mac| {
-                normalize_mac_bytes(mac).is_some_and(|mac| {
-                    bounded_any::<BOUNDED, _>(macs, deadline, |value| *value == mac)
-                })
-            }),
+            CompiledPredicate::Mac(macs) => input
+                .mac
+                .map(|mac| bounded_any::<BOUNDED, _>(macs, deadline, |value| *value == mac)),
         }
     }
 
@@ -857,36 +845,36 @@ fn protocol_value(protocol: &str) -> u8 {
     }
 }
 
-/// Normalize MAC to canonical `aa:bb:cc:dd:ee:ff` form.
-/// Accepts `aa:bb:cc:dd:ee:ff`, `aa-bb-cc-dd-ee-ff`, `aabb.ccdd.eeff`, `aabbccddeeff`.
-fn normalize_mac(s: &str) -> Option<String> {
-    let stripped: String = s
-        .chars()
-        .filter(|&c| c != ':' && c != '-' && c != '.')
-        .collect();
-    if stripped.len() != 12 {
-        return None;
+#[cfg(any(feature = "native-api", test))]
+pub(crate) fn mac_string(mac: [u8; 6]) -> String {
+    let mut text = String::with_capacity(17);
+    for byte in mac_text(mac) {
+        text.push(char::from(byte));
     }
-    let bytes: Vec<u8> = (0..12)
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&stripped[i..i + 2], 16).ok())
-        .collect::<Option<Vec<_>>>()?;
-    Some(
-        bytes
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<Vec<_>>()
-            .join(":"),
-    )
+    text
 }
 
-fn normalize_mac_bytes(s: &str) -> Option<[u8; 6]> {
-    let canonical = normalize_mac(s)?;
-    let mut bytes = [0_u8; 6];
-    for (index, value) in canonical.split(':').enumerate() {
-        bytes[index] = u8::from_str_radix(value, 16).ok()?;
+#[cfg(any(feature = "native-api", test))]
+fn mac_text(mac: [u8; 6]) -> [u8; 17] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = [b':'; 17];
+    for (index, byte) in mac.into_iter().enumerate() {
+        bytes[index * 3] = HEX[(byte >> 4) as usize];
+        bytes[index * 3 + 1] = HEX[(byte & 15) as usize];
     }
-    Some(bytes)
+    bytes
+}
+
+/// Accept the separators used by colon, hyphen, dotted and bare hexadecimal forms.
+fn normalize_mac_bytes(text: &str) -> Option<[u8; 6]> {
+    let mut hex = text.bytes().filter(|b| !matches!(b, b':' | b'-' | b'.'));
+    let mut mac = [0; 6];
+    for byte in &mut mac {
+        let high = char::from(hex.next()?).to_digit(16)?;
+        let low = char::from(hex.next()?).to_digit(16)?;
+        *byte = ((high << 4) | low) as u8;
+    }
+    hex.next().is_none().then_some(mac)
 }
 
 fn parse_ip_version(s: &str) -> Option<u8> {

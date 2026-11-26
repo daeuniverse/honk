@@ -169,9 +169,18 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             "mac",
             json!(["00:11:22:33:44:55", "aa:bb:cc:dd:ee:ff"]),
             vec![
-                (sample(|c| c.mac = Some("00:11:22:33:44:55".into())), true),
-                (sample(|c| c.mac = Some("AA:BB:CC:DD:EE:FF".into())), true),
-                (sample(|c| c.mac = Some("00:00:00:00:00:00".into())), false),
+                (
+                    sample(|c| c.mac = Some([0x0, 0x11, 0x22, 0x33, 0x44, 0x55])),
+                    true,
+                ),
+                (
+                    sample(|c| c.mac = Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])),
+                    true,
+                ),
+                (
+                    sample(|c| c.mac = Some([0x0, 0x0, 0x0, 0x0, 0x0, 0x0])),
+                    false,
+                ),
                 (connection(), false),
             ],
         ),
