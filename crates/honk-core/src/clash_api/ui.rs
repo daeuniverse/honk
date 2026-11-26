@@ -284,7 +284,7 @@ async fn fetch_routed(
 ) -> anyhow::Result<bool> {
     let mut url = url.to_string();
     let mut original_business: Option<ScoreContinuation> = None;
-    for _ in 0..=MAX_REDIRECTS {
+    for hop in 0..=MAX_REDIRECTS {
         let (parsed, host, port) = parse_download_url(&url)?;
         let route = tokio::select! {
             biased;
@@ -313,15 +313,20 @@ async fn fetch_routed(
             ProxiedFetch::Body => return Ok(true),
             ProxiedFetch::Stopped => return Ok(false),
             ProxiedFetch::Redirect(location) => {
+                anyhow::ensure!(
+                    hop < MAX_REDIRECTS,
+                    "external UI download: too many redirects"
+                );
+                let next = resolve_redirect_url(&parsed, &location)?;
                 if let Some(original) = original_attempt {
                     original_business = Some(original.continuation()?);
                 }
-                url = parsed.join(&location)?.to_string();
+                url = next.into();
                 debug!(url = %url, "external UI download following redirect");
             }
         }
     }
-    anyhow::bail!("external UI download: too many redirects")
+    unreachable!("redirect bound checked before following")
 }
 
 /// Direct fetch on a bypass-marked socket, streaming with the archive size cap.
@@ -612,6 +617,24 @@ fn parse_download_url(url: &str) -> anyhow::Result<(reqwest::Url, String, u16)> 
         .ok_or_else(|| anyhow::anyhow!("missing port in external UI URL '{url}'"))?;
 
     Ok((parsed, host, port))
+}
+
+fn resolve_redirect_url(previous: &reqwest::Url, location: &str) -> anyhow::Result<reqwest::Url> {
+    let mut next = previous
+        .join(location)
+        .map_err(|e| anyhow::anyhow!("invalid external UI redirect Location: {e}"))?;
+    let _ = next.set_username("");
+    let _ = next.set_password(None);
+    if previous.scheme() == "https" && next.scheme() != "https" {
+        anyhow::bail!("external UI download redirected from https to plaintext");
+    }
+    if !matches!(next.scheme(), "http" | "https") {
+        anyhow::bail!(
+            "unsupported scheme in external UI redirect '{}'",
+            next.scheme()
+        );
+    }
+    Ok(next)
 }
 
 /// Extract a zip archive into `output`, stripping the single top-level
@@ -1850,5 +1873,287 @@ mod tests {
             (1, 1, 3, 1, 2, 0)
         );
         assert_eq!(manager.score_state().root_business_starts(), 1);
+    }
+
+    #[tokio::test]
+    async fn redirects_strip_credentials_and_stop_at_redirect_cap() {
+        let headers_seen = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let recorded = Arc::clone(&headers_seen);
+        let server = tokio::spawn(async move {
+            for hop in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                while !raw.ends_with(b"\r\n\r\n") {
+                    raw.push(socket.read_u8().await.unwrap());
+                    assert!(raw.len() < 16 * 1024);
+                }
+                recorded
+                    .lock()
+                    .push(String::from_utf8_lossy(&raw).to_ascii_lowercase());
+                let reply = match hop {
+                    0 => "HTTP/1.1 302 Found\r\nLocation: /second\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                    1 => format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://injected:pw@{addr}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ),
+                    _ => "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone".to_string(),
+                };
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path(), &[]);
+        let mut archive = ArchiveFile::create(dir.path()).unwrap();
+        assert!(
+            fetch_routed(
+                &ctx,
+                &format!("http://user:secret@{addr}/first"),
+                &mut archive,
+                &mut None,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(archive_bytes(archive).await, b"done");
+        server.await.unwrap();
+        let seen = headers_seen.lock().clone();
+        assert_eq!(seen.len(), 3);
+        assert!(seen[0].contains("authorization: basic "), "{}", seen[0]);
+        assert!(
+            !seen[1].contains("authorization:"),
+            "redirect hop must strip inherited credentials: {}",
+            seen[1]
+        );
+        assert!(
+            !seen[2].contains("authorization:"),
+            "redirect hop must strip Location credentials: {}",
+            seen[2]
+        );
+
+        let cap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cap_addr = cap_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for hop in 0..=MAX_REDIRECTS {
+                let (mut socket, _) = cap_listener.accept().await.unwrap();
+                read_test_request(&mut socket).await;
+                let location = if hop == MAX_REDIRECTS {
+                    "http://[::1"
+                } else {
+                    "/loop"
+                };
+                let reply = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let mut cap_archive = ArchiveFile::create(dir.path()).unwrap();
+        let cap_error = fetch_routed(
+            &ctx,
+            &format!("http://{cap_addr}/start"),
+            &mut cap_archive,
+            &mut None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            cap_error.to_string().contains("too many redirects"),
+            "{cap_error:#}"
+        );
+    }
+
+    #[test]
+    fn https_redirects_reject_plaintext_downgrade_and_allow_https_upgrade() {
+        const CHILD: &str = "HONK_UI_HTTPS_REDIRECT_DOWNGRADE_CHILD";
+        let cert_dir = tempfile::tempdir().unwrap();
+        if std::env::var_os(CHILD).is_none() {
+            let mut ca_params = rcgen::CertificateParams::default();
+            ca_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "honk ui redirect test CA");
+            ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+            let ca_key = rcgen::KeyPair::generate().unwrap();
+            let ca_cert = ca_params.clone().self_signed(&ca_key).unwrap();
+            let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+            let leaf_params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+            let leaf_key = rcgen::KeyPair::generate().unwrap();
+            let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+
+            let ca_pem = cert_dir.path().join("ca.pem");
+            let leaf_der = cert_dir.path().join("leaf.der");
+            let key_der = cert_dir.path().join("leaf.key");
+            std::fs::write(&ca_pem, ca_cert.pem()).unwrap();
+            std::fs::write(&leaf_der, leaf_cert.der().as_ref()).unwrap();
+            std::fs::write(&key_der, leaf_key.serialize_der()).unwrap();
+
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "clash_api::ui::tests::https_redirects_reject_plaintext_downgrade_and_allow_https_upgrade",
+                    "--nocapture",
+                ])
+                .env(CHILD, cert_dir.path())
+                .env("SSL_CERT_FILE", &ca_pem)
+                .env_remove("HTTP_PROXY")
+                .env_remove("HTTPS_PROXY")
+                .env_remove("ALL_PROXY")
+                .env_remove("http_proxy")
+                .env_remove("https_proxy")
+                .env_remove("all_proxy")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        use tokio_rustls::rustls::{self, pki_types::PrivatePkcs8KeyDer};
+        let fixtures = std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let cert_der = rustls::pki_types::CertificateDer::from(
+            std::fs::read(fixtures.join("leaf.der")).unwrap(),
+        );
+        let key_der = PrivatePkcs8KeyDer::from(std::fs::read(fixtures.join("leaf.key")).unwrap());
+        let server_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der.into())
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let plain_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let plain_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let plain_addr = plain_listener.local_addr().unwrap();
+                let plain_hits_bg = Arc::clone(&plain_hits);
+                tokio::spawn(async move {
+                    while let Ok((mut sock, _)) = plain_listener.accept().await {
+                        plain_hits_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        read_test_request(&mut sock).await;
+                        sock.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nleak",
+                        )
+                        .await
+                        .unwrap();
+                    }
+                });
+
+                let spawn_tls_redirect = |acceptor: tokio_rustls::TlsAcceptor, target: String| async move {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    tokio::spawn(async move {
+                        let (tcp, _) = listener.accept().await.unwrap();
+                        let mut tls = acceptor.accept(tcp).await.unwrap();
+                        let mut req = Vec::new();
+                        while !req.ends_with(b"\r\n\r\n") {
+                            req.push(tls.read_u8().await.unwrap());
+                        }
+                        let reply = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        tls.write_all(reply.as_bytes()).await.unwrap();
+                        let _ = tls.shutdown().await;
+                    });
+                    addr
+                };
+
+                let tls_downgrade =
+                    spawn_tls_redirect(acceptor.clone(), format!("http://{plain_addr}/ui.zip"))
+                        .await;
+                let dir = tempfile::tempdir().unwrap();
+                let ctx = test_ctx(dir.path(), &[]);
+                let mut archive = ArchiveFile::create(dir.path()).unwrap();
+                let err = fetch_routed(
+                    &ctx,
+                    &format!("https://{tls_downgrade}/start"),
+                    &mut archive,
+                    &mut None,
+                )
+                .await
+                .expect_err("https -> http redirect must be rejected");
+                assert!(err.to_string().contains("plaintext"), "{err:#}");
+                assert_eq!(plain_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+                let tls_mid =
+                    spawn_tls_redirect(acceptor.clone(), format!("http://{plain_addr}/ui.zip"))
+                        .await;
+                let upgrade_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let upgrade_addr = upgrade_listener.local_addr().unwrap();
+                tokio::spawn(async move {
+                    let (mut sock, _) = upgrade_listener.accept().await.unwrap();
+                    read_test_request(&mut sock).await;
+                    let reply = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: https://{tls_mid}/mid\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    sock.write_all(reply.as_bytes()).await.unwrap();
+                });
+                let mut archive = ArchiveFile::create(dir.path()).unwrap();
+                let err = fetch_routed(
+                    &ctx,
+                    &format!("http://{upgrade_addr}/start"),
+                    &mut archive,
+                    &mut None,
+                )
+                .await
+                .expect_err("http -> https -> http downgrade must be rejected");
+                assert!(err.to_string().contains("plaintext"), "{err:#}");
+                assert_eq!(plain_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+                let tls_origin_listener =
+                    tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let tls_origin_addr = tls_origin_listener.local_addr().unwrap();
+                let acceptor_origin = acceptor.clone();
+                tokio::spawn(async move {
+                    let (tcp, _) = tls_origin_listener.accept().await.unwrap();
+                    let mut tls = acceptor_origin.accept(tcp).await.unwrap();
+                    let mut req = Vec::new();
+                    while !req.ends_with(b"\r\n\r\n") {
+                        req.push(tls.read_u8().await.unwrap());
+                    }
+                    tls.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nsafe",
+                    )
+                    .await
+                    .unwrap();
+                    let _ = tls.shutdown().await;
+                });
+                let tls_hop = spawn_tls_redirect(
+                    acceptor,
+                    format!("https://{tls_origin_addr}/final.zip"),
+                )
+                .await;
+                let http_upgrade_listener =
+                    tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let http_upgrade_addr = http_upgrade_listener.local_addr().unwrap();
+                tokio::spawn(async move {
+                    let (mut sock, _) = http_upgrade_listener.accept().await.unwrap();
+                    read_test_request(&mut sock).await;
+                    let reply = format!(
+                        "HTTP/1.1 301 Moved Permanently\r\nLocation: https://{tls_hop}/hop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    sock.write_all(reply.as_bytes()).await.unwrap();
+                });
+                let mut archive = ArchiveFile::create(dir.path()).unwrap();
+                assert!(
+                    fetch_routed(
+                        &ctx,
+                        &format!("http://{http_upgrade_addr}/start"),
+                        &mut archive,
+                        &mut None,
+                    )
+                    .await
+                    .unwrap()
+                );
+                assert_eq!(archive_bytes(archive).await, b"safe");
+            });
     }
 }
