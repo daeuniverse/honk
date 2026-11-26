@@ -4922,7 +4922,7 @@ async fn ready_pool_reload_fixture() -> (
     ControlPlane,
     Config,
     Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
-    String,
+    crate::pool::ReadyKey,
     tokio::net::TcpStream,
 ) {
     let cp = test_cp().await;
@@ -4943,7 +4943,6 @@ async fn ready_pool_reload_fixture() -> (
     let (peer, _) = listener.accept().await.unwrap();
     cp.connection_pool
         .deposit_ready(
-            generation.generation(),
             &key,
             crate::proxy::ProxyStream {
                 stream: Box::new(client),
