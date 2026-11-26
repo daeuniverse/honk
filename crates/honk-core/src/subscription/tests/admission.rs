@@ -779,3 +779,140 @@ fn ignored_xhttp_options_are_type_checked_alike_in_both_spellings() {
         assert!(!uri_accepts(bad), "{uri}");
     }
 }
+
+#[test]
+fn sing_box_detour_imports_chains_and_redacts_rejected_chain_diagnostics() {
+    use honk_outbound::runtime::OutboundRuntimeRegistry;
+
+    let mut sub = Subscription {
+        name: "sb".into(),
+        url: "https://example.com/sub".into(),
+        ..Default::default()
+    };
+    sub.id = uuid::Uuid::new_v4();
+
+    let valid_and_mixed = r#"{
+      "outbounds": [
+        {"type":"selector","tag":"select","outbounds":["exit-4"]},
+        {"type":"urltest","tag":"auto","outbounds":["exit-4"]},
+        {"type":"direct","tag":"custom-direct"},
+        {"type":"block","tag":"block"},
+        {"type":"dns","tag":"dns"},
+        {"type":"trojan","tag":"exit-4","server":"exit4.example","server_port":443,"password":"p4","tls":{"enabled":true,"server_name":"exit4.example"},"detour":"hop-3"},
+        {"type":"vless","tag":"hop-3","server":"hop3.example","server_port":443,"uuid":"33333333-3333-4333-8333-333333333333","network":"tcp","tls":{"enabled":true,"server_name":"hop3.example"},"detour":"hop-2"},
+        {"type":"shadowsocks","tag":"hop-2","server":"hop2.example","server_port":8388,"method":"aes-256-gcm","password":"p2","detour":"front"},
+        {"type":"socks","tag":"front","server":"127.0.0.1","server_port":1080,"detour":""},
+        {"type":"socks","tag":"via-select","server":"127.0.0.1","server_port":1081,"detour":"select"},
+        {"type":"socks","tag":"via-auto","server":"127.0.0.1","server_port":1082,"detour":"auto"},
+        {"type":"socks","tag":"via-direct","server":"127.0.0.1","server_port":1083,"detour":"custom-direct"},
+        {"type":"socks","tag":"via-dns","server":"127.0.0.1","server_port":1084,"detour":"dns"},
+        {"type":"http","tag":"http-hop","server":"127.0.0.1","server_port":8080},
+        {"type":"socks","tag":"via-http","server":"127.0.0.1","server_port":1085,"detour":"http-hop"},
+        {"type":"shadowsocks","tag":"ss-plugin","server":"127.0.0.1","server_port":8389,"method":"aes-256-gcm","password":"p","plugin":"v2ray-plugin"},
+        {"type":"socks","tag":"via-ss-plugin","server":"127.0.0.1","server_port":1086,"detour":"ss-plugin"},
+        {"type":"socks","tag":"bad-detour-num","server":"127.0.0.1","server_port":1087,"detour":42}
+      ]
+    }"#;
+
+    let mut diagnostics = Vec::new();
+    let nodes =
+        parse_subscription_content_with_diagnostics(&sub, valid_and_mixed, &mut diagnostics)
+            .unwrap();
+    let names: Vec<_> = nodes
+        .iter()
+        .filter(|n| !n.name.starts_with("chain-hop-"))
+        .map(|n| (n.name.as_str(), n.protocol()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("exit-4", NodeProtocol::Chain),
+            ("hop-3", NodeProtocol::Chain),
+            ("hop-2", NodeProtocol::Chain),
+            ("front", NodeProtocol::Socks5),
+        ]
+    );
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|n| n.name.starts_with("chain-hop-"))
+            .count(),
+        3
+    );
+
+    let config = honk_config::Config {
+        nodes,
+        subscriptions: vec![sub],
+        ..Default::default()
+    };
+    let assembled = config
+        .assemble(honk_config::parser::resolve_group_filters)
+        .unwrap();
+    OutboundRuntimeRegistry::build(&assembled.nodes).unwrap();
+
+    let by_index: std::collections::HashMap<_, _> = diagnostics
+        .iter()
+        .map(|d| (d.entry_index.unwrap(), d.code))
+        .collect();
+    for index in [1, 2, 3, 4, 5] {
+        assert_eq!(by_index.get(&index), Some(&"subscription-profile-entry"));
+    }
+    for index in [10, 11, 12, 13, 14, 15, 16, 17] {
+        assert_eq!(
+            by_index.get(&index),
+            Some(&"unsupported-subscription-entry"),
+            "entry {index}"
+        );
+    }
+    assert_eq!(by_index.get(&18), Some(&"malformed-subscription-entry"));
+
+    let redacted_cases = [
+        r#"{"outbounds":[
+          {"type":"trojan","tag":"PRIVATE_TAG_A","server":"private-a.example","server_port":443,"password":"PRIVATE_PASSWORD_A","tls":{"enabled":true},"detour":"PRIVATE_TAG_B"},
+          {"type":"trojan","tag":"PRIVATE_TAG_B","server":"private-b.example","server_port":443,"password":"PRIVATE_PASSWORD_B","tls":{"enabled":true},"detour":"PRIVATE_TAG_A"}
+        ]}"#,
+        r#"{"outbounds":[
+          {"type":"vless","tag":"PRIVATE_EXIT","server":"private.example","server_port":443,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","tls":{"enabled":true},"detour":"PRIVATE_MISSING"}
+        ]}"#,
+        r#"{"outbounds":[
+          {"type":"socks","tag":"PRIVATE_FRONT","server":"private-front.example","server_port":1080},
+          {"type":"hysteria2","tag":"PRIVATE_HY2","server":"private-hy2.example","server_port":443,"password":"PRIVATE_PASSWORD","tls":{"enabled":true},"detour":"PRIVATE_FRONT"}
+        ]}"#,
+        r#"proxies:
+  - {name: PRIVATE_A, type: trojan, server: private-a.example, port: 443, password: PRIVATE_SECRET, dialer-proxy: PRIVATE_B}
+  - {name: PRIVATE_B, type: trojan, server: private-b.example, port: 443, password: PRIVATE_SECRET, dialer-proxy: PRIVATE_A}
+"#,
+    ];
+
+    for (case_idx, body) in redacted_cases.iter().enumerate() {
+        let mut diag = Vec::new();
+        let result =
+            parse_subscription_content_with_diagnostics(&Subscription::default(), body, &mut diag);
+        if case_idx == 2 {
+            let admitted = result.unwrap();
+            assert_eq!(admitted.len(), 1);
+            assert_eq!(admitted[0].name, "PRIVATE_FRONT");
+        } else {
+            assert_eq!(
+                result.unwrap_err().diagnostic.code,
+                "empty-subscription-body"
+            );
+        }
+        let rendered = diag
+            .iter()
+            .map(|d| format!("{d:?} {:?}", d.to_legacy()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for secret in [
+            "PRIVATE_",
+            "private.example",
+            "private-a.example",
+            "private-b.example",
+            "private-front.example",
+            "private-hy2.example",
+            "b831381d-6324-4d53-ad4f-8cda48b30811",
+        ] {
+            assert!(!rendered.contains(secret), "leaked {secret} in {rendered}");
+        }
+    }
+}

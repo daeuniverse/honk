@@ -15,7 +15,11 @@ fn parse_clash_subscription(
         .get("proxies")
         .and_then(serde_yaml::Value::as_sequence)
         .ok_or_else(|| anyhow::anyhow!("no 'proxies' array found in Clash YAML"))?;
-    parse_clash_proxies(proxies, subscription_id)
+    let groups = yaml
+        .as_mapping()
+        .map(super::clash::extract_clash_group_names)
+        .unwrap_or_default();
+    parse_clash_proxies(proxies, &groups, subscription_id)
 }
 
 #[test]

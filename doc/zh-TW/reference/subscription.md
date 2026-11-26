@@ -186,7 +186,7 @@ URL 帶引號時，緊貼結束引號或完整 `(UA)` 字尾的 `#` 會被當作
 
 之後通過驗證的重新整理替換 SQLite 裡的正文行，不再寫舊儲存檔案。
 
-恢復或首次抓取的正文裡，如果某個節點 ID 已被內嵌節點佔用，啟動設定會排除該訂閱，而不是讓啟動失敗；執行時釋出也會拒絕這種衝突。如果節點 ID 已經由其他訂閱釋出，honk 會從本訂閱裡去掉這個節點並記一條 warning，其餘節點照常釋出，該節點仍歸先發布的訂閱。正文仍然可以替換該訂閱自己的節點。
+恢復或首次抓取的正文裡，如果某個節點 ID（包括衍生的鏈式節點 ID）已被內嵌節點或靜態鏈佔用，啟動設定會排除該訂閱，而不是讓啟動失敗；執行時釋出也會拒絕這種衝突。如果節點 ID 已經由其他訂閱釋出，或者節點名稱會遮蔽外部鏈已繫結或已解析的跳名，honk 會從本訂閱裡去掉這個節點並記一條標明 `inline` 或所屬訂閱的 warning，同時串聯捨棄依賴該跳或跳名與本訂閱外已釋出節點衝突的入站鏈，並清理不再被參照的 `chain-hop-<uuid>` 支撐節點，其餘節點照常釋出，原節點仍歸先發布的一方。正文仍然可以替換該訂閱自己的節點。
 
 原生 API 的 provider 會把 `last_error.code` 報為 `publication_rejected`，把 `last_error.details.diagnostic_code` 報為 `duplicate-node-id`。釋出這樣被拒絕後，已恢復的正文仍算已恢復：該訂閱不參與首次抓取等待，背景重新整理照常執行，並重複這項檢查。
 
@@ -281,6 +281,15 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 | `fingerprint`、`pin-sha256`、`pin_sha256` | `tls_pin_sha256` | 葉憑證 SHA-256 固定值，十六進位，忽略冒號和空白；它取代 PKI 與主機名稱驗證。所有 TLS 協定都會匯入 Clash 的 `fingerprint`，不帶 TLS 的協定則略過該條目。已提供的別名必須一致。 |
 | `alpn` | `tls_alpn` | raw TCP TLS 的有序字串清單或逗號分隔字串；XHTTP 只接受 H2，省略時正規化為 `["h2"]`。QUIC 保留下文的協定專屬規則。 |
 | `disable-sni`, `disable_sni` | — | `true` 時略過該條目；`false` 可以接受。 |
+| `dialer-proxy`, `dialer_proxy` | `chain` | 可選字串，指向同一正文裡另一個帶明確名稱的 `proxies` 條目；已提供的別名必須一致。見[鏈式代理條目](#鏈式代理條目)。 |
+
+#### 鏈式代理條目
+
+Clash 的 `dialer-proxy` / `dialer_proxy` 和 sing-box 的 `detour` 會把同一訂閱正文內由 2–4 個具體代理跳組成的鏈（支援前向參照）解析為[鏈式節點](./nodes.md#鏈式節點)，保留原條目的顯示名稱，並依有序實體跳 UUID 衍生標準鏈身分。缺失、`null` 或純空白值按獨立節點匯入；非純量或衝突的 Clash 別名，以及非字串的 sing-box `detour` 值，會以 `malformed-subscription-entry` 略過該條目。
+
+各跳只匹配同一正文內非空白的明確 `name` / `tag` 宣告，絕不匹配自動產生的 `<type>-<server>:<port>` 回退名稱。自環、環路、超過四跳、同一條鏈內重複實體跳身分、缺失或重名的跳，以及參照格式錯誤條目的鏈，會以 `malformed-subscription-entry` 略過。經過 `proxy-groups`、`selector` / `urltest` 出站、內建目標（`DIRECT`、`REJECT`、`direct`、`block`、`dns`）、啟用的代理外掛，或不符合[後續跳能力要求](./nodes.md#鏈式節點)的跳，會以 `unsupported-subscription-entry` 略過，同時保留同正文內的其他有效節點。告警只記錄從 1 開始的條目索引和固定原因，不輸出節點名、目標名、主機名或憑據。
+
+當某一跳的實體身分已作為同一正文內名稱唯一的獨立代理節點被接受時（重複身分沿用第一個可用的獨立條目），鏈直接參照該獨立節點；否則 honk 會為每個被至少一條已接受鏈參照的唯一跳身分產生一個名為 `chain-hop-<uuid>` 的支撐實體節點。出口無法直接連線時，可在群組的 `filter` 中使用 `!name(keyword: 'chain-hop-')` 排除自動產生的支撐跳。
 
 #### 協定專屬選項
 
@@ -400,8 +409,9 @@ TLS/SNI、REALITY、WebSocket/gRPC 升級 header、VLESS 封包選項，以及�
 | gRPC 服務名為空或省略 | 保留 sing-box 的空服務名，不使用 honk 的 `GunService` 預設值。 |
 | Hysteria2 提供 `server_ports`，未提供 `server_port` | 以第一個跳躍埠作為名義 endpoint。 |
 | 節點級 uTLS 指紋提示 | 不覆寫 honk 的行程級 TLS 選擇。 |
+| 代理 `detour` | 依明確 `tag` 在具體代理 `outbounds` 之間解析同一訂閱內的 2–4 跳鏈，與 Clash [`dialer-proxy`](#鏈式代理條目)共用驗證、`chain-hop-<uuid>` 支撐節點產生及去識別化診斷規則。 |
 
-不支援的鏈式代理、wire feature 或認證要求，honk 會報錯，不會直接忽略。
+無效或不支援的鏈式代理、wire feature 或認證要求，honk 會報錯，不會直接忽略。
 
 在 sing-box 輸入裡，`network` 表示封包網路 capability，不是流傳輸型別；流傳輸方式由 `transport.type` 選擇。`h2` 這類不支援的名稱，honk 會拒絕，不會把它當成裸 TCP。
 

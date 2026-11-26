@@ -180,7 +180,7 @@ Startup restores nodes before refreshing subscriptions:
 
 A later accepted refresh replaces the SQLite body row, not a legacy file.
 
-If a restored or first-fetched body contains a node ID already used by an inline node, startup excludes that subscription instead of failing, and runtime publication rejects the same collision. A node whose ID another subscription already published is dropped from this subscription with a warning, and its other nodes are published. The first subscription keeps the node. A body may still replace its own subscription's nodes.
+If a restored or first-fetched body contains a node ID (including a derived chain ID) already used by an inline node or static chain, startup excludes that subscription instead of failing, and runtime publication rejects the same collision. A node whose ID another subscription already published, or whose display name would shadow a hop name already bound or satisfied for an external chain, is dropped from this subscription with a warning (attributing inline configuration or the owning subscription), along with any incoming chain whose physical hop was dropped or whose hop name collides with a node already published outside this subscription, while orphaned `chain-hop-<uuid>` backing nodes are pruned and remaining nodes are published. The first owner keeps the node. A body may still replace its own subscription's nodes.
 
 The native API provider reports `last_error.code` as `publication_rejected` and `last_error.details.diagnostic_code` as `duplicate-node-id`. A restored body rejected this way still counts as restored: it skips the first-fetch wait. Background refresh still runs and repeats the check.
 
@@ -274,6 +274,15 @@ Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vle
 | `fingerprint`, `pin-sha256`, `pin_sha256` | `tls_pin_sha256` | Leaf-certificate SHA-256 pin in hex, with colons and whitespace ignored. It replaces PKI and hostname verification. All TLS protocols import Clash's `fingerprint`; a protocol without TLS skips the entry. Supplied aliases must agree. |
 | `alpn` | `tls_alpn` | Ordered string list (or comma-separated string) for raw-TCP TLS. XHTTP accepts only H2 and normalizes omission to `["h2"]`. QUIC retains the protocol-specific rules below. |
 | `disable-sni`, `disable_sni` | — | `true` skips the entry; `false` is accepted. |
+| `dialer-proxy`, `dialer_proxy` | `chain` | Optional string naming another explicit `proxies` entry in the same body; supplied aliases must agree. See [Chained proxy entries](#chained-proxy-entries). |
+
+#### Chained proxy entries
+
+Clash `dialer-proxy` / `dialer_proxy` and sing-box `detour` resolve intra-subscription proxy chains of 2–4 concrete hops, including forward references, into [`chain` nodes](./nodes.md#proxy-chains) that keep the entry's display name and derive canonical chain identity from the ordered physical hop UUIDs. Absent, `null`, or whitespace-only values import the entry as a standalone node; non-scalar or conflicting Clash aliases and non-string sing-box `detour` values skip the entry with `malformed-subscription-entry`.
+
+Hops match explicit non-blank `name` / `tag` declarations in the same body, never synthesized `<type>-<server>:<port>` fallback names. Self-loops, cycles, chains exceeding four hops, repeated physical hop identities within one chain, missing or duplicate hop names, and references to malformed entries skip the entry with `malformed-subscription-entry`. Chaining through `proxy-groups`, `selector` / `urltest` outbounds, built-ins (`DIRECT`, `REJECT`, `direct`, `block`, `dns`), active proxy plugins, or hops failing [later-hop capability checks](./nodes.md#proxy-chains) skips the entry with `unsupported-subscription-entry` while preserving valid sibling entries. Warnings report only the one-based entry index and a static reason without echoing names, targets, hostnames, or credentials.
+
+When a hop's physical identity is already admitted as a uniquely named standalone proxy in the same body (retaining the first usable standalone occurrence on duplicate identities), the chain references that standalone node directly. Otherwise honk materializes one backing physical node named `chain-hop-<uuid>` per unique hop identity referenced by at least one admitted chain. Use `!name(keyword: 'chain-hop-')` in group `filter` expressions to exclude synthesized backing hops when exits are not directly reachable.
 
 #### Protocol-specific options
 
@@ -393,8 +402,9 @@ sing-box TLS is off when `tls` or `tls.enabled` is absent, so Trojan, Hysteria2,
 | Empty or omitted gRPC service name | Retain sing-box's empty service, not honk's `GunService` default. |
 | Hysteria2 `server_ports` without `server_port` | Use the first hopping port as the nominal endpoint. |
 | Per-node uTLS fingerprint hint | Does not override honk's process-wide TLS selection. |
+| Proxy `detour` | Resolve intra-subscription 2–4 hop chains across concrete proxy `outbounds` by explicit `tag`, sharing the validation, `chain-hop-<uuid>` synthesis, and redacted diagnostics of Clash [`dialer-proxy`](#chained-proxy-entries). |
 
-Unsupported chaining, wire features, and authentication requirements are not silently discarded.
+Invalid or unsupported chains, wire features, and authentication requirements are not silently discarded.
 
 In sing-box input, `network` is packet capability, not a stream type. `transport.type` selects the stream. Unsupported stream names such as `h2` reject the entry rather than becoming raw TCP.
 

@@ -13,6 +13,7 @@ use honk_config::node::Node;
 use honk_config::subscription::Subscription;
 use honk_config::types::SubscriptionType;
 
+mod chain;
 mod clash;
 mod json;
 #[cfg(feature = "native-api")]
@@ -32,15 +33,16 @@ pub(crate) use store::{LegacySubscriptionStore, legacy_store_roots, prune_bodies
 pub(crate) use route::FetchFailure;
 pub(crate) use route::{failure_code, failure_stage};
 pub(crate) use supervisor::SubscriptionMergeReply;
-#[cfg(feature = "native-api")]
-pub(crate) use supervisor::same_subscription_source_spec;
 pub(crate) use supervisor::{
     AuthorizedSubscription, SubscriptionAuthorizations, SubscriptionSupervisor,
     SubscriptionSupervisorHandle, drop_nodes_published_elsewhere, same_subscription_worker_set,
     validate_subscription_ids,
 };
 #[cfg(feature = "native-api")]
-pub(crate) use supervisor::{ProviderLoad, RefreshRefusal, RefreshReport};
+pub(crate) use supervisor::{
+    ProviderLoad, RefreshRefusal, RefreshReport, prune_nodes_published_elsewhere,
+    same_subscription_source_spec,
+};
 
 /// Bounds what a hostile or broken origin can make honk buffer before parsing.
 const MAX_SUBSCRIPTION_BYTES: usize = 8 * 1024 * 1024;
@@ -100,24 +102,6 @@ impl IndexedOutcome {
         }
     }
 
-    fn malformed(ordinal: usize, path: &'static str, reason: &'static str) -> Self {
-        Self {
-            ordinal,
-            line: None,
-            path,
-            kind: IndexedOutcomeKind::Malformed((None, reason)),
-        }
-    }
-
-    fn unsupported(ordinal: usize, path: &'static str, reason: &'static str) -> Self {
-        Self {
-            ordinal,
-            line: None,
-            path,
-            kind: IndexedOutcomeKind::Unsupported((None, reason)),
-        }
-    }
-
     fn profile(ordinal: usize, path: &'static str, reason: &'static str) -> Self {
         Self {
             ordinal,
@@ -137,6 +121,19 @@ struct AdmissionOwner<'a> {
     seen: std::collections::HashMap<uuid::Uuid, usize>,
     retained: usize,
     omitted: usize,
+}
+
+pub(super) fn has_unsupported_plugin(node: &Node) -> bool {
+    node.shadowsocks().is_some_and(|config| {
+        config
+            .plugin
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || config
+                .plugin_opts
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+    })
 }
 
 impl<'a> AdmissionOwner<'a> {
@@ -163,16 +160,7 @@ impl<'a> AdmissionOwner<'a> {
         } = outcome;
         match kind {
             IndexedOutcomeKind::Node(node) => {
-                if node.shadowsocks().is_some_and(|config| {
-                    config
-                        .plugin
-                        .as_deref()
-                        .is_some_and(|value| !value.trim().is_empty())
-                        || config
-                            .plugin_opts
-                            .as_deref()
-                            .is_some_and(|value| !value.trim().is_empty())
-                }) {
+                if has_unsupported_plugin(&node) {
                     self.emit_indexed(
                         "unsupported-subscription-entry",
                         Severity::Warning,
@@ -808,7 +796,8 @@ fn parse_structured_subscription(
     if let serde_yaml::Value::Mapping(root) = &value
         && let Some(proxies) = yaml_value(root, "proxies").and_then(serde_yaml::Value::as_sequence)
     {
-        emit_clash_proxies(proxies, subscription_id, &mut *emit);
+        let groups = clash::extract_clash_group_names(root);
+        emit_clash_proxies(proxies, &groups, subscription_id, &mut *emit);
         return Ok(true);
     }
     match value {
@@ -922,10 +911,11 @@ fn yaml_value<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a ser
 #[cfg(test)]
 fn parse_clash_proxies(
     proxies: &[serde_yaml::Value],
+    group_names: &[String],
     subscription_id: Option<uuid::Uuid>,
 ) -> anyhow::Result<Vec<Node>> {
     let mut nodes = Vec::new();
-    emit_clash_proxies(proxies, subscription_id, |outcome| {
+    emit_clash_proxies(proxies, group_names, subscription_id, |outcome| {
         if let IndexedOutcomeKind::Node(node) = outcome.kind {
             nodes.push(node);
         }
@@ -938,23 +928,53 @@ fn parse_clash_proxies(
 
 fn emit_clash_proxies(
     proxies: &[serde_yaml::Value],
+    group_names: &[String],
     subscription_id: Option<uuid::Uuid>,
-    mut emit: impl FnMut(IndexedOutcome),
+    emit: impl FnMut(IndexedOutcome),
 ) {
-    for (index, proxy) in proxies.iter().enumerate() {
-        let ordinal = index + 1;
-        let outcome = match proxy.as_mapping() {
-            None => {
-                IndexedOutcome::malformed(ordinal, "proxies", "Clash proxy entry must be an object")
+    let entries = proxies
+        .iter()
+        .enumerate()
+        .map(|(index, proxy)| {
+            let ordinal = index + 1;
+            let Some(mapping) = proxy.as_mapping() else {
+                return chain::RawChainEntry::Rejected {
+                    ordinal,
+                    explicit_tag: None,
+                    kind: IndexedOutcomeKind::Malformed((
+                        None,
+                        "Clash proxy entry must be an object",
+                    )),
+                };
+            };
+            let explicit_tag = clash::explicit_proxy_name(mapping).ok().flatten();
+            match clash::parse_clash_proxy(mapping, subscription_id, Some("h3")) {
+                Ok(node) => match clash::parse_dialer_proxy(mapping) {
+                    Ok(detour) => chain::RawChainEntry::Candidate {
+                        ordinal,
+                        explicit_tag,
+                        detour,
+                        node,
+                    },
+                    Err(reason) => chain::RawChainEntry::Rejected {
+                        ordinal,
+                        explicit_tag,
+                        kind: IndexedOutcomeKind::Malformed((None, reason)),
+                    },
+                },
+                Err(error @ (_, reason)) => chain::RawChainEntry::Rejected {
+                    ordinal,
+                    explicit_tag,
+                    kind: if reason.contains("unsupported") {
+                        IndexedOutcomeKind::Unsupported(error)
+                    } else {
+                        IndexedOutcomeKind::Malformed(error)
+                    },
+                },
             }
-            Some(mapping) => IndexedOutcome::parsed(
-                ordinal,
-                "proxies",
-                clash::parse_clash_proxy(mapping, subscription_id, Some("h3")),
-            ),
-        };
-        emit(outcome);
-    }
+        })
+        .collect();
+    chain::emit_resolved_entries(entries, group_names, "proxies", subscription_id, emit);
 }
 
 fn parse_clash_subscription(
@@ -967,7 +987,11 @@ fn parse_clash_subscription(
         .get("proxies")
         .and_then(serde_yaml::Value::as_sequence)
         .ok_or_else(|| anyhow::anyhow!("no 'proxies' array found in Clash YAML"))?;
-    emit_clash_proxies(proxies, subscription_id, emit);
+    let groups = yaml
+        .as_mapping()
+        .map(clash::extract_clash_group_names)
+        .unwrap_or_default();
+    emit_clash_proxies(proxies, &groups, subscription_id, emit);
     Ok(())
 }
 

@@ -252,7 +252,8 @@ fn capture_inner(
         }
     }
     // Match the runtime's exact choice: same-fetch active nodes win over cached candidates.
-    crate::control::reload::rebase_subscription_nodes(active, &mut config);
+    let retained = crate::control::reload::rebase_subscription_nodes(active, &mut config);
+    prune_cached_subscription_conflicts(&mut config, &retained);
     let config = config
         .assemble(honk_config::parser::resolve_group_filters)
         .map_err(|mut error| {
@@ -323,6 +324,44 @@ fn capture_inner(
         dependencies,
         dependency_root: dependency_root.map(Path::to_path_buf),
     })
+}
+
+fn prune_cached_subscription_conflicts(
+    config: &mut Config,
+    retained: &std::collections::HashSet<uuid::Uuid>,
+) {
+    if !config.nodes.iter().any(|node| {
+        node.subscription_id
+            .is_some_and(|provider| !retained.contains(&provider))
+    }) {
+        return;
+    }
+    let mut published = Vec::with_capacity(config.nodes.len());
+    let mut cached_by_provider =
+        std::collections::HashMap::<uuid::Uuid, Vec<honk_config::node::Node>>::new();
+    for node in std::mem::take(&mut config.nodes) {
+        match node.subscription_id {
+            Some(provider) if !retained.contains(&provider) => {
+                cached_by_provider.entry(provider).or_default().push(node);
+            }
+            _ => published.push(node),
+        }
+    }
+    for subscription in config
+        .subscriptions
+        .iter()
+        .filter(|sub| sub.enabled && !retained.contains(&sub.id))
+    {
+        if let Some(mut nodes) = cached_by_provider.remove(&subscription.id) {
+            crate::subscription::prune_nodes_published_elsewhere(
+                &published,
+                subscription.id,
+                &mut nodes,
+            );
+            published.extend(nodes);
+        }
+    }
+    config.nodes = published;
 }
 
 /// Reads `reader` to its end into one buffer of the `expected` length, so a

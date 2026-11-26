@@ -810,6 +810,69 @@ fn offline_chain_admission_binds_the_effective_provider_snapshot() {
 }
 
 #[test]
+fn offline_validation_keeps_provider_pruned_to_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let loaded = fixture(
+        temp.path(),
+        "subscription {\n first: 'https://example.invalid/first'\n second: 'https://example.invalid/second'\n third: 'https://example.invalid/third'\n}\ngroup {\n pool { filter: subtag(first, second, third) && !name(keyword: 'chain-hop-') }\n}",
+    );
+    let data_dir = Path::new(&loaded.config.global.data_dir);
+    let first = loaded.config.subscriptions[0].clone();
+    let second = loaded.config.subscriptions[1].clone();
+    let third = loaded.config.subscriptions[2].clone();
+
+    let first_body = "proxies:\n  - {name: front, type: socks5, server: 127.0.0.1, port: 1080}\n  - {name: exit, type: socks5, server: 127.0.0.1, port: 1081, dialer-proxy: front}\n";
+    let second_body = "socks5://127.0.0.1:2080#front";
+    let third_body = "proxies:\n  - {name: front, type: socks5, server: 127.0.0.1, port: 3080}\n  - {name: third-via, type: socks5, server: 127.0.0.1, port: 3081, dialer-proxy: front}\n  - {name: survivor, type: socks5, server: 127.0.0.1, port: 3082}\n";
+
+    let _cache = cache_body(data_dir, &first, first_body);
+    let _cache2 = cache_body(data_dir, &second, second_body);
+    let _cache3 = cache_body(data_dir, &third, third_body);
+
+    let mut active = loaded.config.clone();
+    active.subscriptions.truncate(2);
+    let first_nodes =
+        parse_subscription_content_with_diagnostics(&first, first_body, &mut Vec::new()).unwrap();
+    let mut second_nodes =
+        parse_subscription_content_with_diagnostics(&second, second_body, &mut Vec::new()).unwrap();
+    crate::subscription::drop_nodes_published_elsewhere(
+        &first_nodes,
+        &active.subscriptions,
+        second.id,
+        &mut second_nodes,
+    );
+    assert!(second_nodes.is_empty());
+    active.nodes.extend(first_nodes);
+    active = active
+        .assemble(honk_config::parser::resolve_group_filters)
+        .unwrap();
+
+    let admitted = admit(loaded, &active).unwrap().config;
+    admitted.validate_assembled().unwrap();
+
+    let non_backing: Vec<_> = admitted
+        .nodes
+        .iter()
+        .filter(|node| node.subscription_id.is_some() && !node.name.starts_with("chain-hop-"))
+        .map(|node| (node.name.as_str(), node.protocol()))
+        .collect();
+    assert_eq!(
+        non_backing,
+        [
+            ("front", honk_config::types::NodeProtocol::Socks5),
+            ("exit", honk_config::types::NodeProtocol::Chain),
+            ("survivor", honk_config::types::NodeProtocol::Socks5),
+        ]
+    );
+    assert!(
+        admitted
+            .nodes
+            .iter()
+            .all(|node| node.subscription_id != Some(second.id))
+    );
+}
+
+#[test]
 fn revalidation_detects_a_new_higher_priority_dependency() {
     let working = std::env::current_dir().unwrap();
     let temp = tempfile::tempdir_in(&working).unwrap();

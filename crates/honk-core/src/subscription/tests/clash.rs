@@ -1250,3 +1250,261 @@ fn clash_hysteria2_ports_only_and_ports_with_mport_preserve_identity_and_reuse()
     assert!(reused.contains(&with_mport.id));
     assert!(Arc::ptr_eq(&original, &next.get(&with_mport.id).unwrap()));
 }
+
+#[test]
+fn clash_dialer_proxy_imports_two_to_four_hop_chains_with_canonical_ids() {
+    use honk_outbound::runtime::OutboundRuntimeRegistry;
+
+    let mut sub = Subscription {
+        name: "feed".into(),
+        url: "https://example.com/sub".into(),
+        sub_type: SubscriptionType::Clash,
+        ..Default::default()
+    };
+    sub.id = uuid::Uuid::new_v4();
+
+    let yaml = r#"proxies:
+  - name: via4
+    type: trojan
+    server: exit4.example
+    port: 443
+    password: p4
+    sni: exit4.example
+    dialer-proxy: via3
+  - name: via3
+    type: vmess
+    server: hop3.example
+    port: 443
+    uuid: 33333333-3333-4333-8333-333333333333
+    cipher: auto
+    network: tcp
+    tls: true
+    servername: hop3.example
+    dialer_proxy: mid
+  - name: mid
+    type: ss
+    server: mid.example
+    port: 8388
+    cipher: aes-256-gcm
+    password: p2
+    dialer-proxy: front-alias
+  - name: shared-exit-b
+    type: trojan
+    server: exit4.example
+    port: 443
+    password: p4
+    sni: exit4.example
+    dialer-proxy: alt-front
+  - name: front
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+    dialer-proxy: ""
+  - name: front-alias
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+  - name: alt-front
+    type: hysteria2
+    server: hy2-front.example
+    port: 443
+    password: hy2p
+    dialer_proxy: null
+"#;
+
+    let mut diagnostics = Vec::new();
+    let nodes = parse_subscription_content_with_diagnostics(&sub, yaml, &mut diagnostics).unwrap();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].code, "duplicate-subscription-entry");
+    assert_eq!(diagnostics[0].entry_index, Some(6));
+    assert_eq!(diagnostics[0].related_indices, [5]);
+
+    for node in &nodes {
+        assert_eq!(node.subscription_id, Some(sub.id));
+        assert_eq!(node.id, node.derive_id());
+    }
+
+    let hop_nodes: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.name.starts_with("chain-hop-"))
+        .collect();
+    assert_eq!(hop_nodes.len(), 3, "{nodes:?}");
+
+    let vmess_hop3 = format!(
+        "vmess://{}",
+        base64::engine::general_purpose::STANDARD.encode(
+            r#"{"ps":"hop3","add":"hop3.example","port":443,"id":"33333333-3333-4333-8333-333333333333","scy":"auto","net":"tcp","tls":"tls","sni":"hop3.example"}"#
+        )
+    );
+    let static_dae = honk_config::parser::parse_dae_config(&format!(
+        r#"node {{
+            front: 'socks5://127.0.0.1:1080'
+            alt_front: 'hysteria2://hy2p@hy2-front.example:443'
+            mid_hop: 'ss://YWVzLTI1Ni1nY206cDI@mid.example:8388'
+            hop3: '{vmess_hop3}'
+            exit4: 'trojan://p4@exit4.example:443?sni=exit4.example'
+            dae_mid: front -> mid_hop
+            dae_via3: front -> mid_hop -> hop3
+            dae_via4: front -> mid_hop -> hop3 -> exit4
+            dae_shared_b: alt_front -> exit4
+        }}"#,
+    ))
+    .unwrap()
+    .assemble(honk_config::parser::resolve_group_filters)
+    .unwrap();
+    let static_id = |name: &str| {
+        static_dae
+            .nodes
+            .iter()
+            .find(|node| node.name == name)
+            .unwrap()
+            .id
+    };
+
+    let by_name = |name: &str| nodes.iter().find(|node| node.name == name).unwrap();
+    assert_eq!(by_name("mid").protocol(), NodeProtocol::Chain);
+    assert_eq!(by_name("via3").protocol(), NodeProtocol::Chain);
+    assert_eq!(by_name("via4").protocol(), NodeProtocol::Chain);
+    assert_eq!(by_name("shared-exit-b").protocol(), NodeProtocol::Chain);
+    assert_eq!(by_name("mid").id, static_id("dae_mid"));
+    assert_eq!(by_name("via3").id, static_id("dae_via3"));
+    assert_eq!(by_name("via4").id, static_id("dae_via4"));
+    assert_eq!(by_name("shared-exit-b").id, static_id("dae_shared_b"));
+    assert_eq!(by_name("via4").chain_hops().unwrap()[0], "front");
+    assert_eq!(
+        by_name("shared-exit-b").chain_hops().unwrap()[0],
+        "alt-front"
+    );
+
+    let mut config = honk_config::parser::parse_dae_config(
+        "group {\n selectable { filter: subtag(feed) && !name(keyword: 'chain-hop-') }\n chains { filter: name(mid, via3, via4, 'shared-exit-b') }\n}",
+    )
+    .unwrap();
+    config.subscriptions.push(sub);
+    config.nodes = nodes;
+    let assembled = config
+        .assemble(honk_config::parser::resolve_group_filters)
+        .unwrap();
+    let selectable: Vec<_> = assembled.groups[0]
+        .nodes
+        .iter()
+        .map(|id| {
+            assembled
+                .nodes
+                .iter()
+                .find(|n| n.id == *id)
+                .unwrap()
+                .name
+                .as_str()
+        })
+        .collect();
+    assert_eq!(
+        selectable,
+        ["via4", "via3", "mid", "shared-exit-b", "front", "alt-front"]
+    );
+    assert_eq!(assembled.groups[1].nodes.len(), 4);
+    OutboundRuntimeRegistry::build(&assembled.nodes).unwrap();
+}
+
+#[test]
+fn clash_dialer_proxy_rejects_cycles_five_hops_groups_builtins_and_capabilities() {
+    let yaml = r#"proxy-groups:
+  - name: auto-group
+    type: url-test
+    proxies: [h1]
+proxies:
+  - {name: h1, type: socks5, server: 127.0.0.1, port: 1081}
+  - {name: h2, type: socks5, server: 127.0.0.1, port: 1082, dialer-proxy: h1}
+  - {name: h3, type: socks5, server: 127.0.0.1, port: 1083, dialer-proxy: h2}
+  - {name: h4, type: socks5, server: 127.0.0.1, port: 1084, dialer-proxy: h3}
+  - {name: too-deep, type: socks5, server: 127.0.0.1, port: 1085, dialer-proxy: h4}
+  - {name: self-loop, type: socks5, server: 127.0.0.1, port: 1086, dialer-proxy: self-loop}
+  - {name: cycle-a, type: socks5, server: 127.0.0.1, port: 1087, dialer-proxy: cycle-b}
+  - {name: cycle-b, type: socks5, server: 127.0.0.1, port: 1088, dialer-proxy: cycle-a}
+  - {name: into-cycle, type: socks5, server: 127.0.0.1, port: 1089, dialer-proxy: cycle-a}
+  - {name: missing-hop, type: socks5, server: 127.0.0.1, port: 1090, dialer-proxy: ghost}
+  - {name: dup-hop, type: socks5, server: 127.0.0.1, port: 1091}
+  - {name: dup-hop, type: socks5, server: 127.0.0.1, port: 1092}
+  - {name: uses-dup, type: socks5, server: 127.0.0.1, port: 1093, dialer-proxy: dup-hop}
+  - {name: same-endpoint, type: socks5, server: 127.0.0.1, port: 1081, dialer-proxy: h1}
+  - {name: via-group, type: socks5, server: 127.0.0.1, port: 1094, dialer-proxy: auto-group}
+  - {name: via-direct, type: socks5, server: 127.0.0.1, port: 1095, dialer-proxy: DIRECT}
+  - {name: via-reject, type: socks5, server: 127.0.0.1, port: 1096, dialer-proxy: REJECT}
+  - {name: hy2-exit, type: hysteria2, server: hy2.example, port: 443, password: p, dialer-proxy: h1}
+  - {name: tuic-exit, type: tuic, server: tuic.example, port: 443, uuid: 11111111-1111-4111-8111-111111111111, password: p, dialer-proxy: h1}
+  - {name: juicity-exit, type: juicity, server: juic.example, port: 443, uuid: 22222222-2222-4222-8222-222222222222, password: p, dialer-proxy: h1}
+  - {name: anytls-exit, type: anytls, server: any.example, port: 443, password: p, dialer-proxy: h1}
+  - {name: xhttp-exit, type: vless, server: xhttp.example, port: 443, uuid: 33333333-3333-4333-8333-333333333333, tls: true, network: xhttp, dialer-proxy: h1}
+  - {name: vision-exit, type: vless, server: vision.example, port: 443, uuid: 44444444-4444-4444-8444-444444444444, tls: true, flow: xtls-rprx-vision, dialer-proxy: h1}
+  - {name: enc-exit, type: vless, server: enc.example, port: 443, uuid: 55555555-5555-4555-8555-555555555555, encryption: mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, dialer-proxy: h1}
+  - {name: mux-exit, type: vless, server: mux.example, port: 443, uuid: 66666666-6666-4666-8666-666666666666, smux: {enabled: true, protocol: h2mux}, dialer-proxy: h1}
+  - {name: plugin-hop, type: ss, server: plug.example, port: 8388, cipher: aes-256-gcm, password: p, plugin: obfs-local}
+  - {name: via-plugin, type: socks5, server: 127.0.0.1, port: 1097, dialer-proxy: plugin-hop}
+  - {name: conflict-detour, type: socks5, server: 127.0.0.1, port: 1098, dialer-proxy: h1, dialer_proxy: h2}
+  - {name: bad-detour-type, type: socks5, server: 127.0.0.1, port: 1099, dialer-proxy: [h1]}
+"#;
+
+    for sub_type in [SubscriptionType::Clash, SubscriptionType::Simple] {
+        let sub = Subscription {
+            name: "feed".into(),
+            url: "https://example.com/sub".into(),
+            sub_type,
+            ..Default::default()
+        };
+        let mut diagnostics = Vec::new();
+        let nodes =
+            parse_subscription_content_with_diagnostics(&sub, yaml, &mut diagnostics).unwrap();
+        let non_backing: Vec<_> = nodes
+            .iter()
+            .filter(|n| !n.name.starts_with("chain-hop-"))
+            .map(|n| (n.name.as_str(), n.protocol()))
+            .collect();
+        assert_eq!(
+            non_backing,
+            [
+                ("h1", NodeProtocol::Socks5),
+                ("h2", NodeProtocol::Chain),
+                ("h3", NodeProtocol::Chain),
+                ("h4", NodeProtocol::Chain),
+                ("dup-hop", NodeProtocol::Socks5),
+                ("dup-hop", NodeProtocol::Socks5),
+            ]
+        );
+        let config = honk_config::Config {
+            nodes,
+            subscriptions: vec![sub],
+            ..Default::default()
+        };
+        config.validate_assembled().unwrap();
+
+        let by_index: std::collections::HashMap<_, _> = diagnostics
+            .iter()
+            .map(|d| (d.entry_index.unwrap(), (d.code, d.message)))
+            .collect();
+        for index in [5, 6, 7, 8, 9, 10, 13, 14, 28, 29] {
+            assert_eq!(
+                by_index.get(&index).map(|&(code, _)| code),
+                Some("malformed-subscription-entry"),
+                "entry {index}"
+            );
+        }
+        assert_eq!(
+            by_index[&5].1,
+            "subscription chain exceeds maximum hop count"
+        );
+        assert_eq!(by_index[&6].1, "subscription chain contains a cycle");
+        assert_eq!(by_index[&7].1, "subscription chain contains a cycle");
+        assert_eq!(by_index[&9].1, "subscription chain contains a cycle");
+        assert_eq!(
+            by_index[&14].1,
+            "subscription chain repeats a physical hop endpoint"
+        );
+        for index in [15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27] {
+            assert_eq!(
+                by_index.get(&index).map(|&(code, _)| code),
+                Some("unsupported-subscription-entry"),
+                "entry {index}"
+            );
+        }
+    }
+}

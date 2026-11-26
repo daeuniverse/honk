@@ -182,6 +182,150 @@ pub(crate) fn validate_subscription_ids(subscriptions: &[Subscription]) -> anyho
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublishedOwner {
+    Inline,
+    Provider(uuid::Uuid),
+}
+
+#[cfg(feature = "native-api")]
+pub(crate) fn prune_nodes_published_elsewhere(
+    published: &[Node],
+    provider: uuid::Uuid,
+    nodes: &mut Vec<Node>,
+) {
+    let _ = prune_published_elsewhere_inner(published, provider, nodes);
+}
+
+fn prune_published_elsewhere_inner(
+    published: &[Node],
+    provider: uuid::Uuid,
+    nodes: &mut Vec<Node>,
+) -> (Vec<String>, Vec<PublishedOwner>) {
+    let bound_or_physical =
+        |node: &Node| node.chain_hops().is_none() || node.resolved_chain_hops().is_some();
+    let mut inline_ids: HashSet<uuid::Uuid> = HashSet::new();
+    let mut owners: HashMap<uuid::Uuid, uuid::Uuid> = HashMap::new();
+    let mut external_names: HashMap<&str, PublishedOwner> = HashMap::new();
+    for node in published
+        .iter()
+        .filter(|node| node.subscription_id != Some(provider))
+    {
+        if bound_or_physical(node) {
+            match node.subscription_id {
+                None => {
+                    inline_ids.insert(node.id);
+                }
+                Some(owner) => {
+                    owners.insert(node.id, owner);
+                }
+            }
+        }
+        if !matches!(
+            node.outbound,
+            honk_config::node::OutboundConfig::Direct | honk_config::node::OutboundConfig::Block
+        ) {
+            let owner = node
+                .subscription_id
+                .map_or(PublishedOwner::Inline, PublishedOwner::Provider);
+            external_names.entry(node.name.as_str()).or_insert(owner);
+        }
+    }
+
+    let mut protected_hop_names: HashMap<&str, PublishedOwner> = HashMap::new();
+    for chain in published
+        .iter()
+        .filter(|node| node.subscription_id != Some(provider))
+    {
+        let Some(hop_names) = chain.chain_hops() else {
+            continue;
+        };
+        for hop_name in hop_names {
+            if let Some(&owner) = external_names.get(hop_name.as_str()) {
+                protected_hop_names
+                    .entry(hop_name.as_str())
+                    .or_insert(owner);
+            } else if chain.resolved_chain_hops().is_some()
+                && let Some(owner) = chain.subscription_id
+            {
+                protected_hop_names
+                    .entry(hop_name.as_str())
+                    .or_insert(PublishedOwner::Provider(owner));
+            }
+        }
+    }
+
+    let mut dropped = Vec::new();
+    let mut dropped_owners: Vec<PublishedOwner> = Vec::new();
+    let mut dropped_physical_ids = HashSet::new();
+    let mut dropped_chain = false;
+    let mut record_owner = |owner: PublishedOwner| {
+        if !dropped_owners.contains(&owner) {
+            dropped_owners.push(owner);
+        }
+    };
+
+    nodes.retain(|node| {
+        if bound_or_physical(node) && inline_ids.contains(&node.id) {
+            return true;
+        }
+        let id_owner = bound_or_physical(node)
+            .then(|| owners.get(&node.id).copied())
+            .flatten()
+            .map(PublishedOwner::Provider);
+        let hop_name_owner = protected_hop_names.get(node.name.as_str()).copied();
+        let Some(owner) = id_owner.or(hop_name_owner) else {
+            return true;
+        };
+        if node.chain_hops().is_none() {
+            dropped_physical_ids.insert(node.id);
+        } else {
+            dropped_chain = true;
+        }
+        dropped.push(node.name.clone());
+        record_owner(owner);
+        false
+    });
+
+    nodes.retain(|node| {
+        let Some(resolved_hops) = node.resolved_chain_hops() else {
+            return true;
+        };
+        let missing_hop = resolved_hops
+            .iter()
+            .any(|hop_id| dropped_physical_ids.contains(hop_id));
+        let mut ambiguous_hop = false;
+        if let Some(hop_names) = node.chain_hops() {
+            for hop_name in hop_names {
+                if let Some(&owner) = external_names.get(hop_name.as_str()) {
+                    ambiguous_hop = true;
+                    record_owner(owner);
+                }
+            }
+        }
+        if !missing_hop && !ambiguous_hop {
+            return true;
+        }
+        dropped.push(node.name.clone());
+        dropped_chain = true;
+        false
+    });
+
+    if dropped_chain {
+        let referenced_hop_ids: HashSet<_> = nodes
+            .iter()
+            .filter_map(Node::resolved_chain_hops)
+            .flatten()
+            .copied()
+            .collect();
+        nodes.retain(|node| {
+            !super::chain::is_synthesized_chain_hop(node) || referenced_hop_ids.contains(&node.id)
+        });
+    }
+
+    (dropped, dropped_owners)
+}
+
 /// Drops the nodes whose IDs another provider already published, so an
 /// endpoint served by two providers stays with the first one instead of
 /// rejecting the whole publication of the second.
@@ -191,42 +335,42 @@ pub(crate) fn drop_nodes_published_elsewhere(
     provider: uuid::Uuid,
     nodes: &mut Vec<Node>,
 ) {
-    let owners: HashMap<_, _> = published
-        .iter()
-        .filter(|node| node.chain_hops().is_none())
-        .filter_map(|node| Some((node.id, node.subscription_id.filter(|id| *id != provider)?)))
-        .collect();
-    let mut dropped = Vec::new();
-    let mut dropped_owners = Vec::new();
-    nodes.retain(|node| {
-        if node.chain_hops().is_some() {
-            return true;
-        }
-        let Some(owner) = owners.get(&node.id) else {
-            return true;
-        };
-        dropped.push(node.name.clone());
-        if !dropped_owners.contains(owner) {
-            dropped_owners.push(*owner);
-        }
-        false
-    });
+    let (dropped, dropped_owners) = prune_published_elsewhere_inner(published, provider, nodes);
+
     if dropped.is_empty() {
         return;
     }
-    let name = |id: uuid::Uuid| {
+    let provider_name = |id: uuid::Uuid| {
         subscriptions
             .iter()
             .find(|subscription| subscription.id == id)
-            .map_or("", |subscription| subscription.name.as_str())
+            .map(|subscription| subscription.name.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("unknown")
     };
-    let owners: Vec<_> = dropped_owners.into_iter().map(name).collect();
-    warn!(
-        provider = %name(provider),
-        nodes = %dropped.join(", "),
-        owners = %owners.join(", "),
-        "Subscription nodes already published by another provider; keeping the first copy"
-    );
+    let has_inline = dropped_owners.contains(&PublishedOwner::Inline);
+    let owners: Vec<_> = dropped_owners
+        .into_iter()
+        .map(|owner| match owner {
+            PublishedOwner::Inline => "inline",
+            PublishedOwner::Provider(id) => provider_name(id),
+        })
+        .collect();
+    if has_inline {
+        warn!(
+            provider = %provider_name(provider),
+            nodes = %dropped.join(", "),
+            owners = %owners.join(", "),
+            "Subscription nodes already published by inline configuration or another provider; keeping the first copy"
+        );
+    } else {
+        warn!(
+            provider = %provider_name(provider),
+            nodes = %dropped.join(", "),
+            owners = %owners.join(", "),
+            "Subscription nodes already published by another provider; keeping the first copy"
+        );
+    }
 }
 
 struct FetchCompletion {

@@ -149,6 +149,7 @@ struct ProbeOutcome {
 pub async fn run(args: SubArgs) -> anyhow::Result<()> {
     configure_tls(&args)?;
     let mut nodes = load_nodes(&args).await?;
+    let runtimes = build_probe_runtimes(&nodes, args.concurrency);
     if args.limit > 0 {
         nodes.truncate(args.limit);
     }
@@ -172,6 +173,7 @@ pub async fn run(args: SubArgs) -> anyhow::Result<()> {
         v6: args.v6_target,
         udp_dns,
         dns_resolver,
+        runtimes: runtimes.clone(),
     });
 
     let mut set = tokio::task::JoinSet::new();
@@ -200,6 +202,10 @@ pub async fn run(args: SubArgs) -> anyhow::Result<()> {
             }
             None => break,
         }
+    }
+    drop(targets);
+    if let Some(runtimes) = runtimes {
+        runtimes.shutdown().await;
     }
 
     let alive_v4 = outcomes
@@ -415,6 +421,65 @@ fn vless_shape(node: &Node) -> String {
     format!("vless/{carrier}/{transport}{vision}/tcp={tcp}/{udp_label}={udp}{mux}")
 }
 
+fn build_probe_runtimes(
+    nodes: &[Node],
+    concurrency: usize,
+) -> Option<Arc<honk_outbound::runtime::OutboundRuntimeRegistry>> {
+    let dial_budget = concurrency
+        .max(1)
+        .saturating_mul(6)
+        .max(honk_config::config::GlobalConfig::default().max_concurrent_dials);
+    honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(nodes, dial_budget, None)
+        .ok()
+        .map(|(registry, _)| Arc::new(registry))
+}
+
+fn acquire_probe_runtime(
+    runtimes: Option<&honk_outbound::runtime::OutboundRuntimeRegistry>,
+    node: &Node,
+    requirement: honk_outbound::proxy::WarmRequirement,
+) -> Result<
+    (
+        Arc<honk_outbound::runtime::NodeRuntime>,
+        Option<honk_outbound::runtime::EphemeralRuntimeGuard>,
+    ),
+    ProbeFailureKind,
+> {
+    if node.chain_hops().is_some() {
+        let runtimes = runtimes.ok_or(ProbeFailureKind::Admission)?;
+        return honk_outbound::urltest::try_probe_runtime(runtimes, node, requirement)
+            .map_err(|_| ProbeFailureKind::Admission);
+    }
+    match runtimes {
+        Some(runtimes) if runtimes.get(&node.id).is_some() => {
+            honk_outbound::urltest::try_probe_runtime(runtimes, node, requirement)
+                .map_err(|_| ProbeFailureKind::Admission)
+        }
+        _ => honk_outbound::runtime::NodeRuntime::try_ephemeral_guarded(node)
+            .map(|guard| (guard.runtime(), Some(guard)))
+            .map_err(|_| ProbeFailureKind::Admission),
+    }
+}
+
+async fn close_probe_guard(guard: Option<honk_outbound::runtime::EphemeralRuntimeGuard>) {
+    if let Some(mut guard) = guard
+        && let Err(error) = guard.close().await
+    {
+        eprintln!("probe runtime cleanup failed: {error}");
+    }
+}
+
+fn classify_probe_dial_error(error: &anyhow::Error) -> ProbeFailureKind {
+    if error
+        .chain()
+        .any(|cause| cause.is::<honk_outbound::proxy::MissingProtocolHandler>())
+    {
+        ProbeFailureKind::Handler
+    } else {
+        ProbeFailureKind::Exchange
+    }
+}
+
 /// Everything a probe run needs to reach the test target.
 struct ProbeTargets {
     host: String,
@@ -425,6 +490,7 @@ struct ProbeTargets {
     v6: Option<SocketAddr>,
     udp_dns: UdpCheckTarget,
     dns_resolver: Option<Arc<DnsResolver>>,
+    runtimes: Option<Arc<honk_outbound::runtime::OutboundRuntimeRegistry>>,
 }
 
 async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets) -> ProbeOutcome {
@@ -440,6 +506,7 @@ async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets
     // column separately: one slow column must not erase finished siblings.
     let deadline = targets.timeout.saturating_add(Duration::from_secs(1));
     let timed_out = ProbeOutcome::timed_out(registry, &node, targets);
+    let runtimes = targets.runtimes.as_deref();
     async fn bounded<T>(deadline: Duration, fallback: T, probe: impl Future<Output = T>) -> T {
         tokio::time::timeout(deadline, probe)
             .await
@@ -452,6 +519,7 @@ async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets
             timed_out.v4,
             probe_family(
                 registry,
+                runtimes,
                 &node,
                 &targets.host,
                 targets.port,
@@ -465,6 +533,7 @@ async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets
             timed_out.v6,
             probe_family(
                 registry,
+                runtimes,
                 &node,
                 &targets.host,
                 targets.port,
@@ -478,6 +547,7 @@ async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets
             timed_out.udp_dns,
             probe_udp_dns(
                 registry,
+                runtimes,
                 &node,
                 &targets.udp_dns,
                 targets.dns_resolver.as_deref(),
@@ -489,6 +559,7 @@ async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets
             timed_out.udp_quic,
             probe_udp_quic(
                 registry,
+                runtimes,
                 &node,
                 &targets.host,
                 targets.port,
@@ -500,6 +571,7 @@ async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets
             timed_out.urltest,
             probe_urltest(
                 registry,
+                runtimes,
                 &node,
                 targets.url.as_deref().unwrap_or_default(),
                 targets.timeout,
@@ -521,6 +593,7 @@ async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets
 
 async fn probe_urltest(
     registry: &ProxyRegistry,
+    runtimes: Option<&honk_outbound::runtime::OutboundRuntimeRegistry>,
     node: &Node,
     url: &str,
     timeout: Duration,
@@ -528,15 +601,21 @@ async fn probe_urltest(
     let Some(entry) = registry.find(node.protocol()) else {
         return Some(Err(ProbeFailureKind::Handler));
     };
-    let mut guard = match honk_outbound::runtime::NodeRuntime::try_ephemeral_guarded(node) {
-        Ok(guard) => guard,
-        Err(_) => return Some(Err(ProbeFailureKind::Admission)),
+    let (runtime, guard) = match acquire_probe_runtime(
+        runtimes,
+        node,
+        honk_outbound::proxy::WarmRequirement::Session,
+    ) {
+        Ok(acquired) => acquired,
+        Err(failure) => return Some(Err(failure)),
     };
-    let measured = urltest_node(&guard.runtime(), entry.tcp.as_ref(), url, timeout).await;
-    if let Err(error) = guard.close().await {
-        eprintln!("probe runtime cleanup failed: {error}");
-    }
-    Some(measured.map_err(|_| ProbeFailureKind::Exchange))
+    let check = urltest_node(&runtime, entry.tcp.as_ref(), url, timeout);
+    let measured = match runtimes {
+        Some(runtimes) => runtimes.scope_dials(check).await,
+        None => check.await,
+    };
+    close_probe_guard(guard).await;
+    Some(measured.map_err(|error| classify_probe_dial_error(&error)))
 }
 
 impl ProbeOutcome {
@@ -556,16 +635,11 @@ impl ProbeOutcome {
     }
 
     fn timed_out(registry: &ProxyRegistry, node: &Node, targets: &ProbeTargets) -> Self {
-        let packet_available = registry
-            .find(node.protocol())
-            .and_then(|entry| entry.packet.as_ref())
-            .is_some()
-            && honk_outbound::descriptor::carries_udp(honk_outbound::descriptor::UdpPath::Own(
-                node,
-            ));
         let packet_result = |port| {
-            (packet_available && honk_outbound::descriptor::udp_target_allowed(node, port))
-                .then_some(Err(ProbeFailureKind::Timeout))
+            udp::resolve_udp_probe_target(registry, targets.runtimes.as_deref(), node, port)
+                .ok()
+                .flatten()
+                .map(|_| Err(ProbeFailureKind::Timeout))
         };
         Self {
             node_name: node.name.clone(),
@@ -615,8 +689,10 @@ async fn server_families(node: &Node) -> (bool, bool) {
 /// dial() return, which is free for session-multiplexed protocols, proves
 /// nothing). The reported value follows urltest's warm-path convention —
 /// one round trip over the established connection, setup excluded.
+#[allow(clippy::too_many_arguments)]
 async fn probe_family(
     registry: &ProxyRegistry,
+    runtimes: Option<&honk_outbound::runtime::OutboundRuntimeRegistry>,
     node: &Node,
     url_host: &str,
     url_port: u16,
@@ -635,22 +711,27 @@ async fn probe_family(
         return Some(Err(ProbeFailureKind::Handler));
     };
     let url = format!("https://{url_host}/");
-    let mut guard = match honk_outbound::runtime::NodeRuntime::try_ephemeral_guarded(node) {
-        Ok(guard) => guard,
-        Err(_) => return Some(Err(ProbeFailureKind::Admission)),
+    let (runtime, guard) = match acquire_probe_runtime(
+        runtimes,
+        node,
+        honk_outbound::proxy::WarmRequirement::Session,
+    ) {
+        Ok(acquired) => acquired,
+        Err(failure) => return Some(Err(failure)),
     };
-    let measured = honk_outbound::urltest::urltest_node_addr(
-        &guard.runtime(),
+    let check = honk_outbound::urltest::urltest_node_addr(
+        &runtime,
         entry.tcp.as_ref(),
         &url,
         addr,
         timeout,
-    )
-    .await;
-    if let Err(error) = guard.close().await {
-        eprintln!("probe runtime cleanup failed: {error}");
-    }
-    Some(measured.map_err(|_| ProbeFailureKind::Exchange))
+    );
+    let measured = match runtimes {
+        Some(runtimes) => runtimes.scope_dials(check).await,
+        None => check.await,
+    };
+    close_probe_guard(guard).await;
+    Some(measured.map_err(|error| classify_probe_dial_error(&error)))
 }
 
 fn print_outcome(outcome: &ProbeOutcome) {

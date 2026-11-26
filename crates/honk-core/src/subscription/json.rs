@@ -4,19 +4,31 @@
 use honk_config::node::Node;
 use serde_yaml::{Mapping, Value};
 
-use super::IndexedOutcome;
-#[cfg(test)]
-use super::IndexedOutcomeKind;
+use super::{IndexedOutcome, IndexedOutcomeKind, chain};
 
 mod sing_box;
 
 enum NormalizedEntry {
-    Node(Mapping),
-    Profile(&'static str),
-    Unsupported(&'static str),
+    Node {
+        explicit_tag: Option<String>,
+        detour: Option<String>,
+        proxy: Mapping,
+    },
+    Group {
+        explicit_tag: Option<String>,
+        reason: &'static str,
+    },
+    Builtin {
+        explicit_tag: Option<String>,
+        reason: &'static str,
+    },
+    Unsupported {
+        explicit_tag: Option<String>,
+        reason: &'static str,
+    },
 }
 
-type NodeResult = Result<NormalizedEntry, &'static str>;
+type NodeResult = Result<NormalizedEntry, (Option<String>, &'static str)>;
 
 #[cfg(test)]
 pub(super) fn parse_json_subscription(
@@ -90,28 +102,72 @@ fn parse_entries(
     path: &'static str,
     emit: &mut impl FnMut(IndexedOutcome),
 ) -> anyhow::Result<()> {
-    for (index, entry) in entries.into_iter().enumerate() {
-        let ordinal = index + 1;
-        let outcome = match normalize(entry) {
-            Ok(NormalizedEntry::Node(proxy)) => IndexedOutcome::parsed(
-                ordinal,
-                path,
-                super::clash::parse_clash_proxy(&proxy, subscription_id, None),
-            ),
-            Ok(NormalizedEntry::Profile(reason)) => IndexedOutcome::profile(ordinal, path, reason),
-            Ok(NormalizedEntry::Unsupported(reason)) => {
-                IndexedOutcome::unsupported(ordinal, path, reason)
+    let raw_entries = entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let ordinal = index + 1;
+            match normalize(entry) {
+                Ok(NormalizedEntry::Node {
+                    explicit_tag,
+                    detour,
+                    proxy,
+                }) => match super::clash::parse_clash_proxy(&proxy, subscription_id, None) {
+                    Ok(node) => chain::RawChainEntry::Candidate {
+                        ordinal,
+                        explicit_tag,
+                        detour,
+                        node,
+                    },
+                    Err(error @ (_, reason)) => chain::RawChainEntry::Rejected {
+                        ordinal,
+                        explicit_tag,
+                        kind: if reason.contains("unsupported") {
+                            IndexedOutcomeKind::Unsupported(error)
+                        } else {
+                            IndexedOutcomeKind::Malformed(error)
+                        },
+                    },
+                },
+                Ok(NormalizedEntry::Group {
+                    explicit_tag,
+                    reason,
+                }) => chain::RawChainEntry::Group {
+                    ordinal,
+                    explicit_tag,
+                    reason,
+                },
+                Ok(NormalizedEntry::Builtin {
+                    explicit_tag,
+                    reason,
+                }) => chain::RawChainEntry::Builtin {
+                    ordinal,
+                    explicit_tag,
+                    reason,
+                },
+                Ok(NormalizedEntry::Unsupported {
+                    explicit_tag,
+                    reason,
+                }) => chain::RawChainEntry::Rejected {
+                    ordinal,
+                    explicit_tag,
+                    kind: IndexedOutcomeKind::Unsupported((None, reason)),
+                },
+                Err((explicit_tag, reason)) => chain::RawChainEntry::Rejected {
+                    ordinal,
+                    explicit_tag,
+                    kind: IndexedOutcomeKind::Malformed((None, reason)),
+                },
             }
-            Err(reason) => IndexedOutcome::malformed(ordinal, path, reason),
-        };
-        emit(outcome);
-    }
+        })
+        .collect();
+    chain::emit_resolved_entries(raw_entries, &[], path, subscription_id, emit);
     Ok(())
 }
 
 fn normalize_sip008(value: Value) -> NodeResult {
     let Value::Mapping(mut source) = value else {
-        return Err("SIP008 server must be an object");
+        return Err((None, "SIP008 server must be an object"));
     };
     let mut proxy = Mapping::new();
     put(&mut proxy, "type", Value::String("ss".into()));
@@ -125,16 +181,22 @@ fn normalize_sip008(value: Value) -> NodeResult {
             ("plugin", "plugin"),
             ("plugin_opts", "plugin-opts"),
         ],
-    )?;
-    move_credential_strings(&mut source, &mut proxy, &[("password", "password")])?;
+    )
+    .map_err(|reason| (None, reason))?;
+    move_credential_strings(&mut source, &mut proxy, &[("password", "password")])
+        .map_err(|reason| (None, reason))?;
     match source.remove("server_port") {
         None | Some(Value::Null) => {}
         Some(port) if matches!(port.as_u64(), Some(1..=65535)) => {
             put(&mut proxy, "port", port);
         }
-        Some(_) => return Err("SIP008 server port must be an integer"),
+        Some(_) => return Err((None, "SIP008 server port must be an integer")),
     }
-    Ok(NormalizedEntry::Node(proxy))
+    Ok(NormalizedEntry::Node {
+        explicit_tag: None,
+        detour: None,
+        proxy,
+    })
 }
 
 fn put(mapping: &mut Mapping, key: &str, value: Value) {
@@ -451,7 +513,7 @@ mod tests {
     fn sing_box_rejects_removed_vless_mode_before_projection() {
         assert!(matches!(
             sing_box::normalize(json(r#"{"type":"vless","vless_mode":null}"#)),
-            Err("VLESS vless_mode was removed")
+            Err((_, "VLESS vless_mode was removed"))
         ));
         let nodes = parse_json_subscription(
             json(

@@ -174,20 +174,21 @@ impl SupervisorState {
         userinfo: SubscriptionUserinfo,
     ) -> Option<usize> {
         super::drop_nodes_published_elsewhere(current, subscriptions, subscription.id, &mut nodes);
+        let bound_or_physical =
+            |node: &Node| node.chain_hops().is_none() || node.resolved_chain_hops().is_some();
         let mut ids: HashSet<_> = current
             .iter()
-            .filter(|node| {
-                node.chain_hops().is_none() && node.subscription_id != Some(subscription.id)
-            })
+            .filter(|node| node.subscription_id != Some(subscription.id) && bound_or_physical(node))
             .map(|node| node.id)
             .collect();
         let mut observations = self.observations.write();
         let load = &mut observations.get_mut(&subscription.id).unwrap().load;
-        if nodes
+        let duplicate = nodes
             .iter()
-            .filter(|node| node.chain_hops().is_none())
+            .filter(|node| bound_or_physical(node))
             .any(|node| !ids.insert(node.id))
-        {
+            || has_colliding_unbound_static_chain(current, subscription.id, &nodes, &mut ids);
+        if duplicate {
             warn!(
                 subscription = %subscription.name,
                 "Subscription node ID duplicates another node; provider rejected"
@@ -228,4 +229,59 @@ impl SupervisorState {
             provider.finished(Instant::now(), Some(error));
         }
     }
+}
+
+fn has_colliding_unbound_static_chain(
+    current: &[Node],
+    provider: uuid::Uuid,
+    incoming: &[Node],
+    ids: &mut HashSet<uuid::Uuid>,
+) -> bool {
+    let mut unbound_chains = current
+        .iter()
+        .filter(|node| {
+            node.subscription_id != Some(provider)
+                && node.chain_hops().is_some()
+                && node.resolved_chain_hops().is_none()
+        })
+        .peekable();
+    if unbound_chains.peek().is_none() {
+        return false;
+    }
+    let mut by_name: HashMap<&str, Option<&Node>> = HashMap::new();
+    for node in current
+        .iter()
+        .filter(|node| node.subscription_id != Some(provider))
+        .chain(incoming.iter())
+    {
+        by_name
+            .entry(node.name.as_str())
+            .and_modify(|unique| *unique = None)
+            .or_insert(Some(node));
+    }
+    for chain in unbound_chains {
+        let Some(hop_names) = chain.chain_hops() else {
+            continue;
+        };
+        let mut resolved_hops = Vec::with_capacity(hop_names.len());
+        let mut complete = true;
+        for hop_name in hop_names {
+            match by_name.get(hop_name.as_str()).copied().flatten() {
+                Some(target) if target.chain_hops().is_none() => resolved_hops.push(target),
+                _ => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            continue;
+        }
+        if let Ok(bound) = Node::chain_from_nodes(&chain.name, &resolved_hops)
+            && !ids.insert(bound.id)
+        {
+            return true;
+        }
+    }
+    false
 }

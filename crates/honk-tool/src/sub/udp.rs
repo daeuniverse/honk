@@ -108,32 +108,96 @@ async fn resolve_udp_check_target(
     }
 }
 
+pub(super) fn resolve_udp_probe_target<'a>(
+    registry: &'a ProxyRegistry,
+    runtimes: Option<&'a honk_outbound::runtime::OutboundRuntimeRegistry>,
+    node: &'a Node,
+    port: u16,
+) -> Result<Option<&'a dyn honk_outbound::proxy::PacketOutbound>, ProbeFailureKind> {
+    if let Some(runtimes) = runtimes
+        && runtimes.get(&node.id).is_some()
+    {
+        return match registry.udp_probe_target(runtimes, node) {
+            Ok((packet, terminal)) => {
+                Ok(honk_outbound::descriptor::udp_target_allowed(terminal, port).then_some(packet))
+            }
+            Err(error)
+                if error
+                    .chain()
+                    .any(|cause| cause.is::<honk_outbound::proxy::MissingProtocolHandler>()) =>
+            {
+                Err(ProbeFailureKind::Handler)
+            }
+            Err(_) => Ok(None),
+        };
+    }
+    if node.chain_hops().is_some() {
+        return if registry.find(node.protocol()).is_none() {
+            Err(ProbeFailureKind::Handler)
+        } else {
+            Err(ProbeFailureKind::Admission)
+        };
+    }
+    let Some(entry) = registry.find(node.protocol()) else {
+        return Err(ProbeFailureKind::Handler);
+    };
+    if !honk_outbound::descriptor::carries_udp(honk_outbound::descriptor::UdpPath::Own(node))
+        || !honk_outbound::descriptor::udp_target_allowed(node, port)
+    {
+        return Ok(None);
+    }
+    Ok(entry.packet.as_deref())
+}
+
+async fn dial_probe_udp_transport(
+    packet: &dyn honk_outbound::proxy::PacketOutbound,
+    runtimes: Option<&honk_outbound::runtime::OutboundRuntimeRegistry>,
+    node: &Node,
+    target: SocketAddr,
+    timeout: Duration,
+) -> Result<std::sync::Arc<dyn honk_outbound::proxy::PacketTransport>, ProbeFailureKind> {
+    if node.chain_hops().is_some() {
+        let runtimes = runtimes.ok_or(ProbeFailureKind::Admission)?;
+        let (runtime, guard) = super::acquire_probe_runtime(
+            Some(runtimes),
+            node,
+            honk_outbound::proxy::WarmRequirement::Udp,
+        )?;
+        let result = runtimes
+            .scope_dials(packet.dial_udp_transport_runtime(runtime, target, None, timeout))
+            .await
+            .map_err(|error| super::classify_probe_dial_error(&error));
+        super::close_probe_guard(guard).await;
+        return result;
+    }
+    let dial = packet.dial_udp_transport(node, target, None, timeout);
+    let result = match runtimes {
+        Some(runtimes) => runtimes.scope_dials(dial).await,
+        None => dial.await,
+    };
+    result.map_err(|error| super::classify_probe_dial_error(&error))
+}
+
 /// UDP probe: one minimal DNS A query through the node's UDP transport.
 /// Proves the node's UDP relay path end to end (mirrors the engine's
 /// `probe_node_udp` health check).
 pub(super) async fn probe_udp_dns(
     registry: &ProxyRegistry,
+    runtimes: Option<&honk_outbound::runtime::OutboundRuntimeRegistry>,
     node: &Node,
     target: &UdpCheckTarget,
     resolver: Option<&DnsResolver>,
     timeout: Duration,
 ) -> Option<Result<Duration, ProbeFailureKind>> {
-    let Some(entry) = registry.find(node.protocol()) else {
-        return Some(Err(ProbeFailureKind::Handler));
+    let packet = match resolve_udp_probe_target(registry, runtimes, node, target.port()) {
+        Ok(Some(packet)) => packet,
+        Ok(None) => return None,
+        Err(failure) => return Some(Err(failure)),
     };
-    if !honk_outbound::descriptor::carries_udp(honk_outbound::descriptor::UdpPath::Own(node)) {
-        return None;
-    }
-    if !honk_outbound::descriptor::udp_target_allowed(node, target.port()) {
-        return None;
-    }
-    let packet = entry.packet.as_ref()?;
     let result = tokio::time::timeout(timeout, async {
         let dns_server = resolve_udp_check_target(target, resolver).await?;
-        let transport = packet
-            .dial_udp_transport(node, dns_server, None, timeout)
-            .await
-            .map_err(|_| ProbeFailureKind::Exchange)?;
+        let transport =
+            dial_probe_udp_transport(packet, runtimes, node, dns_server, timeout).await?;
         honk_core::dns::forwarder::udp_dns_probe(&*transport)
             .await
             .map(|sample| sample.latency)
@@ -152,28 +216,24 @@ pub(super) async fn probe_udp_dns(
 /// through the node's UDP path.
 pub(super) async fn probe_udp_quic(
     registry: &ProxyRegistry,
+    runtimes: Option<&honk_outbound::runtime::OutboundRuntimeRegistry>,
     node: &Node,
     url_host: &str,
     url_port: u16,
     timeout: Duration,
 ) -> Option<Result<Duration, ProbeFailureKind>> {
-    let Some(entry) = registry.find(node.protocol()) else {
-        return Some(Err(ProbeFailureKind::Handler));
+    let packet = match resolve_udp_probe_target(registry, runtimes, node, url_port) {
+        Ok(Some(packet)) => packet,
+        Ok(None) => return None,
+        Err(failure) => return Some(Err(failure)),
     };
-    if !honk_outbound::descriptor::carries_udp(honk_outbound::descriptor::UdpPath::Own(node)) {
-        return None;
-    }
-    if !honk_outbound::descriptor::udp_target_allowed(node, url_port) {
-        return None;
-    }
-    let packet = entry.packet.as_ref()?;
     let addr = match tokio::net::lookup_host((url_host, url_port)).await {
         Ok(mut addrs) => addrs.find(SocketAddr::is_ipv4)?,
         Err(_) => return Some(Err(ProbeFailureKind::Resolve)),
     };
-    let transport = match packet.dial_udp_transport(node, addr, None, timeout).await {
+    let transport = match dial_probe_udp_transport(packet, runtimes, node, addr, timeout).await {
         Ok(transport) => transport,
-        Err(_) => return Some(Err(ProbeFailureKind::Exchange)),
+        Err(failure) => return Some(Err(failure)),
     };
 
     let probe_node = Node {

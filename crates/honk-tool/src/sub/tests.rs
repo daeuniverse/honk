@@ -63,6 +63,7 @@ async fn udp_dns_resolution_timeout_does_not_abort_unrelated_probe() {
             port: 53,
         },
         dns_resolver: Some(Arc::new(silent_dns_resolver(sink.local_addr().unwrap()))),
+        runtimes: None,
     };
     let registry = ProxyRegistry::default_resolver().unwrap();
     let outcome = probe_node(&registry, direct_node(), &targets).await;
@@ -80,7 +81,15 @@ async fn udp_dns_without_system_resolver_reports_resolve() {
         port: 53,
     };
     assert_eq!(
-        probe_udp_dns(&registry, &node, &target, None, Duration::from_millis(40),).await,
+        probe_udp_dns(
+            &registry,
+            None,
+            &node,
+            &target,
+            None,
+            Duration::from_millis(40),
+        )
+        .await,
         Some(Err(ProbeFailureKind::Resolve))
     );
 }
@@ -96,13 +105,42 @@ async fn unavailable_vless_handler_refuses_before_target_resolution() {
     };
     let timeout = Duration::from_millis(40);
     assert_eq!(
-        probe_udp_dns(&registry, &node, &target, None, timeout).await,
+        probe_udp_dns(&registry, None, &node, &target, None, timeout).await,
         Some(Err(ProbeFailureKind::Handler))
     );
     assert_eq!(
-        probe_udp_quic(&registry, &node, "must-not-resolve.invalid", 443, timeout).await,
+        probe_udp_quic(
+            &registry,
+            None,
+            &node,
+            "must-not-resolve.invalid",
+            443,
+            timeout
+        )
+        .await,
         Some(Err(ProbeFailureKind::Handler))
     );
+
+    let exit = Node::from_share_link("trojan://secret@127.0.0.1:443?sni=example.com#exit").unwrap();
+    let chain = Node::chain_from_nodes("vless-front-chain", &[&node, &exit]).unwrap();
+    let nodes = vec![node, exit, chain.clone()];
+    let runtimes = build_probe_runtimes(&nodes, 2).unwrap();
+    assert_eq!(
+        probe_urltest(
+            &registry,
+            Some(&runtimes),
+            &chain,
+            "http://127.0.0.1:9/",
+            timeout
+        )
+        .await,
+        Some(Err(ProbeFailureKind::Handler))
+    );
+    assert_eq!(
+        probe_udp_dns(&registry, Some(&runtimes), &chain, &target, None, timeout).await,
+        Some(Err(ProbeFailureKind::Handler))
+    );
+    runtimes.shutdown().await;
 }
 
 #[cfg(feature = "rprx")]
@@ -123,6 +161,7 @@ async fn udp_policy_denied_target_skips_dns_resolution() {
     assert_eq!(
         probe_udp_dns(
             &registry,
+            None,
             &node,
             &target,
             Some(&resolver),
@@ -152,6 +191,7 @@ async fn udp_policy_denied_target_skips_quic_resolution() {
     assert_eq!(
         probe_udp_quic(
             &registry,
+            None,
             &node,
             "must-not-resolve.invalid",
             443,
@@ -298,6 +338,7 @@ fn timeout_targets(dns_port: u16, port: u16) -> ProbeTargets {
         v6: None,
         udp_dns: UdpCheckTarget::Literal(SocketAddr::from(([127, 0, 0, 1], dns_port))),
         dns_resolver: None,
+        runtimes: None,
     }
 }
 
@@ -440,6 +481,7 @@ async fn slow_column_keeps_finished_sibling_results() {
         v6: Some(closed),
         udp_dns: UdpCheckTarget::Literal(closed),
         dns_resolver: None,
+        runtimes: None,
     };
     let registry = ProxyRegistry::default_resolver().unwrap();
     let outcome = probe_node(&registry, direct_node(), &targets).await;
@@ -447,4 +489,52 @@ async fn slow_column_keeps_finished_sibling_results() {
     assert_eq!(outcome.urltest, Some(Err(ProbeFailureKind::Timeout)));
     assert_eq!(outcome.v4, Some(Err(ProbeFailureKind::Exchange)));
     assert_eq!(outcome.v6, Some(Err(ProbeFailureKind::Exchange)));
+}
+
+#[tokio::test]
+async fn chain_udp_probe_dials_through_bound_first_hop() {
+    let front_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front_addr = front_listener.local_addr().unwrap();
+    let accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let accepted_bg = Arc::clone(&accepted);
+    let server = tokio::spawn(async move {
+        if let Ok((stream, _)) = front_listener.accept().await {
+            accepted_bg.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+
+    let front = Node::from_share_link(&format!("socks5://{front_addr}#front")).unwrap();
+    let exit = Node::from_share_link("trojan://secret@127.0.0.1:443?sni=example.com#exit").unwrap();
+    let chain = Node::chain_from_nodes("via", &[&front, &exit]).unwrap();
+    let nodes = vec![front, exit, chain.clone()];
+    let runtimes = build_probe_runtimes(&nodes, 4).unwrap();
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let target = UdpCheckTarget::Literal("127.0.0.1:53".parse().unwrap());
+
+    assert_eq!(
+        probe_udp_dns(
+            &registry,
+            None,
+            &chain,
+            &target,
+            None,
+            Duration::from_millis(200),
+        )
+        .await,
+        Some(Err(ProbeFailureKind::Admission))
+    );
+    let result = probe_udp_dns(
+        &registry,
+        Some(&runtimes),
+        &chain,
+        &target,
+        None,
+        Duration::from_millis(200),
+    )
+    .await;
+    server.abort();
+    runtimes.shutdown().await;
+    assert_eq!(result, Some(Err(ProbeFailureKind::Exchange)));
+    assert!(accepted.load(std::sync::atomic::Ordering::SeqCst));
 }

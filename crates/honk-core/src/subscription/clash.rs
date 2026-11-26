@@ -681,6 +681,26 @@ fn validate_imported_node(node: &Node) -> Result<(), &'static str> {
     Ok(())
 }
 
+pub(super) fn explicit_proxy_name(mapping: &Mapping) -> Result<Option<String>, &'static str> {
+    Ok(yaml_text_alias(mapping, &["name"])?.filter(|value| !value.trim().is_empty()))
+}
+
+pub(super) fn parse_dialer_proxy(mapping: &Mapping) -> Result<Option<String>, &'static str> {
+    optional_text_alias(mapping, &["dialer-proxy", "dialer_proxy"])
+}
+
+pub(super) fn extract_clash_group_names(root: &Mapping) -> Vec<String> {
+    let Some(groups) = yaml_value(root, "proxy-groups").and_then(serde_yaml::Value::as_sequence)
+    else {
+        return Vec::new();
+    };
+    groups
+        .iter()
+        .filter_map(serde_yaml::Value::as_mapping)
+        .filter_map(|group| explicit_proxy_name(group).ok().flatten())
+        .collect()
+}
+
 pub(super) fn parse_clash_proxy(
     mapping: &Mapping,
     subscription_id: Option<uuid::Uuid>,

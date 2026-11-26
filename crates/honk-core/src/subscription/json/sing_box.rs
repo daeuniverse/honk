@@ -10,10 +10,15 @@ use super::{
 
 pub(super) fn normalize(value: Value) -> NodeResult {
     let Value::Mapping(mut source) = value else {
-        return Err("sing-box outbound must be an object");
+        return Err((None, "sing-box outbound must be an object"));
     };
+    let explicit_tag = source
+        .get("tag")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
     let Some(Value::String(kind)) = source.remove("type") else {
-        return Err("sing-box outbound type is missing or invalid");
+        return Err((explicit_tag, "sing-box outbound type is missing or invalid"));
     };
     let protocol = match kind.as_str() {
         "shadowsocks" | "ss" => NodeProtocol::SS,
@@ -25,23 +30,33 @@ pub(super) fn normalize(value: Value) -> NodeResult {
         "tuic" => NodeProtocol::Tuic,
         "juicity" => NodeProtocol::Juicity,
         "anytls" => NodeProtocol::AnyTLS,
-        "selector" | "urltest" | "direct" | "block" | "dns" => {
-            return Ok(NormalizedEntry::Profile(
-                "sing-box non-proxy profile outbound",
-            ));
+        "selector" | "urltest" => {
+            return Ok(NormalizedEntry::Group {
+                explicit_tag,
+                reason: "sing-box non-proxy profile outbound",
+            });
+        }
+        "direct" | "block" | "dns" => {
+            return Ok(NormalizedEntry::Builtin {
+                explicit_tag,
+                reason: "sing-box non-proxy profile outbound",
+            });
         }
         _ => {
-            return Ok(NormalizedEntry::Unsupported(
-                "sing-box outbound type is unsupported",
-            ));
+            return Ok(NormalizedEntry::Unsupported {
+                explicit_tag,
+                reason: "sing-box outbound type is unsupported",
+            });
         }
     };
     if protocol == NodeProtocol::VLess && source.contains_key("vless_mode") {
-        return Err("VLESS vless_mode was removed");
+        return Err((explicit_tag, "VLESS vless_mode was removed"));
     }
-    if source.remove("detour").is_some_and(|value| active(&value)) {
-        return Err("sing-box detour chaining is unsupported");
-    }
+    let detour = match source.remove("detour") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => (!value.trim().is_empty()).then_some(value),
+        Some(_) => return Err((explicit_tag, "sing-box detour must be a string")),
+    };
 
     let mut proxy = Mapping::new();
     put(&mut proxy, "type", Value::String(protocol.as_str().into()));
@@ -49,9 +64,11 @@ pub(super) fn normalize(value: Value) -> NodeResult {
         &mut source,
         &mut proxy,
         &[("tag", "name"), ("server", "server")],
-    )?;
+    )
+    .map_err(|reason| (explicit_tag.clone(), reason))?;
     let hopping_port = if protocol == NodeProtocol::Hysteria2 {
-        normalize_server_ports(&mut source, &mut proxy)?
+        normalize_server_ports(&mut source, &mut proxy)
+            .map_err(|reason| (explicit_tag.clone(), reason))?
     } else {
         None
     };
@@ -63,10 +80,10 @@ pub(super) fn normalize(value: Value) -> NodeResult {
             put(&mut proxy, "port", Value::Number(port.into()));
         }
         (Some(Value::Null) | None, None) => {}
-        _ => return Err("sing-box outbound port must be an integer"),
+        _ => return Err((explicit_tag, "sing-box outbound port must be an integer")),
     }
 
-    match protocol {
+    let proxy = match protocol {
         NodeProtocol::SS => normalize_shadowsocks(source, proxy),
         NodeProtocol::Socks5 => normalize_socks5(source, proxy),
         NodeProtocol::VMess => normalize_vmess(source, proxy),
@@ -78,7 +95,12 @@ pub(super) fn normalize(value: Value) -> NodeResult {
         NodeProtocol::AnyTLS => normalize_anytls(source, proxy),
         NodeProtocol::Direct | NodeProtocol::Block | NodeProtocol::Chain => unreachable!(),
     }
-    .map(NormalizedEntry::Node)
+    .map_err(|reason| (explicit_tag.clone(), reason))?;
+    Ok(NormalizedEntry::Node {
+        explicit_tag,
+        detour,
+        proxy,
+    })
 }
 
 fn normalize_shadowsocks(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'static str> {
