@@ -106,6 +106,8 @@ pub enum FatalError {
     ListenerPanicked,
     #[error("NFQUEUE verdict socket failed: {error}")]
     VerdictSocket { error: String },
+    #[error("NFQUEUE verdict rejected by kernel (errno {errno}): {error}")]
+    VerdictRejected { errno: i32, error: String },
 }
 
 #[derive(Debug, thiserror::Error)]

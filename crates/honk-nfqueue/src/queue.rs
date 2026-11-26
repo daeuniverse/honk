@@ -9,7 +9,7 @@ use bytes::{Bytes, BytesMut};
 
 use crate::netlink;
 use crate::packet;
-use crate::verdict::{GuardTracker, VerdictGuard};
+use crate::verdict::{GuardTracker, NFQA_MSG_VERDICT, VerdictGuard};
 use crate::{
     COPY_RANGE, FatalError, FatalNotifier, MAX_DATAGRAM_SIZE, PacketCallback, QUEUE_MAXLEN,
     QUEUE_NUM, SO_RCVBUF_SIZE,
@@ -275,6 +275,10 @@ fn dispatch_datagram(
         let message = message.map_err(|error| FatalError::MalformedMessage {
             error: error.to_string(),
         })?;
+        if message.message_type == netlink::NLMSG_ERROR {
+            handle_nlmsg_error(&message)?;
+            continue;
+        }
         let expected_type = (netlink::NFNL_SUBSYS_QUEUE << 8) | NFQA_MSG_PACKET;
         if message.message_type != expected_type {
             return Err(FatalError::UnexpectedMessage {
@@ -306,6 +310,59 @@ fn dispatch_datagram(
         });
     }
     Ok(())
+}
+
+// Kernel verdict handlers reply with NLMSG_ERROR even without NLM_F_ACK when a
+// queued skb was already flushed by hook, netdev, or conntrack teardown (-ENOENT).
+fn handle_nlmsg_error(message: &netlink::Message) -> Result<(), FatalError> {
+    let nlmsg_error =
+        netlink::parse_nlmsg_error(message.flags, &message.body).map_err(|error| {
+            FatalError::MalformedMessage {
+                error: error.into(),
+            }
+        })?;
+    if nlmsg_error.original_sequence != message.sequence {
+        return Err(FatalError::MalformedMessage {
+            error: "NLMSG_ERROR sequence mismatch".into(),
+        });
+    }
+    let expected_verdict_type = (netlink::NFNL_SUBSYS_QUEUE << 8) | NFQA_MSG_VERDICT;
+    if nlmsg_error.original_type != expected_verdict_type {
+        return Err(FatalError::UnexpectedMessage {
+            message_type: nlmsg_error.original_type,
+        });
+    }
+    if nlmsg_error.original_flags & netlink::NLM_F_REQUEST == 0 {
+        return Err(FatalError::MalformedMessage {
+            error: "NLMSG_ERROR original message is not a request".into(),
+        });
+    }
+    if let Some(original_body) = nlmsg_error.original_body {
+        if original_body.len() < netlink::NFGENMSG_LEN || original_body[1] != 0 {
+            return Err(FatalError::MalformedMessage {
+                error: "invalid NFQUEUE verdict nfgenmsg".into(),
+            });
+        }
+        let queue = u16::from_be_bytes([original_body[2], original_body[3]]);
+        if queue != QUEUE_NUM {
+            return Err(FatalError::UnexpectedQueue { queue });
+        }
+    }
+    match nlmsg_error.error {
+        0 => Ok(()),
+        error if error == -libc::ENOENT => Ok(()),
+        error => {
+            let Some(errno) = error.checked_neg() else {
+                return Err(FatalError::MalformedMessage {
+                    error: "overflowing NLMSG_ERROR code".into(),
+                });
+            };
+            Err(FatalError::VerdictRejected {
+                errno,
+                error: io::Error::from_raw_os_error(errno).to_string(),
+            })
+        }
+    }
 }
 
 fn receive_exact(fd: RawFd) -> Result<Option<Bytes>, FatalError> {
@@ -701,5 +758,255 @@ mod tests {
         )
         .expect_err("malformed netlink length must stop the listener");
         assert!(matches!(error, FatalError::MalformedMessage { .. }));
+    }
+
+    fn nlmsg_error_message(
+        error_code: i32,
+        outer_flags: u16,
+        outer_sequence: u32,
+        original: &[u8],
+        trailing: &[u8],
+    ) -> Vec<u8> {
+        let mut message =
+            Vec::with_capacity(netlink::NLMSG_HDRLEN + 4 + original.len() + trailing.len());
+        message.extend_from_slice(&[0; 4]);
+        message.extend_from_slice(&netlink::NLMSG_ERROR.to_ne_bytes());
+        message.extend_from_slice(&outer_flags.to_ne_bytes());
+        message.extend_from_slice(&outer_sequence.to_ne_bytes());
+        message.extend_from_slice(&0u32.to_ne_bytes());
+        message.extend_from_slice(&error_code.to_ne_bytes());
+        message.extend_from_slice(original);
+        message.extend_from_slice(trailing);
+        netlink::seal_message(&mut message, 0);
+        message
+    }
+
+    fn verdict_request(sequence: u32, queue: u16) -> Vec<u8> {
+        let mut request = crate::verdict::build_verdict_message(42, NF_DROP, None, sequence);
+        request[18..20].copy_from_slice(&queue.to_be_bytes());
+        request
+    }
+
+    #[test]
+    fn nlmsg_error_ack_and_stale_verdict_enoent_continue_dispatch() {
+        let (socket, peer, mut fatal) = QueueSocket::for_test();
+        let tracker = GuardTracker::new();
+        let (sender, events) = std::sync::mpsc::channel();
+        let callback: PacketCallback = Arc::new(move |event, mut guard| {
+            guard.accept(0x400).unwrap();
+            sender.send(event).unwrap();
+        });
+
+        let verdict = verdict_request(7, QUEUE_NUM);
+        for ack in [
+            nlmsg_error_message(
+                0,
+                netlink::NLM_F_CAPPED,
+                7,
+                &verdict[..netlink::NLMSG_HDRLEN],
+                &[],
+            ),
+            nlmsg_error_message(0, 0, 7, &verdict[..netlink::NLMSG_HDRLEN], &[]),
+            nlmsg_error_message(
+                0,
+                netlink::NLM_F_CAPPED | netlink::NLM_F_ACK_TLVS,
+                7,
+                &verdict[..netlink::NLMSG_HDRLEN],
+                &[8, 0, 3, 0, 1, 2, 3, 4],
+            ),
+            nlmsg_error_message(0, 0, 7, &verdict, &[]),
+            nlmsg_error_message(-libc::ENOENT, 0, 7, &verdict, &[]),
+            nlmsg_error_message(
+                -libc::ENOENT,
+                netlink::NLM_F_ACK_TLVS,
+                7,
+                &verdict,
+                &[8, 0, 2, 0, 0, 0, 0, 0],
+            ),
+        ] {
+            dispatch_datagram(
+                Bytes::from(ack),
+                Instant::now(),
+                &socket,
+                &callback,
+                &tracker,
+            )
+            .expect("verdict ACK and stale-packet ENOENT must not fail dispatch");
+        }
+        assert!(events.try_recv().is_err());
+
+        let mut coalesced =
+            nlmsg_error_message(-libc::ENOENT, 0, 8, &verdict_request(8, QUEUE_NUM), &[]);
+        coalesced.extend_from_slice(&queued_udp_message(99, 12, 0));
+        dispatch_datagram(
+            Bytes::from(coalesced),
+            Instant::now(),
+            &socket,
+            &callback,
+            &tracker,
+        )
+        .expect("coalesced stale-packet ENOENT must let following packet dispatch");
+
+        let PacketEvent::Datagram(packet) = events.try_recv().expect("coalesced packet event")
+        else {
+            panic!("expected valid datagram after NLMSG_ERROR");
+        };
+        assert_eq!(packet.payload.as_ref(), b"next");
+        assert_eq!(tracker.count(), 0);
+        assert!(fatal.try_recv().is_err());
+        assert!(receive_exact(peer.as_raw_fd()).unwrap().is_some());
+    }
+
+    #[test]
+    fn nlmsg_error_socketpair_listener_survives_enoent_and_stops_on_einval() {
+        let (socket, peer, _fatal) = QueueSocket::for_test();
+        set_nonblocking(socket.fd.as_raw_fd()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let tracker = GuardTracker::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let callback: PacketCallback = Arc::new(move |event, mut guard| {
+            guard.drop_packet().unwrap();
+            tx.send(event).unwrap();
+        });
+        let listener_socket = Arc::clone(&socket);
+        let listener_stop = Arc::clone(&stop);
+        let listener_tracker = Arc::clone(&tracker);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let result = listen(listener_socket, listener_stop, callback, listener_tracker);
+            let _ = done_tx.send(result);
+        });
+
+        let enoent = nlmsg_error_message(-libc::ENOENT, 0, 9, &verdict_request(9, QUEUE_NUM), &[]);
+        netlink::send(peer.as_raw_fd(), &enoent).unwrap();
+        netlink::send(peer.as_raw_fd(), &queued_udp_message(55, 12, 0)).unwrap();
+        let event = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("listener must survive ENOENT and deliver following packet");
+        assert!(matches!(event, PacketEvent::Datagram(_)));
+        let _verdict_reply = netlink::recv_datagram(peer.as_raw_fd(), 128).unwrap();
+
+        let einval =
+            nlmsg_error_message(-libc::EINVAL, 0, 10, &verdict_request(10, QUEUE_NUM), &[]);
+        netlink::send(peer.as_raw_fd(), &einval).unwrap();
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        stop.store(true, Ordering::Release);
+        handle.join().expect("listener thread");
+        let result = result.expect("listener must stop immediately on EINVAL verdict error");
+        assert!(matches!(
+            result,
+            Err(FatalError::VerdictRejected { errno, .. }) if errno == libc::EINVAL
+        ));
+    }
+
+    #[test]
+    fn nlmsg_error_rejects_malformed_capped_wrong_queue_non_verdict_and_other_errnos() {
+        let (socket, _peer, _fatal) = QueueSocket::for_test();
+        let tracker = GuardTracker::new();
+        let callback: PacketCallback = Arc::new(|_, _| panic!("error frame dispatched as packet"));
+
+        let valid_verdict = verdict_request(11, QUEUE_NUM);
+        let mut bad_orig_len = valid_verdict.clone();
+        bad_orig_len[..4].copy_from_slice(&15u32.to_ne_bytes());
+        let mut non_request = valid_verdict.clone();
+        non_request[6..8].copy_from_slice(&0u16.to_ne_bytes());
+        let mut bad_nfgen_version = valid_verdict.clone();
+        bad_nfgen_version[17] = 1;
+        let mut header_only_verdict = valid_verdict[..netlink::NLMSG_HDRLEN].to_vec();
+        header_only_verdict[..4].copy_from_slice(&(netlink::NLMSG_HDRLEN as u32).to_ne_bytes());
+        let mut config_msg = valid_verdict.clone();
+        config_msg[4..6]
+            .copy_from_slice(&((netlink::NFNL_SUBSYS_QUEUE << 8) | NFQA_MSG_CONFIG).to_ne_bytes());
+
+        let malformed_cases = vec![
+            nlmsg_error_message(-libc::ENOENT, 0, 11, &[0u8; 12], &[]),
+            nlmsg_error_message(1, 0, 11, &valid_verdict, &[]),
+            nlmsg_error_message(i32::MIN, 0, 11, &valid_verdict, &[]),
+            nlmsg_error_message(-libc::ENOENT, 0, 11, &bad_orig_len, &[]),
+            nlmsg_error_message(-libc::ENOENT, 0, 12, &valid_verdict, &[]),
+            nlmsg_error_message(
+                -libc::ENOENT,
+                netlink::NLM_F_CAPPED,
+                11,
+                &valid_verdict[..netlink::NLMSG_HDRLEN],
+                &[],
+            ),
+            nlmsg_error_message(
+                -libc::ENOENT,
+                0,
+                11,
+                &valid_verdict[..valid_verdict.len() - 4],
+                &[],
+            ),
+            nlmsg_error_message(-libc::ENOENT, 0, 11, &non_request, &[]),
+            nlmsg_error_message(-libc::ENOENT, 0, 11, &bad_nfgen_version, &[]),
+            nlmsg_error_message(-libc::ENOENT, 0, 11, &header_only_verdict, &[]),
+            nlmsg_error_message(0, 0, 11, &bad_nfgen_version, &[]),
+        ];
+        for frame in malformed_cases {
+            let err = dispatch_datagram(
+                Bytes::from(frame),
+                Instant::now(),
+                &socket,
+                &callback,
+                &tracker,
+            )
+            .expect_err("malformed or capped negative NLMSG_ERROR must fail closed");
+            assert!(
+                matches!(err, FatalError::MalformedMessage { .. }),
+                "expected MalformedMessage, got {err:?}"
+            );
+        }
+
+        for err_code in [0, -libc::ENOENT, -libc::EINVAL] {
+            let frame = nlmsg_error_message(err_code, 0, 11, &config_msg, &[]);
+            let err = dispatch_datagram(
+                Bytes::from(frame),
+                Instant::now(),
+                &socket,
+                &callback,
+                &tracker,
+            )
+            .expect_err("non-verdict NLMSG_ERROR must fail closed");
+            assert!(matches!(
+                err,
+                FatalError::UnexpectedMessage { message_type }
+                    if message_type == (netlink::NFNL_SUBSYS_QUEUE << 8) | NFQA_MSG_CONFIG
+            ));
+        }
+
+        for err_code in [0, -libc::ENOENT] {
+            let frame =
+                nlmsg_error_message(err_code, 0, 11, &verdict_request(11, QUEUE_NUM + 1), &[]);
+            let err = dispatch_datagram(
+                Bytes::from(frame),
+                Instant::now(),
+                &socket,
+                &callback,
+                &tracker,
+            )
+            .expect_err("wrong-queue NLMSG_ERROR must fail closed");
+            assert!(matches!(
+                err,
+                FatalError::UnexpectedQueue { queue } if queue == QUEUE_NUM + 1
+            ));
+        }
+
+        for expected_errno in [libc::EINVAL, libc::ENODEV, libc::EPERM, libc::ENOBUFS] {
+            let frame =
+                nlmsg_error_message(-expected_errno, 0, 11, &verdict_request(11, QUEUE_NUM), &[]);
+            let err = dispatch_datagram(
+                Bytes::from(frame),
+                Instant::now(),
+                &socket,
+                &callback,
+                &tracker,
+            )
+            .expect_err("non-ENOENT verdict rejection must fail closed");
+            assert!(matches!(
+                err,
+                FatalError::VerdictRejected { errno, .. } if errno == expected_errno
+            ));
+        }
     }
 }

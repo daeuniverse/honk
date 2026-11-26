@@ -8,6 +8,7 @@ use crate::queue::QueueSocket;
 
 pub const NF_DROP: u32 = 0;
 pub const NF_ACCEPT: u32 = 1;
+pub(crate) const NFQA_MSG_VERDICT: u16 = 1;
 const NFQA_VERDICT_HDR: u16 = 2;
 const NFQA_MARK: u16 = 3;
 
@@ -134,7 +135,7 @@ pub(crate) fn build_verdict_message(
     let mut buffer = Vec::with_capacity(48);
     let start = netlink::put_message_header(
         &mut buffer,
-        (netlink::NFNL_SUBSYS_QUEUE << 8) | 1,
+        (netlink::NFNL_SUBSYS_QUEUE << 8) | NFQA_MSG_VERDICT,
         netlink::NLM_F_REQUEST,
         sequence,
         0,

@@ -94,10 +94,17 @@ fn exercise_kernel_contract(runtime: &tokio::runtime::Runtime) {
     );
 
     let (event_tx, events) = mpsc::channel();
+    let (held_tx, held_guards) = mpsc::channel();
     let callback: PacketCallback = Arc::new(move |event, mut guard| {
         let PacketEvent::Datagram(packet) = event else {
             panic!("valid kernel datagram rejected: {event:?}");
         };
+        if packet.payload.as_ref() == b"hold-across-flush" {
+            held_tx
+                .send((packet.payload, guard))
+                .expect("held guard receiver");
+            return;
+        }
         let decision = if packet.payload.starts_with(b"accept-") {
             CallbackDecision::Accept
         } else if packet.payload.as_ref() == b"explicit-drop" {
@@ -253,6 +260,29 @@ fn exercise_kernel_contract(runtime: &tokio::runtime::Runtime) {
         &events,
         &mut fatal,
         b"accept-rebound",
+        CallbackDecision::Accept,
+    );
+
+    ipv4_client
+        .send(b"hold-across-flush")
+        .expect("send datagram held across interface flush");
+    let (held_payload, mut stale_guard) = held_guards
+        .recv_timeout(Duration::from_secs(3))
+        .expect("receive held NFQUEUE guard");
+    assert_eq!(held_payload.as_ref(), b"hold-across-flush");
+    set_loopback_up(false);
+    set_loopback_up(true);
+    stale_guard
+        .drop_packet()
+        .expect("send verdict for kernel-flushed packet");
+    drop(stale_guard);
+    assert_no_delivery(&ipv4_receiver, Duration::from_millis(100));
+    exercise_datagram(
+        &ipv4_client,
+        &ipv4_receiver,
+        &events,
+        &mut fatal,
+        b"accept-after-stale-verdict",
         CallbackDecision::Accept,
     );
 
@@ -439,6 +469,10 @@ fn assert_no_delivery(socket: &UdpSocket, timeout: Duration) {
 }
 
 fn configure_loopback() {
+    set_loopback_up(true);
+}
+
+fn set_loopback_up(up: bool) {
     let interface = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
     assert_ne!(
         interface,
@@ -447,6 +481,7 @@ fn configure_loopback() {
         io::Error::last_os_error()
     );
     let socket = open_netlink_socket(NETLINK_ROUTE);
+    let flags = if up { IFF_UP } else { 0 };
     let mut request = Vec::with_capacity(48);
     request.extend_from_slice(&[0; 4]);
     request.extend_from_slice(&RTM_NEWLINK.to_ne_bytes());
@@ -456,12 +491,12 @@ fn configure_loopback() {
     request.extend_from_slice(&[0, 0]);
     request.extend_from_slice(&0u16.to_ne_bytes());
     request.extend_from_slice(&(interface as i32).to_ne_bytes());
-    request.extend_from_slice(&IFF_UP.to_ne_bytes());
+    request.extend_from_slice(&flags.to_ne_bytes());
     request.extend_from_slice(&IFF_UP.to_ne_bytes());
     let request_length = request.len() as u32;
     request[..4].copy_from_slice(&request_length.to_ne_bytes());
     netlink::send(socket.as_raw_fd(), &request).expect("RTM_NEWLINK request");
-    expect_ack(socket.as_raw_fd(), 1, "bring loopback up");
+    expect_ack(socket.as_raw_fd(), 1, "set loopback state");
 }
 
 fn expect_ack(fd: RawFd, sequence: u32, operation: &str) {

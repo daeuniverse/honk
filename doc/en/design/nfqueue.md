@@ -52,7 +52,7 @@ flowchart LR
 | Verdict ownership | A non-`Clone`, exactly-once `VerdictGuard`; dropping an uncommitted guard sends `NF_DROP` |
 | Ingest ownership | One actor bounded to `256` entries and `8 MiB` of queued payload; a UDP slow-path permit is attempted only when the actor dequeues an entry |
 | nftables ownership | One atomic transaction owns exact `inet honk_nfqueue` / `udp_decision`, an `inet prerouting` filter chain at priority `-250`; only UDP carrying the pending signature reaches the queue |
-| Failure policy | No queue bypass, fanout, or fail-open flag exists. Identifiable bad or truncated UDP payloads and invalid checksums receive `NF_DROP`. Malformed queue metadata, unidentifiable headers, `ENOBUFS`, listener exit, and verdict-socket failure stay fatal |
+| Failure policy | No queue bypass, fanout, or fail-open flag exists. Identifiable bad or truncated UDP payloads and invalid checksums receive `NF_DROP`; kernel `ENOENT` replies for already-flushed verdict packet IDs are ignored. Malformed queue metadata, unidentifiable headers, `ENOBUFS`, listener exit, other kernel verdict rejections, and verdict-socket failure stay fatal |
 
 The service binds queue `320` before publishing the nftables transaction. Installing the transaction reclaims the stale reserved table under the singleton process lock. On an orderly final shutdown, the service drains every dispatched guard, closes the queue, and deletes the owned table last. Same-network-namespace firewall managers must not mutate either reserved nftables object while honk runs.
 

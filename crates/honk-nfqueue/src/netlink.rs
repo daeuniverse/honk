@@ -11,10 +11,13 @@ pub(crate) const NFNL_MSG_BATCH_END: u16 = 17;
 pub(crate) const NLMSG_ERROR: u16 = 2;
 pub(crate) const NLM_F_REQUEST: u16 = 0x01;
 pub(crate) const NLM_F_ACK: u16 = 0x04;
+pub(crate) const NLM_F_CAPPED: u16 = 0x100;
+pub(crate) const NLM_F_ACK_TLVS: u16 = 0x200;
 pub(crate) const NLM_F_CREATE: u16 = 0x400;
 pub(crate) const NLA_F_NESTED: u16 = 0x8000;
 const NLA_F_NET_BYTEORDER: u16 = 0x4000;
 pub(crate) const NLMSG_HDRLEN: usize = 16;
+pub(crate) const NLMSGERR_HDRLEN: usize = 4 + NLMSG_HDRLEN;
 pub(crate) const NFGENMSG_LEN: usize = 4;
 const NLA_HDRLEN: usize = 4;
 pub(crate) const NFPROTO_INET: u8 = 1;
@@ -111,6 +114,68 @@ pub(crate) struct Message {
     pub(crate) sequence: u32,
     pub(crate) flags: u16,
     pub(crate) body: Bytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NlmsgError<'a> {
+    pub(crate) error: i32,
+    pub(crate) original_type: u16,
+    pub(crate) original_flags: u16,
+    pub(crate) original_sequence: u32,
+    pub(crate) original_body: Option<&'a [u8]>,
+}
+
+pub(crate) fn parse_nlmsg_error(flags: u16, body: &[u8]) -> Result<NlmsgError<'_>, &'static str> {
+    if body.len() < NLMSGERR_HDRLEN {
+        return Err("truncated NLMSG_ERROR");
+    }
+    let error = i32::from_ne_bytes(body[0..4].try_into().expect("four bytes"));
+    if error > 0 {
+        return Err("positive NLMSG_ERROR code");
+    }
+    let original_header = &body[4..NLMSGERR_HDRLEN];
+    let original_length = u32::from_ne_bytes(original_header[0..4].try_into().expect("four bytes"));
+    let Some(original_length) = usize::try_from(original_length)
+        .ok()
+        .filter(|&length| length >= NLMSG_HDRLEN)
+    else {
+        return Err("invalid NLMSG_ERROR original length");
+    };
+    let original_type = u16::from_ne_bytes(original_header[4..6].try_into().expect("two bytes"));
+    let original_flags = u16::from_ne_bytes(original_header[6..8].try_into().expect("two bytes"));
+    let original_sequence =
+        u32::from_ne_bytes(original_header[8..12].try_into().expect("four bytes"));
+
+    let original_body = if error < 0 {
+        if flags & NLM_F_CAPPED != 0 {
+            return Err("capped NLMSG_ERROR is unexpected");
+        }
+        let Some(original_end) = original_length.checked_add(4) else {
+            return Err("overflowing NLMSG_ERROR original length");
+        };
+        if body.len() < original_end {
+            return Err("truncated NLMSG_ERROR original payload");
+        }
+        Some(&body[NLMSGERR_HDRLEN..original_end])
+    } else if flags & (NLM_F_CAPPED | NLM_F_ACK_TLVS) == 0 && body.len() > NLMSGERR_HDRLEN {
+        let Some(original_end) = original_length.checked_add(4) else {
+            return Err("overflowing NLMSG_ERROR original length");
+        };
+        if body.len() < original_end {
+            return Err("truncated NLMSG_ERROR original payload");
+        }
+        Some(&body[NLMSGERR_HDRLEN..original_end])
+    } else {
+        None
+    };
+
+    Ok(NlmsgError {
+        error,
+        original_type,
+        original_flags,
+        original_sequence,
+        original_body,
+    })
 }
 
 pub(crate) struct Messages {
@@ -380,6 +445,39 @@ mod tests {
             Err(DecodeError::InvalidMessageLength(
                 NLMSG_HDRLEN + NFGENMSG_LEN + 1
             ))
+        );
+    }
+
+    #[test]
+    fn parse_nlmsg_error_bounds_checks_headers_and_echoed_payloads() {
+        assert_eq!(
+            parse_nlmsg_error(0, &[0u8; NLMSGERR_HDRLEN - 1]),
+            Err("truncated NLMSG_ERROR")
+        );
+
+        let mut body = vec![0u8; NLMSGERR_HDRLEN + 4];
+        body[0..4].copy_from_slice(&(-libc::ENOENT).to_ne_bytes());
+        body[4..8].copy_from_slice(&u32::MAX.to_ne_bytes());
+        body[8..10].copy_from_slice(&0x0301u16.to_ne_bytes());
+        body[10..12].copy_from_slice(&NLM_F_REQUEST.to_ne_bytes());
+        body[12..16].copy_from_slice(&5u32.to_ne_bytes());
+        assert!(parse_nlmsg_error(0, &body).is_err());
+
+        body[4..8].copy_from_slice(&20u32.to_ne_bytes());
+        body[20..24].copy_from_slice(&[0, 0, 1, 64]);
+        assert_eq!(
+            parse_nlmsg_error(0, &body),
+            Ok(NlmsgError {
+                error: -libc::ENOENT,
+                original_type: 0x0301,
+                original_flags: NLM_F_REQUEST,
+                original_sequence: 5,
+                original_body: Some(&[0, 0, 1, 64][..]),
+            })
+        );
+        assert_eq!(
+            parse_nlmsg_error(NLM_F_CAPPED, &body[..NLMSGERR_HDRLEN]),
+            Err("capped NLMSG_ERROR is unexpected")
         );
     }
 }

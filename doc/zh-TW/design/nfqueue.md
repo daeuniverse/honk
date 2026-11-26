@@ -50,7 +50,7 @@ flowchart LR
 | Verdict 所有權 | 使用不可 `Clone`、只允許提交一次的 `VerdictGuard`；未提交的 guard 在 drop 時傳送 `NF_DROP` |
 | Ingest 所有權 | 單 actor，佇列上限為 `256` 筆和 `8 MiB` payload；僅當 actor dequeue 時才嘗試取得 UDP slow-path permit |
 | nftables 所有權 | 由單一原子交易獨佔 `inet honk_nfqueue` / `udp_decision`，即優先順序 `-250` 的 `inet prerouting` filter chain；只有攜帶 Pending 簽名的 UDP 才進入佇列 |
-| 失敗策略 | 不設定 queue bypass、fanout 或 fail-open flag。可識別的壞包、UDP payload 截斷和檢查碼錯誤傳送 `NF_DROP`；畸形佇列後設資料、無法辨識的封包標頭、`ENOBUFS`、listener 退出和 verdict socket 失敗仍為 fatal |
+| 失敗策略 | 不設定 queue bypass、fanout 或 fail-open flag。可識別的壞包、UDP payload 截斷和檢查碼錯誤傳送 `NF_DROP`；已由核心清除的 verdict 封包 ID 回傳 `ENOENT` 時予以忽略。畸形佇列後設資料、無法辨識的封包標頭、`ENOBUFS`、listener 退出、其他核心 verdict 拒絕和 verdict socket 失敗仍為 fatal |
 
 服務先繫結佇列 `320`，再發布 nftables 交易。安裝階段在單一實例鎖保護下回收殘留的保留 table。最終有序關閉時，它先 drain 所有已分派的 guard，再關閉佇列，最後刪除自有 table。同一網路命名空間裡的防火牆管理器不得在 honk 執行期間修改這些保留的 nftables 物件。
 
