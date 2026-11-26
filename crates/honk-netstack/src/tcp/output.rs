@@ -1,5 +1,8 @@
+use std::convert::Infallible;
 use std::time::Instant;
 
+use crate::IovTransmit;
+use crate::flow::FourTuple;
 use crate::offload::{GsoKind, GsoTx, Transmit, TxCaps, TxCsum};
 use crate::wire::{
     self,
@@ -7,8 +10,9 @@ use crate::wire::{
 };
 
 use super::pacing::Pacer;
+use super::ring::Pool;
 use super::sent::{APP_LIMITED, Descriptor, FIN as SENT_FIN, Stamp};
-use super::{Tcb, TcpState};
+use super::{Room, Tcb, TcpState};
 
 pub enum Output {
     Sent(usize),
@@ -41,140 +45,216 @@ enum Kind {
     },
 }
 
+struct Request {
+    now: Instant,
+    max_len: usize,
+    caps: TxCaps,
+    payload_allowed: bool,
+}
+
+struct Selection {
+    pacer: Option<Pacer>,
+    pacing_deadline: Option<Instant>,
+    retrans_cursor: u32,
+    cwnd_limited: bool,
+    tlp_due: bool,
+    refused: bool,
+    probe: bool,
+    pipe: u32,
+    unsent_left: usize,
+}
+
+impl Selection {
+    fn new(t: &Tcb) -> Self {
+        Self {
+            pacer: None,
+            pacing_deadline: t.pacing_deadline,
+            retrans_cursor: t.sent.retrans_cursor,
+            cwnd_limited: t.cwnd_limited,
+            tlp_due: t.tlp_due,
+            refused: false,
+            probe: false,
+            pipe: 0,
+            unsent_left: 0,
+        }
+    }
+
+    fn apply(&self, t: &mut Tcb) {
+        if let Some(pacer) = self.pacer {
+            t.pacer = pacer;
+        }
+        t.pacing_deadline = self.pacing_deadline;
+        t.sent.retrans_cursor = self.retrans_cursor;
+        t.cwnd_limited = self.cwnd_limited;
+        t.tlp_due = self.tlp_due;
+    }
+
+    fn room<const IOV: bool>(&mut self, room: Room) -> Result<bool, ()> {
+        match room {
+            Room::Grew if IOV => Err(()),
+            Room::Ready | Room::Grew => Ok(true),
+            Room::Refused => {
+                self.refused = true;
+                Ok(false)
+            }
+        }
+    }
+
+    /// `tso_max` can raise the burst to one full TSO packet, within the two millisecond cap.
+    fn pace_ok(
+        &mut self,
+        t: &Tcb,
+        now: Instant,
+        bytes: u32,
+        mss: u32,
+        tso_max: usize,
+        rate: Option<u64>,
+    ) -> bool {
+        self.pacing_deadline = rate.and_then(|rate| {
+            let burst = (tso_max as u64).max(super::pacing::BURST_SEGMENTS);
+            self.pacer
+                .get_or_insert(t.pacer)
+                .check(now, bytes.min(mss), rate, mss, burst)
+        });
+        self.pacing_deadline.is_none()
+    }
+
+    /// Start a segment against the congestion budget as for plain TCP. Pacing also bounds the
+    /// run by the tokens from `pace_ok` and roughly one millisecond of traffic at that rate.
+    fn tso_segs(&self, cap: usize, max: usize, budget: usize, rate: Option<u64>) -> usize {
+        let mut n = max.min(budget.div_ceil(cap));
+        if let Some(rate) = rate {
+            let tokens = self.pacer.as_ref().expect("TSO has passed pacing").tokens();
+            let by_tokens = usize::try_from(tokens / cap as u64).unwrap_or(usize::MAX);
+            let by_size = usize::try_from(rate / 1000 / cap as u64).unwrap_or(usize::MAX);
+            n = n.min(by_tokens).min(by_size.max(2));
+        }
+        n.max(1)
+    }
+}
+
 impl Tcb {
     #[cfg(test)]
-    pub fn output(&mut self, now: Instant, out: &mut [u8], pool: &mut super::ring::Pool) -> Output {
+    pub fn output(&mut self, now: Instant, out: &mut [u8], pool: &mut Pool) -> Output {
         self.output_with(now, out, pool, TxCaps::NONE, &mut Transmit::plain(0), true)
     }
 
-    /// Emits a TCP packet with the driver's capabilities. A TSO packet keeps one send descriptor
-    /// per segment, so SACK, RACK and retransmission see ordinary segments.
+    /// A TSO packet still owns one send descriptor per wire segment.
     pub fn output_with(
         &mut self,
         now: Instant,
         out: &mut [u8],
-        pool: &mut super::ring::Pool,
+        pool: &mut Pool,
         caps: TxCaps,
         tx: &mut Transmit,
         payload_allowed: bool,
     ) -> Output {
-        let v6 = self.tuple.local.is_ipv6();
-        let ip_len = wire::ip_header_len(v6);
+        let request = Request {
+            now,
+            max_len: out.len(),
+            caps,
+            payload_allowed,
+        };
+        match self.output_to::<false, Infallible>(
+            request,
+            pool,
+            *tx,
+            |tuple, hdr, parts, info, _| {
+                let src = tuple.local.ip();
+                let dst = tuple.remote.ip();
+                let n = if info.csum == TxCsum::Full {
+                    wire_tcp::emit_packet_parts(out, src, dst, hdr, parts)
+                } else {
+                    wire_tcp::emit_partial_parts(out, src, dst, hdr, parts)
+                };
+                Ok(n.is_some())
+            },
+        ) {
+            Ok(IovTransmit::Packet(info)) => {
+                *tx = info;
+                Output::Sent(info.len)
+            }
+            Ok(IovTransmit::BufferTooSmall) => Output::Blocked,
+            Ok(IovTransmit::Deferred) => Output::Deferred,
+            Ok(IovTransmit::Idle) => Output::None,
+            Ok(IovTransmit::Progress | IovTransmit::NeedsIcmp) => unreachable!(),
+            Err(never) => match never {},
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn output_iov<E>(
+        &mut self,
+        now: Instant,
+        max_len: usize,
+        pool: &mut Pool,
+        caps: TxCaps,
+        payload_allowed: bool,
+        identity: Transmit,
+        emit: &mut impl FnMut(&[u8], &[&[u8]], Transmit) -> Result<(), E>,
+    ) -> Result<IovTransmit, E> {
+        let request = Request {
+            now,
+            max_len,
+            caps,
+            payload_allowed,
+        };
+        self.output_to::<true, E>(
+            request,
+            pool,
+            identity,
+            |tuple, hdr, parts, info, data_len| {
+                let mut header = [0; 128];
+                let Some(len) = wire_tcp::emit_header_only(
+                    &mut header,
+                    tuple.local.ip(),
+                    tuple.remote.ip(),
+                    hdr,
+                    data_len,
+                    parts,
+                    info.csum != TxCsum::Full,
+                ) else {
+                    return Ok(false);
+                };
+                emit(&header[..len], parts, info)?;
+                Ok(true)
+            },
+        )
+    }
+
+    fn output_to<const IOV: bool, E>(
+        &mut self,
+        request: Request,
+        pool: &mut Pool,
+        mut tx: Transmit,
+        send: impl FnOnce(&FourTuple, &Header, &[&[u8]], Transmit, usize) -> Result<bool, E>,
+    ) -> Result<IovTransmit, E> {
+        let now = request.now;
         let syn = matches!(self.state, TcpState::SynSent | TcpState::SynReceived);
         let mut options = self.options(now, syn);
-        let mut kind = if self.rst_pending {
+        let mut selection = Selection::new(self);
+        let kind = if self.rst_pending {
             Some(Kind::Reset)
         } else if syn && self.syn_due {
             Some(Kind::Syn)
+        } else if !syn && self.state != TcpState::Closed {
+            let Ok(kind) = self.select::<IOV>(&request, pool, &options, &mut selection) else {
+                return Ok(IovTransmit::Progress);
+            };
+            kind
         } else {
             None
         };
-        let mut probe = false;
-        let mut pipe = 0;
-        let mut unsent_left = 0;
-        if kind.is_none() && !syn && self.state != TcpState::Closed {
-            let cap = self.payload_cap(&options);
-            let mss = self.send_mss();
-            pipe = self.recovery.pipe(&self.sent, self.sack);
-            let budget = self.recovery.budget(pipe, self.cc.cwnd()) as usize;
-            let can_send_new = self.may_send_new();
-            let sent_offset = self.snd_nxt.wrapping_sub(self.snd_una) as usize;
-            let unsent = self.tx.len().saturating_sub(sent_offset);
-            let rwnd = self
-                .snd_wnd
-                .saturating_sub(self.snd_nxt.wrapping_sub(self.snd_una))
-                as usize;
-            // Segments one TSO packet may hold at most: the 64 KiB IP limit and the caller's buffer.
-            let tso_max = if !caps.tso(v6) || cap == 0 {
-                1
-            } else {
-                let headers = ip_len + wire_tcp::header_len(&options, false);
-                let capacity = usize::from(u16::MAX).min(out.len());
-                (capacity.saturating_sub(headers) / cap).max(1)
-            };
-            if self.tlp_due {
-                kind = self.tlp_kind(pool, cap, unsent, rwnd, can_send_new, payload_allowed);
-                probe = kind.is_some();
-                if payload_allowed && kind.is_none() {
-                    self.tlp_due = false;
-                }
-            }
-            if kind.is_none()
-                && !self.recovery.hold_retransmits()
-                && let Some((i, start, len, fin)) = self.sent.next_retransmit(payload_allowed)
-            {
-                let data = (len as usize - usize::from(fin)).min(cap);
-                let fin = fin && data as u32 + 1 == len;
-                if budget > 0
-                    && (data != 0 || fin)
-                    && (data as u32 + u32::from(fin) == len || self.sent.ensure_room(pool, 1))
-                {
-                    let rate = Pacer::rate(self.cc.cwnd(), self.rtt.srtt(), self.cc.pacing_gain());
-                    if self.pace_ok(now, data as u32, mss, tso_max, rate) {
-                        let (mut data, mut segs) = (data, 1);
-                        // A run of lost whole segments goes out as one TSO packet.
-                        if tso_max >= 2 && !fin && data == cap && data as u32 == len {
-                            let n = self.tso_segs(cap, tso_max, budget, rate);
-                            if n > 1 {
-                                let (count, end) = self.sent.lost_run(i, cap as u32, n);
-                                segs = count;
-                                data = end.wrapping_sub(start) as usize;
-                            }
-                        }
-                        kind = Some(Kind::Retransmit {
-                            index: i,
-                            start,
-                            data,
-                            fin,
-                            segs,
-                        });
-                    }
-                }
-            }
-            if kind.is_none() && can_send_new && (payload_allowed || unsent == 0) {
-                let data = unsent.min(cap).min(rwnd);
-                let fin = self.fin_requested
-                    && self.fin_seq.is_none()
-                    && data == unsent
-                    && rwnd > data
-                    && budget > 0;
-                if unsent == 0 {
-                    self.cwnd_limited = false;
-                } else if data != 0 && budget == 0 {
-                    self.cwnd_limited = true;
-                }
-                if budget > 0 && (data != 0 || fin) && self.sent.ensure_room(pool, 2) {
-                    let rate = Pacer::rate(self.cc.cwnd(), self.rtt.srtt(), self.cc.pacing_gain());
-                    if self.pace_ok(now, data as u32, mss, tso_max, rate) {
-                        let (mut data, mut fin, mut segs) = (data, fin, 1);
-                        if tso_max >= 2 && data == cap && unsent > data && rwnd > data {
-                            let n = self
-                                .tso_segs(cap, tso_max, budget, rate)
-                                .min(unsent.min(rwnd).div_ceil(cap));
-                            if n > 1 && self.sent.ensure_room(pool, n + 1) {
-                                data = unsent.min(rwnd).min(n * cap);
-                                segs = data.div_ceil(cap);
-                                fin = self.fin_requested
-                                    && self.fin_seq.is_none()
-                                    && data == unsent
-                                    && rwnd > data;
-                            }
-                        }
-                        unsent_left = unsent - data;
-                        kind = Some(Kind::New { data, fin, segs });
-                    }
-                }
-            }
-            if kind.is_none() && self.ack_due != 0 {
-                kind = Some(Kind::Ack);
-            }
-            if kind.is_none() && self.probe_due {
-                kind = Some(Kind::Probe);
-            }
+        if !IOV {
+            // Contiguous pulls have always published selection state even on a short buffer.
+            selection.apply(self);
         }
         let Some(kind) = kind else {
+            if IOV {
+                return Ok(self.finish_idle(now, selection));
+            }
             self.rearm(now);
-            return Output::None;
+            return Ok(IovTransmit::Idle);
         };
         if matches!(kind, Kind::Reset) {
             options = Options::default();
@@ -227,19 +307,23 @@ impl Tcb {
             urgent: 0,
             options,
         };
-        let need = ip_len + wire_tcp::header_len(&hdr.options, flags & SYN != 0) + data_len;
-        if out.len() < need {
-            return Output::Blocked;
+        let v6 = self.tuple.local.is_ipv6();
+        let ip_len = wire::ip_header_len(v6);
+        let header_len = ip_len + wire_tcp::header_len(&hdr.options, flags & SYN != 0);
+        let need = header_len + data_len;
+        if request.max_len < need {
+            return Ok(IovTransmit::BufferTooSmall);
         }
         let segs = match kind {
             Kind::New { segs, .. } | Kind::Retransmit { segs, .. } => segs,
             _ => 1,
         };
-        if self.sack
-            && matches!(kind, Kind::Retransmit { .. })
-            && !self.recovery.rack.ensure_room(pool, segs)
-        {
-            return Output::Deferred;
+        if self.sack && matches!(kind, Kind::Retransmit { .. }) {
+            match self.recovery.rack.ensure_room::<IOV>(pool, segs) {
+                Room::Grew if IOV => return Ok(IovTransmit::Progress),
+                Room::Refused => return Ok(IovTransmit::Deferred),
+                Room::Ready | Room::Grew => {}
+            }
         }
         // Every segment but the last is a full payload; they share one header.
         let seg_size = if segs > 1 {
@@ -247,29 +331,33 @@ impl Tcb {
         } else {
             data_len
         };
-        let (payload, parts) = self.tx.slices(off, data_len);
-        let ips = (self.tuple.local.ip(), self.tuple.remote.ip());
-        let partial = segs > 1 || caps.csum(v6);
-        let Some(n) = (if partial {
-            wire_tcp::emit_partial_parts(out, ips.0, ips.1, &hdr, &payload[..parts])
-        } else {
-            wire_tcp::emit_packet_parts(out, ips.0, ips.1, &hdr, &payload[..parts])
-        }) else {
-            return Output::Blocked;
-        };
-        if partial {
-            tx.csum = TxCsum::Partial {
+        tx.len = need;
+        tx.gso = (segs > 1).then_some(GsoTx {
+            kind: GsoKind::Tcp,
+            size: seg_size as u16,
+            hdr_len: header_len as u16,
+        });
+        tx.csum = if segs > 1 || request.caps.csum(v6) {
+            TxCsum::Partial {
                 start: ip_len as u16,
                 offset: 16,
-            };
+            }
+        } else {
+            TxCsum::Full
+        };
+        let (payload, parts) = self.tx.slices(off, data_len);
+        if !send(&self.tuple, &hdr, &payload[..parts], tx, data_len)? {
+            return Ok(IovTransmit::BufferTooSmall);
         }
-        if segs > 1 {
-            tx.gso = Some(GsoTx {
-                kind: GsoKind::Tcp,
-                size: seg_size as u16,
-                hdr_len: (n - data_len) as u16,
-            });
+        if IOV {
+            selection.apply(self);
         }
+        let Selection {
+            probe,
+            pipe,
+            unsent_left,
+            ..
+        } = selection;
         if flags & (ACK | SYN) != 0 && flags & RST == 0 {
             let right = self.wire_right(flags & SYN != 0);
             self.max_adv_right = super::seq::max(self.max_adv_right, right);
@@ -413,42 +501,200 @@ impl Tcb {
             }
         }
         self.rearm(now);
-        Output::Sent(n)
+        Ok(IovTransmit::Packet(tx))
+    }
+
+    fn select<const IOV: bool>(
+        &mut self,
+        request: &Request,
+        pool: &mut Pool,
+        options: &Options,
+        sel: &mut Selection,
+    ) -> Result<Option<Kind>, ()> {
+        let now = request.now;
+        let payload_allowed = request.payload_allowed;
+        let cap = self.payload_cap(options);
+        let mss = self.send_mss();
+        sel.pipe = self.recovery.pipe(&self.sent, self.sack);
+        let budget = self.recovery.budget(sel.pipe, self.cc.cwnd()) as usize;
+        let can_send_new = self.may_send_new();
+        let flight = self.snd_nxt.wrapping_sub(self.snd_una);
+        let unsent = self.tx.len().saturating_sub(flight as usize);
+        let rwnd = self.snd_wnd.saturating_sub(flight) as usize;
+        let v6 = self.tuple.local.is_ipv6();
+        let tso_max = if !request.caps.tso(v6) || cap == 0 {
+            1
+        } else {
+            let headers = wire::ip_header_len(v6) + wire_tcp::header_len(options, false);
+            (request
+                .max_len
+                .min(usize::from(u16::MAX))
+                .saturating_sub(headers)
+                / cap)
+                .max(1)
+        };
+
+        if self.tlp_due {
+            let new = if can_send_new && payload_allowed {
+                unsent.min(cap).min(rwnd)
+            } else {
+                0
+            };
+            let kind = self.tlp_kind::<IOV>(pool, cap, new, payload_allowed, sel)?;
+            if kind.is_some() {
+                sel.probe = true;
+                return Ok(kind);
+            }
+            if payload_allowed && (!IOV || !sel.refused) {
+                sel.tlp_due = false;
+            }
+        }
+        if !self.recovery.hold_retransmits()
+            && let Some((i, start, len, fin)) = self
+                .sent
+                .scan_retransmit(payload_allowed, &mut sel.retrans_cursor)
+        {
+            let data = (len as usize - usize::from(fin)).min(cap);
+            let fin = fin && data as u32 + 1 == len;
+            if budget > 0
+                && (data != 0 || fin)
+                && (data as u32 + u32::from(fin) == len
+                    || sel.room::<IOV>(self.sent.ensure_room(pool, 1))?)
+            {
+                let rate = Pacer::rate(self.cc.cwnd(), self.rtt.srtt(), self.cc.pacing_gain());
+                if sel.pace_ok(self, now, data as u32, mss, tso_max, rate) {
+                    let (mut data, mut segs) = (data, 1);
+                    // A run of lost whole segments goes out as one TSO packet.
+                    if tso_max >= 2 && !fin && data == cap && data as u32 == len {
+                        let n = sel.tso_segs(cap, tso_max, budget, rate);
+                        if n > 1 {
+                            let (count, end) = self.sent.lost_run(i, cap as u32, n);
+                            segs = count;
+                            data = end.wrapping_sub(start) as usize;
+                        }
+                    }
+                    return Ok(Some(Kind::Retransmit {
+                        index: i,
+                        start,
+                        data,
+                        fin,
+                        segs,
+                    }));
+                }
+            }
+        }
+        if can_send_new && (payload_allowed || unsent == 0) {
+            let data = unsent.min(cap).min(rwnd);
+            let fin = self.fin_requested
+                && self.fin_seq.is_none()
+                && data == unsent
+                && rwnd > data
+                && budget > 0;
+            if unsent == 0 {
+                sel.cwnd_limited = false;
+            } else if data != 0 && budget == 0 {
+                sel.cwnd_limited = true;
+            }
+            if budget > 0
+                && (data != 0 || fin)
+                && sel.room::<IOV>(self.sent.ensure_room(pool, 2))?
+            {
+                let rate = Pacer::rate(self.cc.cwnd(), self.rtt.srtt(), self.cc.pacing_gain());
+                if sel.pace_ok(self, now, data as u32, mss, tso_max, rate) {
+                    let (mut data, mut fin, mut segs) = (data, fin, 1);
+                    if tso_max >= 2 && data == cap && unsent > data && rwnd > data {
+                        let n = sel
+                            .tso_segs(cap, tso_max, budget, rate)
+                            .min(unsent.min(rwnd).div_ceil(cap));
+                        if n > 1 && sel.room::<IOV>(self.sent.ensure_room(pool, n + 1))? {
+                            data = unsent.min(rwnd).min(n * cap);
+                            segs = data.div_ceil(cap);
+                            fin = self.fin_requested
+                                && self.fin_seq.is_none()
+                                && data == unsent
+                                && rwnd > data;
+                        }
+                    }
+                    sel.unsent_left = unsent - data;
+                    return Ok(Some(Kind::New { data, fin, segs }));
+                }
+            }
+        }
+        if self.ack_due != 0 {
+            return Ok(Some(Kind::Ack));
+        }
+        Ok(self.probe_due.then_some(Kind::Probe))
+    }
+
+    fn finish_idle(&mut self, now: Instant, mut selection: Selection) -> IovTransmit {
+        let before = (self.persist, self.rto_deadline);
+        self.rearm(now);
+        let timer_changed = before != (self.persist, self.rto_deadline);
+        if selection.refused {
+            // Keep the cursor for a later retry, while allowing timers for other work to arm.
+            selection.retrans_cursor = self.sent.retrans_cursor;
+        }
+        if self
+            .pacing_deadline
+            .zip(selection.pacing_deadline)
+            .is_some_and(|(armed, proposed)| now < armed && armed <= proposed)
+        {
+            // Keep the earlier wakeup. Token refills before it alone are not progress.
+            selection.pacing_deadline = self.pacing_deadline;
+            selection.pacer = None;
+        }
+        if selection.pacing_deadline != self.pacing_deadline
+            || selection.retrans_cursor != self.sent.retrans_cursor
+            || selection.cwnd_limited != self.cwnd_limited
+            || selection.tlp_due != self.tlp_due
+            || selection.pacer.is_some_and(|p| p != self.pacer)
+        {
+            selection.apply(self);
+            return IovTransmit::Progress;
+        }
+        if timer_changed {
+            IovTransmit::Progress
+        } else if selection.refused {
+            IovTransmit::Deferred
+        } else {
+            IovTransmit::Idle
+        }
     }
 
     /// The segment a tail loss probe sends: new data if there is any and the peer allows it,
     /// otherwise the newest unacknowledged one (RFC 8985 §7.3).
-    fn tlp_kind(
+    fn tlp_kind<const IOV: bool>(
         &mut self,
-        pool: &mut super::ring::Pool,
+        pool: &mut Pool,
         cap: usize,
-        unsent: usize,
-        rwnd: usize,
-        can_send_new: bool,
+        new: usize,
         payload_allowed: bool,
-    ) -> Option<Kind> {
+        sel: &mut Selection,
+    ) -> Result<Option<Kind>, ()> {
         // `cap` can be zero (tiny path MTU under large options): an empty segment is no probe.
-        let new = unsent.min(cap).min(rwnd);
-        if payload_allowed && can_send_new && new != 0 && self.sent.ensure_room(pool, 2) {
-            return Some(Kind::New {
+        if new != 0 && sel.room::<IOV>(self.sent.ensure_room(pool, 2))? {
+            return Ok(Some(Kind::New {
                 data: new,
                 fin: false,
                 segs: 1,
-            });
+            }));
         }
-        let (index, start, len, fin) = self.sent.last_unsacked()?;
+        let Some((index, start, len, fin)) = self.sent.last_unsacked() else {
+            return Ok(None);
+        };
         let data = (len as usize - usize::from(fin)).min(cap);
         let fin = fin && data as u32 + 1 == len;
-        ((payload_allowed || data == 0)
+        let can_send = (payload_allowed || data == 0)
             && (data != 0 || fin)
-            && (data as u32 + u32::from(fin) == len || self.sent.ensure_room(pool, 1)))
-        .then_some(Kind::Retransmit {
+            && (data as u32 + u32::from(fin) == len
+                || sel.room::<IOV>(self.sent.ensure_room(pool, 1))?);
+        Ok(can_send.then_some(Kind::Retransmit {
             index,
             start,
             data,
             fin,
             segs: 1,
-        })
+        }))
     }
 
     /// Whether queued data and our FIN may still leave. CLOSING counts: the peer's FIN can arrive
@@ -477,48 +723,6 @@ impl Tcb {
         if !(can_send_new && self.tx.len() > flight && self.snd_wnd as usize > flight) {
             self.recovery.end_frto();
         }
-    }
-
-    /// Pacing gate; records when the next segment may leave if it may not leave now. With TSO
-    /// (`tso_max` segments per packet) the bucket holds up to one full TSO packet, still bounded
-    /// by two milliseconds of traffic.
-    fn pace_ok(
-        &mut self,
-        now: Instant,
-        bytes: u32,
-        mss: u32,
-        tso_max: usize,
-        rate: Option<u64>,
-    ) -> bool {
-        let Some(rate) = rate else {
-            self.pacing_deadline = None;
-            return true;
-        };
-        let burst = (tso_max as u64).max(super::pacing::BURST_SEGMENTS);
-        match self.pacer.check(now, bytes.min(mss), rate, mss, burst) {
-            None => {
-                self.pacing_deadline = None;
-                true
-            }
-            Some(at) => {
-                self.pacing_deadline = Some(at);
-                false
-            }
-        }
-    }
-
-    /// How many `cap`-byte segments one TSO packet may carry now, at most `max` (always at least
-    /// one): bounded by the congestion `budget` (a started segment counts, as for single
-    /// segments), by the pacer's tokens (called right after `pace_ok` admitted the first segment),
-    /// and by roughly one millisecond of traffic at the pacing rate, as Linux's TSO autosizing.
-    fn tso_segs(&self, cap: usize, max: usize, budget: usize, rate: Option<u64>) -> usize {
-        let mut n = max.min(budget.div_ceil(cap));
-        if let Some(rate) = rate {
-            let by_tokens = usize::try_from(self.pacer.tokens() / cap as u64).unwrap_or(usize::MAX);
-            let by_size = usize::try_from(rate / 1000 / cap as u64).unwrap_or(usize::MAX);
-            n = n.min(by_tokens).min(by_size.max(2));
-        }
-        n.max(1)
     }
 
     fn options(&self, now: Instant, syn: bool) -> Options {
@@ -571,3 +775,6 @@ impl Tcb {
         peer_cap.min(mtu_cap)
     }
 }
+
+#[cfg(test)]
+mod tests;

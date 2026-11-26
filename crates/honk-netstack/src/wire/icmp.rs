@@ -4,7 +4,7 @@ use std::ops::Range;
 use super::checksum::{Checksum, checksum};
 use super::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, ParseError, emit_ip_header, ipv6};
 
-const HEADER_LEN: usize = 8;
+pub(crate) const HEADER_LEN: usize = 8;
 const MAX_QUOTE_LEN: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +142,30 @@ pub(crate) fn emit_error(
     out: &mut [u8],
     src: IpAddr,
     dst: IpAddr,
+    kind: (u8, u8),
+    rest: [u8; 4],
+    quote: &[u8],
+) -> Option<usize> {
+    let header = emit_error_parts::<true>(out, src, dst, kind, rest, quote)?;
+    Some(header + quote.len())
+}
+
+/// Writes only the IP and ICMP headers, with a checksum over the borrowed quote.
+pub(crate) fn emit_error_header(
+    out: &mut [u8],
+    src: IpAddr,
+    dst: IpAddr,
+    kind: (u8, u8),
+    rest: [u8; 4],
+    quote: &[u8],
+) -> Option<usize> {
+    emit_error_parts::<false>(out, src, dst, kind, rest, quote)
+}
+
+fn emit_error_parts<const COPY_QUOTE: bool>(
+    out: &mut [u8],
+    src: IpAddr,
+    dst: IpAddr,
     (ty, code): (u8, u8),
     rest: [u8; 4],
     quote: &[u8],
@@ -153,20 +177,24 @@ pub(crate) fn emit_error(
         PROTO_ICMPV6
     };
     let iplen = emit_ip_header(out, src, dst, proto, len)?;
-    let total = iplen + len;
-    let msg = out.get_mut(iplen..total)?;
-    msg[0..4].copy_from_slice(&[ty, code, 0, 0]);
-    msg[4..8].copy_from_slice(&rest);
+    let header_len = iplen + HEADER_LEN;
+    let total = if COPY_QUOTE { iplen + len } else { header_len };
+    let (header, body) = out.get_mut(iplen..total)?.split_at_mut(HEADER_LEN);
+    header[0..4].copy_from_slice(&[ty, code, 0, 0]);
+    header[4..8].copy_from_slice(&rest);
     let mut c = if src.is_ipv4() {
         Checksum::new()
     } else {
         Checksum::pseudo(src, dst, PROTO_ICMPV6, len)
     };
-    let (header, body) = msg.split_at_mut(HEADER_LEN);
     c.add(header);
-    c.copy_add(body, quote);
+    if COPY_QUOTE {
+        c.copy_add(body, quote);
+    } else {
+        c.add(quote);
+    }
     header[2..4].copy_from_slice(&c.finish().to_be_bytes());
-    Some(total)
+    Some(header_len)
 }
 
 #[cfg(test)]

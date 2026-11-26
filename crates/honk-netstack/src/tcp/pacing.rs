@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 pub const BURST_SEGMENTS: u64 = 10;
 const BURST_TIME: Duration = Duration::from_millis(2);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 pub struct Pacer {
     tokens: u64,
     last: Instant,

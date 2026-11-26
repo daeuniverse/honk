@@ -20,6 +20,9 @@ use crate::timer::Timers;
 use crate::wire::{self, ParseError};
 use crate::{MemoryBudget, MemoryReservation, OwnedPacket};
 
+mod transmit_iov;
+pub use transmit_iov::IovTransmit;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub mtu: u16,
@@ -1301,16 +1304,7 @@ impl Stack {
                     result => return result,
                 }
             }
-            let h = wire::tcp::Header {
-                src_port: c.tuple.local.port(),
-                dst_port: c.tuple.remote.port(),
-                seq: c.seq,
-                ack: c.ack,
-                flags: c.flags,
-                window: 0,
-                urgent: 0,
-                options: wire::tcp::Options::default(),
-            };
+            let h = c.header();
             return match Self::emit_tcp_control(out, c.tuple, &h, caps, tx) {
                 Some(n) => {
                     self.pop_control();
@@ -1345,24 +1339,7 @@ impl Stack {
                 self.timewait_ready.pop_front();
                 continue;
             }
-            let mut options = wire::tcp::Options::default();
-            if let Some(recent) = t.ts_recent {
-                options.timestamps = Some((
-                    t.ts_offset
-                        .wrapping_add(now.saturating_duration_since(self.epoch).as_millis() as u32),
-                    recent,
-                ));
-            }
-            let h = wire::tcp::Header {
-                src_port: t.tuple.local.port(),
-                dst_port: t.tuple.remote.port(),
-                seq: t.snd_nxt,
-                ack: t.rcv_nxt,
-                flags: wire::tcp::ACK,
-                window: t.window,
-                urgent: 0,
-                options,
-            };
+            let h = t.ack_header(now, self.epoch);
             return match Self::emit_tcp_control(out, t.tuple, &h, caps, tx) {
                 Some(n) => {
                     tx.flow = Some(FlowId {

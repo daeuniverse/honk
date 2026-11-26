@@ -31,6 +31,7 @@ flowchart LR
 | `poll_transmit(now, out) -> Option<usize>` | 把一个完整 IP 包写入 `out[..n]`。`out` 过小时返回 `None` 且不丢包。`None` 也表示 cwnd、rwnd 或 pacing 当前不允许发送。 |
 | `poll_transmit_with(now, out, TxCaps) -> Option<Transmit>` | 同一调度器，在透明模式下可选用 TCP 分段卸载；返回 `len`、`gso`、`csum` 和已知 TCP 输出的原始 `flow` 句柄，无状态或未知流输出的 `flow` 为 `None`。Endpoint 模式忽略卸载能力。`poll_transmit` 是使用 `TxCaps::NONE` 的普通包封装，会丢弃这些元数据。 |
 | `poll_control_transmit(now, out)` | 复用 TCP emitter，但不发送 TCP/UDP 载荷；保留普通 readiness、DRR 和载荷 TLP 义务，允许符合协议条件的 ACK/RST/SYN/FIN/探测、TIME_WAIT ACK 和 ICMP。调用前须取得控制 frame/descriptor credit。 |
+| `poll_transmit_iov` | 同步借出一个 IP/传输头及最多 18 个载荷切片。回调接受整包后提交。拒写保留原队位、协议状态和预算。`Progress` 单独完成有界的准备或清理，调用方随后重新轮询。 |
 | `poll_timeout()` / `handle_timeout(now)` | 所有流或重组中最早的 deadline；条目可能已过期，因此提前唤醒是合法的。 |
 | `poll_event()` | 合并后的 `Ready` 位（`CONNECTED`、`READABLE`、`WRITABLE`、`READ_CLOSED`、`ERROR`）；每个流在事件链表上最多出现一次。 |
 | `tcp_retained(id)` | 原始 TCP 句柄仍在本 Stack 持有应用/协议状态、紧凑 TIME_WAIT 或排队控制回复时为 true；不包含已经交给 driver 的输出包。 |

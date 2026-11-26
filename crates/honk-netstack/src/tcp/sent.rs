@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use super::seq;
+use super::{Room, seq};
 
 pub const SACKED: u8 = 1;
 pub const LOST: u8 = 2;
@@ -14,6 +14,7 @@ pub const EVER_RETRANS: u8 = 16;
 pub const APP_LIMITED: u8 = 32;
 
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct Descriptor {
     pub end_seq: u32,
     pub xmit_ts: Instant,
@@ -142,7 +143,7 @@ pub struct Sent {
     pub lost: u32,
     pub retrans: u32,
     pub highest_sacked: u32,
-    retrans_cursor: u32,
+    pub(super) retrans_cursor: u32,
     capacity_charged: usize,
     runs: Option<Box<Runs>>,
 }
@@ -167,9 +168,9 @@ impl Sent {
         }
     }
 
-    pub fn ensure_room(&mut self, pool: &mut super::ring::Pool, extra: usize) -> bool {
+    pub(super) fn ensure_room(&mut self, pool: &mut super::ring::Pool, extra: usize) -> Room {
         if self.queue.len() + extra <= self.queue.capacity() {
-            return true;
+            return Room::Ready;
         }
         let old = self.capacity_charged;
         let new = self
@@ -182,13 +183,13 @@ impl Sent {
         let shared_extra =
             (new.saturating_sub(FLOOR_SLOTS) - old.saturating_sub(FLOOR_SLOTS)) * size;
         if !pool.reserve_bytes(shared_extra) {
-            return false;
+            return Room::Refused;
         }
         self.queue.reserve_exact(new - self.queue.len());
         debug_assert_eq!(self.queue.capacity(), new);
         pool.metadata_grow((new - old) * size);
         self.capacity_charged = new;
-        true
+        Room::Grew
     }
 
     /// Nothing in flight: give the storage back, floor included. The floor is reserved at
@@ -456,14 +457,16 @@ impl Sent {
         self.check();
     }
 
-    pub fn next_retransmit(&mut self, payload_allowed: bool) -> Option<(usize, u32, u32, bool)> {
+    pub(super) fn scan_retransmit(
+        &self,
+        payload_allowed: bool,
+        cursor: &mut u32,
+    ) -> Option<(usize, u32, u32, bool)> {
         // Every candidate is counted in `lost`; a flow without loss skips the scan.
         if self.lost == 0 {
             return None;
         }
-        let mut i = self
-            .queue
-            .partition_point(|d| seq::le(d.end_seq, self.retrans_cursor));
+        let mut i = self.queue.partition_point(|d| seq::le(d.end_seq, *cursor));
         let mut start = self.start_of(i);
         while i < self.queue.len() {
             let d = &self.queue[i];
@@ -473,16 +476,24 @@ impl Sent {
                 if !payload_allowed && !(len == 1 && fin) {
                     return None;
                 }
-                self.retrans_cursor = start;
+                *cursor = start;
                 return Some((i, start, len, fin));
             }
             start = d.end_seq;
             if payload_allowed {
-                self.retrans_cursor = start;
+                *cursor = start;
             }
             i += 1;
         }
         None
+    }
+
+    #[cfg(test)]
+    pub fn next_retransmit(&mut self, payload_allowed: bool) -> Option<(usize, u32, u32, bool)> {
+        let mut cursor = self.retrans_cursor;
+        let candidate = self.scan_retransmit(payload_allowed, &mut cursor);
+        self.retrans_cursor = cursor;
+        candidate
     }
 
     /// Extends the whole `cap`-byte lost descriptor `i` over its successors that one TSO packet
@@ -959,7 +970,7 @@ mod tests {
         let mut pool =
             super::super::ring::Pool::with_limits(0, 2 * super::super::ring::CHUNK + FLOOR_BYTES);
         let mut s = Sent::new(1000);
-        assert!(s.ensure_room(&mut pool, 2));
+        assert!(matches!(s.ensure_room(&mut pool, 2), Room::Grew));
         assert_eq!(pool.allocated_bytes(), FLOOR_BYTES);
         let now = Instant::now();
         for i in 0..FLOOR_SLOTS - 1 {
@@ -973,7 +984,7 @@ mod tests {
             });
         }
         assert!(
-            !s.ensure_room(&mut pool, 2),
+            matches!(s.ensure_room(&mut pool, 2), Room::Refused),
             "descriptor growth must respect the shared limit"
         );
         s.release(&mut pool);

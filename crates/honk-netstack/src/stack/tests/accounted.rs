@@ -584,3 +584,137 @@ fn accounted_udp_refusal_global_burst_is_shared_between_owners() {
     drop((owners, icmp, charge));
     assert_eq!(budget.used(), 0);
 }
+
+#[test]
+fn rejected_iov_preserves_queue_order_credit_and_original_handle() {
+    use std::io::ErrorKind;
+
+    for class in 0..3 {
+        let (mut stack, budget) = bounded(4);
+        let now = stack.epoch + Duration::from_millis(7);
+        let first = stack
+            .tcp_connect(now, "198.51.100.8:443".parse().unwrap())
+            .unwrap();
+        let second = stack
+            .tcp_connect(now, "198.51.100.9:443".parse().unwrap())
+            .unwrap();
+        let tw = reusable_tombstone(&mut stack, false, now);
+        let Some(Flow::TimeWait(state)) = &mut stack.table.slots[tw.idx as usize].flow else {
+            unreachable!()
+        };
+        state.handle_generation = 73;
+        let original = FlowId {
+            idx: tw.idx,
+            generation: 73,
+        };
+        let tuple = state.tuple;
+        stack.timewait_ready.push_back(tw);
+        stack.queue_control(Control {
+            tuple,
+            seq: 13,
+            ack: 0,
+            flags: wire::tcp::RST,
+            icmp: None,
+            flow: Some(second),
+            source: None,
+        });
+        stack.table.slots[first.idx as usize].deficit = 37;
+        stack.class = class;
+        let expected_owner = [second, original, first][usize::from(class)];
+        let service_at = now + Duration::from_millis(1);
+        let mut previous = None;
+        for error in [ErrorKind::WouldBlock, ErrorKind::BrokenPipe] {
+            let before = (
+                stack.now,
+                stack.ready.clone(),
+                stack.timewait_ready.clone(),
+                stack.controls.len(),
+                stack.class,
+                stack.control_class,
+                stack.table.tcp_retention_changed,
+                stack.counters.tx_packets,
+                budget.used(),
+                budget.release_epoch(),
+            );
+            let capture = |header: &[u8], parts: &[&[u8]], tx: Transmit| {
+                assert_eq!(tx.flow, Some(expected_owner));
+                assert!(parts.is_empty());
+                let offered = (header.to_vec(), tx);
+                if let Some(previous) = &previous {
+                    assert_eq!(previous, &offered);
+                }
+                previous = Some(offered);
+                Err(error)
+            };
+            assert_eq!(
+                stack
+                    .poll_transmit_iov(service_at, 1500, TxCaps::NONE, false, None, capture)
+                    .unwrap_err(),
+                error
+            );
+            assert_eq!(
+                before,
+                (
+                    stack.now,
+                    stack.ready.clone(),
+                    stack.timewait_ready.clone(),
+                    stack.controls.len(),
+                    stack.class,
+                    stack.control_class,
+                    stack.table.tcp_retention_changed,
+                    stack.counters.tx_packets,
+                    budget.used(),
+                    budget.release_epoch()
+                )
+            );
+            let slot = &stack.table.slots[first.idx as usize];
+            assert_eq!(slot.deficit, 37);
+            assert!(slot.on_tx);
+            assert!(matches!(&slot.flow, Some(Flow::Tcp(t)) if t.syn_due && t.iss == t.snd_nxt));
+            assert!(
+                matches!(&stack.table.slots[tw.idx as usize].flow, Some(Flow::TimeWait(t)) if t.ack_due)
+            );
+        }
+        let (bytes, expected) = previous.unwrap();
+        let sent = stack.counters.tx_packets;
+        let result = stack
+            .poll_transmit_iov(
+                service_at,
+                1500,
+                TxCaps::NONE,
+                false,
+                None,
+                |header, parts, tx| {
+                    assert_eq!(tx, expected);
+                    assert_eq!(header, bytes);
+                    assert!(parts.is_empty());
+                    Ok::<(), ErrorKind>(())
+                },
+            )
+            .unwrap();
+        assert!(matches!(result, IovTransmit::Packet(tx) if tx == expected));
+        assert_eq!(stack.counters.tx_packets, sent + 1);
+        match class {
+            0 => {
+                assert!(stack.controls.is_empty());
+                assert!(stack.table.tcp_retention_changed);
+            }
+            1 => {
+                assert!(stack.timewait_ready.is_empty());
+                assert!(
+                    matches!(&stack.table.slots[tw.idx as usize].flow, Some(Flow::TimeWait(t)) if !t.ack_due)
+                );
+            }
+            _ => {
+                let slot = &stack.table.slots[first.idx as usize];
+                assert!(
+                    matches!(&slot.flow, Some(Flow::Tcp(t)) if !t.syn_due && t.snd_nxt == t.iss.wrapping_add(1))
+                );
+                assert_eq!(
+                    slot.deficit,
+                    37 + u32::from(stack.cfg.mtu) - expected.len as u32
+                );
+            }
+        }
+    }
+}

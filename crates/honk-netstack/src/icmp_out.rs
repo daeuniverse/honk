@@ -7,20 +7,18 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
-use crate::wire::{self, icmp::emit_error, ipv6};
-use crate::{Stack, UdpError};
+use crate::wire::{self, icmp, ipv6};
+use crate::{Stack, Transmit, UdpError};
 
 /// Quote ceiling: the whole error packet stays within the minimum MTU (RFC 1812 / RFC 4443).
 const MAX_ERROR_V4: usize = 576;
 const MAX_ERROR_V6: usize = 1280;
-/// Fixed ICMP header (type, code, checksum, 4-byte rest).
-const ICMP_HEADER: usize = 8;
 /// RFC 4443 §3.1 code 1: "communication with destination administratively prohibited".
 const V6_ADMIN_PROHIBITED: u8 = 1;
 
 pub(crate) fn quote_limit(v6: bool) -> usize {
     let cap = if v6 { MAX_ERROR_V6 } else { MAX_ERROR_V4 };
-    cap - wire::ip_header_len(v6) - ICMP_HEADER
+    cap - wire::ip_header_len(v6) - icmp::HEADER_LEN
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +83,21 @@ struct Target {
     last: Instant,
 }
 
+struct LimiterUpdate {
+    allowed: bool,
+    global: u64,
+    at: Instant,
+    target: Option<(usize, Target)>,
+}
+
+struct ErrorPacket<'a> {
+    src: IpAddr,
+    dst: IpAddr,
+    kind: (u8, u8),
+    rest: [u8; 4],
+    quote: &'a [u8],
+}
+
 /// Pure ICMP limiter state; a sharded embedding supplies its realm's serialized instance.
 pub struct IcmpOut {
     limits: IcmpLimits,
@@ -141,19 +154,79 @@ impl IcmpOut {
         source: Option<IpAddr>,
         out: &mut [u8],
     ) -> IcmpEmit {
+        let (packet, update) = match self.prepare(now, kind, quoted, source, out.len()) {
+            Ok(prepared) => prepared,
+            Err(result) => return result,
+        };
+        self.reserve_target(update.as_ref());
+        let n = icmp::emit_error(
+            out,
+            packet.src,
+            packet.dst,
+            packet.kind,
+            packet.rest,
+            packet.quote,
+        )
+        .expect("validated ICMP packet extent");
+        self.commit_sent(update);
+        IcmpEmit::Sent(n)
+    }
+
+    /// `None` means target capacity was grown in a separate poll, without consuming the quote.
+    pub(crate) fn emit_iov<E>(
+        &mut self,
+        now: Instant,
+        kind: Reject,
+        quoted: &[u8],
+        max_len: usize,
+        mut tx: Transmit,
+        emit: &mut impl FnMut(&[u8], &[&[u8]], Transmit) -> Result<(), E>,
+    ) -> Result<Option<IcmpEmit>, E> {
+        let (packet, update) = match self.prepare(now, kind, quoted, None, max_len) {
+            Ok(prepared) => prepared,
+            Err(result) => return Ok(Some(result)),
+        };
+        if self.reserve_target(update.as_ref()) {
+            return Ok(None);
+        }
+        let mut header = [0; ipv6::HEADER_LEN + icmp::HEADER_LEN];
+        let n = icmp::emit_error_header(
+            &mut header,
+            packet.src,
+            packet.dst,
+            packet.kind,
+            packet.rest,
+            packet.quote,
+        )
+        .expect("validated ICMP header extent");
+        tx.len = n + packet.quote.len();
+        emit(&header[..n], &[packet.quote], tx)?;
+        self.commit_sent(update);
+        Ok(Some(IcmpEmit::Sent(tx.len)))
+    }
+
+    fn prepare<'a>(
+        &mut self,
+        now: Instant,
+        kind: Reject,
+        quoted: &'a [u8],
+        source: Option<IpAddr>,
+        max_len: usize,
+    ) -> Result<(ErrorPacket<'a>, Option<LimiterUpdate>), IcmpEmit> {
         let Some(orig) = inspect(quoted) else {
             self.suppressed += 1;
-            return IcmpEmit::Suppressed;
+            return Err(IcmpEmit::Suppressed);
         };
         if orig.suppressed() {
             self.suppressed += 1;
-            return IcmpEmit::Suppressed;
+            return Err(IcmpEmit::Suppressed);
         }
         let v6 = orig.src.is_ipv6();
         let ip_len = wire::ip_header_len(v6);
         let quote = &quoted[..quoted.len().min(quote_limit(v6))];
-        if out.len() < ip_len + ICMP_HEADER + quote.len() {
-            return IcmpEmit::TooSmall;
+        let source = source.unwrap_or(orig.dst);
+        if max_len < ip_len + icmp::HEADER_LEN + quote.len() || source.is_ipv6() != v6 {
+            return Err(IcmpEmit::TooSmall);
         }
         let ((ty, code), rest) = match (kind, v6) {
             (Reject::Unreachable, false) => ((3, 3), [0; 4]),
@@ -172,28 +245,31 @@ impl IcmpOut {
             }
             (Reject::PacketTooBig { mtu }, true) => ((2, 0), mtu.to_be_bytes()),
         };
-        if !matches!(kind, Reject::PacketTooBig { .. }) && !self.allow(now, orig.src) {
-            self.rate_limited += 1;
-            return IcmpEmit::RateLimited;
-        }
-        match emit_error(
-            out,
-            source.unwrap_or(orig.dst),
-            orig.src,
-            (ty, code),
-            rest,
-            quote,
-        ) {
-            Some(n) => {
-                self.sent += 1;
-                IcmpEmit::Sent(n)
+        let update = if matches!(kind, Reject::PacketTooBig { .. }) {
+            None
+        } else {
+            let update = self.allow_peek(now, orig.src);
+            if !update.allowed {
+                self.commit(update);
+                self.rate_limited += 1;
+                return Err(IcmpEmit::RateLimited);
             }
-            None => IcmpEmit::TooSmall,
-        }
+            Some(update)
+        };
+        Ok((
+            ErrorPacket {
+                src: source,
+                dst: orig.src,
+                kind: (ty, code),
+                rest,
+                quote,
+            },
+            update,
+        ))
     }
 
     /// Both limiters must agree before either is charged.
-    fn allow(&mut self, now: Instant, target: IpAddr) -> bool {
+    fn allow_peek(&self, now: Instant, target: IpAddr) -> LimiterUpdate {
         let now = self.global_last.map_or(now, |last| now.max(last));
         let l = self.limits;
         let cap = u64::from(l.burst) * MSG;
@@ -206,10 +282,14 @@ impl IcmpOut {
             }
         }
         .min(cap);
-        self.global_last = Some(now);
-        self.global = global;
+        let mut update = LimiterUpdate {
+            allowed: false,
+            global,
+            at: now,
+            target: None,
+        };
         if global < MSG {
-            return false;
+            return update;
         }
         let interval = (l.target_interval.as_micros() as u64).max(1);
         let burst = interval.saturating_mul(u64::from(l.target_burst));
@@ -219,29 +299,92 @@ impl IcmpOut {
             let us = now.saturating_duration_since(t.last).as_micros() as u64;
             t.credit.saturating_add(us).min(burst)
         });
-        if let Some(i) = slot {
-            self.targets[i].credit = credit;
-            self.targets[i].last = now;
-        }
-        if credit < interval {
-            return false;
-        }
-        self.global = global - MSG;
-        let entry = Target {
-            ip: target,
-            credit: credit - interval,
-            last: now,
-        };
-        match slot {
-            Some(i) => self.targets[i] = entry,
-            None if self.targets.len() < l.max_targets => self.targets.push(entry),
-            None => {
-                if let Some(oldest) = self.targets.iter_mut().min_by_key(|t| t.last) {
-                    *oldest = entry;
+        update.allowed = credit >= interval;
+        let slot = if update.allowed {
+            update.global -= MSG;
+            slot.or_else(|| {
+                if self.targets.len() < l.max_targets {
+                    Some(self.targets.len())
+                } else {
+                    self.targets
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, t)| t.last)
+                        .map(|(i, _)| i)
                 }
+            })
+        } else {
+            slot
+        };
+        update.target = slot.map(|i| {
+            (
+                i,
+                Target {
+                    ip: target,
+                    credit: if update.allowed {
+                        credit - interval
+                    } else {
+                        credit
+                    },
+                    last: now,
+                },
+            )
+        });
+        update
+    }
+
+    fn reserve_target(&mut self, update: Option<&LimiterUpdate>) -> bool {
+        if update
+            .and_then(|update| update.target.as_ref())
+            .is_some_and(|(i, _)| *i == self.targets.capacity())
+        {
+            self.targets.reserve(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn commit(&mut self, update: LimiterUpdate) {
+        self.global_last = Some(update.at);
+        self.global = update.global;
+        if let Some((i, entry)) = update.target {
+            if i == self.targets.len() {
+                debug_assert!(i < self.targets.capacity());
+                self.targets.push(entry);
+            } else {
+                self.targets[i] = entry;
             }
         }
-        true
+    }
+
+    fn commit_sent(&mut self, update: Option<LimiterUpdate>) {
+        if let Some(update) = update {
+            self.commit(update);
+        }
+        self.sent += 1;
+    }
+
+    #[cfg(test)]
+    fn allow(&mut self, now: Instant, target: IpAddr) -> bool {
+        let update = self.allow_peek(now, target);
+        let allowed = update.allowed;
+        self.reserve_target(Some(&update));
+        self.commit(update);
+        allowed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn limiter_snapshot(&self) -> impl std::fmt::Debug + Eq + use<> {
+        (
+            self.global,
+            self.global_last,
+            self.targets.capacity(),
+            self.targets
+                .iter()
+                .map(|t| (t.ip, t.credit, t.last))
+                .collect::<Vec<_>>(),
+        )
     }
 }
 
@@ -453,6 +596,101 @@ mod tests {
             out.truncate(n);
         }
         (r, out)
+    }
+
+    #[test]
+    fn iov_refill_eviction_and_ptb_commit_only_after_acceptance() {
+        use std::io::ErrorKind::{BrokenPipe, WouldBlock};
+
+        let now = Instant::now();
+        let limits = IcmpLimits {
+            per_sec: 1,
+            burst: 1,
+            target_burst: 1,
+            max_targets: 1,
+            ..IcmpLimits::default()
+        };
+        for (src, dst) in family() {
+            let original = udp_packet(src, dst, 23);
+            let other = udp_packet(dst, src, 23);
+            let mut state = IcmpOut::new(limits);
+            let reject = Reject::AdminProhibited;
+            assert!(matches!(
+                emit(&mut state, now, reject, &original).0,
+                IcmpEmit::Sent(_)
+            ));
+
+            for (at, kind, quote, target) in [
+                (now + Duration::from_secs(1), reject, &original, src),
+                (now + Duration::from_secs(2), reject, &other, dst),
+                (
+                    now + Duration::from_millis(2500),
+                    Reject::PacketTooBig { mtu: 1280 },
+                    &other,
+                    dst,
+                ),
+            ] {
+                let before = state.limiter_snapshot();
+                let counts = (state.sent, state.suppressed, state.rate_limited);
+                let (expected, bytes) = emit(&mut IcmpOut::new(limits), at, kind, quote);
+                let check = |header: &[u8], parts: &[&[u8]], tx: Transmit| {
+                    assert_eq!(parts, &[quote.as_slice()]);
+                    assert_eq!(parts[0].as_ptr(), quote.as_ptr());
+                    assert_eq!(tx, Transmit::plain(bytes.len()));
+                    assert_eq!([header, parts[0]].concat(), bytes);
+                };
+
+                for failure in [WouldBlock, BrokenPipe] {
+                    assert_eq!(
+                        state.emit_iov(
+                            at,
+                            kind,
+                            quote,
+                            1500,
+                            Transmit::plain(0),
+                            &mut |h, p, tx| {
+                                check(h, p, tx);
+                                Err(failure)
+                            }
+                        ),
+                        Err(failure),
+                    );
+                    assert_eq!(state.limiter_snapshot(), before);
+                    assert_eq!((state.sent, state.suppressed, state.rate_limited), counts);
+                }
+                assert_eq!(
+                    state.emit_iov(
+                        at,
+                        kind,
+                        quote,
+                        1500,
+                        Transmit::plain(0),
+                        &mut |h, p, tx| {
+                            check(h, p, tx);
+                            Ok::<_, std::io::ErrorKind>(())
+                        }
+                    ),
+                    Ok(Some(expected)),
+                );
+                assert_eq!(
+                    (state.sent, state.suppressed, state.rate_limited),
+                    (counts.0 + 1, 0, 0)
+                );
+                assert_eq!(state.targets.len(), 1);
+                assert_eq!(state.targets[0].ip, target);
+                if let Reject::PacketTooBig { mtu } = kind {
+                    assert_eq!(state.limiter_snapshot(), before);
+                    let ip = parse_ip(&bytes).unwrap();
+                    let message = icmp::parse(ip.src, ip.dst, &bytes[ip.payload])
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(message.kind, icmp::IcmpKind::PacketTooBig { mtu });
+                } else {
+                    assert_eq!((state.global, state.global_last), (0, Some(at)));
+                    assert_eq!((state.targets[0].credit, state.targets[0].last), (0, at));
+                }
+            }
+        }
     }
 
     #[test]

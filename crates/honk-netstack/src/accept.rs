@@ -11,7 +11,9 @@ use crate::tcp::Tcb;
 use crate::tcp::output::Output;
 use crate::tcp::passive::Gate;
 use crate::wire;
-use crate::{DropReason, FlowId, Rx, SourceContext, Stack, StreamError};
+use crate::{
+    DropReason, FlowId, IcmpState, IovTransmit, Rx, SourceContext, Stack, StreamError, Transmit,
+};
 
 /// Longest a SYN may stay undecided or deferred. The edge classifier's handoff expires at 30 s;
 /// deciding within 25 s keeps the stack's answer from racing it.
@@ -81,6 +83,15 @@ pub enum Refuse {
     IcmpUnreachable,
     /// ICMP administratively prohibited (v4 code 13, v6 code 1).
     IcmpAdminProhibited,
+}
+
+impl Refuse {
+    fn icmp_kind(self) -> Reject {
+        match self {
+            Self::IcmpAdminProhibited => Reject::AdminProhibited,
+            _ => Reject::HostUnreachable,
+        }
+    }
 }
 
 impl Stack {
@@ -274,16 +285,13 @@ impl Stack {
         icmp: &mut Option<&mut crate::IcmpState>,
     ) -> Output {
         let mut quote = [0u8; 64];
-        let kind = match how {
-            Refuse::IcmpAdminProhibited => Reject::AdminProhibited,
-            _ => Reject::HostUnreachable,
-        };
         let result = match quote_syn(c.tuple, c.seq, &mut quote) {
-            Some(n) => {
-                icmp.as_deref_mut()
-                    .unwrap_or(&mut self.icmp_out)
-                    .emit(now, kind, &quote[..n], out)
-            }
+            Some(n) => icmp.as_deref_mut().unwrap_or(&mut self.icmp_out).emit(
+                now,
+                how.icmp_kind(),
+                &quote[..n],
+                out,
+            ),
             None => IcmpEmit::Suppressed,
         };
         if result == IcmpEmit::TooSmall {
@@ -293,6 +301,47 @@ impl Stack {
         match result {
             IcmpEmit::Sent(n) => Output::Sent(n),
             _ => Output::None,
+        }
+    }
+
+    pub(crate) fn emit_refusal_iov<E>(
+        &mut self,
+        now: Instant,
+        c: &Control,
+        how: Refuse,
+        icmp: &mut Option<&mut IcmpState>,
+        max_len: usize,
+        emit: &mut impl FnMut(&[u8], &[&[u8]], Transmit) -> Result<(), E>,
+    ) -> Result<IovTransmit, E> {
+        let mut quote = [0; 64];
+        let Some(n) = quote_syn(c.tuple, c.seq, &mut quote) else {
+            self.pop_control();
+            return Ok(IovTransmit::Progress);
+        };
+        let mut tx = Transmit {
+            flow: c.flow,
+            source: c.source,
+            ..Transmit::plain(0)
+        };
+        match icmp.as_deref_mut().unwrap_or(&mut self.icmp_out).emit_iov(
+            now,
+            how.icmp_kind(),
+            &quote[..n],
+            max_len,
+            tx,
+            emit,
+        )? {
+            Some(IcmpEmit::Sent(n)) => {
+                self.pop_control();
+                tx.len = n;
+                Ok(IovTransmit::Packet(tx))
+            }
+            Some(IcmpEmit::TooSmall) => Ok(IovTransmit::BufferTooSmall),
+            Some(IcmpEmit::Suppressed | IcmpEmit::RateLimited) => {
+                self.pop_control();
+                Ok(IovTransmit::Progress)
+            }
+            None => Ok(IovTransmit::Progress),
         }
     }
 
@@ -341,4 +390,130 @@ pub(crate) fn quote_syn(tuple: FourTuple, seq: u32, out: &mut [u8]) -> Option<us
         options: wire::tcp::Options::default(),
     };
     wire::tcp::emit_packet(out, tuple.remote.ip(), tuple.local.ip(), &h, [&[], &[]])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::testutil::{v4, v6};
+    use crate::{Config, ExcludeSet, MemoryBudget, Mode, RxMeta, TxCaps};
+    use std::io::ErrorKind::{self, BrokenPipe, WouldBlock};
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+
+    #[test]
+    fn refused_syn_iov_preserves_original_flow_until_device_accepts() {
+        let now = Instant::now();
+        let no_emit = |_: &[u8], _: &[&[u8]], _: Transmit| -> Result<(), ErrorKind> {
+            panic!("refusal maintenance must not offer a packet")
+        };
+        for (client, local) in [(v4(192, 0, 2, 1), v4(198, 51, 100, 1)), (v6(1), v6(2))] {
+            let mut cfg = Config::new([9; 32]);
+            cfg.mode = Mode::Transparent {
+                exclude: ExcludeSet::default(),
+            };
+            cfg.max_flows = 8;
+            cfg.icmp_limits.target_burst = 1;
+            let budget = MemoryBudget::new(1 << 20);
+            cfg.shared_budget = Some(Arc::clone(&budget));
+            let mut stack = Stack::new(cfg, now);
+            stack.prepare_source_context().unwrap();
+            let how = Refuse::IcmpAdminProhibited;
+            let source = SourceContext {
+                lineage: NonZeroU64::MIN,
+                snapshot: NonZeroU64::MIN,
+            };
+            let mut refused = Vec::new();
+
+            for port in [40_000, 40_001] {
+                let tuple = FourTuple {
+                    local: SocketAddr::new(local, 443),
+                    remote: SocketAddr::new(client, port),
+                };
+                let mut syn = [0; 64];
+                let n = quote_syn(tuple, 42, &mut syn).unwrap();
+                let (rx, _) =
+                    stack.receive_with_context(now, &syn[..n], RxMeta::VERIFY, source, |_, _| true);
+                assert!(matches!(rx, Rx::Consumed));
+                let id = stack.poll_accept().unwrap().id;
+                stack.tcp_refuse(id, how);
+                assert!(stack.tcp_retained(id));
+                refused.push((id, syn, n));
+            }
+            let used = budget.used();
+            let epoch = budget.release_epoch();
+            let _ = stack.take_tcp_retention_change();
+            let (id, syn, n) = refused[0];
+            let mut expected = [0; 1500];
+            let IcmpEmit::Sent(len) =
+                IcmpState::default().emit(now, how.icmp_kind(), &syn[..n], &mut expected)
+            else {
+                panic!("refused SYN is answerable");
+            };
+            let mut maintenance = 0;
+            loop {
+                match stack.poll_transmit_iov(now, len - 1, TxCaps::NONE, false, None, no_emit) {
+                    Ok(IovTransmit::Progress) => {
+                        maintenance += 1;
+                        assert!(
+                            maintenance <= refused.len(),
+                            "stale ready entries must quiesce"
+                        );
+                    }
+                    Ok(IovTransmit::BufferTooSmall) => break,
+                    other => panic!("short refusal buffer: {other:?}"),
+                }
+            }
+            assert!(refused.iter().all(|(id, _, _)| stack.tcp_retained(*id)));
+            assert_eq!((budget.used(), budget.release_epoch()), (used, epoch));
+            assert!(matches!(
+                stack.poll_transmit_iov(now, len, TxCaps::NONE, false, None, no_emit),
+                Ok(IovTransmit::Progress),
+            ));
+            let limiter = stack.icmp_out.limiter_snapshot();
+            let tx = Transmit {
+                flow: Some(id),
+                source: Some(source),
+                ..Transmit::plain(len)
+            };
+            let check = |header: &[u8], parts: &[&[u8]], offered: Transmit| {
+                assert_eq!(parts, &[&syn[..n]]);
+                assert_eq!(offered, tx);
+                assert_eq!([header, parts[0]].concat(), expected[..len]);
+            };
+            for failure in [WouldBlock, BrokenPipe] {
+                let result =
+                    stack.poll_transmit_iov(now, len, TxCaps::NONE, false, None, |h, p, t| {
+                        check(h, p, t);
+                        Err(failure)
+                    });
+                assert_eq!(result.unwrap_err(), failure);
+                assert_eq!(stack.icmp_out.limiter_snapshot(), limiter);
+                assert_eq!((stack.icmp_out.sent, stack.icmp_out.rate_limited), (0, 0));
+                assert_eq!(stack.stats().tx_packets, 0);
+                assert!(refused.iter().all(|(id, _, _)| stack.tcp_retained(*id)));
+                assert!(!stack.take_tcp_retention_change());
+                assert_eq!((budget.used(), budget.release_epoch()), (used, epoch));
+            }
+            let result = stack.poll_transmit_iov(now, len, TxCaps::NONE, false, None, |h, p, t| {
+                check(h, p, t);
+                Ok::<_, ErrorKind>(())
+            });
+            assert!(matches!(result, Ok(IovTransmit::Packet(sent)) if sent == tx));
+            assert_eq!(stack.stats().tx_packets, 1);
+            assert!(!stack.tcp_retained(id));
+            assert!(stack.take_tcp_retention_change());
+            let second = refused[1].0;
+            assert!(stack.tcp_retained(second));
+            assert!(matches!(
+                stack.poll_transmit_iov(now, len, TxCaps::NONE, false, None, no_emit),
+                Ok(IovTransmit::Progress),
+            ));
+            assert!(!stack.tcp_retained(second));
+            assert!(stack.take_tcp_retention_change());
+            assert_eq!((stack.icmp_out.sent, stack.icmp_out.rate_limited), (1, 1));
+            assert_eq!(stack.stats().tx_packets, 1);
+            assert_eq!((budget.used(), budget.release_epoch()), (used, epoch));
+        }
+    }
 }

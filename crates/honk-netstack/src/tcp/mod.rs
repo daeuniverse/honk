@@ -37,6 +37,12 @@ pub const FIN_ACK: u8 = 32;
 pub const TIME_WAIT: Duration = Duration::from_secs(60);
 const DELAY_ACK: Duration = Duration::from_millis(40);
 
+enum Room {
+    Ready,
+    Grew,
+    Refused,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TcpState {
     SynSent,

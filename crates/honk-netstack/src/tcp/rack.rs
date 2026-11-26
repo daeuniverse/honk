@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::sent::{EVER_RETRANS, LOST, Newest, RETRANS, SACKED, Sent};
-use super::seq;
+use super::{Room, seq};
 
 const FIFO_FLOOR: usize = super::sent::FLOOR_SLOTS;
 type Retransmit = (u32, Instant);
@@ -84,35 +84,44 @@ impl Rack {
         std::mem::size_of::<Retransmits>() + 3 * FIFO_FLOOR * std::mem::size_of::<Retransmit>()
     }
 
-    pub(super) fn ensure_room(&mut self, pool: &super::ring::Pool, extra: usize) -> bool {
-        let Some(budget) = pool.index_budget() else {
-            return true;
-        };
-        let q = self.retransmits.get_or_insert_default();
-        let Some(needed) = q.len().checked_add(extra) else {
-            return false;
-        };
-        if needed <= q.capacity() {
-            return true;
+    pub(super) fn ensure_room<const IOV: bool>(
+        &mut self,
+        pool: &super::ring::Pool,
+        extra: usize,
+    ) -> Room {
+        let budget = pool.index_budget();
+        if !IOV && budget.is_none() {
+            return Room::Ready;
         }
-        let Some(capacity) = needed.max(FIFO_FLOOR).checked_next_power_of_two() else {
-            return false;
+        let old = self.retransmits.as_deref();
+        let (len, capacity) = old.map_or((0, 0), |q| (q.len(), q.capacity()));
+        if extra <= capacity - len {
+            return Room::Ready;
+        }
+        let Some(budget) = budget else {
+            self.retransmits.get_or_insert_default().reserve(extra);
+            return Room::Grew;
+        };
+        let Some(capacity) = len
+            .checked_add(extra)
+            .and_then(|needed| needed.max(FIFO_FLOOR).checked_next_power_of_two())
+        else {
+            return Room::Refused;
         };
         let Some(bytes) = capacity
             .saturating_sub(FIFO_FLOOR)
             .checked_mul(std::mem::size_of::<Retransmit>())
             .and_then(|n| n.checked_mul(3))
         else {
-            return false;
+            return Room::Refused;
         };
-        let old_bytes = q
-            .reservation
-            .as_ref()
+        let old_bytes = old
+            .and_then(|q| q.reservation.as_ref())
             .map_or(0, crate::MemoryReservation::bytes);
         let Some(reservation) = budget.reserve(bytes.saturating_sub(old_bytes)) else {
-            return false;
+            return Room::Refused;
         };
-        let len = q.len();
+        let q = self.retransmits.get_or_insert_default();
         q.reserve_exact(capacity - len);
         assert!(q.capacity() <= capacity, "unfunded RACK FIFO capacity");
         if let Some(held) = &mut q.reservation {
@@ -120,7 +129,7 @@ impl Rack {
         } else {
             q.reservation = Some(reservation);
         }
-        true
+        Room::Grew
     }
 
     pub fn new(start: u32) -> Rack {
@@ -278,6 +287,11 @@ impl Rack {
     #[cfg(test)]
     pub fn pending_retransmits(&self) -> usize {
         self.retransmits.as_ref().map_or(0, |q| q.len())
+    }
+
+    #[cfg(test)]
+    pub(super) fn retransmit_entries(&self) -> Option<&VecDeque<Retransmit>> {
+        self.retransmits.as_deref().map(|q| &q.entries)
     }
 
     fn pop_retransmit(&mut self) {
@@ -512,16 +526,19 @@ mod tests {
             .with_index_accounting();
         let mut rack = Rack::new(0);
         let now = Instant::now();
-        assert!(rack.ensure_room(&pool, 2 * FIFO_FLOOR));
+        assert!(matches!(
+            rack.ensure_room::<false>(&pool, 2 * FIFO_FLOOR),
+            Room::Grew
+        ));
         for i in 0..2 * FIFO_FLOOR {
             rack.on_retransmit(i as u32, now);
         }
         let held = budget.reserve(1).unwrap();
-        assert!(!rack.ensure_room(&pool, 1));
+        assert!(matches!(rack.ensure_room::<false>(&pool, 1), Room::Refused));
         assert_eq!(rack.pending_retransmits(), 2 * FIFO_FLOOR);
         assert_eq!(budget.used(), unit + 1);
         drop(held);
-        assert!(rack.ensure_room(&pool, 1));
+        assert!(matches!(rack.ensure_room::<false>(&pool, 1), Room::Grew));
         assert_eq!(budget.used(), 3 * unit);
         rack.on_retransmit((2 * FIFO_FLOOR) as u32, now);
         rack.trim((2 * FIFO_FLOOR) as u32);
@@ -536,16 +553,19 @@ mod tests {
             .with_index_accounting();
         let mut rack = Rack::new(1000);
         let now = Instant::now();
-        assert!(rack.ensure_room(&pool, FIFO_FLOOR));
+        assert!(matches!(
+            rack.ensure_room::<false>(&pool, FIFO_FLOOR),
+            Room::Grew
+        ));
         for end in 0..FIFO_FLOOR {
             rack.on_retransmit(end as u32, now);
         }
         assert_eq!(budget.used(), 0, "fixed FIFO floor is in stack overhead");
         let held = budget.reserve(budget.limit()).unwrap();
-        assert!(!rack.ensure_room(&pool, 1));
+        assert!(matches!(rack.ensure_room::<false>(&pool, 1), Room::Refused));
         assert_eq!(rack.pending_retransmits(), FIFO_FLOOR);
         drop(held);
-        assert!(rack.ensure_room(&pool, 1));
+        assert!(matches!(rack.ensure_room::<false>(&pool, 1), Room::Grew));
         rack.on_retransmit(100, now);
         assert!(budget.used() >= FIFO_FLOOR * std::mem::size_of::<Retransmit>());
         rack.trim(99);

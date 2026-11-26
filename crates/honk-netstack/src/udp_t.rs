@@ -17,7 +17,7 @@ use crate::icmp_out::Reject;
 use crate::offload::{GsoKind, GsoTx, MAX_USO_RX, MAX_USO_TX, RxMeta, Transmit, TxCaps, TxCsum};
 use crate::tcp::output::Output;
 use crate::wire::{self, IpPacket, ipv4, ipv6};
-use crate::{DropReason, MemoryBudget, Rx, SourceContext, Stack, UdpError};
+use crate::{DropReason, IovTransmit, MemoryBudget, Rx, SourceContext, Stack, UdpError};
 
 /// Why a transparent UDP datagram is refused (ICMP mapping of the design, §3.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,10 +48,11 @@ struct Pending {
 }
 
 impl Pending {
-    /// Writes the next fragment and advances; `None` if `out` is too small (nothing changes).
-    fn emit(&mut self, out: &mut [u8]) -> Option<usize> {
-        let n = self.chunk.min(self.datagram.len() - self.next);
-        let more = self.next + n < self.datagram.len();
+    fn fragment(&self, out: &mut [u8]) -> Option<(usize, &[u8])> {
+        let end = (self.next + self.chunk).min(self.datagram.len());
+        let payload = &self.datagram[self.next..end];
+        let n = payload.len();
+        let more = end < self.datagram.len();
         let (iplen, extra) = match (self.src, self.dst) {
             (IpAddr::V4(s), IpAddr::V4(d)) => {
                 let h = ipv4::emit_fragment(
@@ -77,11 +78,16 @@ impl Pending {
             }
             _ => return None,
         };
-        let start = iplen + extra;
-        out.get_mut(start..start + n)?
-            .copy_from_slice(&self.datagram[self.next..self.next + n]);
-        self.next += n;
-        Some(start + n)
+        Some((iplen + extra, payload))
+    }
+
+    /// Writes the next fragment and advances only when it fits.
+    fn emit(&mut self, out: &mut [u8]) -> Option<usize> {
+        let (header_len, payload) = self.fragment(out)?;
+        let end = header_len + payload.len();
+        out.get_mut(header_len..end)?.copy_from_slice(payload);
+        self.next += payload.len();
+        Some(end)
     }
 
     fn done(&self) -> bool {
@@ -345,17 +351,48 @@ impl UdpTx {
         };
         tx.source = p.source;
         if p.done() {
-            let p = self.queue.pop_front().expect("front");
-            let freed = p.datagram.capacity();
-            self.bytes -= freed;
-            if let Some(budget) = &self.budget {
-                budget.refund(freed);
-            }
-            if let Some(budget) = &self.pending_budget {
-                budget.refund(freed);
-            }
+            self.release_front();
         }
         Output::Sent(n)
+    }
+
+    pub(crate) fn poll_iov<E>(
+        &mut self,
+        max_len: usize,
+        emit: &mut impl FnMut(&[u8], &[&[u8]], Transmit) -> Result<(), E>,
+    ) -> Result<IovTransmit, E> {
+        let Some(p) = self.queue.front_mut() else {
+            return Ok(IovTransmit::Idle);
+        };
+        let mut header = [0; ipv6::HEADER_LEN + ipv6::FRAGMENT_HEADER_LEN];
+        let (header_len, payload) = p.fragment(&mut header).expect("validated UDP fragment");
+        let len = header_len + payload.len();
+        if len > max_len {
+            return Ok(IovTransmit::BufferTooSmall);
+        }
+        let tx = Transmit {
+            source: p.source,
+            ..Transmit::plain(len)
+        };
+        emit(&header[..header_len], &[payload], tx)?;
+        p.next += payload.len();
+        if p.done() {
+            self.release_front();
+        }
+        Ok(IovTransmit::Packet(tx))
+    }
+
+    fn release_front(&mut self) {
+        let p = self.queue.pop_front().expect("front");
+        let freed = p.datagram.capacity();
+        drop(p);
+        self.bytes -= freed;
+        if let Some(budget) = &self.budget {
+            budget.refund(freed);
+        }
+        if let Some(budget) = &self.pending_budget {
+            budget.refund(freed);
+        }
     }
 
     #[cfg(any(test, feature = "fuzz-checks"))]
@@ -877,6 +914,108 @@ mod tests {
             s.poll_udp_frag(&mut out, &mut Transmit::plain(0)),
             Output::None
         ));
+    }
+
+    #[test]
+    fn rejected_iov_udp_fragments_keep_fifo_offsets_and_both_budgets() {
+        use std::io::ErrorKind::{BrokenPipe, WouldBlock};
+        use std::num::NonZeroU64;
+
+        let now = Instant::now();
+        for v6 in [false, true] {
+            let (src, dst) = addrs(v6);
+            let root = MemoryBudget::new(4816);
+            let pending = MemoryBudget::new(4816);
+            let mut cfg = Config::new([9; 32]);
+            cfg.mtu = 1280;
+            cfg.shared_budget = Some(Arc::clone(&root));
+            let mut s = Stack::new(cfg, now);
+            s.udp_tx.with_pending_budget(Arc::clone(&pending));
+            let mut reference = stack(1280);
+            let source = |id| SourceContext {
+                lineage: NonZeroU64::new(id).unwrap(),
+                snapshot: NonZeroU64::MIN,
+            };
+            let mut out = [0; 1280];
+            for (size, id) in [(3000, 1), (1800, 2)] {
+                let payload = Rng::new(id).bytes(size);
+                s.send_udp_from(src, dst, &payload, Some(source(id)), &mut out)
+                    .unwrap();
+                reference
+                    .udp_send_from(src, dst, &payload, &mut out)
+                    .unwrap();
+            }
+            let expected = drain(&mut reference, Vec::new());
+            assert_eq!(expected.len(), 4);
+            let no_emit = |_: &[u8], _: &[&[u8]], _: Transmit| -> Result<(), std::io::ErrorKind> {
+                panic!("no UDP fragment may be offered")
+            };
+
+            for (index, (bytes, remaining)) in expected[1..].iter().zip([4816, 1808, 0]).enumerate()
+            {
+                let offsets = |s: &Stack| {
+                    s.udp_tx
+                        .queue
+                        .iter()
+                        .map(|p| (p.id, p.next))
+                        .collect::<Vec<_>>()
+                };
+                let before = offsets(&s);
+                let p = s.udp_tx.queue.front().unwrap();
+                let payload = p.datagram[p.next..].as_ptr();
+                let budgets = || {
+                    (
+                        root.used(),
+                        root.release_epoch(),
+                        pending.used(),
+                        pending.release_epoch(),
+                    )
+                };
+                let charged = budgets();
+                let tx_packets = s.stats().tx_packets;
+                assert!(matches!(
+                    s.poll_transmit_iov(now, bytes.len() - 1, TxCaps::NONE, false, None, no_emit),
+                    Ok(IovTransmit::BufferTooSmall),
+                ));
+
+                let tx = Transmit {
+                    source: Some(source(if index < 2 { 1 } else { 2 })),
+                    ..Transmit::plain(bytes.len())
+                };
+                let check = |h: &[u8], parts: &[&[u8]], offered: Transmit| {
+                    assert_eq!(parts.len(), 1);
+                    assert_eq!(parts[0].as_ptr(), payload);
+                    assert_eq!(offered, tx);
+                    assert_eq!([h, parts[0]].concat(), *bytes);
+                };
+                for failure in [WouldBlock, BrokenPipe] {
+                    let result =
+                        s.poll_transmit_iov(now, 1280, TxCaps::NONE, false, None, |h, p, t| {
+                            check(h, p, t);
+                            Err(failure)
+                        });
+                    assert_eq!(result.unwrap_err(), failure);
+                    assert_eq!(offsets(&s), before);
+                    assert_eq!(s.udp_tx.bytes, charged.0);
+                    assert_eq!(budgets(), charged);
+                    assert_eq!(s.stats().tx_packets, tx_packets);
+                }
+                let result =
+                    s.poll_transmit_iov(now, 1280, TxCaps::NONE, false, None, |h, p, t| {
+                        check(h, p, t);
+                        Ok::<_, std::io::ErrorKind>(())
+                    });
+                assert!(matches!(result, Ok(IovTransmit::Packet(sent)) if sent == tx));
+                let releases = index as u64;
+                assert_eq!(budgets(), (remaining, releases, remaining, releases));
+                assert_eq!(s.stats().tx_packets, tx_packets + 1);
+                s.udp_tx.check();
+            }
+            assert!(matches!(
+                s.poll_transmit_iov(now, 1280, TxCaps::NONE, false, None, no_emit),
+                Ok(IovTransmit::Idle),
+            ));
+        }
     }
 
     #[test]

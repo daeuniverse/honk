@@ -214,8 +214,8 @@ pub use mode::{ExcludeSet, Mode};
 pub use offload::{Csum, GsoKind, GsoRx, GsoTx, RxMeta, SourceContext, Transmit, TxCaps, TxCsum};
 pub use stack::{
     AccountedTransmit, BindError, Config, ConnectError, ConstructionError, DropReason, FlowId,
-    Ready, ReceiveOutcome, ReceiveReport, Rx, Stack, StackStats, StreamError, UdpError,
-    ValidatedSource,
+    IovTransmit, Ready, ReceiveOutcome, ReceiveReport, Rx, Stack, StackStats, StreamError,
+    UdpError, ValidatedSource,
 };
 pub use tcp::{TcpState, TcpStats};
 pub use udp_t::UdpRefuse;

@@ -21,7 +21,10 @@ use std::time::{Duration, Instant};
 use crate::icmp_out::{IcmpEmit, IcmpOut, Reject};
 use crate::tcp::output::Output;
 use crate::wire::frag::{self, Fragment};
-use crate::{DropReason, MemoryBudget, MemoryReservation, Rx, SourceContext, Transmit};
+use crate::{
+    DropReason, IcmpState, IovTransmit, MemoryBudget, MemoryReservation, Rx, SourceContext,
+    Transmit,
+};
 
 /// Fixed bookkeeping charged per datagram next to its data, header and range storage.
 const ENTRY_OVERHEAD: usize = 256;
@@ -916,18 +919,51 @@ impl Reassembler {
             if result == IcmpEmit::TooSmall {
                 return (Output::Blocked, None);
             }
-            let quote = self.expired.pop_front().expect("front");
-            let charged = quote.bytes.capacity();
-            let source = quote.source;
-            let fragment = quote.fragment;
-            drop(quote);
-            self.shrink(charged);
+            let (source, fragment) = self.release_expired();
             if let IcmpEmit::Sent(n) = result {
                 tx.source = source;
                 return (Output::Sent(n), Some(fragment));
             }
         }
         (Output::None, None)
+    }
+
+    pub(crate) fn poll_icmp_iov<E>(
+        &mut self,
+        now: Instant,
+        icmp: &mut IcmpState,
+        max_len: usize,
+        emit: &mut impl FnMut(&[u8], &[&[u8]], Transmit) -> Result<(), E>,
+    ) -> Result<(IovTransmit, Option<FragmentInfo>), E> {
+        let Some(quote) = self.expired.front() else {
+            return Ok((IovTransmit::Idle, None));
+        };
+        let mut tx = Transmit {
+            source: quote.source,
+            ..Transmit::plain(0)
+        };
+        match icmp.emit_iov(now, Reject::TimeExceeded, &quote.bytes, max_len, tx, emit)? {
+            Some(IcmpEmit::Sent(n)) => {
+                let (_, fragment) = self.release_expired();
+                tx.len = n;
+                Ok((IovTransmit::Packet(tx), Some(fragment)))
+            }
+            Some(IcmpEmit::TooSmall) => Ok((IovTransmit::BufferTooSmall, None)),
+            Some(IcmpEmit::Suppressed | IcmpEmit::RateLimited) => {
+                self.release_expired();
+                Ok((IovTransmit::Progress, None))
+            }
+            None => Ok((IovTransmit::Progress, None)),
+        }
+    }
+
+    fn release_expired(&mut self) -> (Option<SourceContext>, FragmentInfo) {
+        let quote = self.expired.pop_front().expect("front");
+        let charged = quote.bytes.capacity();
+        let result = (quote.source, quote.fragment);
+        drop(quote);
+        self.shrink(charged);
+        result
     }
 
     pub(crate) fn pending_icmp(&self) -> bool {
@@ -1245,6 +1281,112 @@ mod tests {
                 r.poll_icmp(late, &mut icmp, &mut out, &mut Transmit::plain(0)),
                 Output::None
             ));
+            r.assert_idle();
+        }
+    }
+
+    #[test]
+    fn rejected_iov_timeout_keeps_quote_and_limiter_until_retry() {
+        use std::io::ErrorKind::{BrokenPipe, WouldBlock};
+
+        let now = Instant::now();
+        for (src, dst) in families() {
+            let budget = MemoryBudget::new(64 * 1024);
+            let mut r = Reassembler::default().with_budget(Some(Arc::clone(&budget)));
+            let source = Some(SourceContext {
+                lineage: NonZeroU64::MIN,
+                snapshot: NonZeroU64::MIN,
+            });
+            let first = datagram(src, dst, 3000, 3);
+            let reversed = datagram(dst, src, 3000, 4);
+            for (id, whole) in [(8, &first), (9, &first), (10, &reversed)] {
+                let f = split(whole, id, 1000);
+                pending(r.push(now, frag::parse(&f[0]).unwrap(), source));
+            }
+            let late = now + r.limits.timeout;
+            r.expire(late);
+            assert_eq!(r.stats.timeouts, 3);
+            let order = |r: &Reassembler| r.expired.iter().map(|q| q.fragment).collect::<Vec<_>>();
+            let queued = order(&r);
+            let quote = &r.expired[0].bytes;
+            let charge = quote.capacity();
+            let retained = quote.as_ptr();
+            let mut expected = [0; 1500];
+            let IcmpEmit::Sent(len) =
+                IcmpOut::default().emit(late, Reject::TimeExceeded, quote, &mut expected)
+            else {
+                panic!("expected Time Exceeded");
+            };
+            let mut icmp = IcmpOut::new(crate::IcmpLimits {
+                target_burst: 1,
+                ..crate::IcmpLimits::default()
+            });
+            let no_emit =
+                &mut |_: &[u8], _: &[&[u8]], _: Transmit| -> Result<(), std::io::ErrorKind> {
+                    panic!("quote maintenance must not offer a packet")
+                };
+            let epoch = budget.release_epoch();
+            assert_eq!(budget.used(), 3 * charge);
+            assert!(matches!(
+                r.poll_icmp_iov(late, &mut icmp, len - 1, no_emit),
+                Ok((IovTransmit::BufferTooSmall, None)),
+            ));
+            assert!(matches!(
+                r.poll_icmp_iov(late, &mut icmp, len, no_emit),
+                Ok((IovTransmit::Progress, None)),
+            ));
+            assert_eq!(order(&r), queued);
+            assert_eq!((budget.used(), budget.release_epoch()), (3 * charge, epoch));
+            let limiter = icmp.limiter_snapshot();
+            let tx = Transmit {
+                source,
+                ..Transmit::plain(len)
+            };
+            let check = |h: &[u8], parts: &[&[u8]], offered: Transmit| {
+                assert_eq!(parts.len(), 1);
+                assert_eq!(parts[0].as_ptr(), retained);
+                assert_eq!(offered, tx);
+                assert_eq!([h, parts[0]].concat(), expected[..len]);
+            };
+            for failure in [WouldBlock, BrokenPipe] {
+                let result = r.poll_icmp_iov(late, &mut icmp, len, &mut |h, p, t| {
+                    check(h, p, t);
+                    Err(failure)
+                });
+                assert_eq!(result.unwrap_err(), failure);
+                assert_eq!(order(&r), queued);
+                assert_eq!(r.bytes(), 3 * charge);
+                assert_eq!((budget.used(), budget.release_epoch()), (3 * charge, epoch));
+                assert_eq!(icmp.limiter_snapshot(), limiter);
+                assert_eq!((icmp.sent, icmp.suppressed, icmp.rate_limited), (0, 0, 0));
+            }
+            let result = r.poll_icmp_iov(late, &mut icmp, len, &mut |h, p, t| {
+                check(h, p, t);
+                Ok::<_, std::io::ErrorKind>(())
+            });
+            assert!(
+                matches!(result, Ok((IovTransmit::Packet(sent), Some(info))) if sent == tx && info == queued[0])
+            );
+            assert_eq!(order(&r), queued[1..]);
+            assert_eq!(
+                (budget.used(), budget.release_epoch()),
+                (2 * charge, epoch + 1)
+            );
+
+            assert!(matches!(
+                r.poll_icmp_iov(late, &mut icmp, len, no_emit),
+                Ok((IovTransmit::Progress, None)),
+            ));
+            assert_eq!(order(&r), queued[2..]);
+            assert_eq!((budget.used(), budget.release_epoch()), (charge, epoch + 2));
+            assert_eq!((icmp.sent, icmp.suppressed, icmp.rate_limited), (1, 0, 1));
+            let result = r.poll_icmp_iov(late, &mut icmp, len, &mut |_, _, _| {
+                Ok::<_, std::io::ErrorKind>(())
+            });
+            assert!(
+                matches!(result, Ok((IovTransmit::Packet(_), Some(info))) if info == queued[2])
+            );
+            assert_eq!((budget.used(), budget.release_epoch()), (0, epoch + 3));
             r.assert_idle();
         }
     }
