@@ -115,8 +115,8 @@ impl UdpReplySocketFactory for Replies {
                     ));
                 }
                 if source_work
-                    .plain_address()
-                    .is_some_and(|address| owned.worker_for_udp(address) != exact.worker())
+                    .plain_client()
+                    .is_some_and(|client| owned.worker_for_udp(client) != exact.worker())
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -1275,7 +1275,7 @@ impl PacketEndpoints {
             }
             let packet_source = match packet_source {
                 Some(source) => Some(source.hold(scope)?),
-                None => Some(scope.hold_source(source.ip())?),
+                None => Some(scope.hold_udp_source(source)?),
             };
             let retained_source = packet_source.clone();
             let reservation =
@@ -1311,7 +1311,7 @@ impl PacketEndpoints {
         }
         let source_work = match packet_source {
             Some(source) => source.hold(scope)?,
-            None => scope.hold_source(source.ip())?,
+            None => scope.hold_udp_source(source)?,
         };
         #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
         let source_work = {

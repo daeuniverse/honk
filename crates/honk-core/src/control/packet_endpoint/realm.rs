@@ -256,7 +256,18 @@ impl PacketRealm {
             return Ok((&self.owners()[0], None));
         };
         let (worker, claim) = match ip.proto {
-            wire::PROTO_UDP => (self.worker_for_udp(ip.src), None),
+            wire::PROTO_UDP => {
+                let mut port = [0; 2];
+                if ip.payload.len() < 8
+                    || view
+                        .copy_to(ip.payload.start..ip.payload.start + 2, &mut port)
+                        .is_none()
+                {
+                    return Ok((&self.owners()[0], None));
+                }
+                let client = SocketAddr::new(ip.src, u16::from_be_bytes(port));
+                (self.worker_for_udp(client), None)
+            }
             wire::PROTO_TCP => {
                 let mut header = [0; 14];
                 let needed = if self.queue_affine() { header.len() } else { 4 };

@@ -559,12 +559,12 @@ impl PacketScope {
     pub(crate) fn local_failed(&self) -> bool {
         self.0.local.get().is_some_and(|local| local.failed())
     }
-    pub(super) fn local_source_work(&self, address: IpAddr) -> io::Result<Option<SourceWork>> {
+    pub(super) fn local_source_work(&self, client: SocketAddr) -> io::Result<Option<SourceWork>> {
         let mut parked = self.0.inner.lock();
         if parked.closing || parked.finished {
             return Ok(None);
         }
-        SourceWork::plain(self, &mut parked, address).map(Some)
+        SourceWork::plain(self, &mut parked, client).map(Some)
     }
 }
 
@@ -2717,7 +2717,7 @@ mod tests {
         }
         let client = (1..=254)
             .map(|n| SocketAddr::from(([192, 0, 2, n], 53001)))
-            .find(|a| realm.worker_for_udp(a.ip()) == 1)
+            .find(|a| realm.worker_for_udp(*a) == 1)
             .unwrap();
         let sender = realm.datagram_sender("203.0.113.2:53".parse().unwrap());
         let mut send = Box::pin(sender.send_to(b"owner one", client));

@@ -462,15 +462,15 @@ impl PacketScope {
         SourceWork::retained(self, &mut inner.source_work, context)
     }
 
-    pub(in crate::control) fn hold_source(&self, address: IpAddr) -> io::Result<SourceWork> {
+    pub(in crate::control) fn hold_udp_source(&self, client: SocketAddr) -> io::Result<SourceWork> {
         self.0.with(|inner| {
-            let work = SourceWork::plain(self, inner, address)?;
+            let work = SourceWork::plain(self, inner, client)?;
             #[cfg(target_os = "linux")]
             if let Some(peer) = inner
                 .peers
                 .iter()
                 .flatten()
-                .find(|peer| peer.address() == address)
+                .find(|peer| peer.address() == client.ip())
             {
                 return Ok(work.with_peer(peer.clone()));
             }
@@ -589,6 +589,7 @@ pub(in crate::control) struct SourceWork {
     index: usize,
     origin: SourceOrigin,
     context: Option<SourceContext>,
+    plain_port: Option<u16>,
 }
 
 impl SourceWork {
@@ -689,16 +690,17 @@ impl SourceWork {
     pub(super) fn plain(
         scope: &PacketScope,
         inner: &mut Inner,
-        address: IpAddr,
+        client: SocketAddr,
     ) -> io::Result<Self> {
         if inner.closing || inner.aborted || inner.finished {
             return Err(closed());
         }
         Ok(Self {
-            index: inner.source_work.hold_address(address)?,
+            index: inner.source_work.hold_address(client.ip())?,
             origin: SourceOrigin::Plain,
             scope: scope.clone(),
             context: None,
+            plain_port: Some(client.port()),
         })
     }
 
@@ -713,6 +715,7 @@ impl SourceWork {
             index: sources.index(context).expect("retained source"),
             origin: SourceOrigin::Plain,
             context: Some(context),
+            plain_port: None,
         })
     }
 
@@ -739,17 +742,17 @@ impl SourceWork {
             None
         }
     }
-    pub(in crate::control) fn plain_address(&self) -> Option<IpAddr> {
-        if self.context.is_some() {
-            return None;
-        }
+    pub(in crate::control) fn plain_client(&self) -> Option<SocketAddr> {
+        let port = self.plain_port?;
         #[cfg(target_os = "linux")]
         if let Some(peer) = self.peer() {
-            return Some(peer.address());
+            return Some(SocketAddr::new(peer.address(), port));
         }
         let inner = self.scope.0.inner.lock();
         match &inner.source_work.storage {
-            SourceStorage::Plain(cells) => cells[self.index].map(|(address, _)| address),
+            SourceStorage::Plain(cells) => {
+                cells[self.index].map(|(ip, _)| SocketAddr::new(ip, port))
+            }
             SourceStorage::Host { .. } => None,
         }
     }
@@ -765,11 +768,14 @@ impl SourceWork {
     pub(in crate::control) fn optional_facts(&self) -> Option<HostSourceFacts> {
         self.context.map(|_| self.facts())
     }
-    pub(in crate::control) fn identity(&self) -> (usize, usize, Option<SourceContext>) {
+    pub(in crate::control) fn identity(
+        &self,
+    ) -> (usize, usize, Option<SourceContext>, Option<u16>) {
         (
             Arc::as_ptr(&self.scope.0) as usize,
             self.index,
             self.context,
+            self.plain_port,
         )
     }
     #[cfg(target_os = "linux")]
@@ -826,6 +832,7 @@ impl Clone for SourceWork {
             scope: self.scope.clone(),
             index: self.index,
             context: self.context,
+            plain_port: self.plain_port,
             origin: self.origin.clone(),
         }
     }
@@ -1019,13 +1026,15 @@ mod mac_tests {
     async fn source_mac_uses_retained_peer_and_host_tun_remain_missing() {
         let budget = MemoryBudget::new(CAPTURE_MEMORY);
         let (scope, owner) = capture_scope(1280, 1, 16, &budget).unwrap();
-        let work = scope.hold_source("192.0.2.1".parse().unwrap()).unwrap();
+        let work = scope
+            .hold_udp_source("192.0.2.1:40000".parse().unwrap())
+            .unwrap();
         assert_eq!(work.source_mac(), None);
         let work = work.with_peer(test_peer(1, 0, [2; 6], 7));
         let cloned = work.clone();
         assert_eq!(work.source_mac(), Some([2; 6]));
         let changed = scope
-            .hold_source("192.0.2.1".parse().unwrap())
+            .hold_udp_source("192.0.2.1:40000".parse().unwrap())
             .unwrap()
             .with_peer(test_peer(1, 1, [4; 6], 7));
         assert_eq!(cloned.source_mac(), Some([2; 6]));

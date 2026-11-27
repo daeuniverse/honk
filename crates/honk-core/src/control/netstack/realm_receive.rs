@@ -478,7 +478,7 @@ impl Inner {
             | Rx::TransparentOwned { src, .. }
             | Rx::TransparentSplit { src, .. } => {
                 let work = if scope.is_local() {
-                    let Some(work) = scope.local_source_work(src.ip())? else {
+                    let Some(work) = scope.local_source_work(*src)? else {
                         return Ok((
                             Rx::Dropped(DropReason::Stale),
                             self.receive_result(report),
@@ -487,7 +487,7 @@ impl Inner {
                     };
                     work
                 } else {
-                    SourceWork::plain(scope, self, src.ip())?
+                    SourceWork::plain(scope, self, *src)?
                 };
                 Some(match peer.filter(|peer| peer.learned()) {
                     Some(peer) => work.with_peer(peer),

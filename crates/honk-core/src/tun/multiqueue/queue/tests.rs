@@ -84,9 +84,13 @@ impl Fixture {
     }
 
     fn client(&self, owner: usize) -> SocketAddr {
-        (1..=254)
-            .map(|last| SocketAddr::from(([192, 0, 2, last], 41000)))
-            .find(|client| self.realm.worker_for_udp(client.ip()) == owner)
+        self.client_on("192.0.2.10".parse().unwrap(), owner)
+    }
+
+    fn client_on(&self, address: std::net::IpAddr, owner: usize) -> SocketAddr {
+        (41000..=u16::MAX)
+            .map(|port| SocketAddr::new(address, port))
+            .find(|&client| self.realm.worker_for_udp(client) == owner)
             .unwrap()
     }
 
@@ -187,81 +191,83 @@ fn fragments(source: SocketAddr, destination: SocketAddr, body: &[u8]) -> [Vec<u
 async fn cross_queue_fragments_visit_owner_zero_then_deliver_once_on_canonical_fd() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let mut f = Fixture::new().await;
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let client = f.client(1);
-        let body: Vec<_> = (0..1800).map(|i| (i % 251) as u8).collect();
-        let [first, last] = fragments(client, upstream.local_addr().unwrap(), &body);
-        let now = Instant::now();
-        let expired = now - Duration::from_secs(31);
-        // An old queued pair must not obtain a new 30s lifetime when queue zero runs.
-        f.input(2, &last, expired).await;
-        f.input(1, &first, expired).await;
-        assert_eq!(
-            f.inbox(0).len(),
-            2,
-            "both foreign FDs hand fragments to owner zero"
-        );
-        f.drain(0);
-        assert!(f.inbox(1).is_empty());
+        for (bind, address) in [("127.0.0.1:0", "192.0.2.10"), ("[::1]:0", "2001:db8::10")] {
+            let upstream = UdpSocket::bind(bind).await.unwrap();
+            let client = f.client_on(address.parse().unwrap(), 1);
+            let body: Vec<_> = (0..1800).map(|i| (i % 251) as u8).collect();
+            let [first, last] = fragments(client, upstream.local_addr().unwrap(), &body);
+            let now = Instant::now();
+            let expired = now - Duration::from_secs(31);
+            // An old queued pair must not obtain a new 30s lifetime when queue zero runs.
+            f.input(2, &last, expired).await;
+            f.input(1, &first, expired).await;
+            assert_eq!(
+                f.inbox(0).len(),
+                2,
+                "both foreign FDs hand fragments to owner zero"
+            );
+            f.drain(0);
+            assert!(f.inbox(1).is_empty());
 
-        let latest = now - Duration::from_millis(2);
-        let earliest = now - Duration::from_millis(9);
-        f.input(2, &last, latest).await;
-        f.input(1, &first, earliest).await;
-        f.queues[1].rx.fill(0);
-        f.queues[2].rx.fill(0);
-        {
-            let fragments = f.inbox(0);
-            assert_eq!(fragments.len(), 2);
-            assert_eq!(fragments[0].cell, last);
-            assert_eq!(fragments[1].cell, first);
-            assert_eq!(
-                (fragments[0].ingress_at, fragments[1].ingress_at),
-                (latest, earliest)
+            let latest = now - Duration::from_millis(2);
+            let earliest = now - Duration::from_millis(9);
+            f.input(2, &last, latest).await;
+            f.input(1, &first, earliest).await;
+            f.queues[1].rx.fill(0);
+            f.queues[2].rx.fill(0);
+            {
+                let fragments = f.inbox(0);
+                assert_eq!(fragments.len(), 2);
+                assert_eq!(fragments[0].cell, last);
+                assert_eq!(fragments[1].cell, first);
+                assert_eq!(
+                    (fragments[0].ingress_at, fragments[1].ingress_at),
+                    (latest, earliest)
+                );
+            }
+            f.drain(0);
+            {
+                let records = f.inbox(1);
+                assert_eq!(records.len(), 1);
+                let record = &records[0];
+                let packet = record
+                    .complete
+                    .as_ref()
+                    .expect("move the original reassembly, without copying it into the cell");
+                assert!(record.cell.is_empty());
+                assert!(packet.charged_to(&f.budget));
+                assert_eq!(record.meta, RxMeta::VERIFY);
+                assert_eq!(
+                    (record.ingress_at, packet.completion_ingress()),
+                    (latest, latest)
+                );
+            }
+            f.drain(1);
+            let mut bytes = [0; 2048];
+            let (len, source) = upstream.recv_from(&mut bytes).await.unwrap();
+            assert_eq!(&bytes[..len], &body);
+            upstream.send_to(b"owner reply", source).await.unwrap();
+            let len = f.reply(1, &mut bytes).await;
+            let (packet, _) = decode_record(&bytes[..len]).unwrap();
+            let ip = wire::parse_ip(packet).unwrap();
+            assert_eq!(ip.dst, client.ip());
+            let udp = &packet[ip.payload];
+            let (_, port, range) = wire::udp::parse(udp).unwrap();
+            assert_eq!(port, client.port());
+            assert_eq!(&udp[range], b"owner reply");
+            for q in [0, 2] {
+                f.drain(q);
+                assert_eq!(
+                    f.peers[q].recv(&mut bytes).unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), upstream.recv_from(&mut bytes))
+                    .await
+                    .is_err()
             );
         }
-        f.drain(0);
-        {
-            let records = f.inbox(1);
-            assert_eq!(records.len(), 1);
-            let record = &records[0];
-            let packet = record
-                .complete
-                .as_ref()
-                .expect("move the original reassembly, without copying it into the cell");
-            assert!(record.cell.is_empty());
-            assert!(packet.charged_to(&f.budget));
-            assert_eq!(record.meta, RxMeta::VERIFY);
-            assert_eq!(
-                (record.ingress_at, packet.completion_ingress()),
-                (latest, latest)
-            );
-        }
-        f.drain(1);
-        let mut bytes = [0; 2048];
-        let (len, source) = upstream.recv_from(&mut bytes).await.unwrap();
-        assert_eq!(&bytes[..len], &body);
-        upstream.send_to(b"owner reply", source).await.unwrap();
-        let len = f.reply(1, &mut bytes).await;
-        let (packet, _) = decode_record(&bytes[..len]).unwrap();
-        let ip = wire::parse_ip(packet).unwrap();
-        assert_eq!(ip.dst, client.ip());
-        let udp = &packet[ip.payload];
-        let (_, port, range) = wire::udp::parse(udp).unwrap();
-        assert_eq!(port, client.port());
-        assert_eq!(&udp[range], b"owner reply");
-        for q in [0, 2] {
-            f.drain(q);
-            assert_eq!(
-                f.peers[q].recv(&mut bytes).unwrap_err().kind(),
-                io::ErrorKind::WouldBlock
-            );
-        }
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), upstream.recv_from(&mut bytes))
-                .await
-                .is_err()
-        );
         f.finish().await;
     })
     .await

@@ -150,7 +150,7 @@ CPU and generated output share `Retained::Endpoint(OutputOwner)` and the same ex
 During physical XDP shutdown the driver discards queued, unpublished CPU output without filling the device. Published descriptors keep their original owners until a real completion; stopping a worker is not a substitute.
 
 Each physical XDP logical ingress uses one `PacketRealm` with one or two independent Stack owners.
-Queues belong permanently to `queue_id % workers`. With two owners and one physical member, new TCP flows prefer the receiving queue. A queue change does not move a live flow, its `TIME_WAIT` state or its exported output: the scalar path checks for the retained owner before passing the packet to either Stack. Concurrent dispatches of one tuple share a bounded, temporary claim. Multi-member realms still hash the TCP tuple; UDP still hashes the client address. Peer, DNS and UDP source identity
+Queues belong permanently to `queue_id % workers`. With two owners and one physical member, new TCP flows prefer the receiving queue. A queue change does not move a live flow, its `TIME_WAIT` state or its exported output: the scalar path checks for the retained owner before passing the packet to either Stack. Concurrent dispatches of one tuple share a bounded, temporary claim. Multi-member realms still hash the TCP tuple; UDP hashes the canonical client IP and source port. The same client socket keeps one worker across destinations. Peer, DNS and UDP source identity
 remain realm-scoped, while application, retirement and CQ retain the exact owner
 and FlowId. Cross-worker handoff has 64 funded cells overall and 32 queued entries
 per destination; borrowed RX never escapes its callback. Core and Host coordination

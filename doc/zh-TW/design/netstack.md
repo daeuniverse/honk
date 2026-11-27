@@ -15,6 +15,8 @@
 
 `host_facts: false` 支援 1 到 8 個佇列。多佇列使用一個非實體 realm，每個佇列各由一個 `PacketDriver` 驅動自己的 Stack。半開 TCP、待處理 UDP 與 ICMP 限額在 realm 內共享。每個佇列的 RX 緩衝區和 FIFO 均在啟動時向共用的 384 MiB 擷取預算預留空間。FIFO 按最大 IP 封包與中繼資料大小計費。實體 XDP 維持原本的 1 或 2 個擁有者。
 
+實體 XDP 與多佇列 TUN 都按用戶端的標準化 IP 位址和 UDP 來源埠選擇擁有者。同一用戶端來源埠送往不同目的地時，封包和回覆都由同一擁有者處理。
+
 單佇列可選用獨立 HostFacts scope，且維持單一來源讀取者。獨立 DNS 在 plain scope 學習，多佇列分片共用同一個 plain DNS 範圍。請參閱 [TUN 資料路徑](./datapath.md#linux-tun-endpoint)。
 
 完整的協定、記憶體與排程設計請參閱[英文版](../../en/design/netstack.md)。

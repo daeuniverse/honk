@@ -263,7 +263,7 @@ async fn shared_reply_source_releases_first_target_and_terminal_drain_clears_bin
         });
     }
     let mut physical = scope
-        .hold_source(client.ip())
+        .hold_udp_source(client)
         .unwrap()
         .with_peer(crate::xdp::routing_input::test_peer(1, 0, [2; 6], 7));
     assert!(physical.admit_udp_process(client, target).is_err());
@@ -272,7 +272,7 @@ async fn shared_reply_source_releases_first_target_and_terminal_drain_clears_bin
     assert!(shared_physical.packet_input().is_none());
     drop(shared_physical);
 
-    let mut view = scope.hold_source(client.ip()).unwrap();
+    let mut view = scope.hold_udp_source(client).unwrap();
     view.admit_udp_process(client, target).unwrap();
     let still_host = view
         .clone()

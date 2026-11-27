@@ -743,7 +743,7 @@ mod packet_mac_tests {
         let client: SocketAddr = "192.0.2.1:40000".parse().unwrap();
         let destination: SocketAddr = "198.51.100.1:443".parse().unwrap();
         let work = scope
-            .hold_source(client.ip())
+            .hold_udp_source(client)
             .unwrap()
             .with_peer(test_peer(1, 0, [2; 6], 7));
         for protocol in ["tcp", "udp"] {

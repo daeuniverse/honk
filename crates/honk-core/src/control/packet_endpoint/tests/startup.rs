@@ -602,7 +602,9 @@ async fn xdp_reload_drains_queued_initializers_across_its_epoch_without_losing_o
                         dscp: 0,
                         routing: None,
                         bytes: FundedDatagram::copy_from(payload, &budget).unwrap(),
-                        source_work: scope.hold_source("192.0.2.10".parse().unwrap()).unwrap(),
+                        source_work: scope
+                            .hold_udp_source("192.0.2.10:41003".parse().unwrap())
+                            .unwrap(),
                         auxiliary: None,
                     }))
                     .unwrap();

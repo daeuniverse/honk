@@ -117,8 +117,8 @@ impl PacketRealm {
         self.worker(ownership::canonical(client, destination))
     }
 
-    pub(crate) fn worker_for_udp(&self, client: IpAddr) -> usize {
-        self.worker(client.to_canonical())
+    pub(crate) fn worker_for_udp(&self, client: SocketAddr) -> usize {
+        self.worker((client.ip().to_canonical(), client.port()))
     }
 
     pub(crate) fn queue_affine(&self) -> bool {

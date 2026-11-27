@@ -1,5 +1,104 @@
 use super::*;
 
+fn udp_dispatch_worker(
+    realm: &PacketRealm,
+    local: usize,
+    client: SocketAddr,
+    destination: SocketAddr,
+) -> usize {
+    let mut packet = [0; 64];
+    let len = wire::udp::emit_packet(&mut packet, client, destination, &[]).unwrap();
+    let split = wire::parse_ip(&packet[..len]).unwrap().payload.start + 1;
+    let segments = [&packet[..split], &packet[split..len]];
+    let (owner, claim) = realm
+        .dispatch_owner(local, wire::PacketView::new(&segments).unwrap())
+        .unwrap();
+    assert!(claim.is_none());
+    owner.worker()
+}
+
+#[tokio::test]
+async fn udp_source_ports_distribute_one_ip_and_preserve_destination_affinity() {
+    use crate::control::netstack::{CAPTURE_MEMORY, capture_tun_realm};
+    use std::net::IpAddr;
+
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    for count in [4, 8] {
+        let (realm, owners) =
+            capture_tun_realm(1280, count, honk_netstack::TxCaps::NONE, &budget).unwrap();
+        for (ip, a, b) in [
+            ("192.0.2.10", "203.0.113.1:53", "198.51.100.2:9000"),
+            ("2001:db8::10", "[2001:db8::1]:53", "[2001:db8:1::2]:9000"),
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            let a: SocketAddr = a.parse().unwrap();
+            let b: SocketAddr = b.parse().unwrap();
+            let mut seen = std::collections::BTreeSet::new();
+            for port in 41000..41256 {
+                let client = SocketAddr::new(ip, port);
+                let worker = udp_dispatch_worker(&realm, 0, client, a);
+                seen.insert(worker);
+                assert_eq!(udp_dispatch_worker(&realm, count - 1, client, b), worker);
+                if let IpAddr::V4(v4) = ip {
+                    let mapped = SocketAddr::new(v4.to_ipv6_mapped().into(), port);
+                    assert_eq!(
+                        udp_dispatch_worker(
+                            &realm,
+                            1,
+                            mapped,
+                            "[::ffff:203.0.113.1]:53".parse().unwrap()
+                        ),
+                        worker
+                    );
+                }
+            }
+            assert!(
+                seen.len() > 1,
+                "same-IP UDP ports stayed on one worker: {ip} {seen:?}"
+            );
+        }
+        for owner in owners {
+            owner.shutdown().await;
+        }
+        drop(realm);
+        assert_eq!(budget.used(), 0);
+    }
+}
+
+#[tokio::test]
+async fn incomplete_udp_headers_stay_on_owner_zero() {
+    use crate::control::netstack::{CAPTURE_MEMORY, capture_tun_realm};
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, owners) = capture_tun_realm(1280, 4, honk_netstack::TxCaps::NONE, &budget).unwrap();
+    for (src, dst) in [
+        ("192.0.2.10", "203.0.113.9"),
+        ("2001:db8::10", "2001:db8::9"),
+    ] {
+        let client = udp_client_on(&realm, src.parse().unwrap(), 2);
+        let destination = SocketAddr::new(dst.parse().unwrap(), 123);
+        assert_eq!(udp_dispatch_worker(&realm, 3, client, destination), 2);
+        for bytes in 0..8 {
+            let mut packet = [0; 64];
+            let start = wire::emit_ip_header(
+                &mut packet,
+                client.ip(),
+                destination.ip(),
+                wire::PROTO_UDP,
+                bytes,
+            )
+            .unwrap();
+            packet[start..start + 2].copy_from_slice(&client.port().to_be_bytes());
+            let view = wire::PacketView::from_slice(&packet[..start + bytes]);
+            let (owner, claim) = realm.dispatch_owner(3, view).unwrap();
+            assert_eq!(owner.worker(), 0, "truncated {bytes}-byte UDP header");
+            assert!(claim.is_none());
+        }
+    }
+    for owner in owners {
+        owner.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn tun_sharded_receive_preserves_routed_rxmeta_and_verifies_reassembly() {
     use crate::control::netstack::{CAPTURE_MEMORY, capture_tun_realm};
@@ -23,10 +122,7 @@ async fn tun_sharded_receive_preserves_routed_rxmeta_and_verifies_reassembly() {
         .await
         .unwrap();
 
-    let client = (1..=254)
-        .map(|last| SocketAddr::from(([192, 0, 2, last], 41000)))
-        .find(|client| realm.worker_for_udp(client.ip()) == 2)
-        .unwrap();
+    let client = udp_client_on(&realm, "192.0.2.10".parse().unwrap(), 2);
     let destination = "203.0.113.9:4444".parse().unwrap();
     let owner = realm.owner(2).unwrap();
     let now = Instant::now();
@@ -232,10 +328,7 @@ async fn one_logical_realm_drives_two_owners_through_the_shared_udp_pool() {
         let (realm, owners) =
             super::super::super::netstack::capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
         let clients: [SocketAddr; 2] = std::array::from_fn(|worker| {
-            (1..=254)
-                .map(|last| SocketAddr::from(([192, 0, 2, last], 41000)))
-                .find(|client| realm.worker_for_udp(client.ip()) == worker)
-                .unwrap()
+            udp_client_on(&realm, "192.0.2.10".parse().unwrap(), worker)
         });
         let (plane, _health) = local_plane().await;
         let (endpoints, mut owner, drivers) = PacketEndpoints::start(
@@ -264,9 +357,13 @@ async fn one_logical_realm_drives_two_owners_through_the_shared_udp_pool() {
             }
         });
         for (worker, client) in clients.into_iter().enumerate() {
+            let payload = if worker == 1 {
+                b"".as_slice()
+            } else {
+                b"query"
+            };
             let mut bytes = [0; 128];
-            let len =
-                wire::udp::emit_packet(&mut bytes, client, destination, &[worker as u8]).unwrap();
+            let len = wire::udp::emit_packet(&mut bytes, client, destination, payload).unwrap();
             let (selected, _claim) = endpoints
                 .execution_owner(realm.scope(), wire::PacketView::from_slice(&bytes[..len]))
                 .unwrap();
@@ -275,19 +372,33 @@ async fn one_logical_realm_drives_two_owners_through_the_shared_udp_pool() {
                 .receive(realm.scope(), &bytes[..len], Instant::now())
                 .unwrap();
             let reply = realm.owners()[worker].next_output().await.unwrap();
-            let ip = wire::parse_ip(reply.packet()).unwrap();
-            assert_eq!(ip.dst, client.ip());
-            assert_eq!(ip.src, destination.ip());
+            assert_eq!(
+                super::udp::wire_reply_payload(reply.packet(), client, destination),
+                payload
+            );
             assert!(endpoints.retained_transport(
                 realm.scope(),
                 client,
                 destination,
                 wire::PROTO_UDP
             ));
-            assert!(!realm.owners()[1 - worker].retains_source(client.ip()));
+            assert!(realm.owners()[worker].retains_source(client.ip()));
             reply.release();
         }
         echo.await.unwrap();
+        let ip = clients[0].ip();
+        assert!(endpoints.retains_source(realm.scope(), ip));
+        for (worker, client) in clients.into_iter().enumerate() {
+            endpoints
+                .shared
+                .udp_pool
+                .remove(realm.scope(), client, destination);
+            while realm.owners()[worker].retains_source(ip) {
+                tokio::task::yield_now().await;
+            }
+            assert!(endpoints.shared.udp_pool.wait_for_retirements().await);
+            assert_eq!(endpoints.retains_source(realm.scope(), ip), worker == 0);
+        }
         endpoints.shutdown().await.unwrap();
         owner.run().await.unwrap();
     })
@@ -325,36 +436,62 @@ async fn realm_start_refuses_swapped_original_owner_capabilities() {
 
 #[tokio::test]
 async fn shared_reply_factory_resolves_each_foreign_client_to_its_actual_owner() {
-    let budget = MemoryBudget::new(super::super::super::netstack::CAPTURE_MEMORY);
-    let (realm, owners) =
-        super::super::super::netstack::capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
-    let factory = Replies(Arc::from([realm.clone()]));
-    let ReplySocketFd::Packet(sender) = factory
-        .create(realm.scope(), "203.0.113.9:53".parse().unwrap(), None)
-        .unwrap()
-    else {
-        panic!("packet realm requires its real packet reply transport");
-    };
-    for worker in 0..2 {
-        let client = (1..=254)
-            .map(|last| SocketAddr::from(([192, 0, 2, last], 41000)))
-            .find(|client| realm.worker_for_udp(client.ip()) == worker)
-            .unwrap();
-        sender.send_to(b"foreign", client).await.unwrap();
-        let output = realm.owners()[worker].next_output().await.unwrap();
-        assert_eq!(
-            wire::packet_addresses(output.packet()).unwrap().1,
-            client.ip()
-        );
-        assert!(
-            realm.owners()[1 - worker]
-                .poll_output(&mut std::task::Context::from_waker(std::task::Waker::noop()))
-                .is_pending()
-        );
-        output.release();
-    }
-    for owner in owners {
-        owner.shutdown().await;
+    use crate::control::netstack::{CAPTURE_MEMORY, capture_tun_realm};
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    for count in [4, 8] {
+        let (realm, owners) =
+            capture_tun_realm(1280, count, honk_netstack::TxCaps::NONE, &budget).unwrap();
+        let factory = Replies(Arc::from([realm.clone()]));
+        for (ip, peer) in [
+            ("192.0.2.10", "203.0.113.9:9000"),
+            ("2001:db8::10", "[2001:db8::9]:9000"),
+            ("::ffff:192.0.2.10", "[::ffff:203.0.113.9]:9000"),
+        ] {
+            let peer = peer.parse().unwrap();
+            let ReplySocketFd::Packet(foreign) = factory.create(realm.scope(), peer, None).unwrap()
+            else {
+                panic!("packet reply transport")
+            };
+            for worker in 0..count {
+                let scope = realm.owner(worker).unwrap();
+                let client = udp_client_on(&realm, ip.parse().unwrap(), worker);
+                assert_eq!(udp_dispatch_worker(&realm, 0, client, peer), worker);
+                let work = scope.hold_udp_source(client).unwrap();
+                let ReplySocketFd::Packet(primary) =
+                    factory.create(realm.scope(), peer, Some(&work)).unwrap()
+                else {
+                    panic!("packet reply transport")
+                };
+                for (sender, payload) in [(&primary, b"primary".as_slice()), (&foreign, b"foreign")]
+                {
+                    assert_eq!(
+                        sender.send_to(payload, client).await.unwrap(),
+                        payload.len()
+                    );
+                    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                    let std::task::Poll::Ready(Some(output)) = scope.poll_output(&mut cx) else {
+                        panic!("missing reply on worker {worker}")
+                    };
+                    assert_eq!(
+                        super::udp::wire_reply_payload(output.packet(), client, peer),
+                        payload
+                    );
+                    output.release();
+                    assert!(
+                        realm
+                            .owners()
+                            .iter()
+                            .all(|s| s.poll_output(&mut cx).is_pending())
+                    );
+                }
+            }
+        }
+        drop(factory);
+        for owner in owners {
+            owner.shutdown().await;
+        }
+        drop(realm);
+        assert_eq!(budget.used(), 0);
     }
 }
 
@@ -363,13 +500,10 @@ async fn exact_udp_source_refuses_another_worker_and_another_client() {
     let budget = MemoryBudget::new(super::super::super::netstack::CAPTURE_MEMORY);
     let (realm, owners) =
         super::super::super::netstack::capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
-    let client = (1..=254)
-        .map(|last| SocketAddr::from(([192, 0, 2, last], 41000)))
-        .find(|client| realm.worker_for_udp(client.ip()) == 0)
-        .unwrap();
+    let client = udp_client_on(&realm, "192.0.2.10".parse().unwrap(), 0);
     let factory = Replies(Arc::from([realm.clone()]));
     let source = "203.0.113.9:53".parse().unwrap();
-    let wrong = realm.owners()[1].hold_source(client.ip()).unwrap();
+    let wrong = realm.owners()[1].hold_udp_source(client).unwrap();
     assert_eq!(
         factory
             .create(realm.scope(), source, Some(&wrong))
@@ -378,7 +512,7 @@ async fn exact_udp_source_refuses_another_worker_and_another_client() {
         io::ErrorKind::InvalidInput
     );
     drop(wrong);
-    let work = realm.owners()[0].hold_source(client.ip()).unwrap();
+    let work = realm.owners()[0].hold_udp_source(client).unwrap();
     let ReplySocketFd::Packet(sender) = factory.create(realm.scope(), source, Some(&work)).unwrap()
     else {
         panic!("packet reply transport");
@@ -388,7 +522,31 @@ async fn exact_udp_source_refuses_another_worker_and_another_client() {
         sender.send_to(b"reply", other).await.unwrap_err().kind(),
         io::ErrorKind::InvalidInput
     );
-    drop((work, sender));
+    let same_ip = (0..=u16::MAX)
+        .map(|port| SocketAddr::new(client.ip(), port))
+        .find(|&other| other != client && realm.worker_for_udp(other) == 0)
+        .unwrap();
+    assert_eq!(
+        sender
+            .send_to(b"wrong port", same_ip)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let other_work = realm.owners()[0].hold_udp_source(same_ip).unwrap();
+    assert_eq!(
+        work.identity().1,
+        other_work.identity().1,
+        "both ports retain one IP cell"
+    );
+    assert_ne!(work.identity(), other_work.identity());
+    assert!(
+        realm.owners()[0]
+            .poll_output(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            .is_pending()
+    );
+    drop((other_work, work, sender));
     for owner in owners {
         owner.shutdown().await;
     }

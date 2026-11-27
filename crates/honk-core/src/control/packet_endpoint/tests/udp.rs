@@ -165,7 +165,11 @@ async fn reply_payload(
     payload
 }
 
-fn wire_reply_payload(packet: &[u8], source: SocketAddr, destination: SocketAddr) -> &[u8] {
+pub(super) fn wire_reply_payload(
+    packet: &[u8],
+    source: SocketAddr,
+    destination: SocketAddr,
+) -> &[u8] {
     let ip = wire::parse_ip(packet).unwrap();
     assert_eq!((ip.src, ip.dst), (destination.ip(), source.ip()));
     let udp = &packet[ip.payload];
@@ -177,6 +181,103 @@ fn wire_reply_payload(packet: &[u8], source: SocketAddr, destination: SocketAddr
 
 async fn reply(scope: &PacketScope, source: SocketAddr, destination: SocketAddr, expected: &[u8]) {
     assert_eq!(reply_payload(scope, source, destination).await, expected);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn sharded_udp_client_keeps_one_mapping_and_receives_foreign_replies() {
+    use crate::control::netstack::{CAPTURE_MEMORY, capture_tun_realm};
+    use crate::control::tests::support::{QuicUdpMode, QuicUdpPeer};
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for (queues, bind, client_ip) in [
+            (4, "127.0.0.1:0", "192.0.2.10"),
+            (8, "[::1]:0", "2001:db8::10"),
+        ] {
+            let bind: SocketAddr = bind.parse().unwrap();
+            let mut peer = QuicUdpPeer::start(QuicUdpMode::TuicDatagram, bind)
+                .await
+                .unwrap();
+            let (plane, _health) = local_plane_with(|config| {
+                config.nodes.push(peer.node.clone());
+                config.groups.push(honk_config::node::Group {
+                    name: "eim".into(),
+                    nodes: vec![peer.node.id],
+                    ..Default::default()
+                });
+                config.routing.default_outbound = "eim".into();
+            })
+            .await;
+            let budget = MemoryBudget::new(CAPTURE_MEMORY);
+            let (realm, owners) =
+                capture_tun_realm(1280, queues, honk_netstack::TxCaps::NONE, &budget).unwrap();
+            let worker = queues - 1;
+            let client = udp_client_on(&realm, client_ip.parse().unwrap(), worker);
+            let (endpoints, mut supervisor, _) = PacketEndpoints::start(
+                plane,
+                vec![(realm.clone(), owners)],
+                4,
+                false,
+                None,
+                ScopeId::HOST,
+            )
+            .await
+            .unwrap();
+            std::future::poll_fn(|cx| supervisor.poll_ready(cx))
+                .await
+                .unwrap();
+            let a = UdpSocket::bind(bind).await.unwrap();
+            let b = UdpSocket::bind(bind).await.unwrap();
+            let foreign = UdpSocket::bind(bind).await.unwrap();
+            let mut mapping = None;
+            for (socket, payload) in [(&a, b"first".as_slice()), (&b, b"second")] {
+                let destination = socket.local_addr().unwrap();
+                let mut packet = [0; 128];
+                let n = wire::udp::emit_packet(&mut packet, client, destination, payload).unwrap();
+                endpoints
+                    .receive(realm.scope(), &packet[..n], Instant::now())
+                    .unwrap();
+                let event = peer.packets.recv().await.unwrap();
+                assert_eq!(
+                    (event.target, event.payload.as_slice()),
+                    (destination, payload)
+                );
+                let mut incoming = [0; 32];
+                let (len, source) = socket.recv_from(&mut incoming).await.unwrap();
+                assert_eq!((&incoming[..len], source), (payload, event.mapping));
+                let identity = (event.connection, event.session, source);
+                assert_eq!(
+                    *mapping.get_or_insert(identity),
+                    identity,
+                    "a new destination changed the source association"
+                );
+                socket.send_to(payload, source).await.unwrap();
+                reply(realm.owner(worker).unwrap(), client, destination, payload).await;
+            }
+            foreign
+                .send_to(b"unsolicited", mapping.unwrap().2)
+                .await
+                .unwrap();
+            reply(
+                realm.owner(worker).unwrap(),
+                client,
+                foreign.local_addr().unwrap(),
+                b"unsolicited",
+            )
+            .await;
+            assert!(!endpoints.retained_transport(
+                realm.scope(),
+                client,
+                foreign.local_addr().unwrap(),
+                wire::PROTO_UDP
+            ));
+            endpoints.shutdown().await.unwrap();
+            supervisor.run().await.unwrap();
+            peer.close().await.unwrap();
+        }
+    })
+    .await
+    .expect("shared-source traffic must reach the selected worker and join");
 }
 
 #[cfg(target_os = "linux")]
@@ -569,7 +670,7 @@ async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
             if matches!(disposition, "pname_raw" | "missing_pname_controller") {
                 let name = if disposition == "pname_raw" { "curl" } else { "" };
                 let process = crate::control::netstack::ProcessMeta::test_gateway(417, name);
-                let work = scope.hold_source(source.ip()).unwrap().with_process_input(process);
+                let work = scope.hold_udp_source(source).unwrap().with_process_input(process);
                 let received = endpoints.queue_datagram(&scope, source, destination, 0, None,
                     Some(PacketSource::Completed(work)), None,
                     |budget| FundedDatagram::copy_from(&query, budget),

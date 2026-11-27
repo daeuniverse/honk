@@ -150,7 +150,7 @@ CPU 与直接生成输出共用 `Retained::Endpoint(OutputOwner)`，在同一 CQ
 物理 XDP 关停时，driver 可丢弃仍在 CPU 队列、尚未发布的输出，不再向设备补包。已发布的描述符保留原 owner，只有真实 CQ 才能归还；停止 worker 不能代替完成。
 
 物理 XDP 的每个逻辑入口在同一 `PacketRealm` 下使用一个或两个独立 Stack owner。
-队列固定归 `queue_id % workers`。单物理成员、两个 owner 时，新 TCP 流优先归收包队列。队列变化不会迁移活跃流、`TIME_WAIT` 或已导出的输出：逐包回退在把报文交给任一 Stack 前先查实际持有者。同时分派的同一四元组共用一个临时、有界的归属记录。多成员 realm 仍按 TCP 四元组哈希；UDP 仍按客户端地址哈希。peer、DNS 和 UDP source 身份仍属于逻辑 realm，应用、退休与
+队列固定归 `queue_id % workers`。单物理成员、两个 owner 时，新 TCP 流优先归收包队列。队列变化不会迁移活跃流、`TIME_WAIT` 或已导出的输出：逐包回退在把报文交给任一 Stack 前先查实际持有者。同时分派的同一四元组共用一个临时、有界的归属记录。多成员 realm 仍按 TCP 四元组哈希；UDP 按规范化的客户端 IP 和源端口哈希。同一客户端套接字访问不同目的地时使用同一 worker。peer、DNS 和 UDP source 身份仍属于逻辑 realm，应用、退休与
 CQ 则保留精确 owner 和 FlowId。跨 worker 交接共用 64 个已计费 cell，每个目的
 队列最多等待 32 项，借用 RX 不会逃出 callback。Core 与 Host 协调留在 worker 0；
 drain 确认绑定该轮开始前观察到的 epoch，不能借用后来发布的 barrier。

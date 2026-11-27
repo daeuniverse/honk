@@ -18,6 +18,14 @@ impl PacketEndpoints {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn udp_client_on(realm: &PacketRealm, ip: std::net::IpAddr, worker: usize) -> SocketAddr {
+    (41000..=u16::MAX)
+        .map(|port| SocketAddr::new(ip, port))
+        .find(|&client| realm.worker_for_udp(client) == worker)
+        .expect("client port hashing to the requested worker")
+}
+
 fn scope(budget: &Arc<MemoryBudget>) -> (PacketScope, PacketOwner) {
     let mut config = StackConfig::new([73; 32]);
     config.mode = Mode::Transparent {

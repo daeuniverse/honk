@@ -11,7 +11,7 @@ async fn controller_dns_claim_retains_its_actual_source_work() {
     let source: SocketAddr = "192.0.2.10:41000".parse().unwrap();
     let destination: SocketAddr = "198.51.100.9:53".parse().unwrap();
     assert!(!endpoints.retains(scope.scope(), source, destination, 17));
-    let work = scope.hold_source(source.ip()).unwrap();
+    let work = scope.hold_udp_source(source).unwrap();
     assert!(endpoints.retains(scope.scope(), source, destination, 17));
     assert!(!endpoints.retained_transport(scope.scope(), source, destination, 17));
     let unrelated = SocketAddr::new(source.ip(), source.port() + 1);
@@ -384,7 +384,7 @@ async fn udp_initializer_keeps_its_process_on_the_existing_transport() {
         let missing = ProcessMeta::test_gateway(418, "");
         let submit = |client: SocketAddr, process, payload: &[u8]| {
             let work = scope
-                .hold_source(client.ip())
+                .hold_udp_source(client)
                 .unwrap()
                 .with_process_input(process);
             endpoints

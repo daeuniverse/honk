@@ -327,7 +327,7 @@ async fn auxiliary_pause_before_udp_ready_commit_preserves_retirement_reason() {
     let pool = Arc::new(UdpEndpointPool::with_capacity_limit(1));
     let client = make_addr("192.0.2.1", 40000);
     let dst = make_addr("198.51.100.1", 443);
-    let source = scope.hold_source(client.ip()).unwrap();
+    let source = scope.hold_udp_source(client).unwrap();
     let EndpointReservation::Initializing(mut lease) = pool.reserve_payload_or_enqueue_at(
         scope.scope(),
         client,

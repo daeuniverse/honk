@@ -2834,13 +2834,16 @@ impl DatagramSender {
         if self
             .packet_source
             .as_ref()
-            .and_then(SourceWork::plain_address)
-            .is_some_and(|address| address.to_canonical() != client.ip().to_canonical())
+            .and_then(SourceWork::plain_client)
+            .is_some_and(|bound| {
+                bound.port() != client.port()
+                    || bound.ip().to_canonical() != client.ip().to_canonical()
+            })
         {
             return Err(invalid("exact UDP source belongs to another client"));
         }
         let scope = self.realm.as_ref().map_or(&self.scope, |realm| {
-            &realm.owners()[realm.worker_for_udp(client.ip())]
+            &realm.owners()[realm.worker_for_udp(client)]
         });
         #[cfg(target_os = "linux")]
         if let Some(local) = scope.0.local.get() {

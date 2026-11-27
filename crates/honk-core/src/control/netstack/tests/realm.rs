@@ -14,9 +14,9 @@ fn client_for(realm: &PacketRealm, worker: usize) -> SocketAddr {
 
 fn udp_clients(realm: &PacketRealm) -> [SocketAddr; 2] {
     std::array::from_fn(|worker| {
-        (1..=254)
-            .map(|last| SocketAddr::from(([192, 0, 2, last], 41000)))
-            .find(|client| realm.worker_for_udp(client.ip()) == worker)
+        (41000..=u16::MAX)
+            .map(|port| SocketAddr::from(([192, 0, 2, 10], port)))
+            .find(|&client| realm.worker_for_udp(client) == worker)
             .unwrap()
     })
 }
@@ -220,27 +220,23 @@ fn tun_shards_enforce_one_half_open_ceiling() {
 #[tokio::test]
 async fn tun_shards_keep_udp_client_affinity_and_share_pending_bytes() {
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
-    for queues in [1, 2, 3, 8] {
+    for queues in [1, 2, 3, 4, 8] {
         let (realm, owners) = capture_tun_realm(1280, queues, TxCaps::NONE, &budget).unwrap();
         let foreign: SocketAddr = "203.0.113.9:53".parse().unwrap();
         let sender = realm.datagram_sender(foreign);
         let clients: Vec<_> = (0..queues)
             .map(|worker| {
-                (1..=254)
-                    .map(|last| SocketAddr::from(([192, 0, 2, last], 41000)))
-                    .find(|client| realm.worker_for_udp(client.ip()) == worker)
+                (41000..=u16::MAX)
+                    .map(|port| SocketAddr::from(([192, 0, 2, 10], port)))
+                    .find(|&client| realm.worker_for_udp(client) == worker)
                     .unwrap()
             })
             .collect();
         for (worker, &client) in clients.iter().enumerate() {
             let scope = realm.owner(worker).unwrap();
-            for (port, destination) in [
-                (51000, foreign),
-                (52000, "198.51.100.9:123".parse().unwrap()),
-            ] {
+            for destination in [foreign, "198.51.100.9:123".parse().unwrap()] {
                 let mut packet = [0; 128];
-                let source = SocketAddr::new(client.ip(), port);
-                let n = wire::udp::emit_packet(&mut packet, source, destination, b"query").unwrap();
+                let n = wire::udp::emit_packet(&mut packet, client, destination, b"query").unwrap();
                 let (selected, claim) = realm
                     .dispatch_owner(
                         (worker + 1) % queues,
@@ -1326,7 +1322,7 @@ async fn local_window_pair_preserves_parked_source_work_and_funds_both_drivers()
     let narrow = [layout(&first), layout(&second)];
     let held = second
         .scope
-        .local_source_work("192.0.2.1".parse().unwrap())
+        .local_source_work("192.0.2.1:41000".parse().unwrap())
         .unwrap();
     assert!(!PacketDriver::widen_local_pair(
         &mut first,
@@ -1349,13 +1345,16 @@ async fn local_window_pair_preserves_parked_source_work_and_funds_both_drivers()
         let sources: Vec<_> = (0..aliases)
             .map(|n| {
                 let address = std::net::Ipv4Addr::from(0xc0000200u32 + n as u32);
-                driver.scope.local_source_work(address.into()).unwrap()
+                driver
+                    .scope
+                    .local_source_work(SocketAddr::from((address, 41000)))
+                    .unwrap()
             })
             .collect();
         assert!(
             driver
                 .scope
-                .local_source_work("198.51.100.1".parse().unwrap())
+                .local_source_work("198.51.100.1:41000".parse().unwrap())
                 .is_err()
         );
         drop(sources);
