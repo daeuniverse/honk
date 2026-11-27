@@ -1,9 +1,7 @@
 //! Bond coverage is on the logical device, after bonding's receive admission and
 //! before bonding chooses the transmit member. All traffic uses the real control plane.
 
-use super::support::netns::{
-    KernelTcpDial, enter_lab_namespaces, lab_config, pinned_map, run_isolated, tuples_key,
-};
+use super::support::netns::{KernelTcpDial, lab_config, pinned_map, run_isolated, tuples_key};
 use super::support::shared_udp::{SharedUdpMode, SharedUdpPeer};
 use super::{configure_test_edge, fresh_test_netns, in_test_netns, udp_test_forwarder};
 use crate::control::{ControlCommand, ControlPlane};
@@ -240,7 +238,7 @@ struct Scenario {
 fn run_child(case: &str) -> anyhow::Result<()> {
     let (kind, mode) = case.split_once('/').context("bond case")?;
     let (kind, mode) = (Kind::parse(kind)?, Mode::parse(mode)?);
-    enter_lab_namespaces()?;
+    crate::test_support::netns::enter_lab_namespaces()?;
     ip(None, &["link", "set", "lo", "up"])?;
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
     // Neither rp_filter nor an IPv4 Redirect may turn asymmetric bridge traffic into

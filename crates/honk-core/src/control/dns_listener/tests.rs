@@ -1040,11 +1040,7 @@ async fn host_bound_dns_serves_offline_and_learns_live_loopback_queries() {
 #[ignore = "requires the disposable kernel VM gate and SO_MARK privileges"]
 fn tun_prepared_listener_marks_tcp_udp_and_accepted_sockets() {
     std::thread::spawn(|| {
-        crate::control::tests::support::netns::enter_lab_namespaces().unwrap();
-        crate::netlink::NlSock::new()
-            .unwrap()
-            .set_link_up(crate::netlink::ifindex_of("lo").unwrap(), true)
-            .unwrap();
+        crate::test_support::netns::enter_with_loopback().unwrap();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

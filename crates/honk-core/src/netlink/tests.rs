@@ -1,4 +1,6 @@
+use super::links::parse_link_datagram;
 use super::*;
+use std::num::NonZeroU32;
 
 #[test]
 fn attr_alignment() {

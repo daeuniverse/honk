@@ -52,6 +52,9 @@ pub(crate) mod xdp;
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub(crate) mod netns;
+
     pub(crate) mod routed_udp;
 
     pub(crate) fn run_exact_in_child(env: &str, name: &str) -> bool {

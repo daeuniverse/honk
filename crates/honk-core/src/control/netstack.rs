@@ -44,6 +44,8 @@ pub(crate) use realm::{PacketRealm, PacketRealmPlan, TcpClaim};
 pub(crate) use realm_receive::RealmRxBatch;
 
 mod auxiliary;
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+mod host;
 use auxiliary::Auxiliary;
 pub(in crate::control) use auxiliary::AuxiliaryWork;
 #[cfg(target_os = "linux")]
@@ -298,7 +300,7 @@ struct Inner {
     output_peer_holds: Box<[Option<crate::xdp::worker::PeerHold>]>,
     source_work: Sources,
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
-    host_process: Option<auxiliary::HostProcessBinding>,
+    host_process: Option<host::HostProcessBinding>,
     queue: Box<[Option<Queued>]>,
     head: usize,
     queued: usize,
@@ -1553,7 +1555,7 @@ impl Inner {
             && let Some(binding) = &mut self.host_process
         {
             let bytes = &self.frames[index].as_ref().expect("reserved Host output")[..tx.len];
-            binding.outputs[index] = auxiliary::HostOutput::from_packet(bytes, fragment);
+            binding.outputs[index] = host::HostOutput::from_packet(bytes, fragment);
         }
         let queued = self
             .install(lease, index, tx, class, destination, fragment)
@@ -2148,8 +2150,7 @@ impl PacketDriver {
         if tx.flow.is_none()
             && let Some(binding) = &mut reservation.inner.host_process
         {
-            binding.outputs[index] =
-                auxiliary::HostOutput::from_packet(&packet[..tx.len], fragment);
+            binding.outputs[index] = host::HostOutput::from_packet(&packet[..tx.len], fragment);
         }
         reservation.lease = None;
         #[cfg(target_os = "linux")]

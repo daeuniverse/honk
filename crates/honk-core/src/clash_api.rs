@@ -1811,11 +1811,7 @@ mod sampler_tests {
     #[ignore = "requires real SO_MARK in the disposable VM; run via just test-netns"]
     fn netns_tun_listener_marks_accepted_sockets() {
         std::thread::spawn(|| {
-            crate::control::tests::support::netns::enter_lab_namespaces().unwrap();
-            crate::netlink::NlSock::new()
-                .unwrap()
-                .set_link_up(crate::netlink::ifindex_of("lo").unwrap(), true)
-                .unwrap();
+            crate::test_support::netns::enter_with_loopback().unwrap();
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

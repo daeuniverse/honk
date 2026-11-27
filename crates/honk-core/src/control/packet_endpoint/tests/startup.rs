@@ -1216,11 +1216,7 @@ async fn configured_dns_startup(backend: Backend) {
 #[ignore = "requires the disposable kernel VM gate and SO_MARK privileges"]
 fn tun_dns_bind_starts_with_prepared_addresses_and_marks_both_transports() {
     std::thread::spawn(|| {
-        crate::control::tests::support::netns::enter_lab_namespaces().unwrap();
-        crate::netlink::NlSock::new()
-            .unwrap()
-            .set_link_up(crate::netlink::ifindex_of("lo").unwrap(), true)
-            .unwrap();
+        crate::test_support::netns::enter_with_loopback().unwrap();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
