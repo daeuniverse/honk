@@ -10,7 +10,11 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{PacketScope, RetirementCallback, WaitFor, Waiter, capacity, closed, register};
 #[cfg(target_os = "linux")]
-use super::{RemoteProgress, local::LocalFlow, remote::RemoteEndpoint};
+use super::{
+    RemoteProgress,
+    local::LocalFlow,
+    remote::{RemoteEndpoint, RemoteReadHalf, RemoteWriteHalf},
+};
 
 /// Application ownership of an original, Stack-local TCP incarnation.
 #[derive(Debug)]
@@ -112,6 +116,19 @@ impl FlowIo {
     #[cfg(target_os = "linux")]
     pub(in crate::control) fn remote_progress(&self) -> Option<RemoteProgress> {
         self.remote.as_ref().map(RemoteEndpoint::progress)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::control) fn split_remote_mut(
+        &mut self,
+    ) -> io::Result<(RemoteReadHalf<'_>, RemoteWriteHalf<'_>)> {
+        if !self.open {
+            return Err(closed());
+        }
+        self.remote
+            .as_mut()
+            .map(RemoteEndpoint::split_mut)
+            .ok_or_else(|| stream_error(StreamError::Stale))
     }
 
     pub fn scope(&self) -> ScopeId {
@@ -496,12 +513,9 @@ impl AsyncWrite for FlowIo {
     ) -> Poll<io::Result<usize>> {
         #[cfg(target_os = "linux")]
         if self.physical.is_some() {
-            if !self.open {
-                return Poll::Ready(Err(closed()));
-            }
-            return match &mut self.get_mut().remote {
-                Some(remote) => Pin::new(remote).poll_write(cx, data),
-                None => Poll::Ready(Err(stream_error(StreamError::Stale))),
+            return match self.get_mut().split_remote_mut() {
+                Ok((_, mut tx)) => Pin::new(&mut tx).poll_write(cx, data),
+                Err(error) => Poll::Ready(Err(error)),
             };
         }
         self.scope.0.with(|inner| {

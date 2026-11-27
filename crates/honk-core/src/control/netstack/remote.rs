@@ -11,7 +11,7 @@ use crossbeam_utils::atomic::AtomicCell;
 use futures::task::AtomicWaker;
 use honk_netstack::{FlowId, MemoryBudget, MemoryReservation, Stack, StreamError};
 use parking_lot::Mutex;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{capacity, stream_error};
 
@@ -254,12 +254,16 @@ impl Reader {
         Some(&chunk.bytes[self.offset..])
     }
 
-    // An allocation refund/recycle and a descriptor credit occur at the same frontier.
     fn consume(&mut self, ring: &Ring, len: usize, wire: &Wire, pressured: bool) -> Option<usize> {
         self.offset += len;
         if self.offset < self.chunk.as_ref().unwrap().bytes.len() {
             return None;
         }
+        Some(self.release_chunk(ring, wire, pressured))
+    }
+
+    // An allocation refund/recycle and a descriptor credit occur at the same frontier.
+    fn release_chunk(&mut self, ring: &Ring, wire: &Wire, pressured: bool) -> usize {
         let chunk = self.chunk.take().expect("active SPSC chunk");
         self.offset = 0;
         self.next = (self.next + 1) % SLOTS;
@@ -268,7 +272,27 @@ impl Reader {
         } else {
             drop(chunk);
         }
-        Some(ring.occupied.fetch_sub(1, Ordering::AcqRel))
+        ring.occupied.fetch_sub(1, Ordering::AcqRel)
+    }
+
+    fn consume_rx(&mut self, wire: &Wire, amt: usize) {
+        if amt == 0 {
+            return;
+        }
+        let len = self
+            .chunk
+            .as_ref()
+            .map_or(0, |chunk| chunk.bytes.len() - self.offset);
+        assert!(
+            amt <= len,
+            "consumed {amt} bytes from a {len}-byte receive buffer"
+        );
+        if amt < len {
+            self.offset += amt;
+        } else {
+            let before = self.release_chunk(&wire.rx, wire, wire.budget_blocked());
+            wire.wake_rx_consumed(before);
+        }
     }
 }
 
@@ -407,6 +431,16 @@ pub(in crate::control) struct RemoteOwner {
 }
 
 pub(in crate::control) struct RemoteEndpoint(Box<Application>);
+
+pub(in crate::control) struct RemoteReadHalf<'a> {
+    wire: &'a Wire,
+    rx: &'a mut Reader,
+}
+
+pub(in crate::control) struct RemoteWriteHalf<'a> {
+    wire: &'a Wire,
+    tx: &'a mut Writer,
+}
 
 struct Application {
     wire: Arc<Wire>,
@@ -560,8 +594,7 @@ impl RemoteOwner {
                     if n == 0 {
                         break;
                     }
-                    let pressured = self.wire.rx_budget.load(Ordering::Acquire)
-                        || self.wire.tx_budget.load(Ordering::Acquire);
+                    let pressured = self.wire.budget_blocked();
                     if let Some(before) = self.tx.consume(&self.wire.tx, n, &self.wire, pressured) {
                         freed = true;
                         remaining = before - 1;
@@ -626,7 +659,7 @@ impl RemoteOwner {
     }
 
     pub(super) fn budget_blocked(&self) -> bool {
-        self.wire.rx_budget.load(Ordering::Acquire) || self.wire.tx_budget.load(Ordering::Acquire)
+        self.wire.budget_blocked()
     }
 
     pub(super) fn retry_budget(&self) {
@@ -646,48 +679,46 @@ impl RemoteEndpoint {
     pub(super) fn progress(&self) -> RemoteProgress {
         self.0.progress.clone()
     }
+
+    pub(super) fn split_mut(&mut self) -> (RemoteReadHalf<'_>, RemoteWriteHalf<'_>) {
+        let app = self.0.as_mut();
+        let wire = app.wire.as_ref();
+        (
+            RemoteReadHalf {
+                wire,
+                rx: &mut app.rx,
+            },
+            RemoteWriteHalf {
+                wire,
+                tx: &mut app.tx,
+            },
+        )
+    }
 }
 
-impl AsyncRead for RemoteEndpoint {
+impl Reader {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        &mut self,
+        wire: &Wire,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let app = &mut *self.0;
-        let wire = &app.wire;
-        wire.reader.register(cx.waker());
-        // Load terminal state before looking for payload. Seeing a terminal publication must
-        // include the final producer publication, even if both raced the original poll.
-        let terminal = wire.rx_end.get().copied();
+        let terminal = wire.read_terminal(cx);
         let mut read = false;
-        let mut freed = false;
-        let mut remaining = SLOTS;
+        let mut freed_from = None;
         while buf.remaining() != 0 {
-            let Some(data) = app.rx.front(&wire.rx) else {
+            let Some(data) = self.front(&wire.rx) else {
                 break;
             };
             let n = data.len().min(buf.remaining());
             buf.put_slice(&data[..n]);
             read = true;
-            let pressured =
-                wire.rx_budget.load(Ordering::Acquire) || wire.tx_budget.load(Ordering::Acquire);
-            if let Some(before) = app.rx.consume(&wire.rx, n, wire, pressured) {
-                freed = true;
-                remaining = before - 1;
+            if let Some(before) = self.consume(&wire.rx, n, wire, wire.budget_blocked()) {
+                freed_from = Some(before);
             }
         }
-        if freed {
-            fence(Ordering::SeqCst);
-            let wake_full =
-                remaining <= WAKE_LOW_WATERMARK && wire.rx.full.swap(false, Ordering::AcqRel);
-            let wake_rx_budget = wire.rx_budget.load(Ordering::Acquire);
-            if wake_full || wake_rx_budget {
-                wire.owner.wake_by_ref();
-            }
-            if wire.tx_budget.load(Ordering::Acquire) {
-                wire.writer.wake();
-            }
+        if let Some(before) = freed_from {
+            wire.wake_rx_consumed(before);
         }
         if read || buf.remaining() == 0 {
             Poll::Ready(Ok(()))
@@ -697,32 +728,67 @@ impl AsyncRead for RemoteEndpoint {
             Poll::Pending
         }
     }
+
+    fn poll_fill_buf(&mut self, wire: &Wire, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let terminal = wire.read_terminal(cx);
+        if let Some(bytes) = self.front(&wire.rx) {
+            Poll::Ready(Ok(bytes))
+        } else if let Some(error) = terminal {
+            Poll::Ready(error.map_or(Ok(&[][..]), |e| Err(stream_error(e))))
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
-impl AsyncWrite for RemoteEndpoint {
+impl Wire {
+    fn read_terminal(&self, cx: &Context<'_>) -> Option<Option<StreamError>> {
+        self.reader.register(cx.waker());
+        // Observing the terminal state before the front also observes the final payload
+        // publication when both raced this poll.
+        self.rx_end.get().copied()
+    }
+
+    fn budget_blocked(&self) -> bool {
+        self.rx_budget.load(Ordering::Acquire) || self.tx_budget.load(Ordering::Acquire)
+    }
+
+    fn wake_rx_consumed(&self, before: usize) {
+        fence(Ordering::SeqCst);
+        let remaining = before - 1;
+        let wake_full =
+            remaining <= WAKE_LOW_WATERMARK && self.rx.full.swap(false, Ordering::AcqRel);
+        let wake_rx_budget = self.rx_budget.load(Ordering::Acquire);
+        if wake_full || wake_rx_budget {
+            self.owner.wake_by_ref();
+        }
+        if self.tx_budget.load(Ordering::Acquire) {
+            self.writer.wake();
+        }
+    }
+
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        &self,
+        tx: &mut Writer,
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let app = &mut *self.0;
-        let wire = &app.wire;
-        wire.writer.register(cx.waker());
-        if let Some(&error) = wire.tx_error.get() {
+        self.writer.register(cx.waker());
+        if let Some(&error) = self.tx_error.get() {
             return Poll::Ready(Err(stream_error(error)));
         }
-        if wire.shutdown.load(Ordering::Acquire) {
+        if self.shutdown.load(Ordering::Acquire) {
             return Poll::Ready(Err(stream_error(StreamError::Closed)));
         }
-        let (n, pressure, wake_owner) = app.tx.push(&wire.tx, &[IoSlice::new(bytes)], &wire.pool);
+        let (n, pressure, wake_owner) = tx.push(&self.tx, &[IoSlice::new(bytes)], &self.pool);
         if wake_owner {
-            wire.owner.wake_by_ref();
+            self.owner.wake_by_ref();
         }
         if pressure != Pressure::None {
-            wire.backpressure.fetch_add(1, Ordering::Relaxed);
+            self.backpressure.fetch_add(1, Ordering::Relaxed);
         }
-        if pressure == Pressure::Budget && !wire.tx_budget.swap(true, Ordering::AcqRel) {
-            wire.owner.wake_by_ref();
+        if pressure == Pressure::Budget && !self.tx_budget.swap(true, Ordering::AcqRel) {
+            self.owner.wake_by_ref();
         }
         if n != 0 || bytes.is_empty() {
             Poll::Ready(Ok(n))
@@ -731,38 +797,120 @@ impl AsyncWrite for RemoteEndpoint {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let wire = &self.0.wire;
-        wire.writer.register(cx.waker());
-        if let Some(&error) = wire.tx_error.get() {
+    fn poll_flush(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.writer.register(cx.waker());
+        if let Some(&error) = self.tx_error.get() {
             return Poll::Ready(Err(stream_error(error)));
         }
-        if wire.tx.occupied.load(Ordering::Acquire) == 0 {
+        if self.tx.occupied.load(Ordering::Acquire) == 0 {
             return Poll::Ready(Ok(()));
         }
-        wire.tx_flushing.store(true, Ordering::Release);
+        self.tx_flushing.store(true, Ordering::Release);
         fence(Ordering::SeqCst);
-        if wire.tx.occupied.load(Ordering::Acquire) == 0 {
-            wire.tx_flushing.store(false, Ordering::Relaxed);
+        if self.tx.occupied.load(Ordering::Acquire) == 0 {
+            self.tx_flushing.store(false, Ordering::Relaxed);
             Poll::Ready(Ok(()))
         } else {
             Poll::Pending
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let wire = &self.0.wire;
-        wire.writer.register(cx.waker());
-        if wire.shutdown_done.load(Ordering::Acquire) {
+    fn poll_shutdown(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.writer.register(cx.waker());
+        if self.shutdown_done.load(Ordering::Acquire) {
             return Poll::Ready(Ok(()));
         }
-        if let Some(&error) = wire.tx_error.get() {
+        if let Some(&error) = self.tx_error.get() {
             return Poll::Ready(Err(stream_error(error)));
         }
-        if !wire.shutdown.swap(true, Ordering::AcqRel) {
-            wire.owner.wake_by_ref();
+        if !self.shutdown.swap(true, Ordering::AcqRel) {
+            self.owner.wake_by_ref();
         }
         Poll::Pending
+    }
+}
+
+impl AsyncRead for RemoteEndpoint {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let app = self.get_mut().0.as_mut();
+        app.rx.poll_read(&app.wire, cx, buf)
+    }
+}
+
+impl AsyncRead for RemoteReadHalf<'_> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let half = self.get_mut();
+        half.rx.poll_read(half.wire, cx, buf)
+    }
+}
+
+impl AsyncBufRead for RemoteEndpoint {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let app = self.get_mut().0.as_mut();
+        app.rx.poll_fill_buf(&app.wire, cx)
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let app = self.get_mut().0.as_mut();
+        app.rx.consume_rx(&app.wire, amt);
+    }
+}
+
+impl AsyncBufRead for RemoteReadHalf<'_> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let half = self.get_mut();
+        half.rx.poll_fill_buf(half.wire, cx)
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let half = self.get_mut();
+        half.rx.consume_rx(half.wire, amt);
+    }
+}
+
+impl AsyncWrite for RemoteEndpoint {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let app = self.get_mut().0.as_mut();
+        app.wire.poll_write(&mut app.tx, cx, bytes)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.0.wire.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.0.wire.poll_shutdown(cx)
+    }
+}
+
+impl AsyncWrite for RemoteWriteHalf<'_> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let half = self.get_mut();
+        half.wire.poll_write(half.tx, cx, bytes)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.wire.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.wire.poll_shutdown(cx)
     }
 }
 

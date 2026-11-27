@@ -48,6 +48,11 @@ fn handshake(client: &mut Stack, server: &mut Stack, now: Instant) -> (FlowId, F
 
 #[tokio::test]
 async fn partial_stack_commit_fences_flush_progress_and_fin() {
+    check_partial_stack_commit(false).await;
+    check_partial_stack_commit(true).await;
+}
+
+async fn check_partial_stack_commit(split: bool) {
     let now = Instant::now();
     let ((mut server, id), (mut client, client_id)) = connected(now);
     let budget = MemoryBudget::new(128 << 10);
@@ -63,21 +68,29 @@ async fn partial_stack_commit_fences_flush_progress_and_fin() {
     .unwrap();
     let progress = app.progress();
     let empty = budget.used();
-    assert_eq!(app.write(b"abcdef").await.unwrap(), 6);
+    let mut write_half;
+    let tx: &mut (dyn AsyncWrite + Unpin) = if split {
+        let (_, writer) = app.split_mut();
+        write_half = writer;
+        &mut write_half
+    } else {
+        &mut app
+    };
+    assert_eq!(tx.write(b"abcdef").await.unwrap(), 6);
     assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
     assert_eq!(progress.snapshot(), (0, None, None));
-    assert!(futures::poll!(std::pin::pin!(app.flush())).is_pending());
+    assert!(futures::poll!(std::pin::pin!(tx.flush())).is_pending());
     assert_eq!(owner.pump_tx(&mut server, 2, now).unwrap(), 2);
     assert_eq!(progress.snapshot().0, 2);
-    assert!(futures::poll!(std::pin::pin!(app.shutdown())).is_pending());
+    assert!(futures::poll!(std::pin::pin!(tx.shutdown())).is_pending());
     assert!(!owner.shutdown_pending());
-    assert!(futures::poll!(std::pin::pin!(app.flush())).is_pending());
+    assert!(futures::poll!(std::pin::pin!(tx.flush())).is_pending());
     assert_eq!(owner.pump_tx(&mut server, SMALL_CHUNK, now).unwrap(), 4);
     assert_eq!(budget.used(), empty);
-    app.flush().await.unwrap();
+    tx.flush().await.unwrap();
     assert!(owner.shutdown_pending());
     owner.finish_shutdown(server.tcp_shutdown(id));
-    app.shutdown().await.unwrap();
+    tx.shutdown().await.unwrap();
     assert!(progress.finished());
     let (total, first, last) = progress.snapshot();
     assert_eq!(total, 6);
@@ -339,4 +352,5 @@ fn waker_fn(wake: Arc<AtomicWaker>) -> Waker {
     Waker::from(Arc::new(Signal(wake)))
 }
 
+mod buffered;
 mod pool;

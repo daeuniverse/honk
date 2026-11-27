@@ -364,6 +364,28 @@ fn closed_admission_keeps_established_reads_writes_and_original_addresses() {
     assert_eq!(ip.dst, io.peer_addr().ip());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn split_remote_requires_open_attachment() {
+    use honk_netstack::StreamError;
+
+    let now = Instant::now();
+    let (scope, _owner, _) = runtime(now);
+    let (mut flow, _) = handshake(&scope, now, "10.0.0.2:40000".parse().unwrap(), 100);
+    let Err(error) = flow.split_remote_mut() else {
+        panic!("an open stream without a remote attachment must be stale");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    let cause = error.get_ref().unwrap().downcast_ref::<StreamError>();
+    assert_eq!(cause, Some(&StreamError::Stale));
+
+    flow.abort();
+    let Err(error) = flow.split_remote_mut() else {
+        panic!("a closed stream must reject the split");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+}
+
 #[test]
 fn mixed_direct_cpu_batch_retains_original_flows_through_reuse_and_close() {
     let now = Instant::now();
