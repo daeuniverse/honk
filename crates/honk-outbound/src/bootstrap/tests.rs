@@ -27,8 +27,12 @@ fn test_build_and_parse_roundtrip() {
     resp.extend_from_slice(&60u32.to_be_bytes()); // TTL
     resp.extend_from_slice(&4u16.to_be_bytes()); // rdlen
     resp.extend_from_slice(&[93, 184, 216, 34]);
-    let ips = parse_answers(&resp, 1).unwrap();
-    assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+    let records = parse_answers(&resp, 1).unwrap();
+    assert_eq!(
+        records.ips,
+        vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
+    );
+    assert_eq!(records.min_ttl, Some(60));
 }
 
 #[tokio::test]
@@ -45,31 +49,30 @@ async fn local_answers_bypass_network_admission_even_after_its_deadline() {
     let localhost = hosts_addresses(&hosts, "localhost");
     assert!(!localhost.is_empty());
     let refuse = || std::future::ready(Err::<(), _>(io::Error::from(PacketRejection::Capacity)));
+    let (fam, now) = (
+        QueryFamilies::Both { prefer_v6: false },
+        tokio::time::Instant::now(),
+    );
     for (host, expected) in [
         ("192.0.2.1", vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))]),
         ("[2001:db8::1]", vec!["2001:db8::1".parse().unwrap()]),
         ("localhost", localhost),
     ] {
-        assert_eq!(
-            resolve_with_admission(None, host, tokio::time::Instant::now(), refuse)
-                .await
-                .unwrap(),
-            expected
-        );
+        let got = resolve_records_with_admission(None, host, fam, now, refuse)
+            .await
+            .unwrap();
+        assert_eq!(got.ips, expected);
     }
     #[cfg(feature = "owned-tasks")]
     {
         let registry = crate::runtime::OutboundRuntimeRegistry::build(&[]).unwrap();
         let address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let fut = resolve_records_with_admission(None, "pinned.invalid", fam, now, refuse);
         let resolved = registry
-            .scope_pinned_dials(
-                "pinned.invalid",
-                address,
-                resolve_with_admission(None, "pinned.invalid", tokio::time::Instant::now(), refuse),
-            )
+            .scope_pinned_dials("pinned.invalid", address, fut)
             .await
             .unwrap();
-        assert_eq!(resolved, vec![address]);
+        assert_eq!(resolved.ips, vec![address]);
     }
 }
 
@@ -80,9 +83,10 @@ async fn configured_admission_refusal_cannot_fall_back_to_hosts() {
     let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let resolver = BootstrapResolver::parse(&format!("udp://{}", silent.local_addr().unwrap()));
     let mut admissions = 0;
-    let error = resolve_with_admission(
+    let error = resolve_records_with_admission(
         resolver,
         "localhost",
+        QueryFamilies::Both { prefer_v6: false },
         tokio::time::Instant::now() + Duration::from_secs(1),
         || {
             admissions += 1;
@@ -110,12 +114,17 @@ fn qtype(query: &[u8]) -> u16 {
 
 /// A reply to `query` answering with the entries of `ips` in the queried family.
 fn addr_response(query: &[u8], ips: &[IpAddr]) -> Vec<u8> {
+    let records: Vec<_> = ips.iter().map(|&ip| (ip, 60)).collect();
+    addr_response_with_ttls(query, &records)
+}
+
+fn addr_response_with_ttls(query: &[u8], records: &[(IpAddr, u32)]) -> Vec<u8> {
     let qtype = qtype(query);
     let mut resp = query.to_vec();
     resp[2] = 0x81;
     resp[3] = 0x80;
     let mut count = 0u16;
-    for ip in ips {
+    for &(ip, ttl) in records {
         let rdata = match (qtype, ip) {
             (1, IpAddr::V4(ip)) => ip.octets().to_vec(),
             (28, IpAddr::V6(ip)) => ip.octets().to_vec(),
@@ -124,13 +133,23 @@ fn addr_response(query: &[u8], ips: &[IpAddr]) -> Vec<u8> {
         resp.extend_from_slice(&[0xC0, 0x0C]);
         resp.extend_from_slice(&qtype.to_be_bytes());
         resp.extend_from_slice(&1u16.to_be_bytes());
-        resp.extend_from_slice(&60u32.to_be_bytes());
+        resp.extend_from_slice(&ttl.to_be_bytes());
         resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
         resp.extend_from_slice(&rdata);
         count += 1;
     }
     resp[6..8].copy_from_slice(&count.to_be_bytes());
     resp
+}
+
+async fn bind_tcp_udp_pair() -> (tokio::net::TcpListener, tokio::net::UdpSocket) {
+    for _ in 0..8 {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        if let Ok(udp) = tokio::net::UdpSocket::bind(tcp.local_addr().unwrap()).await {
+            return (tcp, udp);
+        }
+    }
+    panic!("could not reserve matching TCP/UDP port");
 }
 
 /// Loopback UDP DNS stub sending every datagram of `replies(query)` per query.
@@ -216,26 +235,6 @@ async fn claimed_node_host_replaces_bootstrap_only_on_the_global_path() {
 }
 
 #[tokio::test]
-async fn silent_aaaa_keeps_a_answer_within_family_budget() {
-    let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 44));
-    let server = spawn_udp_stub(move |query| match qtype(query) {
-        1 => vec![addr_response(query, &[a])],
-        _ => Vec::new(),
-    })
-    .await;
-    let resolver = BootstrapResolver::parse(&format!("udp://{server}"));
-
-    let ips = tokio::time::timeout(
-        QUERY_TIMEOUT + Duration::from_secs(2),
-        resolve_with(resolver, "a-only.invalid"),
-    )
-    .await
-    .expect("resolution finishes within one family budget")
-    .unwrap();
-    assert_eq!(ips, vec![a]);
-}
-
-#[tokio::test]
 async fn truncated_udp_answer_retries_over_tcp() {
     #[cfg(feature = "flow-observation")]
     if run_global_test_in_child("bootstrap::tests::truncated_udp_answer_retries_over_tcp") {
@@ -243,25 +242,7 @@ async fn truncated_udp_answer_retries_over_tcp() {
     }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53));
-    let (tcp, udp) = async {
-        const MAX_ATTEMPTS: usize = 8;
-        let mut last_error = None;
-        for _ in 0..MAX_ATTEMPTS {
-            let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            match tokio::net::UdpSocket::bind(tcp.local_addr().unwrap()).await {
-                Ok(udp) => return (tcp, udp),
-                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-                    last_error = Some(error);
-                }
-                Err(error) => panic!("bind UDP DNS stub: {error}"),
-            }
-        }
-        panic!(
-            "could not reserve TCP/UDP DNS stub after {MAX_ATTEMPTS} attempts: {}",
-            last_error.unwrap()
-        );
-    }
-    .await;
+    let (tcp, udp) = bind_tcp_udp_pair().await;
     // UDP only returns an empty truncated reply; the answer exists only over TCP.
     let server = spawn_udp_stub_on(udp, |query| {
         let mut truncated = addr_response(query, &[]);
@@ -329,11 +310,19 @@ async fn truncated_udp_answer_retries_over_tcp() {
 
         stall.store(true, std::sync::atomic::Ordering::Release);
         let error = observer
-            .scope(resolver.query_family("timeout.invalid", 1))
+            .scope(resolver.query_family(
+                "timeout.invalid",
+                1,
+                tokio::time::Instant::now() + QUERY_TIMEOUT,
+            ))
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        let mut cancelled = Box::pin(observer.scope(resolver.query_family("cancel.invalid", 1)));
+        let mut cancelled = Box::pin(observer.scope(resolver.query_family(
+            "cancel.invalid",
+            1,
+            tokio::time::Instant::now() + QUERY_TIMEOUT,
+        )));
         tokio::select! {
             result = &mut cancelled => panic!("silent TCP peer completed: {result:?}"),
             _ = tcp_started.notified() => {}
@@ -403,7 +392,12 @@ async fn udp_exchange_accepts_only_the_reply_matching_the_query() {
     let resolver = BootstrapResolver::parse(&format!("udp://{spoof_only}")).unwrap();
     let accepted = tokio::time::timeout(
         Duration::from_millis(300),
-        resolver.query_raw("node.example.com", 1, None),
+        resolver.query_raw(
+            "node.example.com",
+            1,
+            tokio::time::Instant::now() + QUERY_TIMEOUT,
+            None,
+        ),
     )
     .await;
     assert!(
@@ -521,12 +515,16 @@ async fn observed_bootstrap_lookup_preserves_source_lineage_and_cancellation() {
         server.send_to(&response, peer).await.unwrap();
         server
     });
-    let (addresses, selection) = observer
+    let (records, selection) = observer
         .scope(crate::runtime::flow_observation::observe_resolution(
-            resolver.query_family("target.example", 1),
+            resolver.query_family(
+                "target.example",
+                1,
+                tokio::time::Instant::now() + QUERY_TIMEOUT,
+            ),
         ))
         .await;
-    let addresses = addresses.unwrap();
+    let addresses = records.unwrap().ips;
     assert_eq!(addresses, ["127.0.0.9".parse::<IpAddr>().unwrap()]);
     assert!(events.lock().iter().all(|(_, event)| match event {
         FlowEvent::Dns(lookup) => lookup.selected_ip.is_none(),
@@ -534,7 +532,11 @@ async fn observed_bootstrap_lookup_preserves_source_lineage_and_cancellation() {
     }));
     selection.unwrap().selected_ip(addresses[0]);
     let server = peer.await.unwrap();
-    let mut cancelled = Box::pin(observer.scope(resolver.query_family("cancel.example", 28)));
+    let mut cancelled = Box::pin(observer.scope(resolver.query_family(
+        "cancel.example",
+        28,
+        tokio::time::Instant::now() + QUERY_TIMEOUT,
+    )));
     let mut query = [0; 512];
     tokio::select! {
         result = &mut cancelled => panic!("silent DNS peer unexpectedly completed: {result:?}"),
@@ -592,4 +594,182 @@ fn system_hosts_matches_aliases_and_address_families() {
     );
     assert!(hosts_addresses(hosts, "ignored").is_empty());
     assert!(hosts_addresses(hosts, "hidden").is_empty());
+}
+
+fn v4(d: u8) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(192, 0, 2, d))
+}
+
+fn rcode_resp(q: &[u8], rc: u8) -> Vec<u8> {
+    let mut r = q.to_vec();
+    r[2..4].copy_from_slice(&[0x81, 0x80 | (rc & 0x0F)]);
+    r[6..8].copy_from_slice(&0u16.to_be_bytes());
+    r
+}
+
+async fn res_udp(a: SocketAddr, f: QueryFamilies, t: Duration) -> io::Result<ResolvedRecords> {
+    let r = BootstrapResolver::parse(&format!("udp://{a}"));
+    let dl = tokio::time::Instant::now() + t;
+    resolve_records_with_admission(r, "t.invalid", f, dl, || std::future::ready(Ok(()))).await
+}
+
+#[tokio::test]
+async fn udp_retransmit_uses_monotonic_timer_despite_continuous_spoofed_packets() {
+    let ms = Duration::from_millis;
+    let srv = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = srv.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        let (n1, p1) = srv.recv_from(&mut buf).await.unwrap();
+        let (q1, t0) = (buf[..n1].to_vec(), tokio::time::Instant::now());
+        let mut tick = tokio::time::interval(ms(25));
+        let (n2, p2) = loop {
+            tokio::select! {
+                _ = tick.tick() => for b in mismatched_replies(&q1, v4(99)) { let _ = srv.send_to(&b, p1).await; },
+                r = srv.recv_from(&mut buf) => break r.unwrap(),
+            }
+        };
+        let delay = t0.elapsed();
+        assert_eq!((p2, &buf[..n2]), (p1, q1.as_slice()));
+        let rep = addr_response_with_ttls(&buf[..n2], &[(v4(77), 90)]);
+        srv.send_to(&rep, p2).await.unwrap();
+        delay
+    });
+    let fut = res_udp(addr, QueryFamilies::Ipv4Only, QUERY_TIMEOUT);
+    fn assert_send<T: Send>(_: &T) {}
+    assert_send(&fut);
+    let (rec, delay) = (fut.await.unwrap(), peer.await.unwrap());
+    assert_eq!((rec.ips, rec.min_ttl), (vec![v4(77)], Some(90)));
+    assert!(delay >= ms(350) && delay < ms(1000));
+}
+
+#[tokio::test]
+async fn dual_stack_asymmetric_windows_prefer_ipv6_and_single_family() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst as O};
+
+    let ms = Duration::from_millis;
+    let v6: IpAddr = "2001:db8::20".parse().unwrap();
+    let st = Arc::new(std::array::from_fn::<_, 3, _>(|_| AtomicUsize::new(0)));
+    let st_p = Arc::clone(&st);
+    let srv = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = srv.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        while let Ok((n, peer)) = srv.recv_from(&mut buf).await {
+            let q = &buf[..n];
+            let rep = if qtype(q) == 1 {
+                st_p[0].fetch_add(1, O);
+                addr_response_with_ttls(q, &[(v4(10), 120)])
+            } else if qtype(q) == 28 && st_p[2].load(O) != 0 {
+                match st_p[1].fetch_add(1, O) {
+                    0 => continue,
+                    1 => tokio::time::sleep(ms(150)).await,
+                    _ => {}
+                }
+                addr_response_with_ttls(q, &[(v6, 45)])
+            } else {
+                continue;
+            };
+            let _ = srv.send_to(&rep, peer).await;
+        }
+    });
+    let cnt = || (st[0].load(O), st[1].load(O));
+    let v4f = QueryFamilies::Both { prefer_v6: false };
+    let v6f = QueryFamilies::Both { prefer_v6: true };
+    let t0 = tokio::time::Instant::now();
+    let rec = res_udp(addr, v4f, QUERY_TIMEOUT).await.unwrap();
+    assert_eq!((rec.ips, rec.min_ttl), (vec![v4(10)], Some(120)));
+    assert!(t0.elapsed() >= ms(450) && t0.elapsed() < ms(900));
+    let t1 = tokio::time::Instant::now();
+    assert!(res_udp(addr, v4f, ms(150)).await.unwrap().ips == [v4(10)] && t1.elapsed() < ms(500));
+    st[2].store(1, O);
+    let p6 = res_udp(addr, v6f, QUERY_TIMEOUT).await.unwrap();
+    let want = (vec![v6, v4(10)], Some(45), 2);
+    assert_eq!((p6.ips, p6.min_ttl, cnt().1), want);
+    let ((c4, c6), v4o, v6o) = (cnt(), QueryFamilies::Ipv4Only, QueryFamilies::Ipv6Only);
+    for (f, ip, exp) in [(v4o, v4(10), (c4 + 1, c6)), (v6o, v6, (c4 + 1, c6 + 1))] {
+        let ips = res_udp(addr, f, QUERY_TIMEOUT).await.unwrap().ips;
+        assert_eq!((ips, cnt()), (vec![ip], exp));
+    }
+}
+
+#[tokio::test]
+async fn parse_answers_validates_rcodes_cname_ttl_and_nxdomain_fallback() {
+    let q = build_query("rcode.example", 1);
+    for bad in [1u8, 2, 5] {
+        let e = parse_answers(&rcode_resp(&q, bad), 1).unwrap_err();
+        assert!(e.to_string().contains(&format!("RCODE {bad}")));
+    }
+    let nx = parse_answers(&rcode_resp(&q, 3), 1).unwrap();
+    assert!(nx.ips.is_empty() && nx.min_ttl.is_none());
+
+    let mut mixed = addr_response_with_ttls(&q, &[(v4(1), 180), (v4(2), 42)]);
+    mixed[6..8].copy_from_slice(&3u16.to_be_bytes());
+    mixed.extend_from_slice(&[0xC0, 0x0C, 0, 5, 0, 1, 0, 0, 0, 5, 0, 2, 0xC0, 0x0C]);
+    assert_eq!(parse_answers(&mixed, 1).unwrap().min_ttl, Some(42));
+
+    let mut alias = build_query("upstream.example", 1);
+    alias[2..8].copy_from_slice(&[0x81, 0x80, 0, 1, 0, 1]);
+    alias.extend_from_slice(&[0xC0, 0x0C, 0, 5, 0, 1, 0, 0, 0, 30, 0, 10]);
+    let off = alias.len() as u8;
+    alias.extend_from_slice(b"\x07backend\xC0\x15");
+    assert_eq!(parse_answers(&alias, 1).unwrap().min_ttl, None);
+    alias[6..8].copy_from_slice(&4u16.to_be_bytes());
+    alias.extend_from_slice(&[0xC0, off]);
+    alias.extend_from_slice(b"\x00\x01\x00\x01\x00\x00\x01\x2C\x00\x04\xC0\x00\x02\x0A\x05other\xC0\x15\x00\x05\x00\x01\x00\x00\x00\x05\x00\x07\x04junk\xC0\x15\x04junk\xC0\x15\x00\x01\x00\x01\x00\x00\x00\x05\x00\x04\xCB\x00\x71\x09");
+    let aliased = parse_answers(&alias, 1).unwrap();
+    assert_eq!((aliased.ips, aliased.min_ttl), (vec![v4(10)], Some(30)));
+
+    let many: Vec<_> = (1..=40).map(|i| (v4(i), 60 + u32::from(i))).collect();
+    let capped = parse_answers(&addr_response_with_ttls(&q, &many), 1).unwrap();
+    assert_eq!((capped.ips.len(), capped.min_ttl), (32, Some(61)));
+
+    let nx_srv = spawn_udp_stub(|q| vec![rcode_resp(q, 3)]).await;
+    let hosts = tokio::fs::read_to_string("/etc/hosts").await.unwrap();
+    let r = BootstrapResolver::parse(&format!("udp://{nx_srv}"));
+    let dl = tokio::time::Instant::now() + QUERY_TIMEOUT;
+    let f = QueryFamilies::Both { prefer_v6: false };
+    let fut = resolve_records_with_admission(r, "localhost", f, dl, || std::future::ready(Ok(())));
+    let (res, want) = (fut.await.unwrap(), hosts_addresses(&hosts, "localhost"));
+    assert_eq!((res.ips, res.min_ttl), (want, None));
+}
+
+#[tokio::test]
+async fn bootstrap_deadlines_bound_tcp_upgrade_and_skip_expired_fallback() {
+    use crate::proxy::{PacketRejection, packet_rejection};
+    use tokio::io::AsyncReadExt;
+
+    let ms = Duration::from_millis;
+    let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let r = BootstrapResolver::parse(&format!("udp://{}", silent.local_addr().unwrap()));
+    let (mut n, dl) = (0usize, tokio::time::Instant::now() + ms(80));
+    let f = QueryFamilies::Both { prefer_v6: false };
+    let cap = || io::Error::from(PacketRejection::Capacity);
+    let admit = || {
+        n += 1;
+        std::future::ready((n == 1).then_some(()).ok_or_else(cap))
+    };
+    let err = resolve_records_with_admission(r, "e.invalid", f, dl, admit)
+        .await
+        .unwrap_err();
+    assert_eq!((n, err.kind()), (1, io::ErrorKind::TimedOut));
+    assert_eq!(packet_rejection(&anyhow::Error::new(err)), None);
+
+    let (tcp, udp) = bind_tcp_udp_pair().await;
+    let addr = udp.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+        tokio::time::sleep(ms(120)).await;
+        let mut trunc = addr_response(&buf[..n], &[]);
+        trunc[2] |= 0x02;
+        let _ = udp.send_to(&trunc, peer).await;
+        if let Ok((mut s, _)) = tcp.accept().await {
+            let _ = s.read_u8().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+    let t0 = tokio::time::Instant::now();
+    let fut = res_udp(addr, QueryFamilies::Ipv4Only, ms(250));
+    assert!(fut.await.unwrap_err().kind() == io::ErrorKind::TimedOut && t0.elapsed() < ms(900));
 }

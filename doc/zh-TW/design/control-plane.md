@@ -191,7 +191,7 @@ NFQUEUE 入口由 `PendingUdpVerdicts` 持有 token/generation、phase、FIFO ve
 | 已接受 TCP 流 | 16,384 | 每個 6 = 98,304 |
 | 保留 TCP pool | 2048 | 每個 1 = 2048 |
 | 臨時出站 dial | 1024 | 每個 1 = 1024 |
-| DNS 自有 socket | 256 | 每 socket 一個額度；endpoint 網路 bootstrap 預留兩個，原始代理節點的 resolver socket 不計入，見 [DNS admission](./dns.md#解析管線) |
+| DNS 自有 socket | 256 | 每 socket 1 個額度；endpoint 網路 bootstrap 依單族或雙棧預留 1 或 2 個額度，原始代理節點的 resolver socket 不計入，見 [DNS admission](./dns.md#解析管線) |
 | VLESS 實體 carrier | 8192 | 每個 1 = 8192 |
 | UDP endpoint | 32,768 | 每個 10 = 327,680 |
 | **合計** |  | **437,760** |

@@ -534,6 +534,10 @@ impl ControlPlane {
                             Some(spawn_network_refresh_retry(self.command_sender()));
                     }
                 }
+                self.dns_controller
+                    .runtime_provider()
+                    .current()
+                    .invalidate_upstream_addrs();
                 self.alive_set.notify_network_change();
             }
             ControlCommand::Shutdown => return false,
@@ -708,5 +712,60 @@ mod tests {
         assert!(!group_slot_flipped(&mut dead, "g", 0, true));
         assert!(!group_slot_flipped(&mut dead, "g", 5, false));
         assert!(group_slot_flipped(&mut dead, "g", 0, false));
+    }
+
+    #[tokio::test]
+    async fn network_changed_invalidates_upstream_bootstrap_addrs() {
+        use crate::dns::runtime::{
+            DnsRuntime, DnsRuntimeParts, RoutingProjectionSnapshot, RuntimeGeneration,
+            RuntimeTransport,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SpyTransport(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl RuntimeTransport for SpyTransport {
+            async fn close(&self) {}
+            fn invalidate_upstream_addrs(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let forwarder = crate::control::tests::support::udp_test_forwarder();
+        let mut plane = ControlPlane::new(
+            Config::default(),
+            Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+            Router::new(&[], "direct").unwrap(),
+            Arc::new(ProxyRegistry::new()),
+            DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+            Arc::clone(&forwarder),
+        )
+        .unwrap();
+        let invalidations = Arc::new(AtomicUsize::new(0));
+        plane
+            .dns_controller
+            .runtime_provider()
+            .publish(DnsRuntime::new(DnsRuntimeParts {
+                generation: RuntimeGeneration::new(1),
+                forwarder,
+                routing_projection: Arc::new(RoutingProjectionSnapshot::new(
+                    1,
+                    Arc::new(Router::new(&[], "direct").unwrap()),
+                )),
+                outbound_runtime: None,
+                transport: Arc::new(SpyTransport(Arc::clone(&invalidations))),
+            }));
+        let mut auth = crate::subscription::SubscriptionAuthorizations::new(&[]).unwrap();
+        assert!(
+            plane
+                .dispatch_control_command(
+                    ControlCommand::NetworkChanged,
+                    &DrainTracker::new(),
+                    &mut auth
+                )
+                .await
+        );
+        assert_eq!(invalidations.load(Ordering::SeqCst), 1);
+        plane.dns_controller.shutdown(Duration::from_secs(2)).await;
     }
 }

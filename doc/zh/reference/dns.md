@@ -365,7 +365,7 @@ dns {
 
 ### bootstrap 拨号顺序
 
-同一策略也决定上游主机名经 bootstrap 解析后的拨号顺序。`both` 和 `preferipv4` 先拨 IPv4，`preferipv6` 先拨 IPv6。TCP、DoT、DoH、DoQ、DoH3 以及经代理承载的 DNS，在拨号失败后会继续试后面的地址。直连 UDP 把那唯一一次重试优先给另一个地址族，再考虑同族的其他地址，并复用连接成功的 socket。`ipv4only` 和 `ipv6only` 只在兼容格式里可用，会把上游拨号候选限制在对应地址族。
+同一策略也控制上游主机名的 bootstrap 查询与拨号顺序。域名上游的 bootstrap 解析结果按 DNS generation 缓存（TTL 钳制在 30–300 秒，带 stale 回退，并在网络变化或全量 DNS 缓存清空时标记待刷新；见[上游 bootstrap 解析与缓存](../design/dns.md#上游-bootstrap-解析与缓存)）。`both` 和 `preferipv4` 先拨 IPv4，`preferipv6` 先拨 IPv6；在各自地址族内，honk 会把最近一次成功的地址提前，但不会覆盖偏好地址族。TCP、DoT、DoH、DoQ、DoH3 以及经代理承载的 DNS，在拨号失败后会继续试后面的地址。直连 UDP 把那唯一一次重试优先给另一个地址族，再考虑同族的其他地址，并复用连接成功的 socket。`ipv4only` 和 `ipv6only` 只在兼容格式里可用，对上游主机名只查询并拨号对应地址族。
 
 ## 缓存与固定 TTL
 

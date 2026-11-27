@@ -42,6 +42,7 @@ mod resources {
         fn reap_idle_resources(&self) -> usize {
             0
         }
+        fn invalidate_upstream_addrs(&self) {}
     }
 
     #[async_trait]
@@ -56,6 +57,10 @@ mod resources {
 
         fn reap_idle_resources(&self) -> usize {
             UpstreamPool::reap_idle_resources(self)
+        }
+
+        fn invalidate_upstream_addrs(&self) {
+            UpstreamPool::invalidate_upstream_addrs(self);
         }
     }
 }
@@ -189,6 +194,10 @@ impl DnsRuntime {
 
     pub(crate) fn reap_idle_resources(&self) -> usize {
         self.parts.transport.reap_idle_resources()
+    }
+
+    pub(crate) fn invalidate_upstream_addrs(&self) {
+        self.parts.transport.invalidate_upstream_addrs();
     }
 
     pub(crate) fn cache(&self) -> Arc<tokio::sync::Mutex<super::cache::DnsCache>> {

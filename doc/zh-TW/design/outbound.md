@@ -398,11 +398,7 @@ Basic Authorization header；顯式設定的 Authorization 優先。同源重新
 中由 [`subtag()` 規則](../reference/dns.md#節點伺服器網域)路由的主機名稱。
 `resolve_with*` 用於 DNS 上游 endpoint，會跳過它，因此上游自己的網域不會遞迴。其
 餘情況下，設定的 bootstrap resolver 透過帶 bypass mark 的 UDP/TCP 發出查詢。查詢
-失敗時回退到 `/etc/hosts` 及 `/etc/resolv.conf` 中第一個數字 nameserver；DNS
-socket 同樣帶 mark，不呼叫 libc NSS，也不追加搜尋字尾。A 和 AAAA 同時查詢，各自
-有獨立的 3 s 預算。只接受與隨機查詢 ID 及原問題完全匹配的回應；被截斷的 UDP 應答
-會改用帶 mark 的 TCP 重試。`query_ech_config` 透過同一 raw 路徑查詢 DNS HTTPS 記
-錄，`qtype 65`，並提取 SVCB `ech` 參數。
+失敗時回退到 `/etc/hosts` 及非同步讀取的 `/etc/resolv.conf` 中第一個數字 nameserver；DNS socket 同樣帶 mark，不呼叫 libc NSS，也不追加搜尋字尾。UDP 查詢重用單一已連線的帶 mark socket 並依單調時鐘重傳（`400 ms`、`1,200 ms`，最多 3 次），只接受與隨機查詢 ID 及原問題完全匹配的回應，驗證標頭 RCODE（`0` 提取位址與最小 RR TTL，`3` 傳回空結果以保留回退，其餘碼失敗），並在剩餘查詢預算內將截斷（`TC=1`）應答改用帶 mark 的 TCP 重試。雙棧 A/AAAA 併發查詢，各自享有 3 s 預算並採用非對稱完成視窗（偏好族優先 `500 ms`、非偏好族優先 `1,000 ms`），deadline 到期時不丟棄已取得的非空位址族；單族模式只查詢該位址族。`query_ech_config` 在同樣的 3 s 查詢逾時內透過同一 raw 路徑查詢 DNS HTTPS 記錄（`qtype 65`），並提取 SVCB `ech` 參數。
 
 解析完成後，`src/address_race.rs` 為代理伺服器的 TCP `connect_marked` 和共享
 QUIC `QuicClient` 安排連線嘗試。IPv4 和 IPv6 穩定交錯，最多同時 race 兩個位址。

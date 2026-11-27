@@ -180,7 +180,7 @@ remaining budget determines UDP endpoint count. At the cap the fixed partition i
 | Accepted TCP flows | 16,384 | 6 each = 98,304 |
 | Retained TCP pool | 2048 | 1 each = 2048 |
 | Transient outbound dials | 1024 | 1 each = 1024 |
-| DNS-owned sockets | 256 | 1 credit per socket; endpoint network bootstrap reserves 2 (raw proxy-node resolver sockets are uncharged, see [DNS admission](./dns.md#resolution-pipeline)) |
+| DNS-owned sockets | 256 | 1 credit per socket; endpoint network bootstrap reserves 1 (single-family) or 2 (dual-stack) (raw proxy-node resolver sockets are uncharged, see [DNS admission](./dns.md#resolution-pipeline)) |
 | VLESS physical carriers | 8192 | 1 each = 8192 |
 | UDP endpoints | 32,768 | 10 each = 327,680 |
 | **Total** |  | **437,760** |

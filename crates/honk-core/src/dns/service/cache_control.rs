@@ -25,6 +25,11 @@ impl DnsService {
         let cache = self.cache().lock().await.service();
         self.flush_generation
             .send_modify(|generation| *generation = generation.saturating_add(1));
+        if matches!(selection, CacheInvalidation::All)
+            && let Some(provider) = self.provider()
+        {
+            provider.current().invalidate_upstream_addrs();
+        }
         cache
             .invalidate(selection)
             .await

@@ -78,18 +78,19 @@ impl DnsSocketBudget {
         self.acquire_socket_credits_until(1, deadline).await
     }
 
-    pub(crate) async fn acquire_bootstrap_until(
+    pub(crate) async fn acquire_bootstrap_credits_until(
         &self,
+        credits: u32,
         deadline: tokio::time::Instant,
     ) -> anyhow::Result<OwnedSemaphorePermit> {
-        if self.limit < 2 {
+        if self.limit < credits as usize {
             crate::stats::record_dns_event(crate::stats::DnsStatEvent::SocketAdmissionRefused);
             return Err(
                 anyhow::Error::new(honk_outbound::proxy::PacketRejection::Capacity)
-                    .context("DNS bootstrap requires two socket credits"),
+                    .context(format!("DNS bootstrap requires {credits} socket credit(s)")),
             );
         }
-        self.acquire_socket_credits_until(2, deadline).await
+        self.acquire_socket_credits_until(credits, deadline).await
     }
 
     async fn acquire_socket_credits_until(
@@ -270,7 +271,7 @@ mod tests {
             let before = crate::stats::dns_snapshot();
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1);
             let error = match case {
-                Case::BootstrapRefusal => budget.acquire_bootstrap_until(deadline).await,
+                Case::BootstrapRefusal => budget.acquire_bootstrap_credits_until(2, deadline).await,
                 Case::ProxyTimeout => budget.acquire_proxy_until(deadline).await,
             }
             .unwrap_err();
@@ -289,5 +290,18 @@ mod tests {
                 "{case:?}"
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_credit_bootstrap_fits_in_limit_one() {
+        let budget = DnsSocketBudget::new(1);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+        let permit = budget
+            .acquire_bootstrap_credits_until(1, deadline)
+            .await
+            .expect("single-family bootstrap should fit in a one-credit budget");
+        assert_eq!(budget.available_sockets(), 0);
+        drop(permit);
+        assert_eq!(budget.available_sockets(), 1);
     }
 }

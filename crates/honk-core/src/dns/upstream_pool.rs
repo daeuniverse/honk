@@ -1,6 +1,8 @@
 //! Per-upstream DNS query management with connection reuse.
 
 mod admission {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use parking_lot::Mutex;
     use tokio::sync::Notify;
 
@@ -19,6 +21,7 @@ mod admission {
 
     pub(super) struct AdmissionGate {
         state: Mutex<AdmissionState>,
+        open: AtomicBool,
         changed: Notify,
     }
 
@@ -39,8 +42,13 @@ mod admission {
                     in_flight: 0,
                     close_owner: false,
                 }),
+                open: AtomicBool::new(true),
                 changed: Notify::new(),
             }
+        }
+
+        pub(super) fn is_open(&self) -> bool {
+            self.open.load(Ordering::Acquire)
         }
 
         pub(super) fn admit(&self) -> Option<AdmissionPermit<'_>> {
@@ -62,6 +70,7 @@ mod admission {
                     match state.phase {
                         PoolState::Open => {
                             state.phase = PoolState::Closing;
+                            self.open.store(false, Ordering::Release);
                             state.close_owner = true;
                             return Some(ClosePermit::new(self));
                         }
@@ -143,6 +152,7 @@ mod admission {
         }
     }
 }
+mod addr_cache;
 mod entries {
     use super::MAX_UDP_SHARDS;
     use std::collections::HashMap;
@@ -151,6 +161,7 @@ mod entries {
 
     use honk_config::dns::{DnsStrategy, DnsUpstream};
 
+    use super::addr_cache::UpstreamAddrCache;
     use super::transports::TransportSlots;
     use crate::dns::endpoint::DnsEndpoint;
     use crate::dns::transport::UdpPool;
@@ -163,38 +174,149 @@ mod entries {
     #[derive(Default)]
     pub(super) struct UdpState {
         pub(super) current: Option<SocketAddr>,
+        current_epoch: u64,
+        invalidation_epoch: u64,
         pub(super) pools: [Option<UdpFamily>; 2],
     }
 
     impl UdpState {
-        pub(super) fn current_address(&self) -> Option<SocketAddr> {
+        pub(super) fn current_address(&self) -> Option<(SocketAddr, u64)> {
             let current = self.current?;
+            if self.current_epoch < self.invalidation_epoch {
+                return None;
+            }
             let family = usize::from(current.is_ipv6());
             self.pools[family]
                 .as_ref()
                 .filter(|pools| {
                     pools.address == current && pools.shards.iter().any(Option::is_some)
                 })
-                .map(|_| current)
+                .map(|_| (current, self.current_epoch))
         }
 
-        pub(super) fn mark_current(&mut self, address: SocketAddr) {
+        pub(super) fn mark_current(&mut self, address: SocketAddr, epoch: u64) {
+            if epoch < self.invalidation_epoch {
+                return;
+            }
             let family = usize::from(address.is_ipv6());
             if self.pools[family].as_ref().is_some_and(|pools| {
                 pools.address == address && pools.shards.iter().any(Option::is_some)
             }) {
                 self.current = Some(address);
+                self.current_epoch = epoch;
+            }
+        }
+
+        pub(super) fn clear_current(&mut self) {
+            self.current = None;
+        }
+
+        pub(super) fn invalidate(&mut self, epoch: u64) {
+            if epoch > self.invalidation_epoch {
+                self.invalidation_epoch = epoch;
+            }
+            if self.current_epoch < self.invalidation_epoch {
+                self.current = None;
             }
         }
     }
 
     pub(super) struct UpstreamEntry {
+        pub(super) name: String,
         pub(super) protocol: honk_config::types::DnsProtocol,
         pub(super) endpoint: DnsEndpoint,
         pub(super) outbound: Option<String>,
         pub(super) transports: parking_lot::Mutex<TransportSlots>,
         pub(super) udp: parking_lot::Mutex<UdpState>,
         pub(super) udp_creation: [tokio::sync::Mutex<()>; 2],
+        addr_cache: UpstreamAddrCache,
+    }
+
+    impl UpstreamEntry {
+        pub(super) fn try_hit_addr(
+            &self,
+            now: tokio::time::Instant,
+        ) -> Option<super::addr_cache::ResolvedCandidates> {
+            self.addr_cache.try_hit(now)
+        }
+
+        pub(super) async fn resolve_or_wait_addr<F, Fut, W>(
+            &self,
+            deadline: tokio::time::Instant,
+            is_open: impl Fn() -> bool,
+            resolve: F,
+        ) -> (
+            anyhow::Result<super::addr_cache::ResolvedCandidates>,
+            Option<W>,
+        )
+        where
+            F: FnMut(tokio::time::Instant) -> Fut,
+            Fut: std::future::Future<
+                    Output = (
+                        anyhow::Result<crate::dns::endpoint::ResolvedEndpointAddrs>,
+                        Option<W>,
+                    ),
+                >,
+        {
+            self.addr_cache
+                .resolve_or_wait(&self.name, &self.endpoint.host, deadline, is_open, resolve)
+                .await
+        }
+
+        pub(super) fn record_preferred(&self, address: SocketAddr) {
+            if !self.endpoint.is_domain() {
+                return;
+            }
+            self.addr_cache.record_preferred(address);
+        }
+
+        pub(super) fn mark_dirty_on_all_failed(
+            &self,
+            observed_generation: Option<u64>,
+            now: tokio::time::Instant,
+        ) {
+            if !self.endpoint.is_domain() {
+                return;
+            }
+            self.addr_cache
+                .mark_dirty_on_all_failed(observed_generation, now);
+        }
+
+        pub(super) fn invalidate_addr_cache(&self, now: tokio::time::Instant) {
+            if !self.endpoint.is_domain() {
+                return;
+            }
+            let epoch = self.addr_cache.invalidate(now);
+            // Fence and clear warm UDP affinity so the next datagram query re-resolves
+            // without closing live shards that can be reused if the IP holds.
+            self.udp.lock().invalidate(epoch);
+        }
+
+        #[cfg(test)]
+        pub(super) fn is_addr_in_flight(&self) -> bool {
+            self.addr_cache.is_in_flight()
+        }
+
+        #[cfg(test)]
+        pub(super) fn addr_cache_timestamps(
+            &self,
+        ) -> Option<(
+            tokio::time::Instant,
+            tokio::time::Instant,
+            Option<tokio::time::Instant>,
+            Option<tokio::time::Instant>,
+        )> {
+            self.addr_cache.cache_timestamps()
+        }
+
+        #[cfg(test)]
+        pub(super) fn expire_addr_cache_for_test(
+            &self,
+            now: tokio::time::Instant,
+            retry_after: Option<tokio::time::Instant>,
+        ) {
+            self.addr_cache.expire_for_test(now, retry_after);
+        }
     }
 
     pub(super) fn build_entries(
@@ -221,17 +343,23 @@ mod entries {
             entries.insert(
                 upstream.name.clone(),
                 UpstreamEntry {
+                    name: upstream.name.clone(),
                     protocol: upstream.protocol,
                     endpoint,
                     outbound: upstream.outbound.clone(),
                     transports: parking_lot::Mutex::default(),
                     udp: parking_lot::Mutex::new(UdpState::default()),
                     udp_creation: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
+                    addr_cache: UpstreamAddrCache::default(),
                 },
             );
         }
         Ok(entries)
     }
+}
+
+pub(super) fn pool_closed_error() -> std::io::Error {
+    std::io::Error::other("DNS upstream pool is closed")
 }
 mod query;
 mod routing;
@@ -507,6 +635,13 @@ impl UpstreamPool {
                 self.transport_tasks_failed
                     .store(true, std::sync::atomic::Ordering::Release);
             }
+        }
+    }
+
+    pub(crate) fn invalidate_upstream_addrs(&self) {
+        let now = tokio::time::Instant::now();
+        for entry in self.entries.values() {
+            entry.invalidate_addr_cache(now);
         }
     }
 
