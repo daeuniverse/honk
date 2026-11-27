@@ -239,6 +239,9 @@ const fn traffic_failure_threshold(domain: ProbeDomain) -> u32 {
 #[derive(Debug, Clone)]
 struct PerProtocolState {
     alive: bool,
+    /// A probe or traffic outcome has reached this state; a fresh state's
+    /// `alive: true` is only the optimistic default.
+    measured: bool,
     /// Probe-based consecutive failures.
     consecutive_failures: u32,
     /// Probe-based consecutive successes (for recovery hysteresis).
@@ -258,6 +261,7 @@ impl PerProtocolState {
     /// (shared by all probe/traffic success paths).
     fn reset_on_success(&mut self) {
         self.alive = true;
+        self.measured = true;
         self.consecutive_failures = 0;
         self.consecutive_successes = 0;
         self.traffic_failures = 0;
@@ -266,8 +270,11 @@ impl PerProtocolState {
         self.cooldown_until = Instant::now();
     }
 
+    /// A fresh, never-measured state is not clean, so the first success
+    /// still records `measured`.
     fn is_clean_alive(&self) -> bool {
-        self.alive
+        self.measured
+            && self.alive
             && self.consecutive_failures == 0
             && self.consecutive_successes == 0
             && self.traffic_failures == 0
@@ -277,6 +284,7 @@ impl PerProtocolState {
     fn new() -> Self {
         Self {
             alive: true,
+            measured: false,
             consecutive_failures: 0,
             consecutive_successes: 0,
             traffic_failures: 0,
@@ -797,6 +805,21 @@ impl AliveDialerSet {
             .read()
             .get(&node_id)
             .is_none_or(|s| s[idx].alive && s.routed_udp_available(domain, idx))
+    }
+
+    /// TCP liveness across address families: alive when any family with a
+    /// probe or traffic outcome is alive, or when no family has one yet.
+    pub fn tcp_alive_any_measured(&self, node_id: Uuid) -> bool {
+        let states = self.states.read();
+        let Some(states) = states.get(&node_id) else {
+            return true;
+        };
+        let mut measured = [IpVersion::V4, IpVersion::V6]
+            .into_iter()
+            .map(|ipver| &states[alive_index(ProbeDomain::Tcp, ipver)])
+            .filter(|state| state.measured)
+            .peekable();
+        measured.peek().is_none() || measured.any(|state| state.alive)
     }
 
     /// Get (or create) the `DialerCollection` for a given node and domain index.

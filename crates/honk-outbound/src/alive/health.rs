@@ -351,6 +351,7 @@ impl AliveDialerSet {
 
         let changed = self.with_state(node_id, idx, |e| {
             let was = e.alive;
+            e.measured = true;
             e.consecutive_successes = 0;
             if force {
                 // Forced death: set counters to threshold to match state.

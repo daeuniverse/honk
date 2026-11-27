@@ -443,6 +443,40 @@ async fn test_proxies_structure_and_selector_switch() {
 }
 
 #[tokio::test]
+async fn test_proxies_report_node_alive_from_measured_tcp_families() {
+    let app = spawn_app("", "").await;
+    let client = http_client();
+    let alive_set = &app.state.alive_set;
+    let (v4_only, dual) = (make_node("node-a").id, make_node("node-b").id);
+    let (app, client) = (&app, &client);
+    let node_alive = move |name: &'static str| async move {
+        let body: serde_json::Value = client
+            .get(app.url("/proxies"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        body["proxies"][name]["alive"].clone()
+    };
+
+    // Never probed: optimistic, matching mihomo's default.
+    assert_eq!(node_alive("node-a").await, true);
+
+    // An IPv4-only node never gets a V6 result, so V4 alone decides.
+    alive_set.report_unavailable_forced(v4_only, ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(node_alive("node-a").await, false);
+    alive_set.report_available_traffic(v4_only, ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(node_alive("node-a").await, true);
+
+    // Dual-stack: one dead family does not hide the live one.
+    alive_set.report_available_traffic(dual, ProbeDomain::Tcp, IpVersion::V4);
+    alive_set.report_unavailable_forced(dual, ProbeDomain::Tcp, IpVersion::V6);
+    assert_eq!(node_alive("node-b").await, true);
+}
+
+#[tokio::test]
 async fn test_score_proxy_contract_and_put_rejection() {
     use honk_outbound::group::{
         ScoreOutcome, ScoreSelectionContext, ScoreTarget, SelectionNetwork,

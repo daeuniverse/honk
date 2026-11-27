@@ -483,6 +483,7 @@ impl AliveDialerSet {
                 let slots = states.entry(key.last()).or_insert_with(super::fresh_states);
                 let tcp = &mut slots[alive_index(TCP, key.family())];
                 tcp.alive = false;
+                tcp.measured = true;
                 tcp.traffic_failures = traffic_failure_threshold(TCP);
                 tcp.route_down_at = episode;
                 slots.route_tcp[key.family() as usize] = evidence;

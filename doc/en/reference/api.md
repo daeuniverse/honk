@@ -1558,9 +1558,9 @@ Each subscriber's level filter runs after the shared queue. Lagged clients skip 
 
 `GET /configs` also returns fixed compatibility fields that configure nothing: `mode-list: ["Rule","Global","Direct"]`, `port`, `socks-port` and `mixed-port` of 0, `allow-lan` and `ipv6` false, `bind-address: "*"`, the configured `log-level`, and `tun: {"enable":false}`.
 
-`GET /proxies` returns `{"proxies":{"<name>":<document>}}`; `GET /proxies/{name}` returns one document. A node document has `name`, `type`, `udp: true` and `history`. A group document has `name`, `type`, member names in `all`, its TCP choice in `now` and `history`; Score adds `scoreVerification`. `GLOBAL` has `type: "selector"`, `all` and `now` but no `history`.
+`GET /proxies` returns `{"proxies":{"<name>":<document>}}`; `GET /proxies/{name}` returns one document. A node document has `name`, `type`, `udp: true`, `alive` and `history`. A group document has `name`, `type`, member names in `all`, its TCP choice in `now` and `history`; Score adds `scoreVerification`. `GLOBAL` has `type: "selector"`, `all` and `now` but no `history`.
 
-Node `type` is `Shadowsocks`, `Trojan`, `Vmess`, `Vless`, `Socks5`, `Hysteria2`, `Tuic`, `Juicity`, `AnyTLS`, `Chain`, `Direct` or `Reject` (for `block`). Group `type` is `selector`, `url_test`, `load_balance` or `fallback`; Score reports `url_test`. A `history` entry is `{time,delay}` from the latest real TCP IPv4 measurement.
+Node `type` is `Shadowsocks`, `Trojan`, `Vmess`, `Vless`, `Socks5`, `Hysteria2`, `Tuic`, `Juicity`, `AnyTLS`, `Chain`, `Direct` or `Reject` (for `block`). Group `type` is `selector`, `url_test`, `load_balance` or `fallback`; Score reports `url_test`. A `history` entry is `{time,delay}` from the latest real TCP IPv4 measurement. Node `alive` is the TCP health state of the address families that have a result from qualified health checks or real traffic: `true` when any of them is alive or none has a result yet, `false` when all of them are dead; `history` keeps the last successful sample, so a node with `alive: false` can still show a delay.
 
 `GET /rules` returns `{"rules":[{"type","payload","proxy"}]}`, built from the configured routing rules, without native rule IDs or a fallback row.
 

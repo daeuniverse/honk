@@ -501,6 +501,8 @@ fn build_group_proxy_info(
 ///
 /// Includes the per-node delay history (clash `{time, delay}` shape) so
 /// dashboards can render per-node latencies — group members included.
+/// `alive` is the TCP health of the address families that have a result,
+/// so a single-stack node reads as its one family.
 fn build_node_proxy_info(
     node: &Node,
     alive: &AliveDialerSet,
@@ -510,6 +512,7 @@ fn build_node_proxy_info(
         "name": node.name,
         "type": clash_protocol_type(node.protocol()),
         "udp": true,
+        "alive": alive.tcp_alive_any_measured(node.id),
         "history": [],
     });
     if let Some((latency, at)) = alive.clash_node_latency(node.id, registry) {

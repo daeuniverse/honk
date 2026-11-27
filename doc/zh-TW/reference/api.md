@@ -1457,9 +1457,9 @@ Clash listener 允許任意 CORS 來源，沒有原生 API 那樣的 Host 與 Or
 
 `GET /configs` 還回傳固定的相容欄位，它們不設定任何功能：`mode-list: ["Rule","Global","Direct"]`、值為 0 的 `port`、`socks-port` 與 `mixed-port`、為 `false` 的 `allow-lan` 與 `ipv6`、`bind-address: "*"`、設定的 `log-level`，以及 `tun: {"enable":false}`。
 
-`GET /proxies` 回傳 `{"proxies":{"<name>":<document>}}`；`GET /proxies/{name}` 回傳單一文件。節點文件含 `name`、`type`、`udp: true` 與 `history`。群組文件含 `name`、`type`、成員名稱清單 `all`、TCP 選擇 `now` 與 `history`；Score 另含 `scoreVerification`。`GLOBAL` 含 `type: "selector"`、`all` 與 `now`，沒有 `history`。
+`GET /proxies` 回傳 `{"proxies":{"<name>":<document>}}`；`GET /proxies/{name}` 回傳單一文件。節點文件含 `name`、`type`、`udp: true`、`alive` 與 `history`。群組文件含 `name`、`type`、成員名稱清單 `all`、TCP 選擇 `now` 與 `history`；Score 另含 `scoreVerification`。`GLOBAL` 含 `type: "selector"`、`all` 與 `now`，沒有 `history`。
 
-節點 `type` 為 `Shadowsocks`、`Trojan`、`Vmess`、`Vless`、`Socks5`、`Hysteria2`、`Tuic`、`Juicity`、`AnyTLS`、`Chain`、`Direct` 或 `Reject`，其中 `Reject` 對應 `block`。群組 `type` 為 `selector`、`url_test`、`load_balance` 或 `fallback`；Score 回報為 `url_test`。`history` 項目為 `{time,delay}`，取最近一次真實 TCP IPv4 測量。
+節點 `type` 為 `Shadowsocks`、`Trojan`、`Vmess`、`Vless`、`Socks5`、`Hysteria2`、`Tuic`、`Juicity`、`AnyTLS`、`Chain`、`Direct` 或 `Reject`，其中 `Reject` 對應 `block`。群組 `type` 為 `selector`、`url_test`、`load_balance` 或 `fallback`；Score 回報為 `url_test`。`history` 項目為 `{time,delay}`，取最近一次真實 TCP IPv4 測量。節點 `alive` 表示已有合格健康檢查或真實流量結果的位址族的 TCP 健康狀態：其中任一位址族存活、或尚無任何結果時為 `true`，全部失效時為 `false`；`history` 保留最近一次成功樣本，所以 `alive: false` 的節點仍可能顯示延遲。
 
 `GET /rules` 回傳 `{"rules":[{"type","payload","proxy"}]}`，由設定的路由規則產生，不含原生規則 ID，也沒有 fallback 列。
 
