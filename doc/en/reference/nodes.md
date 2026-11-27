@@ -45,7 +45,8 @@ Flat structured input requires `name`, `protocol`, `address` and `port`, even wh
 | `reality_spider_x` | string? | `null` | Stored `spx`; a REALITY link defaults it to `/`. |
 | `flow` | string? | `null` | VLESS `xtls-rprx-vision` or `xtls-rprx-vision-udp443`; Shadowrocket `xtls=2` selects the base flow. |
 | `network` | string? | `null` | Packet capability for supported protocols; independent of VMess JSON `net` and other stream-transport fields. |
-| `ws_path` / `ws_host` | string? | `null` | WebSocket `path` and Host header. |
+| `udp_over_tcp` | bool | `false` (omitted on output) | Enables non-connect UoT v2 for VMess when `network` permits UDP. |
+| `ws_path` / `ws_host` | string? | `null` | At upgrade time an empty path becomes `/` and a relative path gains a leading `/`. Existing escapes and the query are preserved. The request URI and Host header bracket bare IPv6 literals. An explicit Host keeps its port. |
 | `ws_headers` | object | `{}`; empty maps are omitted on output | Additional WebSocket upgrade headers. See [`ws_headers`](#ws_headers). |
 | `grpc_service` | string? | `null` | gRPC `serviceName` or `service_name`. |
 | `xhttp` | object? | omitted | Canonical XHTTP options in flat structured input and output. See [`xhttp`](#xhttp). |
@@ -283,6 +284,8 @@ Plaintext VLESS has a different identity from TLS. A REALITY key selects the aut
 
 Tuning and display metadata do not participate, except VLESS multiplex limits that change a physical path.
 
+VMess keeps its historical ID when `udp_over_tcp` is omitted or `false`, including for `network: tcp`. Enabling UoT v2 changes the ID. A UoT-enabled node restricted to TCP has a different ID from one that permits UDP.
+
 For XHTTP, identity also includes the effective TLS/plaintext posture and every accepted canonical XHTTP option, including headers, padding and POST pacing. Input aliases, header-name casing and equivalent range representations normalize before derivation. Existing TCP/WS/gRPC identity material is unchanged by adding XHTTP.
 
 For WebSocket, a nonempty canonical header map also joins identity. Header-name casing, insertion order and equal-value aliases do not change it; different values do. An absent or empty map preserves the previous identity.
@@ -313,7 +316,7 @@ Identity is stable across rename, reload, and subscription refresh when the dial
 | --- | --- | --- | --- | --- |
 | `ss` | `shadowsocks` in Clash and sing-box `type` only | Yes | Yes | AEAD and Shadowsocks 2022 |
 | `trojan` | — | Yes | Yes* | TLS; TCP/WS/gRPC/XHTTP transport |
-| `vmess` | — | Yes | No | AEAD; TCP/WS/gRPC/XHTTP and REALITY; handler requires `rprx` |
+| `vmess` | — | Yes | Configurable* | AEAD with opt-in UoT v2; TCP/WS/gRPC/XHTTP and REALITY; handler requires `rprx` |
 | `vless` | — | Yes | Configurable* | Native UDP, UoT v2, H2MUX, XUDP, Mux.Cool, Encryption, REALITY, and Vision; handler requires `rprx` |
 | `socks5` | — | Yes | Yes | CONNECT and UDP ASSOCIATE |
 | `hysteria2` | — | Yes | Yes | QUIC/H3, salamander, brutal/BBR, and port hopping |
@@ -324,19 +327,20 @@ Identity is stable across rename, reload, and subscription refresh when the dial
 | `block` | — | No | No | Reserved built-in reject outbound; no share-link scheme |
 | `chain` | — | Yes | Requires an eligible prefix and exit | Dials through two to four nodes in order. See [Proxy chains](#proxy-chains). |
 
-`network` can disable packet dialing for Trojan, AnyTLS and VLESS independently of their stream transport. VMess UDP is not implemented.
+`network` can disable packet dialing for Trojan, AnyTLS, VLESS and VMess independently of the stream transport. VMess defaults to TCP-only. Enable UoT v2 only with a compatible sing-box or mihomo peer. Stock Xray and v2ray VMess peers use different UDP framing, so leave UoT off for them. honk supports neither VMess `CMD_UDP` nor XUDP.
 
 | Protocol | UDP behavior |
 | --- | --- |
 | AnyTLS | Reject payloads above 16 KiB, matching anytls-go 0.0.13's relay buffer. Non-connect UoT v2 carries each datagram's destination and the server's real source address. One stream serves all destinations of a client source; unsolicited replies retain their real source. |
 | Trojan | One associate stream serves every destination of a client source and returns each reply's real source. A cooperating server can provide EIM/EIF behavior. Destinations share the stream's head-of-line blocking and fail together. |
+| VMess UoT v2 | A single VMess TCP stream carries addressed datagrams for multiple destinations of a client source. Replies carry the actual peer address, including unsolicited replies when the server permits them. Loopback tests against sing-box 1.12.4 cover both a single VMess node and a SOCKS5 → VMess chain. |
 
 SOCKS5 UDP ASSOCIATE keeps one control TCP connection and one relay socket per client source, shared by every destination of that source. Each reply returns the real remote peer named in its header. Whether a peer the client never contacted can reach it depends on the server: Dante's default `udp.connectdst: yes` connects its outbound socket only while a single destination has been used.
 
 **UDP full-cone.** These UDP-capable proxy protocols share one association across all destinations of a client source and return each reply's real remote peer:
 
 - Hysteria2, TUIC, Shadowsocks (AEAD and 2022), Juicity, and SOCKS5;
-- Trojan and AnyTLS;
+- Trojan, AnyTLS, and VMess with UoT v2 enabled;
 - VLESS XUDP/Mux.Cool, UoT v2, and H2MUX.
 
 VLESS native UDP is the exception: its stream names one target. This applies to explicit `native` and to `auto` on UDP/53 and UDP/443 without Vision.
@@ -348,11 +352,10 @@ A reply from a previously uncontacted peer is delivered with that peer's source 
 - With protocol fallback, neither H2MUX nor an Xray UDP pool owns the path. For non-Vision nodes, `packetEncoding=auto` uses connected native UDP on ports 53 and 443. Its stream names one target, so those ports cannot be full-cone. Vision nodes and other ports use Single XUDP. Set `packetEncoding=xudp` to opt in on the native paths.
 - Single XUDP is not the default because of its measured cost. Against sing-box 1.12.4 on loopback with unpaced 1200-byte datagrams, it delivered about half of native's goodput and used 1.9–3.3 times the client CPU per MB. Its p99.9 latency tail was heavier; median and cold-start latency showed no measurable difference. XUDP also rejects datagrams above 7,526 bytes.
 - A VLESS source whose selected paths differ per port gets one association per selected path, even on one node. An example is an Xray UDP pool with UDP/443 `skip`, where 443 takes the protocol fallback instead of the pool.
-- Trojan, Juicity and AnyTLS carry all destinations of a source on one reliable stream. A stalled destination therefore delays its siblings, and a failed write ends all of them. Datagram carriers (Hysteria2, TUIC, Shadowsocks, SOCKS5) do not.
+- Trojan, Juicity, AnyTLS and VMess UoT v2 carry all destinations of a source on one reliable stream. A stalled destination therefore delays its siblings, and a failed write ends all of them. Datagram carriers (Hysteria2, TUIC, Shadowsocks, SOCKS5) do not.
 - Port-53 flows do not publish client reply framing in the datapath, so an unsolicited reply to a port-53 flow depends on host forwarding.
 - All client sources share one process-wide foreign-reply socket pool, with one socket per peer address and a cap of seven sockets per endpoint of capacity. A new foreign peer above the cap evicts the least recently used socket. The janitor closes a socket unused for one NAT timeout.
 - Replies from a source's 64 most recently closed destinations are dropped instead of delivered as foreign replies. This covers connection closure and dead-node purges. Rebinding removes a destination from the list; the 65th closure removes the oldest entry. Idle expiry and transport errors do not add entries, so those peers can still send foreign replies while the source lives. Bound flows are unaffected.
-- VMess has no UDP backend.
 
 For protocols that own `network`, flat structured input accepts comma-separated `tcp`/`udp` tokens, ignoring token whitespace and ASCII case. `tcp` disables UDP, while `udp` and `tcp,udp` both permit it. Empty or whitespace-only text becomes absent and keeps the protocol's default capability. An unknown token such as `quic`, or an empty token inside a nonempty list, rejects the node. This controls UDP admission only; `udp` adds no TCP rejection policy.
 
@@ -430,7 +433,9 @@ The v2rayN JSON form requires `add`, a UUID `id` and a `port` from 1 to 65535, w
 
 Base64-encode the whole object and append it to `vmess://`. A `?query` or `#fragment` after the Base64 makes the link invalid; name the node with `ps` or a dae tag.
 
-VMess JSON `net` and Shadowrocket transport parameters select only the stream transport. They no longer populate packet-network capability. An omitted packet restriction keeps the existing default UDP allowance for protocols with a UDP backend; VMess has none. Valid empty transport spelling is preserved where already used. On non-XHTTP transports, unrelated `mode` and `extra` export fields retain their legacy ignored behavior; they do not select XHTTP. Explicit conflicting transport claims still reject the node.
+VMess JSON `net` and Shadowrocket transport options select the stream transport. In v2rayN JSON, `"udp_over_tcp": true` is a honk extension. Omission or `false` leaves UoT off. Other types, including `null`, reject the link. On a Shadowrocket encoded-authority link, `packetEncoding=uot-v2` enables UoT and `packetEncoding=none` leaves it off. `udp=0` disables UDP even with UoT enabled. `udp=1` alone keeps the TCP-only default, as does a standalone Clash `udp: true`.
+
+Valid empty transport spelling is preserved where already used. On non-XHTTP transports, unrelated `mode` and `extra` export fields retain their legacy ignored behavior. Explicit conflicting transport claims still reject the node.
 
 VLESS supports TCP+REALITY+Vision, TCP+REALITY, TCP+WS, TCP+WS+TLS, TCP+gRPC, and the H2 XHTTP profile below. Unencrypted Vision's direct-copy path requires raw TCP with TLS 1.3 or REALITY, not WS/gRPC/XHTTP; encrypted Vision follows the composition rules below.
 
@@ -442,7 +447,7 @@ Each direction switches independently. See the
 
 #### XHTTP over H2
 
-Trojan, VMess and VLESS share this outbound transport. VMess remains TCP-only. This profile supports XHTTP over H2, not full Xray or mihomo configuration parity.
+Trojan, VMess and VLESS share this outbound transport. A single-hop VMess node can carry UoT v2 over XHTTP. This profile supports XHTTP over H2, not full Xray or mihomo configuration parity.
 
 | Security mode | H2 requirement |
 | --- | --- |
@@ -582,7 +587,7 @@ The query mapping follows the [Shadowrocket exporter](https://github.com/cedar20
 
 honk rejects conflicting TLS/REALITY, flow or transport declarations instead of silently downgrading them. For VLESS, `obfs` accepts only empty/`none`, `websocket`, or `grpc`; honk does not reinterpret unsupported transports as TCP. Canonical `host` and `serviceName`/`service_name` fields keep their existing fallback precedence. Explicit SNI aliases are compared before assignment: equal bytes coalesce, and unequal names reject without case rewriting. Empty or whitespace-only SNI and flow normalize to absent before node-ID derivation. A nonempty flow must be `xtls-rprx-vision` or `xtls-rprx-vision-udp443`.
 
-Clash imports compare `servername`, `server-name`, and `sni`; record imports also compare `tls-name` and `tls-host`, retaining `obfs_sni` as a lower-priority fallback, including Quantumult X WSS Host. Record `off` remains invalid. In share links and VMess JSON, WebSocket `host` is stored only as the Host header; outside WebSocket it is a lower-priority SNI fallback. At dial time an ordinary TLS connection sends the explicit `sni` when set, otherwise a nonempty WebSocket `Host` authority with any port dropped, otherwise the endpoint hostname; a CDN-fronted node therefore verifies the distribution certificate named in the header, not its edge address.
+Clash imports compare `servername`, `server-name`, and `sni`; record imports also compare `tls-name` and `tls-host`, retaining `obfs_sni` as a lower-priority fallback, including Quantumult X WSS Host. Record `off` remains invalid. In share links and VMess JSON, WebSocket `host` is stored only as the Host header; outside WebSocket it is a lower-priority SNI fallback. Ordinary TLS uses the explicit `sni`, then a nonempty WebSocket `Host` without its port, then the endpoint host. An IPv6 literal taken from `Host` or the endpoint is unbracketed for TLS verification and sends no SNI extension. A CDN-fronted node can thus verify the certificate for the distribution named in `Host`.
 
 ### Hysteria2
 
@@ -879,9 +884,9 @@ A chain has no server endpoint, credential, or share-link scheme. JSON, YAML, an
 ### Selection, pooling, and health
 
 - For multi-hop UDP, every physical hop, including the entry, must meet the requirements above for **later TCP hops**. This includes the restriction on hostname-based ECH discovery for ordinary TLS. A TCP-only chain can serve as the prefix of a [group exit route](./groups.md#udp-through-an-exit) when all its physical hops meet those requirements.
-- The last hop also needs tunneled UDP support. It must be Trojan with UDP allowed, or VLESS with UDP allowed, multiplexing off and UDP encoding `auto` or `native`.
+- The last hop must also frame UDP. Eligible exits are Trojan with UDP allowed, VMess with UoT v2 enabled and UDP allowed, or VLESS with UDP allowed, multiplexing off and encoding `auto` or `native`. A VMess exit must support tunneled TCP, which excludes XHTTP and TLS that requires hostname-based ECH discovery.
 - A tunneled VLESS exit uses native UDP even under `auto`, for every permitted port. Each flow opens its own transport, with replies limited to its destination peer.
-- A configured chain with a Trojan exit can share one association and receiver across destinations of the same client source, within the same chain runtime and reply-address mode. A synthesized multi-hop group route uses one transport per flow. A route that collapses to one node uses that node's ordinary UDP transport.
+- A configured chain with a Trojan or eligible VMess UoT v2 exit can share one association and receiver across destinations of the same client source, within the same chain runtime and reply-address mode. A synthesized multi-hop group route uses one transport per flow. A route that collapses to one node uses that node's ordinary UDP transport.
 - A chain has no pool or preconnect of its own. Each dial opens a logical entry stream and repeats every later handshake. The physical first-hop runtime can reuse a suitable session.
 - A dae group with neither node filters nor subgroups includes both the chain and its physical hops. Use `filter` to exclude an exit that cannot be reached directly.
 - If either snapshot contains a chain, a subscription refresh rebinds an explicit, unfiltered member list and removes vanished members without adding unrelated nodes. Between two chain-free snapshots, an unfiltered group without subgroups keeps its legacy behavior: it also takes new ordinary nodes. That refresh does not declare a wildcard for a later chain.

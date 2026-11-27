@@ -705,13 +705,13 @@ cargo run --release -p honk-core -- \
 ## Current capabilities and limitations
 
 - Outbounds include Direct, Block, SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, and VLESS. [Proxy chains](reference/nodes.md#proxy-chains) carry TCP through two to four supported proxies.
-- UDP: Direct, SOCKS5, Shadowsocks, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, and VLESS when its independent packet permission is enabled. VLESS fallback encoding and the multiplex carrier are separate choices; VMess remains TCP-only. See the [VLESS node reference](reference/nodes.md#vless-udp-and-multiplexing).
+- UDP: Direct, SOCKS5, Shadowsocks, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess with explicit UoT v2, and VLESS when its independent packet permission is enabled. VLESS fallback encoding and the multiplex carrier are separate choices. See the [VLESS node reference](reference/nodes.md#vless-udp-and-multiplexing).
 - Groups: Selector, URLTest, LoadBalance, Fallback, and Score.
 - DNS upstreams: UDP, TCP, DoT, DoH, DoH3, and DoQ, optionally through a node or group.
 - `direct` and `block` are built-in nodes and must not be redeclared.
 - `nfqueue_enable` defaults to enabled, always uses queue 320, and exclusively owns `inet honk_nfqueue` / `udp_decision`. Firewall managers in the same network namespace must not modify those objects.
 - Mock builds and builds without the Cargo `ebpf` feature do not provide transparent proxying. Plain `cargo build --release` omits the real datapath; use `--features ebpf`.
-- VMess UDP, a rootless datapath, and non-Linux platforms are not currently supported.
+- Native VMess UDP (`CMD_UDP` or XUDP), a rootless datapath, and non-Linux platforms are not currently supported.
 
 ## Troubleshooting
 

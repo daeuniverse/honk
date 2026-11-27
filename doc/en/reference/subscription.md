@@ -284,8 +284,9 @@ Supported spelling aliases normalize before node identity is derived.
 | Hysteria2 | `password`/`auth`; `obfs: salamander` with `obfs-password`; upload/download bandwidth; `ports`/`mport`/`port-hopping`/`port_hopping` hopping ranges; `hop-interval`/`mhop`; receive windows; MTU and MTU-discovery settings. |
 | TUIC | UUID/password, congestion control, ALPN, receive windows, MTU. |
 | AnyTLS | `idle-session-check-interval`, `idle-session-timeout`, `min-idle-session`. |
+| VMess | `udp-over-tcp` or `udp_over_tcp`: `true` or `{enabled: true, version: 2}` enables UoT v2. The version may be omitted or set to `0` or `2`. Active packet-encoding, packet-address and multiplex wrappers reject the entry. |
 
-Explicit disabled feature blocks are treated as disabled, not as unsupported active features. `udp: true` is accepted for intrinsically UDP-capable protocols, and ignored on VMess, which has no UDP path, so the node still imports for TCP. An explicit UDP restriction is rejected where the node model cannot preserve it.
+Explicit disabled feature blocks are treated as disabled, not as unsupported active features. On VMess, `udp: true` alone keeps the TCP-only default. `udp: false` disables UDP even when UoT v2 is enabled. An explicit UDP restriction is rejected where the node model cannot preserve it.
 
 TUIC permits an absent or empty password. Hysteria2 and Juicity accept an explicit `h3` ALPN matching their fixed runtime selection.
 
@@ -389,6 +390,7 @@ sing-box TLS is off when `tls` or `tls.enabled` is absent, so Trojan, Hysteria2,
 | Source-specific case | Import behavior |
 | --- | --- |
 | WebSocket `transport.headers` | `Host` remains a dedicated string field; repeated Host aliases reject. Other string values, including empty strings, are preserved; null is ignored and other types reject the entry. Names and values follow the [node header contract](./nodes.md#fields). |
+| VMess `udp_over_tcp` | `true` or `{ "enabled": true, "version": 2 }` enables UoT v2. An omitted version defaults to `2`. Any other explicit version on an enabled block rejects the entry. `network: tcp` disables UDP. |
 | VLESS without an enabled H2MUX/UoT wrapper or explicit `packet_encoding` selecting another path | Single XUDP with UDP permitted. This is a sing-box import default, not the global meaning of Auto. |
 | Empty or omitted gRPC service name | Retain sing-box's empty service, not honk's `GunService` default. |
 | Hysteria2 `server_ports` without `server_port` | Use the first hopping port as the nominal endpoint. |

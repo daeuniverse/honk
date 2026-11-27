@@ -105,13 +105,13 @@ framing on their actual transport.
 `src/descriptor.rs` owns `ProtocolDescriptor`, the single per-protocol facts table.
 Predicates take the concrete node, because the VLESS `network` and TCP path, and
 the Trojan transport, affect capability or pooling. Trojan and AnyTLS share
-`network_allows_udp`; VLESS uses canonical `VlessConfig::udp_enabled()`.
+`network_allows_udp`. VMess and VLESS use their respective `udp_enabled()` predicates.
 
 | Protocol | `supports_udp` | `pool_ready_streams` | `pool_bare_tcp` | Generation runtime | Share-link schemes |
 | --- | --- | --- | --- | --- | --- |
 | Shadowsocks, including 2022 | yes | no | yes | `None` | `ss` |
 | Trojan | when `network` is absent or contains `udp` | only `tcp`/empty transport | except XHTTP | `None` | `trojan` |
-| VMess | no | no | except XHTTP | `None` | `vmess` |
+| VMess | when `udp_over_tcp` is true and `network` allows UDP | no | except XHTTP | `None` | `vmess` |
 | VLESS | when `network` allows UDP | no | direct TCP path except XHTTP | `Vless` | `vless` |
 | SOCKS5 | yes | yes | yes | `None` | `socks5`, `socks4`, `socks4a` |
 | Hysteria2 | yes | no | no | `Quic` | `hysteria2`, `hysteria` |
@@ -167,13 +167,13 @@ is not interchangeable with missing UDP support.
 | `socks5` | SOCKS CONNECT | RFC 1928 UDP association with one control stream and one relay-connected socket per client source, shared by all its destinations. Each request header names its destination, and each reply returns the real wire source (IPv4-mapped IPv6 as IPv4). A domain source is accepted only as the dialed name on its port and projects to the captured target; any other name is dropped without DNS. On send, only the dialed name is written; any other name goes out as the numeric target. A truncated, nonzero-RSV, fragmented (`FRAG != 0`), or non-UTF-8-domain relay datagram is dropped on its own at DEBUG. An unknown ATYP or control EOF ends the association. Greeting/authentication and the ASSOCIATE request/reply, including relay DNS resolution, each have a five-second timeout |
 | `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing; one connected server socket and crypto state per client source, usable for every destination (see below) |
 | `trojan` | Trojan stream over shared transport | Trojan UDP framing when `network` allows UDP; one associate stream per client source, each frame names its peer |
-| `vmess` | VMess stream | Unimplemented |
+| `vmess` | VMess stream | Non-connect UoT v2 over `CMD_TCP` to `sp.v2.udp-over-tcp.arpa:0` when enabled |
 | `vless` | Direct, H2, or Mux.Cool from the independent multiplex policy | Available when `network` allows UDP; encoding and optional UDP multiplexing select the path |
 | `hysteria2` | QUIC stream | Hysteria2 QUIC datagrams |
 | `anytls` | AnyTLS logical stream | UoT v2 logical stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagrams or uni-stream fallback |
 | `juicity` | Juicity QUIC stream | One length-framed QUIC bi stream per client source, carrying every destination |
-| `chain` | Hop by hop over its hops' handlers; see [Proxy chains](#proxy-chains) | The exit's `dial_udp_over` (Trojan, VLESS native) or, with a Trojan exit, its `prepare_shared_source_over` |
+| `chain` | Hop by hop over its hops' handlers. See [Proxy chains](#proxy-chains). | `dial_udp_over` for eligible Trojan, VMess UoT v2 and native VLESS exits. Configured chains with Trojan or VMess UoT v2 exits also support `prepare_shared_source_over`. |
 
 Shadowsocks (legacy AEAD and 2022) serves every destination of a client source
 from one `MultiTargetTransport`: one marked socket connected to the server and
@@ -326,6 +326,8 @@ the WebSocket `Host` authority with any port dropped, otherwise the endpoint
 hostname: a CDN-fronted node keeps the edge IP as its address and names the
 distribution only in that header. The shared path therefore gives Trojan,
 VMess, and VLESS consistent TLS, REALITY, WS, gRPC, and XHTTP setup.
+
+VMess and VLESS use `StreamUotTransport` in `src/proxy/uot.rs` for non-connect UoT v2. The first write combines the UoT request with the first addressed datagram. A VMess send waits for the relay to flush the complete frame to its lower writer. Each flow owns its request observation. On a single-node XHTTP candidate, winner commit admits the relay task and publishes the carrier before releasing the VMess header.
 
 If a physical WebSocket peer closes normally before VMess can send its empty
 upload terminator, the relay can finish cleanly only after validating the
@@ -646,7 +648,7 @@ Real sing-box 1.12.4 fixes its direct outbound's form by the first destination.
 After a domain request it maps the same name per datagram. After a numeric
 request, a per-packet FQDN fails with `invalid AddrPort: missing address` and
 ends the whole association. The same rule applies to H2MUX PacketAddr, AnyTLS,
-Trojan, SOCKS5, and Shadowsocks (`addr::dialed_name`). Juicity is unchanged and
+VMess UoT v2, Trojan, SOCKS5, and Shadowsocks (`addr::dialed_name`). Juicity is unchanged and
 unverified, as no juicity-server is available.
 
 Typed policy, size, and carrier-capacity refusals are terminal local results,
@@ -712,7 +714,7 @@ separate child SIDs that may share physical pools.
 Hysteria2 shares one Session ID and TUIC shares one association ID across the
 scope's destinations. Different scopes can share a physical QUIC connection
 without sharing their logical association. These QUIC source paths and their
-shutdown joins remain available without `rprx`; only VLESS alternatives require it.
+shutdown joins remain available without `rprx`. Both VMess and VLESS require it.
 
 Hysteria2 and both TUIC receive modes keep concrete reply peers through the
 existing bounded reassembler. Hysteria2 fragment addresses must agree. TUIC
@@ -725,7 +727,7 @@ keeps its existing rejection of empty inbound payloads. Source preservation does
 not guarantee remote NAT mapping or filtering behavior.
 
 `MultiTargetTransport` is the one generic source transport for Shadowsocks,
-Juicity, SOCKS5, Trojan, AnyTLS, and VLESS UoT v2/H2MUX. Hysteria2, TUIC, and
+Juicity, SOCKS5, Trojan, AnyTLS, VMess UoT v2, and VLESS UoT v2/H2MUX. Hysteria2, TUIC, and
 VLESS XUDP/Mux.Cool keep their concrete arms, so their send path is not boxed.
 Each client source owns one logical association for all destinations. That
 association is one Shadowsocks socket and crypto session, one Juicity
@@ -1320,7 +1322,7 @@ validation. Eligible tunneled VLESS uses native framing even with `auto`.
 collapse and `Tunneled { exit }` for terminal framing in a multi-hop path.
 Every preceding physical hop, including the entry, must satisfy
 `Node::supports_tunneled_dial()`. The bound path's handlers must be executable.
-Configured Trojan chains expose the `tunneled_shared` slot. Their installed
+Configured chains with a Trojan or eligible VMess UoT v2 exit expose `tunneled_shared`. Their installed
 source association owns one receiver and its original path admission, while
 endpoint views settle per-flow Score. Multi-hop group routes and tunneled VLESS
 use per-flow transports. A one-hop collapse follows the node's native source
