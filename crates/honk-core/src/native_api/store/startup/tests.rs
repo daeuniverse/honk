@@ -6,10 +6,15 @@ use super::*;
 fn tree(data_dir: &Path) -> (tempfile::TempDir, PathBuf) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
+    let packet = if crate::PACKET_ONLY {
+        "datapath {\n backend: tun\n direct: endpoint\n tun {\n name: honk0\n address4: 198.18.0.1/32\n table: 202\n rule_priority: 10000\n capture { 0.0.0.0/0 }\n }\n}\n"
+    } else {
+        ""
+    };
     fs::write(
         root.join("config.dae"),
         format!(
-            "include {{ 'auth.dae' }}\nglobal {{ data_dir: '{}' }}\nrouting {{ fallback: direct }}\n",
+            "include {{ 'auth.dae' }}\nglobal {{ data_dir: '{}'\n nfqueue_enable: false }}\nrouting {{ fallback: direct }}\n{packet}",
             data_dir.display()
         ),
     )
@@ -398,4 +403,81 @@ fn the_first_failing_precondition_is_the_one_reported() {
             }
         }
     }
+}
+
+#[cfg(all(feature = "packet-ebpf", not(feature = "legacy-tc")))]
+#[tokio::test]
+async fn packet_only_rejects_active_db_tc_even_if_file_selects_tun() {
+    use clap::Parser as _;
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().canonicalize().unwrap().join("data");
+    let (_src, entry) = tree(&data);
+    let mut startup = DatabaseStartup::open(&entry, &data, &mut Vec::new()).unwrap();
+    startup.record().unwrap();
+    let mut candidate = startup.sources.sources.clone();
+    drop(startup);
+    let store = DbStore::open_in(&data, &entry).unwrap();
+    let pin = store.pin(&entry).unwrap();
+    let root_source = candidate.iter_mut().find(|s| s.path == entry).unwrap();
+    let (prefix, _) = root_source.content.split_once("datapath {").unwrap();
+    let content = format!("{prefix}datapath {{ backend: tc }}\n");
+    root_source.content = Arc::from(content.as_str());
+    let pending = store
+        .commit(pin, &content, &candidate, "test", Box::new(|| Ok(())))
+        .unwrap();
+    let head = store.promote(pending).unwrap();
+    drop(store);
+    let lock = root.path().join("instance.lock");
+    crate::TEST_INSTANCE_LOCK.with(|slot| slot.replace(Some(lock.clone())));
+    let cli = crate::Cli::try_parse_from([
+        "honk-core",
+        "--store",
+        "db",
+        "--data-dir",
+        data.to_str().unwrap(),
+        "-c",
+        entry.to_str().unwrap(),
+        "--mock-ebpf",
+    ])
+    .unwrap();
+    let error = crate::run(cli).await.unwrap_err();
+    crate::TEST_INSTANCE_LOCK.with(|slot| slot.replace(None));
+    assert!(
+        format!("{error:#}").contains(crate::TC_BUILD_ERROR),
+        "{error:#}"
+    );
+    assert!(!lock.exists());
+    assert_eq!(
+        DbStore::open_in(&data, &entry).unwrap().head(),
+        Ok(Some(head))
+    );
+}
+
+#[cfg(all(feature = "packet-ebpf", not(feature = "legacy-tc")))]
+#[tokio::test]
+async fn packet_only_contended_db_import_creates_no_state() {
+    use clap::Parser as _;
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("new-data");
+    let (_source, entry) = tree(&data);
+    let path = temp.path().join("instance.lock");
+    let _held = crate::acquire_instance_lock(&path, std::time::Duration::ZERO).unwrap();
+    crate::TEST_INSTANCE_LOCK.with(|slot| slot.replace(Some(path)));
+    let cli = crate::Cli::try_parse_from([
+        "honk-core",
+        "--store",
+        "db",
+        "--data-dir",
+        data.to_str().unwrap(),
+        "-c",
+        entry.to_str().unwrap(),
+    ])
+    .unwrap();
+    let error = crate::run(cli).await.unwrap_err();
+    crate::TEST_INSTANCE_LOCK.with(|slot| slot.replace(None));
+    assert!(error.to_string().contains("refusing to start"), "{error:#}");
+    assert!(
+        !data.exists(),
+        "a rejected successor created a state directory"
+    );
 }

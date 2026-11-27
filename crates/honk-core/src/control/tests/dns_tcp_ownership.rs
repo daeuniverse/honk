@@ -1,4 +1,4 @@
-#![cfg(all(feature = "ebpf", target_os = "linux"))]
+#![cfg(all(feature = "legacy-tc", target_os = "linux"))]
 
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -78,7 +78,7 @@ pub(crate) enum RemovalReason {
     /// Stateless token-zero UDP in either port-53 direction, regardless of payload.
     /// This reason exempts conn-state lifetime, not transport routing or DNS parsing.
     RawDnsEndpointRetired,
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(any(feature = "legacy-tc", test))]
     /// The flow was handed to the kernel; its terminal conn_state must remain.
     KernelHandoff,
 }
@@ -346,7 +346,7 @@ impl UdpEndpointPool {
         identity.is_some_and(|(token, generation)| self.retire_if_same(key, token, generation))
     }
 
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(any(feature = "legacy-tc", test))]
     pub(in crate::control) fn retire_staged_identity(
         &self,
         scope: ScopeId,

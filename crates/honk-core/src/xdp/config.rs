@@ -10,12 +10,13 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
     };
     datapath.validate()?;
     ensure!(
-        datapath.host.is_none() || cfg!(feature = "ebpf"),
+        datapath.host.is_none() || cfg!(feature = "packet-ebpf"),
         "XDP Host capture requires the built ebpf feature and actual Host runtime admission"
     );
     ensure!(
         !config.global.nfqueue_enable,
-        "XDP requires global.nfqueue_enable: false; NFQUEUE is not an XDP fallback"
+        "{}",
+        crate::XDP_NFQUEUE_ERROR
     );
     ensure!(
         config.global.lan_interface.is_empty() && config.global.wan_interface.is_empty(),
@@ -560,7 +561,7 @@ pub(super) async fn prepare(
     } else {
         ScopeId::HOST
     };
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     let (host_resources, source_support) = if has_host {
         let needs_pname = plane.active_routing_plan_handle().read().plan.features
             & honk_ebpf_common::ROUTING_FEATURE_PROCESS
@@ -573,7 +574,7 @@ pub(super) async fn prepare(
     } else {
         (None, crate::ebpf::PnameSupport::Unavailable)
     };
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(feature = "packet-ebpf"))]
     let source_support = crate::ebpf::PnameSupport::Unavailable;
     let mut devices = StartupDevices(Vec::with_capacity(infos.len()));
     for (device_index, info) in infos.into_iter().enumerate() {
@@ -825,7 +826,7 @@ pub(super) async fn prepare(
             if lan_count != 0 {
                 publisher.prepare_auxiliary(lan_count)?;
             }
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             if let Some(resources) = host_resources {
                 publisher.prepare_host(resources)?;
             }

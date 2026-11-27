@@ -332,7 +332,7 @@ impl ControlPlane {
             selector_bare_warm: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             mode_state: None,
             datapath_flags: None,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             pending_udp_verdicts: None,
             datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(feature = "native-api")]
@@ -358,7 +358,7 @@ impl ControlPlane {
             pre_dns_publication_hook: parking_lot::Mutex::new(None),
             #[cfg(all(test, feature = "clash-api"))]
             clash_publication_pause: parking_lot::Mutex::new(None),
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             iface_watcher: None,
         };
 

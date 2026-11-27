@@ -211,7 +211,7 @@ fn cleanup_requires_unique_exact_keys_and_removes_capture_before_guards() {
     assert_eq!(removal_order(&entries, 10004), [2, 0, 1]);
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 #[test]
 #[ignore = "requires the disposable kernel VM gate"]
 fn kernel_tun_exclusive_fd_and_containment_are_owned() {
@@ -266,7 +266,7 @@ fn kernel_tun_exclusive_fd_and_containment_are_owned() {
         let (mut setup, device, guarded) = TunSetup::prepare_in(
             &config,
             root.path(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             None,
         )
         .unwrap();

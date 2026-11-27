@@ -9,7 +9,7 @@ impl ControlPlane {
     ) -> anyhow::Result<()> {
         let mut error = None;
         if let Some(epoch) = epoch.as_mut() {
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             if let Some(queue) = epoch.queue.as_mut() {
                 retain_error(
                     &mut error,
@@ -139,7 +139,7 @@ impl ControlPlane {
                 retain_error(&mut error, updates.stop().await);
             }
             epoch.health_updates.take();
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             if let Some(queue) = epoch.queue.as_mut() {
                 // Not stage-bounded: see `shutdown_service`.
                 retain_error(&mut error, queue.shutdown_service().await);
@@ -153,7 +153,7 @@ impl ControlPlane {
                 queue.abort_tasks().await;
                 self.pending_udp_verdicts = None;
             }
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             {
                 epoch.queue.take();
             }
@@ -237,7 +237,7 @@ impl ControlPlane {
             &mut fatal,
             self.quiesce_udp_epoch(epoch.as_deref_mut()).await,
         );
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some(watcher) = self.iface_watcher.take() {
             watcher.shutdown(STAGE_TIMEOUT).await;
         }
@@ -355,7 +355,7 @@ mod tests {
                 removal_errors: mpsc::unbounded_channel().1,
                 critical_errors: mpsc::unbounded_channel().1,
                 health_updates: None,
-                #[cfg(feature = "ebpf")]
+                #[cfg(feature = "legacy-tc")]
                 queue: None,
             };
             let guard = ConnectionGuard::new(plane.drain_tracker.clone());

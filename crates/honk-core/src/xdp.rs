@@ -20,7 +20,7 @@ use forward::*;
 use queue_io::*;
 use retain::*;
 pub(crate) mod gateway;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 mod host_identity;
 pub(crate) mod polling;
 pub(crate) mod routing_input;
@@ -506,7 +506,7 @@ impl Runtime {
                     return true;
                 };
                 let source = IpAddr::V6(key.src.into()).to_canonical();
-                #[cfg(feature = "ebpf")]
+                #[cfg(feature = "packet-ebpf")]
                 if self
                     .gateway_maps
                     .as_ref()

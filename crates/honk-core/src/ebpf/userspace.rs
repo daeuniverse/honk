@@ -71,7 +71,7 @@ impl UserspaceBackend {
         }
     }
 
-    #[cfg(all(target_os = "linux", test, feature = "ebpf"))]
+    #[cfg(all(target_os = "linux", test, feature = "packet-ebpf"))]
     pub(crate) fn gateway(&self) -> Option<&Arc<GatewayPublisher>> {
         self.gateway.as_ref()
     }

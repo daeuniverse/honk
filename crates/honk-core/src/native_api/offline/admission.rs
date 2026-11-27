@@ -34,6 +34,7 @@ impl CapturedConfig {
             dependency_root,
         } = self;
         let source = &sources[0].source;
+        crate::validate_packet_build(&config, source)?;
         #[cfg(target_os = "linux")]
         crate::xdp::validate_config(&config).map_err(|_| {
             error(

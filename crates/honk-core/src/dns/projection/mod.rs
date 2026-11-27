@@ -476,7 +476,7 @@ impl RoutingProjection {
     }
 
     /// Publish or withdraw one port's actual driver stamp under the projection lock.
-    #[cfg(all(target_os = "linux", any(feature = "ebpf", test)))]
+    #[cfg(all(target_os = "linux", any(feature = "packet-ebpf", test)))]
     pub(crate) fn set_host_binding(
         &self,
         scope: ScopeId,

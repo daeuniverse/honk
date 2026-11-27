@@ -1,4 +1,4 @@
-#![cfg(feature = "ebpf")]
+#![cfg(feature = "packet-ebpf")]
 
 mod batch_udp;
 mod pending;

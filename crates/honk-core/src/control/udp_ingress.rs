@@ -43,7 +43,7 @@ pub(super) fn udp_original_dst(meta: &UdpRecvMeta, data: &[u8]) -> Option<UdpOri
 )]
 pub(super) enum UdpSlowPathWork {
     Initialize(UdpInitLease),
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     QueuedDatagram {
         data: Bytes,
         raw_dns_route: Option<RawDnsRoute>,
@@ -81,7 +81,7 @@ impl UdpSlowPathWork {
     fn with_packet_route(mut self, capture: impl FnOnce() -> PacketRouteSlot) -> Self {
         match &mut self {
             Self::Initialize(lease) => lease.set_packet_route(capture()),
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             Self::QueuedDatagram { packet_route, .. } => *packet_route = capture(),
             Self::Dns { packet_route, .. } | Self::DnsRefused { packet_route, .. } => {
                 *packet_route = capture();
@@ -454,7 +454,7 @@ impl UdpLoopState {
                     enqueued_at,
                 )
             }
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             DatagramPayload::Owned(data) => {
                 let Some(permit) =
                     try_admit_udp_slow_path(&self.stats, &self.udp_concurrency_limit)
@@ -471,7 +471,7 @@ impl UdpLoopState {
                     packet_route: PacketRouteSlot::ABSENT,
                 }
             }
-            #[cfg(all(test, not(feature = "ebpf")))]
+            #[cfg(all(test, not(feature = "legacy-tc")))]
             DatagramPayload::Owned(_) => unreachable!("queued DNS requires NFQUEUE"),
         };
         #[cfg(feature = "native-api")]
@@ -565,7 +565,7 @@ impl UdpLoopState {
     ) {
         match work {
             UdpSlowPathWork::Done => {}
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             UdpSlowPathWork::QueuedDatagram {
                 data,
                 raw_dns_route,
@@ -830,7 +830,7 @@ pub(super) fn reserve_udp_slow_path(
         data,
     ) {
         UdpSlowPathWork::Initialize(lease) => Some(lease),
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         UdpSlowPathWork::QueuedDatagram { .. } => {
             unreachable!("socket admission cannot produce queued-only work")
         }

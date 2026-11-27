@@ -9,18 +9,18 @@ use crate::stats::StatsManager;
 use honk_config::Config;
 use honk_config::node::{Group, GroupPolicy, Node, OutboundConfig};
 use honk_config::types::NodeProtocol;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 use honk_ebpf_common::DAE_BYPASS_MARK;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 pub(crate) mod netns;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 pub(super) mod shared_udp;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 pub(super) mod wire;
 
 pub(in crate::control) struct TestRetirement {
@@ -79,7 +79,7 @@ pub(in crate::control) type CapturedTcpTarget =
 
 #[derive(Debug, Clone)]
 pub(in crate::control) enum UdpTestMode {
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     TcpConnect,
     DialError,
     SendError,
@@ -122,7 +122,7 @@ pub(in crate::control) enum UdpTestMode {
         hold_reply: bool,
     },
     DnsResponseCaptureTarget(Arc<parking_lot::Mutex<Option<SocketAddr>>>),
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     KernelSocket(Arc<UdpSocket>),
     TcpHold {
         entered: Arc<tokio::sync::Notify>,
@@ -179,7 +179,7 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
                 sends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             UdpTestMode::KernelSocket(socket) => {
                 socket.send_to(_data, self.relay).await?;
                 Ok(())
@@ -207,7 +207,7 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let UdpTestMode::KernelSocket(socket) = &self.mode {
             let (size, _) = socket.recv_from(buf).await?;
             return Ok((size, self.relay));
@@ -263,11 +263,11 @@ impl crate::control::udp_endpoint::UdpReplySocketFactory for UdpTestReplySocketF
     }
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[derive(Debug)]
 pub(super) struct KernelUdpReplySocketFactory;
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 impl crate::control::udp_endpoint::UdpReplySocketFactory for KernelUdpReplySocketFactory {
     fn create(
         &self,
@@ -335,7 +335,7 @@ impl honk_outbound::proxy::TcpOutbound for UdpTestHandler {
         _connect_timeout: Duration,
     ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
         let stream = match &self.mode {
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             UdpTestMode::TcpConnect => TcpStream::connect(target).await?,
             UdpTestMode::TcpHold { entered, release } => {
                 let stream = honk_outbound::util::connect_marked(

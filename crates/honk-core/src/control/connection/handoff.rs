@@ -551,7 +551,7 @@ impl ControlPlaneHandle {
     }
 
     /// A staged node has no kernel group slot. Only a selected group can bind a user slot.
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(any(feature = "legacy-tc", test))]
     pub(in crate::control) fn staged_udp_outbound(
         &self,
         config: &Config,

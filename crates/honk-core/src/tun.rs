@@ -1,7 +1,7 @@
 //! Daemon-owned Linux TUN capture into the existing scoped packet Endpoint executor.
 
 mod setup;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 mod source;
 
 use crate::control::{
@@ -64,7 +64,8 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
     datapath.validate()?;
     ensure!(
         !config.global.nfqueue_enable,
-        "TUN requires global.nfqueue_enable: false"
+        "{}",
+        crate::TUN_NFQUEUE_ERROR
     );
     ensure!(
         config.global.lan_interface.is_empty() && config.global.wan_interface.is_empty(),
@@ -86,7 +87,7 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
     );
     let host_facts = datapath.tun.as_ref().is_some_and(|tun| tun.host_facts);
     ensure!(
-        !host_facts || cfg!(feature = "ebpf"),
+        !host_facts || cfg!(feature = "packet-ebpf"),
         "TUN host_facts requires the built ebpf feature and actual source admission"
     );
     for rule in &config.routing.rules {
@@ -122,7 +123,7 @@ struct Runtime {
     drivers: Vec<PacketDriver>,
     plain_scope: ScopeId,
     host_scope: Option<ScopeId>,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     source: Option<source::Source>,
     pname_support: crate::ebpf::PnameSupportCell,
     endpoints: PacketEndpoints,
@@ -149,7 +150,7 @@ enum Turn {
 impl Runtime {
     fn close_capture(&mut self) -> anyhow::Result<()> {
         *self.pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         let source_close = self.source.as_mut().map(source::Source::close).transpose();
         self.admission.store(false, Ordering::Release);
         let result = self
@@ -159,7 +160,7 @@ impl Runtime {
             .close_capture(self.io.as_ref().expect("live TUN FD").get_ref());
         self.closing = true;
         self.endpoints.close();
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         if let Err(error) = source_close {
             return match result {
                 Ok(()) => Err(error),
@@ -270,7 +271,7 @@ impl Runtime {
             }
             let (length, host): (usize, Option<crate::control::netstack::HostIngress>) = match ready
                 .try_io(|inner| {
-                    #[cfg(feature = "ebpf")]
+                    #[cfg(feature = "packet-ebpf")]
                     if let Some(source) = &mut self.source {
                         return source
                             .read(inner.get_ref().as_raw_fd(), &mut self.rx)
@@ -280,7 +281,7 @@ impl Runtime {
                 }) {
                 Ok(Ok(read)) => read,
                 Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => continue,
-                #[cfg(feature = "ebpf")]
+                #[cfg(feature = "packet-ebpf")]
                 Ok(Err(error)) if source::is_expired(&error) => {
                     self.expired_sources = self.expired_sources.saturating_add(1);
                     continue;
@@ -358,7 +359,7 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         self.admission.store(false, Ordering::Release);
         *self.pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         if let Some(source) = &mut self.source {
             let _ = source.close();
         }
@@ -961,10 +962,10 @@ fn finish_failed_setup(setup: TunSetup, error: anyhow::Error) -> anyhow::Error {
 
 fn finish_startup(
     setup: Option<TunSetup>,
-    #[cfg(feature = "ebpf")] source: Option<source::Source>,
+    #[cfg(feature = "packet-ebpf")] source: Option<source::Source>,
     mut error: anyhow::Error,
 ) -> anyhow::Error {
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     if let Some(mut source) = source {
         if let Err(close) = source.close() {
             error = error.context(close);
@@ -1014,7 +1015,7 @@ async fn run_owned(
         .as_ref()
         .and_then(|value| value.tun.as_ref())
         .unwrap();
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     let mut source = if tun.host_facts {
         match source::Source::prepare(&config, &budget, _pin_root) {
             Ok(source) => Some(source),
@@ -1025,7 +1026,7 @@ async fn run_owned(
     };
     let (setup, device, topology) = match TunSetup::prepare(
         &config,
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         source.as_mut(),
     ) {
         Ok(prepared) => prepared,
@@ -1034,7 +1035,7 @@ async fn run_owned(
                 Some(plane),
                 Err(finish_startup(
                     None,
-                    #[cfg(feature = "ebpf")]
+                    #[cfg(feature = "packet-ebpf")]
                     source,
                     error,
                 )),
@@ -1051,7 +1052,7 @@ async fn run_owned(
                 Some(plane),
                 Err(finish_startup(
                     Some(setup),
-                    #[cfg(feature = "ebpf")]
+                    #[cfg(feature = "packet-ebpf")]
                     source,
                     error.into(),
                 )),
@@ -1069,7 +1070,7 @@ async fn run_owned(
                 Some(plane),
                 Err(finish_startup(
                     Some(setup),
-                    #[cfg(feature = "ebpf")]
+                    #[cfg(feature = "packet-ebpf")]
                     source,
                     error.into(),
                 )),
@@ -1121,7 +1122,7 @@ async fn run_owned(
                 Some(plane),
                 Err(finish_startup(
                     Some(setup),
-                    #[cfg(feature = "ebpf")]
+                    #[cfg(feature = "packet-ebpf")]
                     source,
                     error,
                 )),
@@ -1137,7 +1138,7 @@ async fn run_owned(
                     None,
                     Err(finish_startup(
                         Some(setup),
-                        #[cfg(feature = "ebpf")]
+                        #[cfg(feature = "packet-ebpf")]
                         source,
                         error,
                     )),
@@ -1151,7 +1152,7 @@ async fn run_owned(
         drivers,
         plain_scope,
         host_scope,
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         source,
         pname_support,
         endpoints,
@@ -1191,7 +1192,7 @@ async fn run_owned(
             None,
             Err(finish_startup(
                 runtime.setup.take(),
-                #[cfg(feature = "ebpf")]
+                #[cfg(feature = "packet-ebpf")]
                 runtime.source.take(),
                 error,
             )),
@@ -1213,7 +1214,7 @@ async fn run_owned(
             !runtime.endpoints.is_closing() && !shutdown.requested(),
             "TUN closed before capture publication"
         );
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         if let Some(source) = &mut runtime.source {
             source.activate()?;
             *runtime.pname_support.write() = source.pname_support();
@@ -1273,7 +1274,7 @@ async fn run_owned(
     };
     runtime.drivers.clear();
     drop(runtime.io.take());
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     if let Some(source) = runtime.source.take()
         && let Err(error) = source.finish()
     {

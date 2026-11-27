@@ -42,3 +42,4 @@ Added
 - Narrow DNS projection and control-plane backend capabilities while retaining generation-fenced publication and TC ownership.
 - Build the mock daemon and `honk-tool` without Aya's userspace loader. Real eBPF builds enable the shared ABI's `aya-pod` feature.
 - Share geosite selector expansions between traffic and DNS rules and intern domain predicates by a compact content digest during routing compilation.
+- Add `packet-ebpf` for XDP/TUN without traditional TC or NFQUEUE. `ebpf` continues to enable all three datapaths via `legacy-tc`. Packet-only daemons reject TC configurations and external TC objects before datapath setup.

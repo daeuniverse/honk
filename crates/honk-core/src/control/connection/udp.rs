@@ -10,7 +10,7 @@ use crate::group::SelectionNetwork;
 
 use super::observation::ConnectionObservation;
 
-#[cfg(all(feature = "native-api", feature = "ebpf"))]
+#[cfg(all(feature = "native-api", feature = "legacy-tc"))]
 fn kernel_enforcement(
     observation: &ConnectionObservation,
     action: &'static str,
@@ -43,7 +43,7 @@ impl ControlPlaneHandle {
         let mut lease = lease;
         #[cfg(feature = "native-api")]
         let captured = lease.packet_observation.take();
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         let pending_cleanup = if lease.decision_token() == 0 {
             None
         } else {
@@ -56,7 +56,7 @@ impl ControlPlaneHandle {
                 crate::control::nfqueue::PendingUdpVerdicts::identity_for_lease(&lease),
             ))
         };
-        #[cfg(not(feature = "ebpf"))]
+        #[cfg(not(feature = "legacy-tc"))]
         if lease.decision_token() != 0 {
             anyhow::bail!("staged UDP lease requires the ebpf feature");
         }
@@ -86,7 +86,7 @@ impl ControlPlaneHandle {
         let operation = async {
             tokio::select! {
                 _ = cancellation => {
-                    #[cfg(feature = "ebpf")]
+                    #[cfg(feature = "legacy-tc")]
                     if let Some((verdicts, identity)) = &pending_cleanup
                         && let Err(error) = verdicts.cancel(*identity).await
                     {
@@ -104,7 +104,7 @@ impl ControlPlaneHandle {
                     let Err(error) = result else {
                         return Ok(());
                     };
-                    #[cfg(feature = "ebpf")]
+                    #[cfg(feature = "legacy-tc")]
                     if let Some((verdicts, identity)) = &pending_cleanup
                         && let Err(cancel_error) = verdicts.cancel(*identity).await
                     {
@@ -202,7 +202,7 @@ impl ControlPlaneHandle {
                 "packet UDP routing source changed"
             );
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         let pending = if lease.decision_token() == 0 {
             None
         } else {
@@ -215,7 +215,7 @@ impl ControlPlaneHandle {
                 crate::control::nfqueue::PendingUdpVerdicts::identity_for_lease(&lease),
             ))
         };
-        #[cfg(not(feature = "ebpf"))]
+        #[cfg(not(feature = "legacy-tc"))]
         if lease.decision_token() != 0 {
             anyhow::bail!("staged UDP lease requires the ebpf feature");
         }
@@ -260,7 +260,7 @@ impl ControlPlaneHandle {
                 "Skipping honk-internal UDP {} -> {}",
                 client_addr, original_dst
             );
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             if let Some((verdicts, identity)) = &pending {
                 verdicts.cancel(*identity).await?;
             }
@@ -274,7 +274,7 @@ impl ControlPlaneHandle {
                 "Skipping broadcast/multicast UDP {} -> {}",
                 client_addr, original_dst
             );
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             if let Some((verdicts, identity)) = &pending {
                 verdicts.cancel(*identity).await?;
             }
@@ -349,7 +349,7 @@ impl ControlPlaneHandle {
                     "QUIC ClientHello unresolved within budget; dropping for retransmit {} -> {}",
                     client_addr, original_dst
                 );
-                #[cfg(feature = "ebpf")]
+                #[cfg(feature = "legacy-tc")]
                 if let Some((verdicts, identity)) = &pending {
                     verdicts.cancel(*identity).await?;
                 }
@@ -423,7 +423,7 @@ impl ControlPlaneHandle {
             .await
         };
         observation.routed(&mut route);
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
         let matched_rule = route.matched_rule.take();
         let routed_constraint = if group_owner && !route.reroute_by_sniffed_domain {
@@ -459,7 +459,7 @@ impl ControlPlaneHandle {
         );
         self.stats
             .record_udp_route_latency(route_started_at.elapsed());
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some((verdicts, identity)) = &pending {
             match outbound_name.as_str() {
                 "direct" if !matches!(mode_constraint, OutboundConstraint::Group) => {
@@ -529,7 +529,7 @@ impl ControlPlaneHandle {
         } else {
             IpVersion::V4
         };
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         let staged_outbound;
         let (
             plan,
@@ -590,7 +590,7 @@ impl ControlPlaneHandle {
             {
                 return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
             }
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             {
                 staged_outbound = pending
                     .as_ref()
@@ -670,7 +670,7 @@ impl ControlPlaneHandle {
         lease.set_connection_guard(self.stats.track_outbound(outbound_tracker.clone()));
 
         if plan.targets.is_empty() {
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             if let Some((verdicts, identity)) = &pending {
                 verdicts.cancel(*identity).await?;
             }
@@ -685,7 +685,7 @@ impl ControlPlaneHandle {
             }
             return Ok(());
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let (Some((verdicts, identity)), Some(final_outbound)) = (&pending, staged_outbound) {
             verdicts
                 .activate_proxy(*identity, &lease, final_outbound, mark.unwrap_or(0))

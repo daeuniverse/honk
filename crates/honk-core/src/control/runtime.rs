@@ -138,7 +138,7 @@ pub(super) async fn run_tcp_admission_scaler(
     }
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(super) fn disable_nfqueue_for_startup(config: &mut Config, enabled: &mut bool) {
     config.global.nfqueue_enable = false;
     *enabled = false;
@@ -287,7 +287,7 @@ impl OutboundHealthPublisher {
 }
 
 impl ControlPlane {
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub(super) async fn degrade_nfqueue_startup(
         &mut self,
         enabled: &mut bool,
@@ -471,7 +471,7 @@ impl ControlPlane {
                     }
                     None => true,
                 };
-                #[cfg(feature = "ebpf")]
+                #[cfg(feature = "legacy-tc")]
                 if applied {
                     self.warn_lan_self_protection().await;
                 }
@@ -511,7 +511,7 @@ impl ControlPlane {
             tc_kernel: self.tc_kernel.clone(),
             active_routing_plan: self.active_routing_plan.clone(),
             udp_pool: self.udp_pool.clone(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             pending_udp_verdicts: self.pending_udp_verdicts.clone(),
             tcp_sniff_neg_cache: self.tcp_sniff_neg_cache.clone(),
             sniffer_pool: self.sniffer_pool.clone(),

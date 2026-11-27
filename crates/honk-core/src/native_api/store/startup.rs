@@ -106,19 +106,43 @@ pub(crate) fn stripped_config_matches(original: &Config, stripped: &mut Config) 
 }
 
 impl DatabaseStartup {
-    /// `entry` must be absolute and lexically normal; it is read only while the db is empty.
-    /// A db that does not exist yet is created only after the file has passed every check.
+    #[cfg(test)]
     pub(crate) fn open(
         entry: &Path,
         data_dir: &Path,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> anyhow::Result<Self> {
-        let fresh = if db_exists(data_dir) {
-            None
+        Self::open_with_admission(entry, data_dir, diagnostics, |_| Ok(()))
+    }
+
+    /// Check the selected configuration before taking the packet instance lock or creating state.
+    pub(crate) fn open_with_admission(
+        entry: &Path,
+        data_dir: &Path,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+        mut claim: impl FnMut(&Config) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Self> {
+        let exists = db_exists(data_dir);
+        let needs_import = if exists && crate::PACKET_ONLY {
+            if let Some((loaded, _)) = super::db::read_active(data_dir).map_err(store_error)? {
+                crate::validate_packet_build(&loaded.config, &loaded.sources[0].source)?;
+                claim(&loaded.config)?;
+                false
+            } else {
+                true
+            }
         } else {
+            !exists
+        };
+        let fresh = if needs_import {
             let fresh = FreshImport::load(entry, data_dir, diagnostics)?;
-            std::fs::create_dir_all(data_dir)?;
+            claim(&fresh.config)?;
+            if !exists {
+                std::fs::create_dir_all(data_dir)?;
+            }
             Some(fresh)
+        } else {
+            None
         };
         let state = StateDb::open(data_dir).map_err(|error| store_error(error.into()))?;
         let store = Arc::new(DbStore::open(Arc::new(state), entry).map_err(store_error)?);

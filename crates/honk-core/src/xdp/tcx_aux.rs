@@ -71,7 +71,7 @@ struct PrivateTun {
     guard: AuxTunGuard,
     mtu: u32,
     _guard_memory: MemoryReservation,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     _host_fifo: Option<honk_xsk::HostFifo>,
 }
 
@@ -89,16 +89,16 @@ impl PrivateTun {
         host_budget: Option<&Arc<MemoryBudget>>,
         watch: &AuxLinkWatch,
     ) -> anyhow::Result<Self> {
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         let host_fifo = host_budget.map(honk_xsk::HostFifo::reserve).transpose()?;
-        #[cfg(not(feature = "ebpf"))]
+        #[cfg(not(feature = "packet-ebpf"))]
         let _ = (host_budget, watch);
         let device = TunDevice::new_auxiliary(name).context("create exclusive private TUN")?;
         let guard = AuxTunGuard::install(device.ifindex(), device.as_fd(), budget)?;
         let memory = budget
             .reserve(guard.memory_bytes()?)
             .context("private TUN terminal guard capacity")?;
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         if let Some(fifo) = &host_fifo {
             device.prepare_host_fifo(name, fifo.slots())?;
             watch.verify_host_fifo(name, device.ifindex(), fifo.slots())?;
@@ -109,7 +109,7 @@ impl PrivateTun {
             guard,
             mtu,
             _guard_memory: memory,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             _host_fifo: host_fifo,
         })
     }
@@ -265,7 +265,7 @@ impl PreparedAux {
         root: &Arc<MemoryBudget>,
     ) -> anyhow::Result<(Self, PacketScope, PacketOwner)> {
         ensure!(
-            cfg!(feature = "ebpf"),
+            cfg!(feature = "packet-ebpf"),
             "Host egress requires the ebpf feature"
         );
         Self::prepare(
@@ -521,7 +521,7 @@ impl PreparedAux {
                         let binding = self.binding.as_ref().expect("active device pair");
                         match self.records.service(binding.io.as_ref().expect("active TUN"), owner, cx) {
                             Ok(more) => {
-                                #[cfg(feature = "ebpf")]
+                                #[cfg(feature = "packet-ebpf")]
                                 if let Some(cutoff) = self.records.take_drained_cutoff() {
                                     let id = binding.host_binding.expect("Host input drain");
                                     if let Err(e) = owner.gateway.host_input_drained(self.realm, id, cutoff) {
@@ -610,7 +610,7 @@ impl PreparedAux {
         startup: bool,
         gateway: &GatewayPublisher,
     ) -> anyhow::Result<State> {
-        #[cfg(not(feature = "ebpf"))]
+        #[cfg(not(feature = "packet-ebpf"))]
         let _ = gateway;
         let host = self.is_host();
         let current = match Self::read_link(watch, &self.name, host) {
@@ -630,7 +630,7 @@ impl PreparedAux {
             });
             return Ok(State::Offline(current));
         };
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         let private_mtu = if host && outer.is_l2 {
             // SAFETY: sysconf takes only the supported page-size selector.
             let page = u32::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })?;
@@ -642,7 +642,7 @@ impl PreparedAux {
         } else {
             outer.mtu
         };
-        #[cfg(not(feature = "ebpf"))]
+        #[cfg(not(feature = "packet-ebpf"))]
         let private_mtu = outer.mtu;
         let mut tun = match self.virgin.take() {
             Some(tun) => tun,
@@ -676,7 +676,7 @@ impl PreparedAux {
         });
         let (return_link, host_binding) = if host {
             let binding = ScopeId::allocate().context("Host binding identities exhausted")?;
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             {
                 tun.guard.install_host_delay_filter(
                     tun.device.as_fd(),
@@ -720,7 +720,7 @@ impl PreparedAux {
         b.verify_custody(&self.inner_name)?;
         let private_mtu = b.tun().mtu;
         if b.resumed.is_none() {
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             if b.host_binding.is_some()
                 && !self.records.discard_before_host_open(b.tun().as_raw_fd())?
             {
@@ -732,7 +732,7 @@ impl PreparedAux {
             let scope = owner.driver.sole_owner().expect("auxiliary scope");
             let stamp = scope.binding();
             b.resumed = Some(stamp);
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             if let Some(binding) = b.host_binding {
                 scope.install_host_process_lookup(
                     self.realm,
@@ -766,7 +766,7 @@ impl PreparedAux {
         let outer = b.outer;
         let (broadcasts, count) = watch.ipv4_broadcasts()?;
         let result = match b.host_binding {
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             Some(binding) => owner.gateway.bind_host(
                 self.realm,
                 self.scope,
@@ -776,7 +776,7 @@ impl PreparedAux {
                 Arc::clone(&b.pair),
                 &broadcasts[..count],
             ),
-            #[cfg(not(feature = "ebpf"))]
+            #[cfg(not(feature = "packet-ebpf"))]
             Some(_) => anyhow::bail!("Host egress requires the ebpf feature"),
             None => owner.gateway.bind_auxiliary(
                 self.realm,
@@ -820,7 +820,7 @@ impl PreparedAux {
         binding.pair.verify_open()?;
         binding.verify_custody(&self.inner_name)?;
         gateway.verify_auxiliary(self.realm, &binding.pair)?;
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         if let Some(id) = binding.host_binding
             && !self.records.draining()
             && let Some(cutoff) = gateway.host_pending_drain(self.realm, id)?
@@ -926,7 +926,7 @@ enum Event {
     Stop,
 }
 
-#[cfg(any(feature = "ebpf", test))]
+#[cfg(any(feature = "packet-ebpf", test))]
 fn ethernet_return_mtu(outer_mtu: u32, page: u32, shared_info_size: usize) -> anyhow::Result<u32> {
     ensure!(
         page.is_power_of_two() && shared_info_size != 0,
@@ -956,7 +956,7 @@ fn device_gone(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     #[tokio::test]
     async fn host_fifo_leaves_room_for_stack_rebind() -> anyhow::Result<()> {
         use honk_datapath::buffer::TxClass;

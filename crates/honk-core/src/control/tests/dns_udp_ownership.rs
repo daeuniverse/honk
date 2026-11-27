@@ -406,7 +406,7 @@ async fn malformed_controller_fallback_discards_incompatible_raw_handoff_metadat
     assert_eq!(dns_queries.load(Ordering::SeqCst), 0);
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 fn queued_dns_packet(client: SocketAddr, payload: &[u8], mark: u32) -> honk_nfqueue::QueuedPacket {
     honk_nfqueue::QueuedPacket {
         tuple: honk_nfqueue::UdpTuple {
@@ -420,7 +420,7 @@ fn queued_dns_packet(client: SocketAddr, payload: &[u8], mark: u32) -> honk_nfqu
     }
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 fn queued_dns_owner(
     state: &udp_ingress::UdpLoopState,
 ) -> (
@@ -436,7 +436,7 @@ fn queued_dns_owner(
     (pending, fatal)
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 async fn dispatch_queued_dns(
     state: &udp_ingress::UdpLoopState,
     pending: &nfqueue::PendingUdpVerdicts,
@@ -455,7 +455,7 @@ async fn dispatch_queued_dns(
     );
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[tokio::test]
 async fn queued_dns_uses_canonical_controller_and_raw_owner() {
     let (state, mut received, dns_queries) = fixture(&[]);
@@ -534,7 +534,7 @@ async fn queued_dns_uses_canonical_controller_and_raw_owner() {
     ));
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[tokio::test]
 async fn queued_dns_rejects_stale_carriers_and_closed_or_reopened_admission() {
     let (state, mut received, dns_queries) = fixture(&[]);
@@ -593,7 +593,7 @@ async fn queued_dns_rejects_stale_carriers_and_closed_or_reopened_admission() {
     assert_eq!(dns_queries.load(Ordering::SeqCst), 0);
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[tokio::test]
 async fn queued_dns_verdict_failure_cannot_send_ready_raw_or_start_controller() {
     let (state, mut received, dns_queries) = fixture(&[]);
@@ -627,7 +627,7 @@ async fn queued_dns_verdict_failure_cannot_send_ready_raw_or_start_controller() 
     assert_eq!(dns_queries.load(Ordering::SeqCst), 0);
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[tokio::test]
 async fn queued_dns_config_wait_obeys_receipt_deadline_and_admission_drain() {
     let (state, mut received, dns_queries) = fixture(&[]);

@@ -144,7 +144,7 @@ pub struct MockEbpfBackend {
     /// Interface-binding commits received; reload and merge must leave it at 0.
     pub binding_commits: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Bindings recorded by commits (no real links: `/dev/null` stand-in fds).
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub(crate) bound_interfaces: Vec<(crate::ebpf::interface::Binding, u32, std::os::fd::OwnedFd)>,
     pub routing_publication_order: Vec<MockRoutingPublicationWrite>,
     #[cfg(feature = "reload-bench-counters")]
@@ -175,7 +175,7 @@ pub struct MockEbpfBackend {
     datapath_flags_write_trace: Vec<DatapathFlagsWriteTrace>,
     #[cfg(test)]
     pub datapath_observation_fixture: Option<super::DatapathObservation>,
-    #[cfg(all(test, feature = "ebpf"))]
+    #[cfg(all(test, feature = "legacy-tc"))]
     pub(crate) tc_program_preparation: super::real::programs::TcProgramPreparationFixture,
     #[cfg(test)]
     pub pname_support: super::PnameSupport,

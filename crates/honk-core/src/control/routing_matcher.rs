@@ -352,7 +352,7 @@ impl RoutingPushPlan {
         (*slot == outbound).then_some(name.as_str())
     }
 
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(any(feature = "legacy-tc", test))]
     pub(super) fn group_index(&self, name: &str) -> Option<u8> {
         // The compiler uses the last declaration when names repeat.
         self.group_slots

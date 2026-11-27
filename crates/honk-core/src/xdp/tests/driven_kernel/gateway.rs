@@ -715,7 +715,7 @@ async fn quiet_gateway_detects_revoked_link() -> anyhow::Result<()> {
     quiet_link_loss(DirectProfile::Endpoint).await
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 #[tokio::test]
 #[ignore = "requires the guarded auxiliary WireGuard and native XDP disposable-VM fixture"]
 async fn kernel_gateway_auxiliary_mixed_rollback() -> anyhow::Result<()> {

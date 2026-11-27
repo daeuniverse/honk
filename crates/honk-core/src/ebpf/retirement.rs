@@ -175,7 +175,7 @@ pub struct RetireError {
     pub source: anyhow::Error,
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) fn tuple_matches(a: &TuplesKey, b: &TuplesKey) -> bool {
     (unsafe { a.src_ip.u6_addr8 == b.src_ip.u6_addr8 && a.dst_ip.u6_addr8 == b.dst_ip.u6_addr8 })
         && a.src_port == b.src_port
@@ -577,7 +577,7 @@ fn conn_deletes(result: &Result<RetireCounts, RetireError>) -> u64 {
     retired_counts(result).conn
 }
 
-#[cfg(any(feature = "ebpf", test))]
+#[cfg(any(feature = "legacy-tc", test))]
 /// Redirect and handoff elements one backend's userspace removed. The datapath
 /// only inserts them, so this is what `aux_occupancy` subtracts from its counters.
 #[derive(Debug, Default)]
@@ -586,7 +586,7 @@ pub(crate) struct AuxDeleteTally {
     pub handoff: u64,
 }
 
-#[cfg(any(feature = "ebpf", test))]
+#[cfg(any(feature = "legacy-tc", test))]
 impl AuxDeleteTally {
     /// Count a finished batch, including deletes made before a failure.
     pub(crate) fn record(&mut self, result: &Result<RetireCounts, RetireError>) {

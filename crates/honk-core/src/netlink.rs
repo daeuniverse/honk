@@ -21,14 +21,14 @@ use nix::sys::socket::{MsgFlags, NetlinkAddr, bind, recv, send, setsockopt, sock
 use nix::sys::time::TimeVal;
 
 pub(crate) mod fib;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 mod links;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) use links::LinkSnapshot;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 mod netns_id;
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) fn ipv6_socket_available() -> std::io::Result<bool> {
     match socket2::Socket::new(
         socket2::Domain::IPV6,
@@ -50,18 +50,18 @@ const NLM_F_REQUEST: u16 = 0x01;
 const NLM_F_ACK: u16 = 0x04;
 const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
-#[cfg(feature = "ebpf")]
+#[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
 const NLM_F_REPLACE: u16 = 0x100;
 const NLM_F_DUMP_INTR: u16 = 0x10;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 const NLM_F_DUMP: u16 = 0x300;
 
 const NLMSG_ERROR: u16 = 2;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 const NLMSG_DONE: u16 = 3;
 
 pub(crate) const RTM_NEWLINK: u16 = 16;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 const RTM_GETLINK: u16 = 18;
 pub(crate) const RTM_DELLINK: u16 = 17;
 const RTM_NEWADDR: u16 = 20;
@@ -77,23 +77,23 @@ const IFF_UP: u32 = 0x1;
 
 const IFLA_ADDRESS: u16 = 1;
 const IFLA_MTU: u16 = 4;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 const IFLA_IFNAME: u16 = 3;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 const IFLA_MASTER: u16 = 10;
 const IFLA_LINKINFO: u16 = 18;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 const IFLA_NET_NS_FD: u16 = 28;
 const IFLA_INFO_KIND: u16 = 1;
-#[cfg(feature = "ebpf")]
+#[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
 const IFLA_INFO_DATA: u16 = 2;
-#[cfg(feature = "ebpf")]
+#[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
 const VETH_INFO_PEER: u16 = 1;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 const IFLA_NETKIT_PEER_INFO: u16 = 1;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 const IFLA_NETKIT_MODE: u16 = 5;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 const NETKIT_L2: u32 = 0;
 
 const IFA_ADDRESS: u16 = 1;
@@ -117,14 +117,14 @@ const FRA_FWMASK: u16 = 16;
 const FRA_PRIORITY: u16 = 6;
 const FRA_IIFNAME: u16 = 3;
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 const NUD_PERMANENT: u16 = 0x80;
 const RTN_UNICAST: u8 = 1;
 const RTN_LOCAL: u8 = 2;
 const RTPROT_STATIC: u8 = 4;
 const RT_SCOPE_LINK: u8 = 253;
 const RT_SCOPE_UNIVERSE: u8 = 0;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 const RT_SCOPE_HOST: u8 = 254;
 const FR_ACT_TO_TBL: u8 = 1;
 const RTN_BLACKHOLE: u8 = 6;
@@ -165,7 +165,7 @@ struct RtMsg {
     rtm_flags: u32,
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NdMsg {
@@ -189,7 +189,7 @@ enum Attr {
     U32(u32),
     Bytes(Vec<u8>),
     Str(String),
-    #[cfg(feature = "ebpf")]
+    #[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
     Nested(Vec<(u16, Attr)>),
 }
 
@@ -201,7 +201,7 @@ fn attr_payload(attr: &Attr, out: &mut Vec<u8>) {
             out.extend_from_slice(s.as_bytes());
             out.push(0);
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
         Attr::Nested(children) => {
             for (ty, child) in children {
                 put_attr(out, *ty, child);
@@ -238,14 +238,14 @@ fn ifinfo(ifindex: i32, flags: u32, change: u32) -> IfInfoMsg {
     }
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LinkPairKind {
     Netkit,
     Veth,
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 fn netkit_unavailable(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::EOPNOTSUPP)
 }
@@ -258,7 +258,7 @@ pub(crate) enum MutationError {
     Unconfirmed(#[source] io::Error),
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
 impl MutationError {
     fn into_io(self) -> io::Error {
         match self {
@@ -497,7 +497,7 @@ impl NlSock {
         }
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
     fn request(
         &mut self,
         msg_type: u16,
@@ -547,7 +547,7 @@ impl NlSock {
         )
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(crate) fn set_host_tun_queue_len(
         &mut self,
         ifindex: u32,
@@ -561,7 +561,7 @@ impl NlSock {
         )
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(crate) fn add_host_tun_fifo(
         &mut self,
         ifindex: u32,
@@ -634,7 +634,7 @@ impl NlSock {
         self.request_owned(kind, flags, &header, &attrs)
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     /// Create an L2 netkit pair when supported, otherwise a veth pair.
     pub(crate) fn add_link_pair(&mut self, name: &str, peer: &str) -> io::Result<LinkPairKind> {
         match self.add_netkit_pair(name, peer) {
@@ -647,7 +647,7 @@ impl NlSock {
         }
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     fn add_netkit_pair(&mut self, name: &str, peer: &str) -> io::Result<()> {
         let header = ifinfo(0, 0, 0);
         let mut peer_payload = pod_bytes(&ifinfo(0, 0, 0)).to_vec();
@@ -677,7 +677,7 @@ impl NlSock {
         )
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
     /// Create a veth pair (`name` ↔ `peer_name`).
     pub(crate) fn add_veth_pair(&mut self, name: &str, peer: &str) -> io::Result<()> {
         let header = ifinfo(0, 0, 0);
@@ -705,7 +705,7 @@ impl NlSock {
         )
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
     /// Bring a link up (or down).
     pub(crate) fn set_link_up(&mut self, ifindex: u32, up: bool) -> io::Result<()> {
         let header = ifinfo(ifindex as i32, if up { IFF_UP } else { 0 }, IFF_UP);
@@ -717,7 +717,7 @@ impl NlSock {
         )
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     /// Move a link into the namespace held by `ns_fd`.
     pub(crate) fn set_link_netns_fd(&mut self, ifindex: u32, ns_fd: &OwnedFd) -> io::Result<()> {
         let header = ifinfo(ifindex as i32, 0, 0);
@@ -733,7 +733,7 @@ impl NlSock {
         r
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     /// Delete a link by index.
     pub(crate) fn del_link(&mut self, ifindex: u32) -> io::Result<()> {
         let header = ifinfo(ifindex as i32, 0, 0);
@@ -745,7 +745,7 @@ impl NlSock {
         )
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
     /// Add (or remove) an address on an interface.
     pub(crate) fn addr_op(
         &mut self,
@@ -777,7 +777,7 @@ impl NlSock {
         self.request(ty, flags, pod_bytes(&header), &attrs)
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
     /// Add a route. `dst` is (network, prefix) or None for default.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_route(
@@ -823,7 +823,7 @@ impl NlSock {
         )
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     /// Add/delete a fwmark → table rule.
     fn rule_fwmark(
         &mut self,
@@ -864,7 +864,7 @@ impl NlSock {
         self.request(ty, flags, &header, &attrs)
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub(crate) fn add_rule_fwmark(
         &mut self,
         family: u8,
@@ -875,7 +875,7 @@ impl NlSock {
         self.rule_fwmark(true, family, fwmark, fwmask, table)
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub(crate) fn del_rule_fwmark(
         &mut self,
         family: u8,
@@ -886,7 +886,7 @@ impl NlSock {
         self.rule_fwmark(false, family, fwmark, fwmask, table)
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     /// Replace a static neighbour entry (IP → MAC, permanent).
     pub(crate) fn neigh_replace(
         &mut self,
@@ -918,24 +918,24 @@ impl NlSock {
 }
 
 /// Address families and route enums re-exported for call sites.
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) const FAM_V4: u8 = AF_INET as u8;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) const FAM_V6: u8 = AF_INET6 as u8;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) const ROUTE_UNICAST: u8 = RTN_UNICAST;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) const ROUTE_LOCAL: u8 = RTN_LOCAL;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) const PROTO_STATIC: u8 = RTPROT_STATIC;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) const SCOPE_LINK: u8 = RT_SCOPE_LINK;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) const SCOPE_UNIVERSE: u8 = RT_SCOPE_UNIVERSE;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) const SCOPE_HOST: u8 = RT_SCOPE_HOST;
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 /// Read an interface's ifindex in the mounted sysfs view, not a scoped setns view.
 pub(crate) fn ifindex_of(name: &str) -> io::Result<u32> {
     let s = std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))?;
@@ -944,7 +944,7 @@ pub(crate) fn ifindex_of(name: &str) -> io::Result<u32> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 /// Read an interface's MAC from /sys (namespace-relative).
 pub(crate) fn mac_of(name: &str) -> io::Result<[u8; 6]> {
     let s = std::fs::read_to_string(format!("/sys/class/net/{name}/address"))?;
@@ -960,7 +960,7 @@ pub(crate) fn mac_of(name: &str) -> io::Result<[u8; 6]> {
     Ok(mac)
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 impl NlSock {
     /// Look up a link by name with a 6-byte MAC (client-side filter over
     /// [`Self::dump_links`]); L3 links without a MAC read as not found.
@@ -978,7 +978,7 @@ impl NlSock {
     }
 }
 
-#[cfg(all(test, feature = "ebpf"))]
+#[cfg(all(test, feature = "legacy-tc"))]
 mod tests;
 
 #[cfg(test)]

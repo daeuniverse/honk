@@ -550,7 +550,7 @@ impl DesiredState {
         Some(scope)
     }
 
-    #[cfg(all(target_os = "linux", any(feature = "ebpf", test)))]
+    #[cfg(all(target_os = "linux", any(feature = "packet-ebpf", test)))]
     pub(super) fn set_host_binding(
         &mut self,
         scope: ScopeId,

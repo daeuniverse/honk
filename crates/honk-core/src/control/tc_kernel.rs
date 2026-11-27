@@ -101,7 +101,7 @@ impl TcKernelController {
         self.with_write(|tc| tc.detach_hooks()).await
     }
 
-    #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+    #[cfg(all(feature = "native-api", feature = "legacy-tc", target_os = "linux"))]
     pub(super) async fn prepare_receive_trace(
         &self,
     ) -> anyhow::Result<Option<crate::ebpf::real::programs::ReceiveTracePreparation>> {

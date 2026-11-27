@@ -44,7 +44,7 @@ pub(in crate::control) struct ControlPlaneHandle {
     pub(in crate::control) tc_kernel: Option<Arc<TcKernelController>>,
     pub(in crate::control) active_routing_plan: routing_matcher::SharedRoutingPlan,
     pub(in crate::control) udp_pool: Arc<UdpEndpointPool>,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub(in crate::control) pending_udp_verdicts:
         Option<Arc<crate::control::nfqueue::PendingUdpVerdicts>>,
     pub(in crate::control) tcp_sniff_neg_cache: Arc<crate::control::tcp_sniff::TcpSniffNegCache>,

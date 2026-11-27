@@ -166,7 +166,7 @@ fn remove_stale_temporaries(sources: Option<&SourceUpdate>, config_path: &Path) 
     }
 }
 
-#[cfg(all(test, target_os = "linux", feature = "ebpf"))]
+#[cfg(all(test, target_os = "linux", feature = "packet-ebpf"))]
 mod tests {
     use super::*;
 

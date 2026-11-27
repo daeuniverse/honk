@@ -191,7 +191,7 @@ pub(in crate::control) fn queue_now() -> u32 {
     (monotonic_nanos() / 1_000_000) as u32
 }
 
-#[cfg(any(feature = "ebpf", test))]
+#[cfg(any(feature = "legacy-tc", test))]
 fn queue_timestamp(received_at: Instant) -> u32 {
     queue_now().wrapping_sub(duration_millis(received_at.elapsed()))
 }
@@ -199,7 +199,7 @@ fn queue_timestamp(received_at: Instant) -> u32 {
 #[derive(Clone)]
 pub(in crate::control) enum DatagramPayload<'a> {
     Borrowed(&'a [u8]),
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(any(feature = "legacy-tc", test))]
     Owned(Bytes),
     Funded(FundedDatagram),
 }
@@ -208,7 +208,7 @@ impl DatagramPayload<'_> {
     pub(in crate::control) fn as_slice(&self) -> &[u8] {
         match self {
             Self::Borrowed(data) => data,
-            #[cfg(any(feature = "ebpf", test))]
+            #[cfg(any(feature = "legacy-tc", test))]
             Self::Owned(data) => data,
             Self::Funded(data) => data,
         }
@@ -217,7 +217,7 @@ impl DatagramPayload<'_> {
     fn len(&self) -> usize {
         match self {
             Self::Borrowed(data) => data.len(),
-            #[cfg(any(feature = "ebpf", test))]
+            #[cfg(any(feature = "legacy-tc", test))]
             Self::Owned(data) => data.len(),
             Self::Funded(data) => data.len(),
         }
@@ -226,7 +226,7 @@ impl DatagramPayload<'_> {
     pub(in crate::control) fn into_bytes(self) -> Bytes {
         match self {
             Self::Borrowed(data) => Bytes::copy_from_slice(data),
-            #[cfg(any(feature = "ebpf", test))]
+            #[cfg(any(feature = "legacy-tc", test))]
             Self::Owned(data) => data,
             Self::Funded(data) => data.data,
         }
@@ -414,11 +414,11 @@ pub(in crate::control) enum EndpointReservation {
     CapacityRejected,
     QueueFull,
     QueueClosed,
-    #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+    #[cfg_attr(not(feature = "legacy-tc"), allow(dead_code))]
     IdentityMismatch,
 }
 
-#[cfg(any(feature = "ebpf", test))]
+#[cfg(any(feature = "legacy-tc", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::control) enum OwnedEnqueueError {
     IdentityMismatch,
@@ -477,7 +477,7 @@ impl UdpInitLease {
         self.packet_trace_id
     }
 
-    #[cfg(any(feature = "native-api", feature = "ebpf"))]
+    #[cfg(any(feature = "native-api", feature = "legacy-tc"))]
     pub(in crate::control) fn set_packet_route(&mut self, capture: PacketRouteSlot) {
         self.packet_route = capture;
     }
@@ -560,7 +560,7 @@ impl UdpInitLease {
         self.cancellation.clone()
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub(in crate::control) fn initialization_cancelled(&self) -> bool {
         !self.pool.initialization_epoch_is(self.initializer.epoch)
     }
@@ -735,7 +735,7 @@ impl UdpInitLease {
     /// until the removal worker acknowledges the kernel handoff. A reload that
     /// cancelled initialization after the backend committed still hands off:
     /// the userspace retirement path cannot reclaim a finished kernel state.
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(any(feature = "legacy-tc", test))]
     pub(in crate::control) fn commit_kernel_handoff(&mut self) -> bool {
         let mut occupied = match self.pool.endpoints.entry(self.key) {
             dashmap::mapref::entry::Entry::Occupied(occupied) => occupied,
@@ -1029,7 +1029,7 @@ impl UdpEndpointPool {
                 return EndpointReservation::QueueFull;
             }
         };
-        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
         let packet_source = {
             let mut packet_source = packet_source;
             if let Some(source) = &mut packet_source {
@@ -1305,7 +1305,7 @@ impl UdpEndpointPool {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(any(feature = "legacy-tc", test))]
     pub(in crate::control) fn reserve_owned_or_enqueue_at(
         self: &Arc<Self>,
         scope: ScopeId,
@@ -1411,7 +1411,7 @@ impl UdpEndpointPool {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(any(feature = "legacy-tc", test))]
     pub(in crate::control) fn enqueue_owned_by_token_at(
         &self,
         scope: ScopeId,

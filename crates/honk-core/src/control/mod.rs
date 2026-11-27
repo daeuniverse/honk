@@ -11,17 +11,17 @@ pub(crate) mod dns_listener;
 pub mod drain;
 pub mod janitor;
 pub mod netstack;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) mod nfqueue;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 mod nfqueue_runtime;
 pub mod packet_endpoint;
-#[cfg(all(test, feature = "ebpf"))]
+#[cfg(all(test, feature = "legacy-tc"))]
 use nfqueue_runtime::{
     NFQUEUE_INGEST_BYTE_BUDGET, NFQUEUE_INGEST_QUEUE_LEN, NfqueueActorQueue, NfqueueRuntimeFatal,
     NfqueueTokenRetryBackoff,
 };
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 use nfqueue_runtime::{NfqueueRuntime, NfqueueRuntimeEvent, wait_nfqueue_event};
 mod lifecycle;
 pub mod packet_sniffer;
@@ -73,7 +73,7 @@ use crate::sniffing;
 use crate::stats::StatsManager;
 use bytes::Bytes;
 use drain::DrainTracker;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 use futures::FutureExt;
 use honk_config::node::{Group, GroupPolicy};
 use honk_config::{
@@ -93,7 +93,7 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
 use std::time::Duration;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 use std::time::Instant;
 use tokio::io::Interest;
 #[cfg(test)]
@@ -298,7 +298,7 @@ pub struct ControlPlane {
     mode_state: Option<crate::mode::SharedModeState>,
     /// Sole writer for mode state and DATAPATH_FLAGS_MAP publication.
     datapath_flags: Option<crate::mode::DatapathFlagsHandle>,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pending_udp_verdicts: Option<Arc<nfqueue::PendingUdpVerdicts>>,
     datapath_healthy: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "native-api")]
@@ -326,7 +326,7 @@ pub struct ControlPlane {
     clash_publication_pause: parking_lot::Mutex<Option<ClashPublicationPause>>,
     /// Interface watcher, stopped and joined before `detach_hooks` during
     /// shutdown so it cannot re-attach hooks mid-drain.
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     iface_watcher: Option<crate::ebpf::real::IfaceWatcher>,
 }
 
@@ -447,7 +447,7 @@ impl ControlPlane {
 
     /// Hand the interface watcher to the control plane so shutdown can stop
     /// it before detaching hooks.
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub fn set_iface_watcher(&mut self, watcher: Option<crate::ebpf::real::IfaceWatcher>) {
         self.iface_watcher = watcher;
     }

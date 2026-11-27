@@ -294,6 +294,8 @@ UDP NFQUEUE has no environment-variable switch. It is enabled by default through
 
 With the `ebpf` feature, `build.rs` supplies the object embedded by `include_bytes!`. The `--bpf-object` option replaces those bytes at runtime.
 
+`packet-ebpf` selects XDP/TUN without the traditional TC loader. This build requires an explicit XDP or TUN configuration with `global.nfqueue_enable: false` and rejects `--bpf-object` (`-b`). `legacy-tc` and the compatible `ebpf` feature include all three objects.
+
 Object-declared `ByName` pinning is refused before probe/loading: rebuild with unpinned maps, leaving pin paths to core. Builds without `ebpf` use the mock backend.
 
 ### Kernel BTF

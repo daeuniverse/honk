@@ -104,11 +104,7 @@ fn parse_link(msg: &[u8]) -> io::Result<LinkSnapshot> {
 /// Fold one datagram of an RTM_GETLINK dump (request `seq`) into `links`.
 /// Returns `true` once NLMSG_DONE is seen. Datagrams of an older request
 /// (different seq) are ignored.
-pub(super) fn parse_link_datagram(
-    buf: &[u8],
-    seq: u32,
-    links: &mut Vec<LinkSnapshot>,
-) -> io::Result<bool> {
+fn parse_link_datagram(buf: &[u8], seq: u32, links: &mut Vec<LinkSnapshot>) -> io::Result<bool> {
     let mut off = 0usize;
     while off + 16 <= buf.len() {
         let hlen = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
@@ -177,3 +173,6 @@ impl NlSock {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -207,7 +207,7 @@ pub struct TcpStatsSnapshot {
     pub capacity_rejections: u64,
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub struct NfqueueServiceSample {
     pub kernel_queue_depth: u64,
     pub kernel_dropped: u64,
@@ -1273,7 +1273,7 @@ impl StatsManager {
     pub fn record_udp_slow_permit_closed(&self) {
         self.udp.slow_permit_closed.fetch_add(1, Ordering::Relaxed);
     }
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub fn update_udp_nfqueue_local_stats(
         &self,
         held_packets: usize,
@@ -1294,7 +1294,7 @@ impl StatsManager {
             .store(socket_receive_buffer_bytes as u64, Ordering::Relaxed);
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub fn update_udp_nfqueue_service_stats(&self, stats: NfqueueServiceSample) {
         self.udp
             .nfqueue
@@ -1319,7 +1319,7 @@ impl StatsManager {
         );
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub fn record_udp_nfqueue_service_stats_error(&self) {
         self.udp
             .nfqueue
@@ -1331,7 +1331,7 @@ impl StatsManager {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub fn update_udp_nfqueue_actor_queue(
         &self,
         depth: usize,
@@ -1352,7 +1352,7 @@ impl StatsManager {
         );
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub fn record_udp_nfqueue_actor_queue_full(&self) {
         self.udp
             .nfqueue
@@ -1360,7 +1360,7 @@ impl StatsManager {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub fn record_udp_nfqueue_correlator_full(&self) {
         self.udp
             .nfqueue
@@ -1878,7 +1878,7 @@ mod tests {
         assert_eq!(settled.tuic_clients, 1);
         generation.shutdown().await;
     }
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     #[test]
     fn nfqueue_kernel_stats_failures_are_visible() {
         let stats = StatsManager::new();

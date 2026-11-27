@@ -9,7 +9,7 @@ pub(crate) struct GoldenCase {
     pub label: String,
     pub connection: ConnectionInfo,
     pub decision: RoutingDecision,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub generic_port_punt: bool,
 }
 
@@ -278,7 +278,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
                     } else {
                         expected(None, 0, 0, false)
                     },
-                    #[cfg(feature = "ebpf")]
+                    #[cfg(feature = "legacy-tc")]
                     generic_port_punt: matched
                         && !negated
                         && matches!(field, "port" | "source_port"),
@@ -291,7 +291,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
         name: &'static str,
         condition: Value,
         must: bool,
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         generic_port_punt: bool,
         samples: Vec<(ConnectionInfo, bool)>,
     }
@@ -301,7 +301,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             name: "ordinary-domain-alternatives",
             condition: json!({"source_port":["60000"], "domain":["exact.test"], "domain_suffix":["suffix.test"], "domain_keyword":["needle"], "domain_regex":[r"^rx[0-9]+\.test$"]}),
             must: false,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             generic_port_punt: false,
             samples: vec![
                 (
@@ -338,7 +338,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             name: "ordinary-geosite-alternatives",
             condition: json!({"source_port":["60001"], "domain":["other.test"], "domain_suffix":["imgur.test"], "geosite":["lab"]}),
             must: false,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             generic_port_punt: false,
             samples: vec![
                 (
@@ -375,7 +375,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             name: "ipv6-only-prefix",
             condition: json!({"source_port":["60002"], "ip":["::/0"]}),
             must: false,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             generic_port_punt: false,
             samples: vec![
                 (
@@ -393,7 +393,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             name: "destination-specific-port-miss",
             condition: json!({"source_port":["60003"], "ip":["10.1.0.0/16"], "port":["80"]}),
             must: false,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             generic_port_punt: false,
             samples: vec![],
         },
@@ -401,7 +401,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             name: "destination-parent-must",
             condition: json!({"source_port":["60003"], "ip":["10.0.0.0/8"], "port":["443"]}),
             must: true,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             generic_port_punt: false,
             samples: vec![(
                 sample(|c| {
@@ -416,7 +416,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             name: "source-specific-port-miss",
             condition: json!({"port":["60004"], "source_ip":["172.16.1.0/24"], "source_port":["80"]}),
             must: false,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             generic_port_punt: false,
             samples: vec![],
         },
@@ -424,7 +424,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             name: "source-parent-port-punt",
             condition: json!({"port":["60004"], "source_ip":["172.16.0.0/12"], "source_port":["443"]}),
             must: false,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             generic_port_punt: true,
             samples: vec![(
                 sample(|c| {
@@ -456,7 +456,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
                 } else {
                     expected(None, 0, 0, false)
                 },
-                #[cfg(feature = "ebpf")]
+                #[cfg(feature = "legacy-tc")]
                 generic_port_punt: hit && case.generic_port_punt,
             });
         }
@@ -487,7 +487,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             c.dst_port = 53;
         }),
         decision: expected(Some(priority_id), 1, 0x502, true),
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         generic_port_punt: false,
     });
     cases.push(GoldenCase {
@@ -497,14 +497,14 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             c.dst_port = 53;
         }),
         decision: expected(Some(priority_id + 1), 0, 0x503, true),
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         generic_port_punt: false,
     });
     cases.push(GoldenCase {
         label: "fallback".into(),
         connection: connection(),
         decision: expected(None, 0, 0, false),
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         generic_port_punt: false,
     });
 

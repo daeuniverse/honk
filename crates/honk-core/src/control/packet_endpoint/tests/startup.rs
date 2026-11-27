@@ -1146,7 +1146,7 @@ async fn tun_dns_bind_requires_preparation_before_startup() {
     );
 }
 
-#[cfg(all(target_os = "linux", feature = "ebpf"))]
+#[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
 async fn configured_dns_startup(backend: Backend) {
     let reservation = super::super::super::dns_listener::BoundDnsListener::bind(
         &honk_config::dns::DnsBindEndpoint::parse("tcp+udp://127.0.0.1:0").unwrap(),
@@ -1211,7 +1211,7 @@ async fn configured_dns_startup(backend: Backend) {
     result.unwrap();
 }
 
-#[cfg(all(target_os = "linux", feature = "ebpf"))]
+#[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
 #[test]
 #[ignore = "requires the disposable kernel VM gate and SO_MARK privileges"]
 fn tun_dns_bind_starts_with_prepared_addresses_and_marks_both_transports() {

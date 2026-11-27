@@ -271,7 +271,7 @@ impl PacketDriver {
     }
 
     fn release_host_lookup(&self) {
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         {
             let mut inner = self.scope.0.inner.lock();
             if inner.finished {

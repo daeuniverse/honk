@@ -44,7 +44,7 @@ pub(crate) use realm::{PacketRealm, PacketRealmPlan, TcpClaim};
 pub(crate) use realm_receive::RealmRxBatch;
 
 mod auxiliary;
-#[cfg(all(target_os = "linux", feature = "ebpf"))]
+#[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
 mod host;
 use auxiliary::Auxiliary;
 pub(in crate::control) use auxiliary::AuxiliaryWork;
@@ -299,7 +299,7 @@ struct Inner {
     #[cfg(target_os = "linux")]
     output_peer_holds: Box<[Option<crate::xdp::worker::PeerHold>]>,
     source_work: Sources,
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
     host_process: Option<host::HostProcessBinding>,
     queue: Box<[Option<Queued>]>,
     head: usize,
@@ -606,7 +606,7 @@ impl PacketScope {
                 #[cfg(target_os = "linux")]
                 output_peer_holds: frames.output_peer_holds,
                 source_work: frames.source_work,
-                #[cfg(all(target_os = "linux", feature = "ebpf"))]
+                #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
                 host_process: None,
                 queue: frames.queue,
                 head: 0,
@@ -783,7 +783,7 @@ impl PacketScope {
             if inner.source_work.is_host() {
                 return Rx::Dropped(DropReason::NotForUs);
             }
-            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
             if inner.host_process.is_some() {
                 return self
                     .receive_process(inner, packet, RxMeta::VERIFY, now, |_| true)
@@ -829,7 +829,7 @@ impl PacketScope {
                 return (Rx::Dropped(DropReason::NotForUs), Default::default());
             }
             let pending = check_output && inner.pending_source_output(packet);
-            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
             if inner.host_process.is_some() {
                 return self.receive_process(inner, packet, meta, now, |source| {
                     on_source(source, pending)
@@ -907,7 +907,7 @@ impl PacketScope {
         })
     }
 
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
     fn receive_process(
         &self,
         inner: &mut Inner,
@@ -953,7 +953,7 @@ impl PacketScope {
                 return None;
             }
             let process = pending.as_ref().and_then(|slot| slot.process);
-            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
             if inner.host_process.is_some() && process.is_none() {
                 stack.tcp_refuse(syn.id, honk_netstack::Refuse::Drop);
                 return None;
@@ -1550,7 +1550,7 @@ impl Inner {
         )
         .expect("stack output has IP addresses")
         .1;
-        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
         if tx.flow.is_none()
             && let Some(binding) = &mut self.host_process
         {
@@ -1566,7 +1566,7 @@ impl Inner {
     fn release(&mut self, queued: Queued) {
         let index = self.index(queued.lease);
         self.output_peers[index] = None;
-        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
         if let Some(binding) = &mut self.host_process {
             binding.outputs[index] = None;
         }
@@ -2146,7 +2146,7 @@ impl PacketDriver {
         let queued = reservation
             .inner
             .install(lease, index, tx, class, destination, fragment)?;
-        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
         if tx.flow.is_none()
             && let Some(binding) = &mut reservation.inner.host_process
         {

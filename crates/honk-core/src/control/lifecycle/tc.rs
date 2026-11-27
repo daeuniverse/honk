@@ -15,7 +15,7 @@ impl ControlPlane {
             .bind_endpoint()
             .map_err(|error| anyhow::anyhow!("invalid dns.bind: {error}"))?;
         drop(config);
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         {
             let _reload = self.reload_lock.lock().await;
             self.warn_lan_self_protection().await;
@@ -146,7 +146,7 @@ impl ControlPlane {
             removal_errors,
             critical_errors,
             health_updates: None,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             queue: None,
         };
         let prepared = async {
@@ -161,7 +161,7 @@ impl ControlPlane {
                     honk_datapath::ScopeId::HOST,
                 )?);
             }
-            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+            #[cfg(all(feature = "native-api", feature = "legacy-tc", target_os = "linux"))]
             let record_flows = self.native.is_some()
                 && self
                     .config
@@ -170,9 +170,9 @@ impl ControlPlane {
                     .experimental
                     .native_api
                     .record_flows;
-            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+            #[cfg(all(feature = "native-api", feature = "legacy-tc", target_os = "linux"))]
             let mut trace_error = None;
-            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+            #[cfg(all(feature = "native-api", feature = "legacy-tc", target_os = "linux"))]
             let mut trace_unavailable = [false; 2];
             let state = UdpLoopState::new(self, daens_netns_exists());
             for (socket, family) in epoch
@@ -185,9 +185,9 @@ impl ControlPlane {
                 let state = state.clone();
                 let socket = Arc::clone(socket);
                 let batch = sockets::UdpRecvBatch::new()?;
-                #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+                #[cfg(all(feature = "native-api", feature = "legacy-tc", target_os = "linux"))]
                 let mut batch = batch;
-                #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+                #[cfg(all(feature = "native-api", feature = "legacy-tc", target_os = "linux"))]
                 if record_flows
                     && let Err(error) = enable_receive_trace(&tc, &mut batch, &socket).await
                 {
@@ -208,9 +208,9 @@ impl ControlPlane {
                     }
                 });
             }
-            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+            #[cfg(all(feature = "native-api", feature = "legacy-tc", target_os = "linux"))]
             let trace_degraded = record_udp_trace(&self.degradations, trace_unavailable);
-            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+            #[cfg(all(feature = "native-api", feature = "legacy-tc", target_os = "linux"))]
             if trace_degraded && let Some(error) = &trace_error {
                 warn!(
                     %error,
@@ -250,7 +250,7 @@ impl ControlPlane {
                     initial_route_connectivity(&self.active_routing_plan.read().plan, &manager);
                 publish_group_connectivity(ebpf.as_mut(), &snapshot)?;
             }
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             {
                 let sequence_ready = if epoch.listeners.nfqueue_enabled {
                     self.rotate_udp_decision_generation().await?
@@ -291,7 +291,7 @@ impl ControlPlane {
     }
 
     pub(super) async fn open_epoch(&mut self, epoch: &mut RuntimeEpoch) -> anyhow::Result<()> {
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some(queue) = epoch.queue.as_mut()
             && let Err(error) = queue.check_startup_health().await
         {
@@ -300,16 +300,16 @@ impl ControlPlane {
             self.degrade_nfqueue_startup(&mut epoch.listeners.nfqueue_enabled, error.into())
                 .await;
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         let queue_ready = epoch
             .queue
             .as_ref()
             .is_some_and(|queue| queue.sequence_ready);
-        #[cfg(not(feature = "ebpf"))]
+        #[cfg(not(feature = "legacy-tc"))]
         let queue_ready = false;
         self.initialize_datapath_flags(epoch.listeners.nfqueue_enabled, queue_ready)
             .await?;
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some(queue) = epoch.queue.as_ref()
             && queue.sequence_ready
         {
@@ -320,7 +320,7 @@ impl ControlPlane {
         Ok(())
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub(in crate::control) async fn warn_lan_self_protection(&self) {
         if !daens_netns_exists() {
             return;
@@ -370,7 +370,7 @@ impl ControlPlane {
 
 /// Whether `socket` records kernel UDP receive traces: `SO_RCVPRIORITY` where
 /// the kernel has it, otherwise the eBPF receive trace.
-#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "native-api", feature = "legacy-tc", target_os = "linux"))]
 pub(super) async fn enable_receive_trace(
     tc: &TcKernelController,
     batch: &mut sockets::UdpRecvBatch,
@@ -393,7 +393,7 @@ pub(super) async fn enable_receive_trace(
 }
 
 /// Kernel UDP receive tracing is only needed while flows are recorded.
-#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "native-api", feature = "legacy-tc", target_os = "linux"))]
 pub(super) fn record_udp_trace(
     degradations: &crate::degradations::Degradations,
     unavailable: [bool; 2],

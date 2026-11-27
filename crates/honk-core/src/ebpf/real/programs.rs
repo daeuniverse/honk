@@ -7,7 +7,7 @@ use aya::maps::{Map, MapData};
 use parking_lot::Mutex;
 
 use super::bindings::PreparedTcProgram;
-use crate::ebpf::common::{btf, syscall::map_data};
+use crate::ebpf::common::syscall::map_data;
 use crate::ebpf::interface::TcProgram;
 
 pub(super) type KernelMaps = HashMap<String, Map>;
@@ -143,7 +143,7 @@ impl ProgramLoader {
                 );
                 None
             } else {
-                let result = btf::load_kernel().and_then(|(_, btf)| {
+                let result = crate::ebpf::common::btf::load_kernel().and_then(|(_, btf)| {
                     super::receive_trace::ReceiveTrace::attach(
                         &mut object,
                         &btf,

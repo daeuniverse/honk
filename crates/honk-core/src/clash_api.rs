@@ -1806,7 +1806,7 @@ mod sampler_tests {
         assert!(!tracker.is_enabled());
     }
 
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
     #[test]
     #[ignore = "requires real SO_MARK in the disposable VM; run via just test-netns"]
     fn netns_tun_listener_marks_accepted_sockets() {

@@ -850,7 +850,7 @@ impl ControlPlane {
             return Ok(completion.finish(ReloadOutcome::Rejected));
         }
         drain.start_rejecting();
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some(pending) = self.pending_udp_verdicts.as_ref() {
             pending.cancel_all().await;
         }
@@ -867,7 +867,7 @@ impl ControlPlane {
             .await;
             return Ok(completion.finish(ReloadOutcome::Rejected));
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some(pending) = self.pending_udp_verdicts.as_ref() {
             pending.wait_empty().await;
         }
@@ -1162,7 +1162,7 @@ impl ControlPlane {
             }));
         }
         info!("Configuration applied — {} routes active", route_count);
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if !reuse_routing_state {
             self.warn_lan_self_protection().await;
         }
@@ -1290,21 +1290,21 @@ impl ControlPlane {
     }
 
     fn open_pending_udp_admission(&self) {
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some(pending) = self.pending_udp_verdicts.as_ref() {
             pending.open_admission();
         }
     }
 
     async fn close_and_drain_pending_udp_admission(&self) {
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some(pending) = self.pending_udp_verdicts.as_ref() {
             pending.cancel_all().await;
         }
         if !self.udp_pool.cancel_initializers_and_wait().await {
             warn!("UDP initializers did not drain during admission teardown");
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some(pending) = self.pending_udp_verdicts.as_ref() {
             pending.wait_empty().await;
         }

@@ -13,7 +13,7 @@ use std::{
 };
 use tokio::io::unix::AsyncFd;
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 struct InputDrain {
     cutoff: u64,
     remaining: Option<u64>,
@@ -23,9 +23,9 @@ pub(super) struct Records {
     rx: Box<[u8]>,
     pending: [[Option<OutputLease>; BATCH]; 2],
     first: usize,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     drain: Option<InputDrain>,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     host_reads: Option<u64>,
     _memory: MemoryReservation,
 }
@@ -39,16 +39,16 @@ impl Records {
             rx: vec![0; tun::RX_BYTES].into_boxed_slice(),
             pending: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             first: 0,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             drain: None,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             host_reads: None,
             _memory: memory,
         }))
     }
 
     pub(super) fn dispose(&mut self) {
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         {
             self.drain = None;
             self.host_reads = None;
@@ -58,7 +58,7 @@ impl Records {
         }
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(super) fn discard_before_host_open(
         &mut self,
         fd: std::os::fd::RawFd,
@@ -84,12 +84,12 @@ impl Records {
         Ok(false)
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(super) fn draining(&self) -> bool {
         self.drain.is_some()
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(super) fn request_drain(&mut self, cutoff: u64, passed: Option<u64>) {
         // Candidates dropped between the final filter and enqueue only increase this bound.
         let remaining = self
@@ -99,7 +99,7 @@ impl Records {
         self.drain = Some(InputDrain { cutoff, remaining });
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     fn completed(&mut self, count: usize) {
         let count = count as u64;
         self.host_reads = self.host_reads.and_then(|r| r.checked_add(count));
@@ -111,7 +111,7 @@ impl Records {
         }
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(super) fn take_drained_cutoff(&mut self) -> Option<u64> {
         self.drain
             .take_if(|drain| drain.remaining == Some(0))
@@ -182,9 +182,9 @@ impl Records {
         open: impl Fn() -> bool,
         mut admit: impl FnMut(&[u8]) -> anyhow::Result<()>,
     ) -> anyhow::Result<bool> {
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         let probing = self.drain.is_some();
-        #[cfg(not(feature = "ebpf"))]
+        #[cfg(not(feature = "packet-ebpf"))]
         let probing = false;
         // Read the FD itself when proving a drain, even if the readiness cache is empty.
         let mut ready = match io.poll_read_ready(cx) {
@@ -194,7 +194,7 @@ impl Records {
         };
         let mut bytes = 0;
         let mut attempts = 0;
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         let mut interrupted = 0;
         while attempts < BATCH {
             if !open() {
@@ -207,16 +207,16 @@ impl Records {
             let length = match tun::read_packet(io.get_ref().as_raw_fd(), &mut self.rx) {
                 Ok(length) => length,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                    #[cfg(feature = "ebpf")]
+                    #[cfg(feature = "packet-ebpf")]
                     {
                         interrupted += 1;
                     }
                     continue;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    #[cfg(feature = "ebpf")]
+                    #[cfg(feature = "packet-ebpf")]
                     self.completed(attempts - interrupted - 1);
-                    #[cfg(feature = "ebpf")]
+                    #[cfg(feature = "packet-ebpf")]
                     if let Some(drain) = &mut self.drain {
                         drain.remaining = Some(0);
                     }
@@ -237,7 +237,7 @@ impl Records {
             bytes += length;
             admit(&self.rx[..length])?;
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         self.completed(attempts - interrupted);
         Ok(true)
     }
@@ -247,7 +247,7 @@ impl Records {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     #[tokio::test]
     async fn host_input_drain_requires_completed_reads_or_fd_eagain() {
         use std::os::unix::net::UnixDatagram;

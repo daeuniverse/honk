@@ -876,7 +876,7 @@ fn runtime_refuses_unavailable_tun_authority_without_restricting_dial_modes() {
             .host_facts = true;
         assert_eq!(
             validate_config(&config).is_ok(),
-            cfg!(feature = "ebpf") && predicate.contains("pname"),
+            cfg!(feature = "packet-ebpf") && predicate.contains("pname"),
             "Host process admission or MAC refusal changed: {predicate}"
         );
     }

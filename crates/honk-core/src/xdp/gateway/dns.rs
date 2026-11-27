@@ -290,7 +290,7 @@ impl GatewayDnsBank {
         self.state.lock().pending.take()
     }
 
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(any(feature = "packet-ebpf", test))]
     pub(crate) fn discard_fill(&self, query: crate::dns::projection::QueryScope) {
         let mut state = self.state.lock();
         if state.pending.is_some_and(|fill| fill.query == query) {

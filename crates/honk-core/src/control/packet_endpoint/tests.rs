@@ -11,7 +11,7 @@ mod startup;
 mod tcp_budget;
 mod udp;
 
-#[cfg(all(target_os = "linux", feature = "ebpf"))]
+#[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
 impl PacketEndpoints {
     pub(crate) fn reap_completed_udp_tasks(&self) {
         self.shared.udp_pool.reap_tasks();

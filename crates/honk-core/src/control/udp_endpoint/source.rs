@@ -157,7 +157,7 @@ pub(super) struct SourceOwner {
 }
 
 impl SourceOwner {
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
     pub(super) fn delivering_foreign_reply(
         &self,
         scope: ScopeId,

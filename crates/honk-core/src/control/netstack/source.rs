@@ -528,7 +528,7 @@ impl ProcessMeta {
         }
     }
 
-    #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+    #[cfg(any(test, all(target_os = "linux", feature = "packet-ebpf")))]
     pub(super) fn from_gateway(
         meta: honk_ebpf_common::xdp_gateway::HostFlowMeta,
     ) -> io::Result<Self> {
@@ -575,10 +575,10 @@ enum SourceOrigin {
     Plain,
     #[cfg(target_os = "linux")]
     Physical(crate::xdp::worker::PeerHold),
-    #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+    #[cfg(any(test, all(target_os = "linux", feature = "packet-ebpf")))]
     Gateway {
         process: ProcessMeta,
-        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
         slot: Option<u16>,
     },
 }
@@ -597,7 +597,7 @@ impl SourceWork {
         assert!(matches!(self.origin, SourceOrigin::Plain) && self.context.is_none());
         self.origin = SourceOrigin::Gateway {
             process,
-            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
             slot: None,
         };
         self
@@ -608,14 +608,14 @@ impl SourceWork {
     }
 
     fn gateway_process(&self) -> Option<&ProcessMeta> {
-        #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+        #[cfg(any(test, all(target_os = "linux", feature = "packet-ebpf")))]
         if let SourceOrigin::Gateway { process, .. } = &self.origin {
             return Some(process);
         }
         None
     }
 
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
     fn host_udp_slot(&self) -> Option<u16> {
         match &self.origin {
             SourceOrigin::Gateway { slot, .. } => *slot,
@@ -628,7 +628,7 @@ impl SourceWork {
         if !self.has_gateway_process() {
             return self;
         }
-        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
         if let Some(index) = self.host_udp_slot() {
             self.scope
                 .0
@@ -644,7 +644,7 @@ impl SourceWork {
         self
     }
 
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
     pub(in crate::control) fn admit_udp_process(
         &mut self,
         client: SocketAddr,
@@ -805,7 +805,7 @@ impl SourceWork {
 impl Clone for SourceWork {
     fn clone(&self) -> Self {
         let mut inner = self.scope.0.inner.lock();
-        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
         if let Some(index) = self.host_udp_slot() {
             inner
                 .host_process
@@ -835,7 +835,7 @@ impl Drop for SourceWork {
     fn drop(&mut self) {
         let device = {
             let mut inner = self.scope.0.inner.lock();
-            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
             if let Some(index) = self.host_udp_slot() {
                 inner
                     .host_process

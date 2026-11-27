@@ -3,14 +3,14 @@
 //! Embeds the release tag or Git description for the CLI and Clash API, and
 //! the full source commit that TUN setup receipts record.
 //!
-//! When the `ebpf` feature is enabled, this script ensures the eBPF objects
+//! For packet and legacy builds, this script ensures the selected eBPF objects
 //! are available and copies them into `OUT_DIR` for `include_bytes!`.
 //! Missing or stale objects are built together using the nightly toolchain.
 
 fn main() {
     emit_version();
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     embed_ebpf_object();
 
     #[cfg(feature = "native-ui")]
@@ -260,14 +260,21 @@ fn encode(file: &std::path::Path) -> anyhow::Result<Option<Compressed>> {
     Ok((br.len().max(gzip.len()) < len).then_some(Compressed { br, gzip, len }))
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 fn embed_ebpf_object() {
     use std::{env, path::PathBuf, process::Command};
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../..");
     println!("cargo:rerun-if-env-changed=HONK_EBPF_PREBUILT_DIR");
     let status = Command::new("sh")
         .arg(root.join("ci/ebpf-objects.sh"))
-        .args(["embed", "legacy-tc"])
+        .args([
+            "embed",
+            if cfg!(feature = "legacy-tc") {
+                "legacy-tc"
+            } else {
+                "packet-ebpf"
+            },
+        ])
         .arg(env::var_os("OUT_DIR").unwrap())
         .status()
         .expect("prepare eBPF objects");

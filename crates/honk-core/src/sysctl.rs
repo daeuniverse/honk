@@ -32,7 +32,7 @@ fn set_sysctl_at(key: &str, value: &str, path: &str) -> anyhow::Result<()> {
 /// is a single path segment taken verbatim: a name like `eth0.100` must not be
 /// split on its dot (the dotted form, and `proc_path`, would turn it into
 /// `eth0/100`). The slash key also keeps `sysctl -w` from splitting it.
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 fn device_sysctl_target(family: &str, ifname: &str, key: &str) -> anyhow::Result<(String, String)> {
     anyhow::ensure!(
         !ifname.is_empty() && ifname != "." && ifname != ".." && !ifname.contains(['/', '\0']),
@@ -44,7 +44,7 @@ fn device_sysctl_target(family: &str, ifname: &str, key: &str) -> anyhow::Result
 }
 
 /// Write `net/<family>/conf/<ifname>/<key>`; `family` is `ipv4` or `ipv6`.
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) fn set_device_sysctl(
     family: &str,
     ifname: &str,
@@ -55,7 +55,7 @@ pub(crate) fn set_device_sysctl(
     set_sysctl_at(&key, value, &path)
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) fn require_off(key: &str, optional: bool) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
@@ -78,18 +78,18 @@ pub(crate) fn require_off(key: &str, optional: bool) -> anyhow::Result<()> {
 /// all.forwarding=1 pin: with the stock accept_ra=1 the kernel drops RAs
 /// once forwarding is on, and networkd's userspace RA disables itself the
 /// same way — either path lets the SLAAC default route expire (#46).
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) fn enable_wan_accept_ra(ifname: &str) -> anyhow::Result<()> {
     set_device_sysctl("ipv6", ifname, "accept_ra", "2")
 }
 
 /// Disable reverse-path filtering on the first existing, non-refused resolved LAN name.
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) fn disable_rp_filter(ifname: &str) -> anyhow::Result<()> {
     set_device_sysctl("ipv4", ifname, "rp_filter", "0")
 }
 
-#[cfg(all(test, feature = "ebpf"))]
+#[cfg(all(test, feature = "legacy-tc"))]
 mod tests {
     use super::device_sysctl_target;
 

@@ -1,4 +1,4 @@
-#![cfg(feature = "ebpf")]
+#![cfg(feature = "legacy-tc")]
 
 //! Root-only regression coverage for the production TC object.
 //!

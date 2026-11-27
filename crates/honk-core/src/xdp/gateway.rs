@@ -8,7 +8,7 @@ pub(crate) use hold::HoldCollector;
 pub(crate) use policy::GatewayPolicy;
 pub(crate) use zones::ZoneAdmission;
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 use super::host_identity::HostIdentity;
 use crate::control::routing_matcher::RoutingPushPlan;
 use crate::control::{ControlPlane, ShutdownIntent};
@@ -17,7 +17,7 @@ use crate::stats::xdp::{Diagnostics, DnsProjectionState};
 use dns::GatewayDnsBank;
 use generation::Arbitration;
 use honk_datapath::ScopeId;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 use honk_ebpf_common::xdp_gateway::{GATEWAY_REALM_CAPACITY, HostFlowMeta};
 use honk_ebpf_common::xdp_gateway::{GatewayKey, GatewayReason};
 use honk_netstack::{MemoryBudget, MemoryReservation};
@@ -25,7 +25,7 @@ use honk_xsk::{
     AuxDevicePair, AuxGatewayProgram, AuxReaderGrace, AuxTcxLink, ConntrackKfuncs, GatewayLoad,
     GatewayMaps, GeneralCapture, OwnedXdpLink, Programs, SkbConntrackKfuncs,
 };
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 use honk_xsk::{HostConntrack, HostGatewayLoad, topology::AuxLinkInfo};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use std::{
@@ -74,7 +74,7 @@ struct AuxProgram {
 #[derive(Clone, Copy)]
 enum AuxDirection {
     LanIngress,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     HostEgress {
         stamp: u64,
         binding: u64,
@@ -88,7 +88,7 @@ impl AuxDirection {
             Self::LanIngress => !realms
                 .iter()
                 .any(|&(s, r)| (s == scope || r == realm) && (s, r) != (scope, realm)),
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             Self::HostEgress { .. } => {
                 realm != GATEWAY_REALM_CAPACITY
                     && !realms.iter().any(|&(s, r)| s == scope || r == realm)
@@ -108,9 +108,9 @@ struct AuxMember {
     program: Option<AuxProgram>,
     key_bound: bool,
     dns_active: bool,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     host_bound: bool,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     retiring: bool,
 }
 
@@ -143,9 +143,9 @@ impl AuxMember {
             program: None,
             key_bound: false,
             dns_active: false,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             host_bound: false,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             retiring: false,
         })
     }
@@ -153,7 +153,7 @@ impl AuxMember {
     fn set_dns_binding(&mut self, projection: &RoutingProjection, active: bool) -> io::Result<()> {
         match self.direction {
             AuxDirection::LanIngress => projection.set_aux_binding(self.scope, active)?,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             AuxDirection::HostEgress { stamp, .. } => {
                 projection.set_host_binding(self.scope, stamp, active)?;
             }
@@ -197,7 +197,7 @@ impl Auxiliary {
     }
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 pub(super) struct HostResources {
     identity: HostIdentity,
     bypass_mark: u32,
@@ -205,7 +205,7 @@ pub(super) struct HostResources {
     arbitration: Arc<Arbitration>,
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 impl HostResources {
     pub(super) fn prepare(
         identity: HostIdentity,
@@ -231,14 +231,14 @@ impl HostResources {
     }
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 #[derive(Clone)]
 pub(crate) struct HostProcessLookup {
     maps: Arc<GatewayMaps>,
     arbitration: Arc<Arbitration>,
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 impl HostProcessLookup {
     pub(crate) fn lookup(
         &self,
@@ -514,12 +514,12 @@ pub struct GatewayPublisher {
     state: PublisherState<PublisherInner, OwnedXdpLink>,
     maps: Arc<GatewayMaps>,
     conntrack: Option<Arc<ConntrackKfuncs>>,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     host: Option<HostResources>,
     budget: Arc<MemoryBudget>,
     active_plan: crate::control::routing_matcher::SharedRoutingPlan,
     failure: std::sync::OnceLock<Arc<io::Error>>,
-    #[cfg(all(test, feature = "ebpf"))]
+    #[cfg(all(test, feature = "packet-ebpf"))]
     pub(super) replace_tcx_before_final: AtomicBool,
     // Link custody orders the notrack latch against DNS activation and status publication.
     shadow: GatewayShadow,
@@ -556,13 +556,13 @@ impl GatewayPublisher {
             },
             maps,
             conntrack,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             host: None,
             budget,
             shadow,
             active_plan,
             failure: Default::default(),
-            #[cfg(all(test, feature = "ebpf"))]
+            #[cfg(all(test, feature = "packet-ebpf"))]
             replace_tcx_before_final: AtomicBool::new(false),
         }
     }
@@ -572,12 +572,12 @@ impl GatewayPublisher {
         self.maps.set_mode_flags(flags)
     }
 
-    #[cfg(all(test, feature = "ebpf"))]
+    #[cfg(all(test, feature = "packet-ebpf"))]
     pub(crate) fn fingerprint(&self) -> [u8; 32] {
         self.state.inner.lock().current.policy.bytecode.fingerprint
     }
 
-    #[cfg(all(test, feature = "ebpf"))]
+    #[cfg(all(test, feature = "packet-ebpf"))]
     pub(super) fn auxiliary_program(&self, outer: u32) -> io::Result<Option<u32>> {
         let inner = self.state.inner.lock();
         let Some(member) = inner
@@ -595,7 +595,7 @@ impl GatewayPublisher {
         Ok(Some(id))
     }
 
-    #[cfg(all(test, feature = "ebpf"))]
+    #[cfg(all(test, feature = "packet-ebpf"))]
     pub(super) fn check_unhealthy_auxiliary_retry(&self) -> io::Result<()> {
         let (realm, scope, direction, pair) = {
             let inner = self.state.inner.lock();
@@ -627,7 +627,7 @@ impl GatewayPublisher {
         Ok(())
     }
 
-    #[cfg(all(test, feature = "ebpf"))]
+    #[cfg(all(test, feature = "packet-ebpf"))]
     pub(super) fn unbound_quota_programs(
         &self,
         ifindex: u32,
@@ -727,7 +727,7 @@ impl GatewayPublisher {
         Ok(())
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(super) fn prepare_host(&mut self, host: HostResources) -> io::Result<()> {
         let inner = self.state.inner.get_mut();
         let count = self.maps.host_realms().len();
@@ -748,12 +748,12 @@ impl GatewayPublisher {
         Ok(())
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(super) fn maps(&self) -> &GatewayMaps {
         &self.maps
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(super) fn host_conntrack(&self) -> io::Result<&HostConntrack> {
         self.host
             .as_ref()
@@ -761,7 +761,7 @@ impl GatewayPublisher {
             .ok_or_else(lost_capture)
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(super) fn synchronize_host_input(&self) -> io::Result<()> {
         self.host
             .as_ref()
@@ -770,7 +770,7 @@ impl GatewayPublisher {
             .synchronize_readers()
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(crate) fn host_process_lookup(&self) -> io::Result<HostProcessLookup> {
         let host = self
             .host
@@ -782,12 +782,12 @@ impl GatewayPublisher {
         })
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(super) fn host_pending_drain(&self, realm: u32, binding: u64) -> io::Result<Option<u64>> {
         self.maps.host_pending_drain(realm, binding)
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(super) fn host_input_drained(
         &self,
         realm: u32,
@@ -849,7 +849,7 @@ impl GatewayPublisher {
                 load,
                 lan_ct.ok_or_else(lost_capture)?,
             )?,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             AuxDirection::HostEgress { binding, is_l2, .. } => {
                 let host = self.host.as_ref().ok_or_else(lost_capture)?;
                 let bytecode = generation
@@ -904,7 +904,7 @@ impl GatewayPublisher {
         )
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn bind_host(
         &self,
@@ -977,7 +977,7 @@ impl GatewayPublisher {
                 "gateway auxiliary binding still owned",
             ));
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         // Host policy generations retain the same atomic root for the lifetime of the pair.
         let broadcasts = if matches!(direction, AuxDirection::HostEgress { .. }) {
             pair.replace_host_broadcasts(broadcasts)?;
@@ -1002,7 +1002,7 @@ impl GatewayPublisher {
         let fd = program.program.as_fd();
         let link = match direction {
             AuxDirection::LanIngress => AuxTcxLink::outer(&member.pair, fd, &self.budget)?,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             AuxDirection::HostEgress { .. } => {
                 AuxTcxLink::host_egress(&member.pair, fd, &self.budget)?
             }
@@ -1015,7 +1015,7 @@ impl GatewayPublisher {
         let opened = (|| {
             self.maps.bind_aux_realm(&member.pair, realm)?;
             member.key_bound = true;
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             if let AuxDirection::HostEgress { binding, .. } = member.direction {
                 self.maps.bind_host_realm(realm, binding)?;
                 member.host_bound = true;
@@ -1099,7 +1099,7 @@ impl GatewayPublisher {
         if let Some(aux) = inner.auxiliary.as_mut()
             && let Some(member) = aux.members.iter_mut().find(|m| m.realm == realm)
         {
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             if matches!(member.direction, AuxDirection::HostEgress { .. }) {
                 if member.program.is_none() {
                     return Ok(());
@@ -1155,7 +1155,7 @@ impl GatewayPublisher {
                     .clear_aux_realm(realm, arbitration, &self.budget)?;
                 index
             }
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             AuxDirection::HostEgress { binding, .. } if member.host_bound => {
                 if member.retiring {
                     return Err(publisher_busy());
@@ -1178,7 +1178,7 @@ impl GatewayPublisher {
                 result?;
                 index
             }
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             AuxDirection::HostEgress { .. } => index,
         };
         if let Some(previous) = &mut inner.previous {
@@ -1244,7 +1244,7 @@ impl GatewayPublisher {
             inner.final_publication = Some((fingerprint, generation));
             return Ok(());
         }
-        #[cfg(all(test, feature = "ebpf"))]
+        #[cfg(all(test, feature = "packet-ebpf"))]
         let replacement = if recover && self.replace_tcx_before_final.swap(false, Ordering::AcqRel)
         {
             Some(tests::replace_final_target(self, inner)?)
@@ -1252,7 +1252,7 @@ impl GatewayPublisher {
             None
         };
         let verified = self.verify_auxiliary_targets(inner.auxiliary.as_deref_mut(), None);
-        #[cfg(all(test, feature = "ebpf"))]
+        #[cfg(all(test, feature = "packet-ebpf"))]
         if let Some((realm, replacement)) = replacement {
             tests::restore_and_check_withdrawal(self, inner, realm, replacement)?;
         }
@@ -1308,9 +1308,9 @@ impl GatewayPublisher {
         if let Some(error) = self.capture_error() {
             return Err(error);
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         let host = self.host.as_ref().map(HostResources::arbitration);
-        #[cfg(not(feature = "ebpf"))]
+        #[cfg(not(feature = "packet-ebpf"))]
         let host = None;
         let lan = inner.current.arbitration.as_ref().map(|a| &a.kernel);
         if lan.is_some() || host.is_some() {
@@ -1406,7 +1406,7 @@ mod tests {
 
     // The guarded guest changes the actual link target while the publication lock excludes
     // the watcher. Both programs have identical policy, fact maps, DNS and arbitration.
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(super) fn replace_final_target(
         publisher: &GatewayPublisher,
         inner: &PublisherInner,
@@ -1428,7 +1428,7 @@ mod tests {
         Ok((member.realm, next))
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(super) fn restore_and_check_withdrawal(
         publisher: &GatewayPublisher,
         inner: &mut PublisherInner,
@@ -1457,7 +1457,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     #[test]
     fn host_execution_scopes_are_distinct_from_the_shared_dns_scope() {
         let host_scope = ScopeId::allocate().unwrap();

@@ -118,7 +118,7 @@ impl TunDevice {
         Ok(())
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     pub(crate) fn prepare_host_fifo(&self, name: &str, slots: u32) -> anyhow::Result<()> {
         ensure!(slots != 0, "private Host FIFO capacity is zero");
         let mut netlink = NlSock::new()?;
@@ -773,12 +773,12 @@ impl TunSetup {
     /// subscribed after the last own change, so any notice on it is foreign.
     pub(super) fn prepare(
         config: &Config,
-        #[cfg(feature = "ebpf")] source: Option<&mut super::source::Source>,
+        #[cfg(feature = "packet-ebpf")] source: Option<&mut super::source::Source>,
     ) -> anyhow::Result<(Self, TunDevice, Topology)> {
         Self::prepare_in(
             config,
             honk_config::paths::data_dir(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             source,
         )
     }
@@ -786,7 +786,7 @@ impl TunSetup {
     fn prepare_in(
         config: &Config,
         data_dir: &Path,
-        #[cfg(feature = "ebpf")] source: Option<&mut super::source::Source>,
+        #[cfg(feature = "packet-ebpf")] source: Option<&mut super::source::Source>,
     ) -> anyhow::Result<(Self, TunDevice, Topology)> {
         ensure!(
             !SOURCE_SHA.is_empty(),
@@ -823,7 +823,7 @@ impl TunSetup {
             netlink,
         };
         match setup.install(
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "packet-ebpf")]
             source,
         ) {
             Ok((device, guarded)) => {
@@ -837,11 +837,11 @@ impl TunSetup {
 
     fn install(
         &mut self,
-        #[cfg(feature = "ebpf")] source: Option<&mut super::source::Source>,
+        #[cfg(feature = "packet-ebpf")] source: Option<&mut super::source::Source>,
     ) -> anyhow::Result<(TunDevice, Topology)> {
         let device = self.create_link()?;
         let ifindex = device.ifindex;
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         if let Some(source) = source {
             source.bind(device.as_raw_fd(), ifindex, device.incarnation)?;
         }

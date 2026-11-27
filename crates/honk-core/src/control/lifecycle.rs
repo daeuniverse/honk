@@ -39,7 +39,7 @@ pub(super) struct RuntimeEpoch {
     removal_errors: mpsc::UnboundedReceiver<anyhow::Error>,
     critical_errors: mpsc::UnboundedReceiver<anyhow::Error>,
     health_updates: Option<HealthUpdates>,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     queue: Option<NfqueueRuntime>,
 }
 
@@ -394,7 +394,7 @@ enum EpochEvent {
         )>,
     ),
     Fatal(anyhow::Error),
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     TokenExhausted,
     Reaped,
 }
@@ -410,12 +410,12 @@ impl RuntimeEpoch {
             error = self.removal_errors.recv() => EpochEvent::Fatal(error.unwrap_or_else(|| anyhow::anyhow!("UDP removal owner stopped"))),
             error = self.critical_errors.recv() => EpochEvent::Fatal(error.unwrap_or_else(|| anyhow::anyhow!("critical runtime owner stopped"))),
             event = async {
-                #[cfg(feature = "ebpf")]
+                #[cfg(feature = "legacy-tc")]
                 { match wait_nfqueue_event(&mut self.queue, &plane.ebpf).await {
                     NfqueueRuntimeEvent::Fatal(error) => EpochEvent::Fatal(error),
                     NfqueueRuntimeEvent::TokenExhausted => EpochEvent::TokenExhausted,
                 } }
-                #[cfg(not(feature = "ebpf"))]
+                #[cfg(not(feature = "legacy-tc"))]
                 { std::future::pending::<EpochEvent>().await }
             } => event,
             command = commands.recv() => EpochEvent::Command(command),
@@ -497,7 +497,7 @@ impl ControlPlane {
                         }
                     }
                     EpochEvent::Fatal(error) => fatal = Some(error),
-                    #[cfg(feature = "ebpf")]
+                    #[cfg(feature = "legacy-tc")]
                     EpochEvent::TokenExhausted => {
                         if let Some(queue) = active.queue.as_mut()
                             && let Err(error) = self.recover_nfqueue_token_exhaustion(queue).await

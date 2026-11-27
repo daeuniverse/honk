@@ -9,7 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 const FACT_CAPACITY: u32 = 2_048_000;
 
-#[cfg(all(test, feature = "ebpf"))]
+#[cfg(all(test, feature = "packet-ebpf"))]
 mod tests;
 
 pub(crate) struct GatewayPolicy {

@@ -6,7 +6,7 @@ use crate::dns::query::{IngressProfile, is_exact_dns_query, validate_exact_dns_q
 #[cfg(feature = "native-api")]
 pub(super) mod reload_harness;
 pub(crate) mod support;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 use support::KernelUdpReplySocketFactory;
 use support::{
     FailingUdpTestReplySocketFactory, UdpTestHandler, UdpTestMode, addr, assert_udp_outbound,
@@ -16,21 +16,21 @@ use support::{
 };
 
 mod admission;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 mod bond_binding;
 mod diagnostics;
 mod dns_tcp_ownership;
 mod dns_udp_ownership;
 mod health;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 mod nfqueue_retirement;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 mod tcp_binding;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 mod tcp_tuple_reuse;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 mod udp_fullcone;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 mod vlan_frames;
 
 #[tokio::test]
@@ -147,7 +147,7 @@ async fn health_push_re_resolves_after_reload_writer() {
     assert!(backend.get_outbound_alive(3, 1, 0).unwrap());
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[test]
 fn nfqueue_actor_queue_bounds_small_and_max_payloads() {
     let stats = Arc::new(StatsManager::new());
@@ -182,7 +182,7 @@ fn nfqueue_actor_queue_bounds_small_and_max_payloads() {
     assert_eq!(empty.actor_oldest_age_nanos, 0);
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[tokio::test]
 async fn nfqueue_startup_degradation_clears_config_and_effective_flag() {
     use honk_ebpf_common::{DATAPATH_FLAG_NFQ_ENABLED, DATAPATH_FLAG_NFQ_READY};
@@ -251,7 +251,7 @@ async fn nfqueue_startup_degradation_clears_config_and_effective_flag() {
     );
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[test]
 fn nfqueue_actor_acquires_slow_permits_only_at_dequeue() {
     let limit = Arc::new(tokio::sync::Semaphore::new(1));
@@ -268,7 +268,7 @@ fn nfqueue_actor_acquires_slow_permits_only_at_dequeue() {
     assert!(queue.dequeue(0, true).is_some());
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[test]
 fn nfqueue_token_retry_backoff_caps_at_thirty_seconds() {
     let mut backoff = NfqueueTokenRetryBackoff::default();
@@ -3671,7 +3671,7 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
         super::UdpSlowPathWork::Dns { .. } | super::UdpSlowPathWork::DnsRefused { .. } => {
             panic!("non-DNS follower must not take the DNS branch")
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         super::UdpSlowPathWork::QueuedDatagram { .. } => {
             panic!("socket follower must not defer queue publication")
         }
@@ -4619,7 +4619,7 @@ fn link_lifecycle_cp(backend: crate::ebpf::mock::MockEbpfBackend) -> ControlPlan
     .unwrap()
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[tokio::test]
 async fn exhausted_udp_tokens_wait_for_a_rollback_safe_generation() {
     use honk_ebpf_common::conn::{ConnState, UdpDecisionState};
@@ -4987,7 +4987,7 @@ async fn retirement_worker_escalates_auxiliary_token_mismatch() {
     removal_task.await.unwrap();
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 fn fresh_test_netns() -> std::os::fd::OwnedFd {
     std::thread::spawn(|| {
         nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).expect("unshare test netns");
@@ -4999,7 +4999,7 @@ fn fresh_test_netns() -> std::os::fd::OwnedFd {
     .expect("create test netns")
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 fn in_test_netns<T>(netns: &std::os::fd::OwnedFd, f: impl FnOnce() -> T) -> T {
     let current = std::fs::File::open("/proc/thread-self/ns/net").expect("open current netns");
     nix::sched::setns(netns, nix::sched::CloneFlags::CLONE_NEWNET).expect("enter test netns");
@@ -5011,10 +5011,10 @@ fn in_test_netns<T>(netns: &std::os::fd::OwnedFd, f: impl FnOnce() -> T) -> T {
     }
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 const NETNS_TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 fn wait_for_test_address(address: std::net::IpAddr) {
     let std::net::IpAddr::V6(address) = address else {
         return;
@@ -5043,7 +5043,7 @@ fn wait_for_test_address(address: std::net::IpAddr) {
     }
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 fn configure_test_edge(
     netns: &std::os::fd::OwnedFd,
     interface: &str,
@@ -5120,7 +5120,7 @@ fn configure_test_edge(
     })
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 #[test]
 #[ignore = "requires root, bpffs, nftables, and eBPF TC support"]
 fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
@@ -5509,7 +5509,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
     .map_err(|_| anyhow::anyhow!("NFQUEUE network test thread panicked"))?
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 struct NfqueueRuntimeFixture {
     runtime: NfqueueRuntime,
     listener_fatal_tx: tokio::sync::oneshot::Sender<honk_nfqueue::FatalError>,
@@ -5517,7 +5517,7 @@ struct NfqueueRuntimeFixture {
     ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 fn stop_waiting_task(stop: &tokio::sync::watch::Sender<bool>) -> tokio::task::JoinHandle<()> {
     let mut rx = stop.subscribe();
     tokio::spawn(async move {
@@ -5525,7 +5525,7 @@ fn stop_waiting_task(stop: &tokio::sync::watch::Sender<bool>) -> tokio::task::Jo
     })
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 fn nfqueue_runtime_fixture(
     watchdog: tokio::task::JoinHandle<()>,
     ingest_worker: tokio::task::JoinHandle<()>,
@@ -5568,7 +5568,7 @@ fn nfqueue_runtime_fixture(
     }
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[tokio::test]
 async fn nfqueue_watchdog_exit_completes_shutdown_without_double_join() {
     let (stop, _) = tokio::sync::watch::channel(false);
@@ -5596,7 +5596,7 @@ async fn nfqueue_watchdog_exit_completes_shutdown_without_double_join() {
     assert!(!fixture.listener_fatal_tx.is_closed());
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[tokio::test]
 async fn nfqueue_ingest_actor_exit_completes_shutdown_without_double_join() {
     let (stop, _) = tokio::sync::watch::channel(false);
@@ -5624,7 +5624,7 @@ async fn nfqueue_ingest_actor_exit_completes_shutdown_without_double_join() {
     assert!(!fixture.listener_fatal_tx.is_closed());
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[tokio::test]
 async fn nfqueue_stats_sampler_exit_completes_shutdown_without_double_join() {
     let (stop, _) = tokio::sync::watch::channel(false);

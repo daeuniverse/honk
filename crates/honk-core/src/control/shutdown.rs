@@ -2,7 +2,7 @@ use super::lifecycle::STAGE_TIMEOUT;
 use super::*;
 
 impl ControlPlane {
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub(super) async fn cleanup_nfqueue_startup_failure(
         &mut self,
         runtime: &mut Option<NfqueueRuntime>,

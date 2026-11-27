@@ -781,7 +781,7 @@ mod tests {
     }
 
     /// The documented API shape of an interface binding degradation.
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     #[tokio::test]
     async fn runtime_projects_the_interface_binding_degradation() {
         let state = state().await;

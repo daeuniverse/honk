@@ -621,13 +621,16 @@ impl DbStore {
     }
 }
 
-/// The active revision as one runnable document, read without writing the db
-/// whether or not a daemon holds it open.
-pub(crate) fn export(data_dir: &Path, with_secrets: bool) -> Result<String, StoreError> {
+/// Snapshot the active sources before claiming write ownership. A present, empty DB still imports `-c`.
+pub(super) fn read_active(
+    data_dir: &Path,
+) -> Result<Option<(LoadedConfig, StoredSecrets)>, StoreError> {
     let (_directory, mut connection) = crate::state::open_read_only(data_dir)?;
     let (root, revision, secrets) = {
         let transaction = connection.transaction().map_err(sql)?;
-        let (_, root, revision) = active_revision(&transaction)?.ok_or(StoreError::Invalid)?;
+        let Some((_, root, revision)) = active_revision(&transaction)? else {
+            return Ok(None);
+        };
         let secrets = listener_secrets(&transaction)?;
         transaction.commit().map_err(sql)?;
         (root, revision, secrets)
@@ -645,6 +648,12 @@ pub(crate) fn export(data_dir: &Path, with_secrets: bool) -> Result<String, Stor
         &mut Vec::new(),
     )
     .map_err(|_| StoreError::Corrupt)?;
+    Ok(Some((loaded, secrets)))
+}
+
+/// The active revision as one runnable document, read without writing the db.
+pub(crate) fn export(data_dir: &Path, with_secrets: bool) -> Result<String, StoreError> {
+    let (loaded, secrets) = read_active(data_dir)?.ok_or(StoreError::Invalid)?;
     let text = inline_sources(&loaded.sources).map_err(|_| StoreError::Corrupt)?;
     if with_secrets {
         restore_listener_secrets(&text, &secrets.native_api, &secrets.clash_api)

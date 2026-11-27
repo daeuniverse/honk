@@ -33,7 +33,7 @@ use tracing::debug;
 
 /// How an observed UDP connection ended.
 #[cfg_attr(
-    not(all(feature = "native-api", feature = "ebpf")),
+    not(all(feature = "native-api", feature = "legacy-tc")),
     allow(
         dead_code,
         reason = "builds name only the outcomes their engine paths report"
@@ -139,7 +139,7 @@ pub(in crate::control) use source::{SourceAttachment, SourcePath, SourcePreparat
 use source::{SourceEndpoint, SourceOwner, SourceRetirement, SourceScope};
 #[doc(hidden)]
 pub mod bench_support;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(in crate::control) use admission::OwnedEnqueueError;
 pub(in crate::control) use admission::{
     DatagramPayload, EndpointReservation, FundedDatagram, QueuedDatagram, RawDnsRoute,
@@ -1089,7 +1089,7 @@ impl UdpEndpointPool {
             .contains_key(&EndpointKey::new(scope, client, dst, packet_lineage))
     }
 
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
     pub(in crate::control) fn retains_host_udp(
         &self,
         scope: ScopeId,

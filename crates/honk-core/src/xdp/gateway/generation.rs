@@ -250,15 +250,15 @@ impl GatewayPublisher {
             ));
         }
         let host_enabled = !self.maps.host_realms().is_empty();
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         let prepared = self.host.is_some();
-        #[cfg(not(feature = "ebpf"))]
+        #[cfg(not(feature = "packet-ebpf"))]
         let prepared = false;
         if host_enabled != prepared || host_enabled != inner.current.policy.host_bytecode.is_some()
         {
             return Err(self.fail_capture(io::Error::other("Host gateway preparation mismatch")));
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "packet-ebpf")]
         if let Some(host) = &self.host
             && host.identity.pname_support() == crate::ebpf::PnameSupport::Unavailable
             && plan.features & honk_ebpf_common::ROUTING_FEATURE_PROCESS != 0

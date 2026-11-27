@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 pub(in crate::ebpf) const BTF_HEADER_LEN: usize = 24;
 
-// Only raw BTF parses here; an ELF debug vmlinux needs HONK_VMLINUX_BTF pointed at its extracted `.BTF`.
-const VMLINUX_BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
-// OpenWrt's vmlinux-btf package installs a detached raw BTF blob here for kernels built without BTF.
-const VMLINUX_BTF_FALLBACK_PATH: &str = "/usr/lib/debug/boot/vmlinux";
-const VMLINUX_BTF_ENV: &str = "HONK_VMLINUX_BTF";
-
+#[cfg(feature = "legacy-tc")]
 pub(crate) fn load_kernel() -> anyhow::Result<(Vec<u8>, aya::Btf)> {
+    // Only raw BTF parses here; an ELF debug vmlinux needs HONK_VMLINUX_BTF pointed at its extracted `.BTF`.
+    const VMLINUX_BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
+    // OpenWrt's vmlinux-btf package installs a detached raw BTF blob here for kernels built without BTF.
+    const VMLINUX_BTF_FALLBACK_PATH: &str = "/usr/lib/debug/boot/vmlinux";
+    const VMLINUX_BTF_ENV: &str = "HONK_VMLINUX_BTF";
     let data = if let Some(path) = std::env::var_os(VMLINUX_BTF_ENV) {
         std::fs::read(&path).with_context(|| {
             format!(
@@ -258,6 +258,7 @@ impl<'a> Btf<'a> {
         None
     }
 
+    #[cfg(feature = "legacy-tc")]
     pub(in crate::ebpf) fn unsigned_integer_width(&self, type_id: u32, width: u32) -> bool {
         let Some(cursor) = self.resolve_modifiers(type_id) else {
             return false;
@@ -267,6 +268,7 @@ impl<'a> Btf<'a> {
             && self.u32_at(cursor + 12) == width.checked_mul(8)
     }
 
+    #[cfg(feature = "legacy-tc")]
     pub(in crate::ebpf) fn member_offset(&self, type_name: &str, member_name: &str) -> Option<u32> {
         self.composite_member_offset(self.find_type(4, type_name)?, member_name, 0, None)
     }

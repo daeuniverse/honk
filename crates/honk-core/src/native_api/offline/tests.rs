@@ -106,7 +106,7 @@ fn tun_offline_admission_uses_the_runtime_policy_validator() {
         candidate.config.routing = condition;
         assert_eq!(
             admit(candidate, &active).is_ok(),
-            cfg!(feature = "ebpf"),
+            cfg!(feature = "packet-ebpf"),
             "offline Host process admission must use the executable's real build boundary"
         );
     }
@@ -997,4 +997,17 @@ fn a_sized_read_keeps_whatever_the_file_holds_when_its_length_changed() {
     assert_eq!(&*read_sized(&bytes[..], 4).unwrap(), bytes);
     assert_eq!(&*read_sized(&bytes[..], 64).unwrap(), bytes);
     assert!(read_sized(&[][..], 0).unwrap().is_empty());
+}
+
+#[cfg(all(feature = "packet-ebpf", not(feature = "legacy-tc")))]
+#[test]
+fn packet_only_offline_rejects_an_implicit_tc_backend() {
+    let temp = tempfile::tempdir().unwrap();
+    let loaded = fixture(temp.path(), "");
+    let active = loaded.config.clone();
+    let error = admit(loaded, &active)
+        .err()
+        .expect("TC must fail offline admission");
+    assert_eq!(error.diagnostic.message, crate::TC_BUILD_ERROR);
+    assert!(!temp.path().join("state").exists());
 }

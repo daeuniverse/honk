@@ -1035,7 +1035,7 @@ async fn host_bound_dns_serves_offline_and_learns_live_loopback_queries() {
     controller.shutdown(Duration::from_secs(1)).await;
 }
 
-#[cfg(all(target_os = "linux", feature = "ebpf"))]
+#[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
 #[test]
 #[ignore = "requires the disposable kernel VM gate and SO_MARK privileges"]
 fn tun_prepared_listener_marks_tcp_udp_and_accepted_sockets() {

@@ -423,7 +423,7 @@ impl PacketEndpoints {
         }
     }
 
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
     pub(crate) fn retains_host_flow(
         &self,
         scope: ScopeId,
@@ -932,7 +932,7 @@ impl PacketEndpoints {
         }
         let (scope, _claim) =
             self.execution_owner(scope, honk_netstack::wire::PacketView::from_slice(packet))?;
-        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
         if admission.is_some() && scope.is_gateway_host() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1239,7 +1239,7 @@ impl PacketEndpoints {
             Some(source) => source.hold(scope)?,
             None => scope.hold_source(source.ip())?,
         };
-        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
         let source_work = {
             let mut work = source_work;
             work.admit_udp_process(source, destination)?;

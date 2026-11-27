@@ -806,12 +806,12 @@ impl EbpfBackend for MockEbpfBackend {
     fn detach_hooks(&mut self) -> anyhow::Result<()> {
         self.detach_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         self.bound_interfaces.clear();
         Ok(())
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     fn interface_binding_snapshot(&self) -> anyhow::Result<ebpf::interface::BindingSnapshot> {
         let owned = self
             .bound_interfaces
@@ -824,7 +824,7 @@ impl EbpfBackend for MockEbpfBackend {
         })
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     fn prepare_tc_programs(
         &self,
         _programs: &[ebpf::interface::TcProgram],
@@ -836,7 +836,7 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(None)
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     fn commit_interface_bindings(
         &mut self,
         commit: ebpf::interface::BindingCommit,

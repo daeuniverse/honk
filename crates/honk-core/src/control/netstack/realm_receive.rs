@@ -448,7 +448,7 @@ impl PacketScope {
 }
 
 impl Inner {
-    #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+    #[cfg(any(test, all(target_os = "linux", feature = "packet-ebpf")))]
     pub(super) fn bind_host_process(
         &mut self,
         rx: Rx,

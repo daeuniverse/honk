@@ -1,10 +1,10 @@
 //! eBPF backend abstraction.
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 pub(crate) mod common;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 pub(crate) mod host_bank;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) mod interface;
 pub mod map_snapshot;
 pub mod maps;
@@ -16,11 +16,11 @@ pub mod userspace;
 #[cfg(target_os = "linux")]
 pub use crate::xdp::gateway::GatewayPublisher;
 pub use retirement::*;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub mod real;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub use real::TcpKernelPin;
-#[cfg(all(test, feature = "ebpf"))]
+#[cfg(all(test, feature = "legacy-tc"))]
 pub(crate) mod test_support;
 
 /// Resume state for a bounded traversal of one tuple map. A completed traversal
@@ -56,7 +56,7 @@ pub struct TcpChildProofPending;
 
 pub enum TcpPin {
     Model,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     Kernel(TcpKernelPin),
 }
 
@@ -64,7 +64,7 @@ impl TcpPin {
     pub(crate) fn release(self) -> anyhow::Result<()> {
         match self {
             Self::Model => Ok(()),
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             Self::Kernel(pin) => pin.release(),
         }
     }
@@ -748,11 +748,11 @@ pub trait EbpfBackend: PolicyBackend {
 
     /// Snapshot what this backend owns for the interface reconciler: program
     /// FDs plus dup'd link FDs.
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     fn interface_binding_snapshot(&self) -> anyhow::Result<interface::BindingSnapshot>;
 
     /// Prepare a blocking verifier job without retaining backend ownership.
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     fn prepare_tc_programs(
         &self,
         _programs: &[interface::TcProgram],
@@ -761,14 +761,14 @@ pub trait EbpfBackend: PolicyBackend {
     }
 
     /// Install the current routing generation before making prepared targets bindable.
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     fn commit_tc_programs(&mut self, _batch: real::programs::TcProgramBatch) -> anyhow::Result<()> {
         Ok(())
     }
 
     /// Apply the commit and return replaced or removed link FDs. The caller
     /// must close them outside any lock: the last close takes the rtnl lock.
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     fn commit_interface_bindings(
         &mut self,
         commit: interface::BindingCommit,
@@ -918,7 +918,7 @@ pub trait EbpfBackend: PolicyBackend {
         Err("kernel_trace_unsupported")
     }
 
-    #[cfg(all(feature = "ebpf", feature = "native-api"))]
+    #[cfg(all(feature = "legacy-tc", feature = "native-api"))]
     fn prepare_receive_trace(&self) -> Option<real::programs::ReceiveTracePreparation> {
         None
     }

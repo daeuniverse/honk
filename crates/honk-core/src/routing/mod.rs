@@ -10,7 +10,7 @@ mod fingerprint;
 pub(crate) mod firewall;
 mod geo;
 mod ir;
-#[cfg(any(feature = "ebpf", test))]
+#[cfg(any(feature = "legacy-tc", test))]
 mod lan_protection;
 mod lpm;
 

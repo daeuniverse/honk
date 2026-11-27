@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const WAIT: Duration = Duration::from_secs(20);
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 impl ControlPlane {
     pub(crate) fn tc_health_fixture(
         config: Config,
@@ -354,7 +354,7 @@ async fn ordinary_shutdown_preserves_live_tcp_until_graceful_completion() -> any
     Ok(())
 }
 
-#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "native-api", feature = "legacy-tc", target_os = "linux"))]
 #[tokio::test]
 async fn a_socket_without_any_receive_trace_is_untraced() {
     use std::os::fd::{FromRawFd, IntoRawFd};
@@ -374,7 +374,7 @@ async fn a_socket_without_any_receive_trace_is_untraced() {
     );
 }
 
-#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "native-api", feature = "legacy-tc", target_os = "linux"))]
 #[test]
 fn udp_trace_is_reported_until_a_listener_generation_traces() {
     let degradations = crate::degradations::Degradations::default();

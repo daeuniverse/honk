@@ -764,3 +764,81 @@ fn test_mode_command_rejects_dae_without_rewriting() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[cfg(all(feature = "packet-ebpf", not(feature = "legacy-tc")))]
+#[tokio::test]
+async fn packet_only_daemon_returns_exit_one_before_side_effects() {
+    let root = tempfile::tempdir().unwrap();
+    let entry = root.path().join("config.dae");
+    let data = root.path().join("unused-data");
+    let tc = "TC backend is unavailable in this packet-only build; select xdp or tun, or rebuild with --features ebpf";
+    let tun = "datapath {\n backend: tun\n direct: endpoint\n tun {\n name: honk0\n address4: 198.18.0.1/32\n table: 202\n rule_priority: 10000\n capture { 0.0.0.0/0 }\n }\n}";
+    let xdp = "datapath {\n backend: xdp\n direct: endpoint\n interface { eth0: lan }\n}";
+    async fn refused(
+        entry: &std::path::Path,
+        data: &std::path::Path,
+        args: &[&str],
+        expected: &str,
+    ) {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_honk-core"));
+        command
+            .kill_on_drop(true)
+            .arg("-c")
+            .arg(entry)
+            .arg("--data-dir")
+            .arg(data)
+            .args(args);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
+            .await
+            .expect("rejected configuration must exit")
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(!data.exists(), "refusal created a runtime directory");
+    }
+    for flag in ["-b", "--bpf-object"] {
+        refused(
+            &entry,
+            &data,
+            &[flag, "/unread-object"],
+            "--bpf-object requires legacy-tc support",
+        )
+        .await;
+    }
+    for (global, datapath, error) in [
+        ("lan_interface: lan0\n wan_interface: wan0", "", tc),
+        ("nfqueue_enable: false", "datapath { backend: tc }", tc),
+        ("", tun, "TUN requires global.nfqueue_enable: false"),
+        (
+            "nfqueue_enable: true",
+            tun,
+            "TUN requires global.nfqueue_enable: false",
+        ),
+        (
+            "",
+            xdp,
+            "XDP requires global.nfqueue_enable: false; NFQUEUE is not an XDP fallback",
+        ),
+        (
+            "nfqueue_enable: true",
+            xdp,
+            "XDP requires global.nfqueue_enable: false; NFQUEUE is not an XDP fallback",
+        ),
+    ] {
+        std::fs::write(
+            &entry,
+            format!(
+                "global {{\n data_dir: '{}'\n {global}\n}}\n{datapath}\n",
+                data.display()
+            ),
+        )
+        .unwrap();
+        refused(&entry, &data, &[], error).await;
+        if error == tc {
+            refused(&entry, &data, &["--mock-ebpf"], tc).await;
+        }
+        #[cfg(feature = "native-api")]
+        refused(&entry, &data, &["--store", "db"], error).await;
+    }
+}
