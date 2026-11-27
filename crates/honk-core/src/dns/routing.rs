@@ -192,9 +192,7 @@ mod compiler {
                 })?)
             }
             DnsDomainMatcher::Geosite(code) => {
-                // `geosite_domains` already warns when a code expands to nothing.
-                let domains = assets.geosite_domains(std::slice::from_ref(code));
-                CompiledDomainMatcher::Geosite(shared.geosite(code, &domains))
+                CompiledDomainMatcher::Geosite(shared.geosite(code, assets))
             }
         })
     }

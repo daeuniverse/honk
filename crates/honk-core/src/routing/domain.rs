@@ -1,8 +1,11 @@
 //! Domain predicate matchers, geosite expansion matcher, and their build-local interner.
 
-use super::bounded_any;
+use super::{GeoAssets, SharedMatchers, bounded_any};
 use honk_ebpf_common::ROUTING_FACT_CAPACITY;
 use regex::Regex;
+use sha2::{Digest, Sha256};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -33,7 +36,7 @@ pub(crate) struct GeositeMatcher {
 }
 
 impl GeositeMatcher {
-    pub(crate) fn build(domains: &[GeositeDomain]) -> Self {
+    pub(crate) fn build<'a>(domains: impl IntoIterator<Item = &'a GeositeDomain>) -> Self {
         let mut matcher = GeositeMatcher::default();
         let mut keywords: Vec<&str> = Vec::new();
         for d in domains {
@@ -89,11 +92,47 @@ impl GeositeMatcher {
     }
 }
 
-pub(super) type DomainMatcherKey = Vec<(u8, String)>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct DomainMatcherDigest([u8; 32]);
+
+impl DomainMatcherDigest {
+    pub(super) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    fn from_entries(mut entries: Vec<(u8, Cow<'_, str>)>) -> Self {
+        entries.sort_unstable();
+        entries.dedup();
+        let mut hash = Sha256::new();
+        hash.update(b"honk.domain-matcher-key.v1\0");
+        hash.update((entries.len() as u64).to_le_bytes());
+        for (tag, text) in entries {
+            hash.update([tag]);
+            hash.update((text.len() as u64).to_le_bytes());
+            hash.update(text.as_bytes());
+        }
+        Self(hash.finalize().into())
+    }
+
+    pub(super) fn geosite<'a>(entries: impl Iterator<Item = &'a GeositeDomain>) -> Self {
+        Self::from_entries(entries.map(GeositeDomain::alternative).collect())
+    }
+}
+
+impl GeositeDomain {
+    fn alternative(&self) -> (u8, Cow<'_, str>) {
+        match self {
+            Self::Full(value) => (3, lowercase(value)),
+            Self::Domain(value) => (4, lowercase(value)),
+            Self::Keyword(value) => (5, Cow::Borrowed(value)),
+            Self::Regex(value) => (6, Cow::Borrowed(value.as_str())),
+        }
+    }
+}
 
 /// One `domain(...)` call. Every entry, including expanded geosite codes, is
 /// an alternative: dae ORs the arguments of a single call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct DomainMatcher {
     patterns: Vec<Regex>,
     suffixes: Vec<String>,
@@ -103,14 +142,40 @@ pub(super) struct DomainMatcher {
 }
 
 impl DomainMatcher {
-    pub(super) fn new(
+    pub(super) fn from_selectors(
         domains: &[String],
         suffixes: &[String],
         keywords: &[String],
         regexes: &[String],
-        geosite: &[GeositeDomain],
+        codes: &[String],
+        assets: &GeoAssets,
+        shared: &mut SharedMatchers,
+    ) -> anyhow::Result<(DomainMatcherDigest, Self)> {
+        let mut selectors = Vec::new();
+        let mut matchers = Vec::new();
+        let mut seen = HashSet::new();
+        for code in codes {
+            let code = lowercase(code.trim());
+            let matcher = shared.normalized_geosite(&code, assets);
+            if codes.len() == 1 || seen.insert(Arc::as_ptr(&matcher)) {
+                matchers.push(matcher);
+                selectors.push(code);
+            }
+        }
+        let entries = selectors
+            .iter()
+            .flat_map(|code| assets.geosite_entries(code));
+        Self::new(domains, suffixes, keywords, regexes, entries, matchers)
+    }
+
+    pub(super) fn new<'a>(
+        domains: &[String],
+        suffixes: &[String],
+        keywords: &[String],
+        regexes: &[String],
+        geosite: impl IntoIterator<Item = &'a GeositeDomain>,
         matchers: Vec<Arc<GeositeMatcher>>,
-    ) -> anyhow::Result<(DomainMatcherKey, Self)> {
+    ) -> anyhow::Result<(DomainMatcherDigest, Self)> {
         let mut patterns = Vec::with_capacity(regexes.len() + domains.len());
         for pattern in regexes {
             patterns.push(
@@ -125,20 +190,14 @@ impl DomainMatcher {
                 })?,
             );
         }
-        let mut key = patterns
-            .iter()
-            .map(|pattern| (0, pattern.as_str().to_owned()))
-            .chain(suffixes.iter().cloned().map(|value| (1, value)))
-            .chain(keywords.iter().cloned().map(|value| (2, value)))
-            .chain(geosite.iter().map(|domain| match domain {
-                GeositeDomain::Full(value) => (3, value.to_lowercase()),
-                GeositeDomain::Domain(value) => (4, value.to_lowercase()),
-                GeositeDomain::Keyword(value) => (5, value.clone()),
-                GeositeDomain::Regex(value) => (6, value.as_str().to_owned()),
-            }))
-            .collect::<Vec<_>>();
-        key.sort();
-        key.dedup();
+        let mut entries = Vec::with_capacity(patterns.len() + suffixes.len() + keywords.len());
+        entries.extend(patterns.iter().map(|p| (0, Cow::Borrowed(p.as_str()))));
+        entries.extend(suffixes.iter().map(|s| (1, Cow::Borrowed(s.as_str()))));
+        entries.extend(keywords.iter().map(|s| (2, Cow::Borrowed(s.as_str()))));
+        for domain in geosite {
+            entries.push(domain.alternative());
+        }
+        let key = DomainMatcherDigest::from_entries(entries);
         Ok((
             key,
             Self {
@@ -187,29 +246,50 @@ pub(super) fn lowercase(domain: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Keys copy each matcher's whole expansion and are read only by interning and
-/// the policy fingerprint, so the built router keeps just `matchers`.
+/// First-seen order is part of the policy fingerprint and assigns bitmap positions.
 #[derive(Debug, Default)]
 pub(super) struct DomainRegistry {
-    pub(super) keys: Vec<DomainMatcherKey>,
+    pub(super) keys: Vec<DomainMatcherDigest>,
+    by_digest: HashMap<DomainMatcherDigest, u32>,
     pub(super) matchers: Vec<DomainMatcher>,
 }
 
 impl DomainRegistry {
+    pub(super) fn intern_single(
+        &mut self,
+        digest: DomainMatcherDigest,
+        matcher: Arc<GeositeMatcher>,
+    ) -> anyhow::Result<u32> {
+        self.insert(digest, || DomainMatcher {
+            geosite: vec![matcher],
+            ..Default::default()
+        })
+    }
+
     pub(super) fn intern(
         &mut self,
-        (key, matcher): (DomainMatcherKey, DomainMatcher),
+        (digest, matcher): (DomainMatcherDigest, DomainMatcher),
     ) -> anyhow::Result<u32> {
-        if let Some(id) = self.keys.iter().position(|candidate| *candidate == key) {
-            return Ok(id as u32);
-        }
+        self.insert(digest, || matcher)
+    }
+
+    fn insert(
+        &mut self,
+        key: DomainMatcherDigest,
+        build: impl FnOnce() -> DomainMatcher,
+    ) -> anyhow::Result<u32> {
+        let slot = match self.by_digest.entry(key) {
+            std::collections::hash_map::Entry::Occupied(slot) => return Ok(*slot.get()),
+            std::collections::hash_map::Entry::Vacant(slot) => slot,
+        };
         anyhow::ensure!(
             self.matchers.len() < ROUTING_FACT_CAPACITY,
             "routing policy has more than {ROUTING_FACT_CAPACITY} domain predicates"
         );
         let id = self.matchers.len() as u32;
         self.keys.push(key);
-        self.matchers.push(matcher);
+        self.matchers.push(build());
+        slot.insert(id);
         Ok(id)
     }
 }

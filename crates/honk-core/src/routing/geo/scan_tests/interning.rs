@@ -216,3 +216,62 @@ fn repeated_empty_selectors_share_across_routers_and_each_use_warns() {
         "{logged}"
     );
 }
+
+#[test]
+fn cached_and_mixed_digests_match_an_independent_owned_encoding() {
+    use std::collections::BTreeSet;
+    fn reference(entries: &[(u8, &str)]) -> [u8; 32] {
+        let entries: BTreeSet<(u8, String)> = entries
+            .iter()
+            .map(|&(tag, text)| (tag, text.to_owned()))
+            .collect();
+        let mut bytes = b"honk.domain-matcher-key.v1\0".to_vec();
+        bytes.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (tag, text) in entries {
+            bytes.push(tag);
+            bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        Sha256::digest(bytes).into()
+    }
+    let full = domain_msg(3, "Ä.example", &[("HOT", None)]);
+    let suffix = domain_msg(2, "É.example", &[]);
+    let keyword = domain_msg(0, "Key", &[]);
+    let regex = domain_msg(1, "x.+", &[]);
+    let dat = geosite_dat(&[
+        ("A", vec![keyword.clone(), full.clone(), full.clone()]),
+        ("B", vec![full, suffix, regex, keyword]),
+    ]);
+    let assets = assets_for(&dat, &["a", "b", "a@hot", "a@cold"]);
+    let mut registry = DomainRegistry::default();
+    let mut shared = SharedMatchers::default();
+    let a = &[(3, "ä.example"), (5, "Key")][..];
+    let both = &[(3, "ä.example"), (4, "é.example"), (5, "Key"), (6, "x.+")][..];
+    for (codes, expected) in [
+        (&["a"][..], a),
+        (&["A", " a "], a),
+        (&["a", "b"], both),
+        (&["b", "a"], both),
+        (&["a@hot"], &[(3, "ä.example")]),
+        (&["a@cold"], &[][..]),
+    ] {
+        let index = id(&sites(codes), &assets, &mut shared, &mut registry).unwrap() as usize;
+        assert_eq!(
+            registry.keys[index].as_bytes(),
+            &reference(expected),
+            "{codes:?}"
+        );
+    }
+    let mixed = RoutingCondition {
+        domain: vec!["*.test".into()],
+        domain_regex: vec![r"^.*\.test$".into(), "x.+".into()],
+        domain_suffix: vec!["é.example".into()],
+        domain_keyword: vec!["Key".into()],
+        ..sites(&["a", "b", " A "])
+    };
+    let index = id(&mixed, &assets, &mut shared, &mut registry).unwrap() as usize;
+    let mut expected = both.to_vec();
+    expected.extend([(0, r"^.*\.test$"), (0, "x.+"), (1, "é.example"), (2, "Key")]);
+    assert_eq!(registry.keys[index].as_bytes(), &reference(&expected));
+    assert_eq!(registry.matchers[index].geosite.len(), 2);
+}

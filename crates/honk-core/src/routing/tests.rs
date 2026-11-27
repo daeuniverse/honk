@@ -1279,16 +1279,9 @@ fn geosite_policy_fingerprint_covers_the_exact_expansion() {
     let router = Router::new(&rules, "proxy").unwrap();
     let requirements = GeoRequirements::for_traffic(&rules);
     let sources = GeoSourceSet::load(&requirements);
-    let (exact, _) = DomainMatcher::new(
-        &[],
-        &[],
-        &[],
-        &[],
-        &GeoAssets::from_sources(&requirements, &sources).geosite_domains(&["cn".into()]),
-        Vec::new(),
-    )
-    .unwrap();
-    assert!(!exact.is_empty());
+    let expanded = GeoAssets::from_sources(&requirements, &sources).geosite_domains(&["cn".into()]);
+    assert!(!expanded.is_empty());
+    let (exact, _) = DomainMatcher::new(&[], &[], &[], &[], &expanded, Vec::new()).unwrap();
     assert_eq!(
         router.policy_fingerprint(),
         fingerprint::policy(

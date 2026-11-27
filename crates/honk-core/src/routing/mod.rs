@@ -713,20 +713,28 @@ fn append_conditions(
         || !domain_regex.is_empty()
         || !geosites.is_empty()
     {
-        let (mut geosite_domains, mut matchers) = (Vec::new(), Vec::new());
-        for code in geosites {
-            let selected = assets.geosite_domains(std::slice::from_ref(code));
-            matchers.push(shared.geosite(code, &selected));
-            geosite_domains.extend(selected);
-        }
-        let id = registry.intern(DomainMatcher::new(
-            domains,
-            domain_suffixes,
-            domain_keywords,
-            domain_regex,
-            &geosite_domains,
-            matchers,
-        )?)?;
+        let single = if domains.is_empty()
+            && domain_suffixes.is_empty()
+            && domain_keywords.is_empty()
+            && domain_regex.is_empty()
+        {
+            shared.single_geosite(geosites, assets)
+        } else {
+            None
+        };
+        let id = if let Some((digest, matcher)) = single {
+            registry.intern_single(digest, matcher)?
+        } else {
+            registry.intern(DomainMatcher::from_selectors(
+                domains,
+                domain_suffixes,
+                domain_keywords,
+                domain_regex,
+                geosites,
+                assets,
+                shared,
+            )?)?
+        };
         conditions.push(CompiledCondition {
             not,
             predicate: CompiledPredicate::Domain(id),
