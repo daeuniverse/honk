@@ -55,7 +55,7 @@ impl TrojanHandler {
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
         let header = Self::build_request_header(password, target, target_domain)?;
         let (stream, preparation) =
-            Self::prepare_transport(node, runtime, tcp, connect_timeout).await?;
+            super::transport::prepare_transport(node, runtime, tcp, connect_timeout).await?;
         preparation.commit()?;
         Self::send_request(stream, &header, target, target_domain).await
     }
@@ -87,26 +87,6 @@ impl TrojanHandler {
             .await?
             .commit()
             .await
-    }
-
-    async fn prepare_transport(
-        node: &Node,
-        runtime: Option<&Arc<crate::runtime::NodeRuntime>>,
-        tcp: Option<TcpStream>,
-        timeout: std::time::Duration,
-    ) -> anyhow::Result<(
-        Box<dyn AsyncReadWrite>,
-        super::transport::TransportPreparation,
-    )> {
-        match runtime {
-            Some(runtime) => {
-                super::transport::prepare_transport_runtime(runtime, tcp, timeout).await
-            }
-            None => Ok((
-                super::transport::wrap_transport(node, tcp, timeout).await?,
-                super::transport::TransportPreparation::none(),
-            )),
-        }
     }
 
     async fn prepare_udp_stream(
@@ -157,7 +137,8 @@ impl TrojanHandler {
                 node.network()
             );
         }
-        let (control, preparation) = Self::prepare_transport(node, runtime, None, timeout).await?;
+        let (control, preparation) =
+            super::transport::prepare_transport(node, runtime, None, timeout).await?;
         let tls_handoff = super::chain::native_udp_writer_handoff(node);
         let transport = Self::finish_udp_stream(node, target, domain, control, tls_handoff).await?;
         Ok((transport, preparation))

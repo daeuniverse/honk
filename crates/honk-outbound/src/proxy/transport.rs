@@ -88,6 +88,21 @@ pub(crate) async fn wrap_transport_runtime(
     Ok(stream)
 }
 
+pub(super) async fn prepare_transport(
+    node: &Node,
+    runtime: Option<&Arc<crate::runtime::NodeRuntime>>,
+    tcp: Option<TcpStream>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<(Box<dyn AsyncReadWrite>, TransportPreparation)> {
+    match runtime {
+        Some(runtime) => prepare_transport_runtime(runtime, tcp, timeout).await,
+        None => Ok((
+            wrap_transport(node, tcp, timeout).await?,
+            TransportPreparation::none(),
+        )),
+    }
+}
+
 /// Caller-owned preparation: unpublished XHTTP carriers roll back unless the
 /// selected UDP candidate commits them through its existing preparation fence.
 pub(crate) async fn prepare_transport_runtime(

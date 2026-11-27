@@ -1,10 +1,15 @@
 use super::*;
-use crate::proxy::{DialFailureScope, ProxyRegistry, dial_failure_scope, node_failure};
+use crate::proxy::uot::{self, StreamUotTransport};
+use crate::proxy::{
+    DialFailureScope, PacketOutbound, PacketTransport, PreparedUdpTransport, ProxyRegistry,
+    SharedSourceOutbound, dial_failure_scope, node_failure,
+};
 use crate::runtime::OutboundRuntimeRegistry;
 use crate::test_support::{chain, socks5, socks5_relay};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use honk_config::group_graph::{Composed, compose};
+use std::time::Duration;
 use tokio::net::TcpListener;
 
 const LIMIT: Duration = Duration::from_secs(5);
@@ -338,6 +343,7 @@ async fn confirmed_waits_for_lower_flush_and_returns_its_error() {
 #[cfg(feature = "flow-observation")]
 #[tokio::test]
 async fn shared_header_and_each_flow_have_separate_observation() {
+    use crate::proxy::MultiTargetTransport;
     use crate::proxy::request_observation_support::{DeferringCarrier, milestones, observed};
     use crate::runtime::flow_observation::Milestone::TargetRequestSent;
     tokio::time::timeout(LIMIT, async {

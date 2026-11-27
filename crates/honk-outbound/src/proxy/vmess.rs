@@ -1,8 +1,10 @@
 //! VMess AEAD outbound handler (alterId = 0).
 
+mod relay;
+mod uot;
+
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use async_trait::async_trait;
-use futures_util::FutureExt;
 use honk_config::node::Node;
 use md5::{Digest, Md5};
 use rand::Rng;
@@ -12,21 +14,17 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Waker};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 
 use super::addr::{self, SocksAddr};
-use super::uot::{self, StreamUotTransport};
 use super::{
-    AsyncReadWrite, MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport,
-    ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound, TunnelDialOptions,
+    AsyncReadWrite, ProbeableOutbound, ProxyStream, TcpOutbound, TunnelDialOptions,
     WarmRequirement, WarmableOutbound,
 };
-use crate::runtime::NodeRuntime;
 
 /// VMess protocol version byte.
 const VMESS_VERSION: u8 = 0x01;
@@ -274,31 +272,6 @@ impl VmessStream {
         Self::spawn(stream, (header_wire, session), None, None)
     }
 
-    fn start_uot(
-        stream: Box<dyn AsyncReadWrite>,
-        request: (Vec<u8>, Session),
-        gate: Option<oneshot::Receiver<()>>,
-    ) -> anyhow::Result<Self> {
-        Self::spawn(stream, request, Some(Box::default()), gate)
-    }
-
-    fn commit_uot(
-        carrier: Box<dyn AsyncReadWrite>,
-        header: (Vec<u8>, Session),
-        publish: impl FnOnce() -> anyhow::Result<()>,
-    ) -> anyhow::Result<Self> {
-        let (start, gate) = oneshot::channel();
-        let stream = Self::start_uot(carrier, header, Some(gate))?;
-        if start.is_closed() {
-            return Err(super::PacketRejection::Cancelled.into());
-        }
-        publish()?;
-        start
-            .send(())
-            .map_err(|_| super::PacketRejection::Cancelled)?;
-        Ok(stream)
-    }
-
     fn spawn(
         stream: Box<dyn AsyncReadWrite>,
         request: (Vec<u8>, Session),
@@ -362,7 +335,7 @@ async fn vmess_relay_recorded(
 ) {
     let mut uploaded = Some(uploaded);
     let mut tail = Vec::new();
-    if let Err(error) = vmess_relay(
+    if let Err(error) = relay::run(
         server,
         &mut client,
         request,
@@ -655,85 +628,6 @@ impl VmessHandler {
             target_domain: target_domain.map(|s| s.to_string()),
         })
     }
-
-    fn uot_header(node: &Node, ambiguous_header_io: bool) -> anyhow::Result<(Vec<u8>, Session)> {
-        Self::request_header(
-            uuid(node)?.as_bytes(),
-            SocketAddr::from(([0; 4], 0)),
-            Some(uot::MAGIC_ADDRESS),
-            ambiguous_header_io,
-        )
-    }
-
-    async fn prepare_transport(
-        node: &Node,
-        runtime: Option<&Arc<NodeRuntime>>,
-        timeout: Duration,
-    ) -> anyhow::Result<(
-        Box<dyn AsyncReadWrite>,
-        super::transport::TransportPreparation,
-    )> {
-        match runtime {
-            Some(runtime) => {
-                super::transport::prepare_transport_runtime(runtime, None, timeout).await
-            }
-            None => Ok((
-                super::transport::wrap_transport(node, None, timeout).await?,
-                super::transport::TransportPreparation::none(),
-            )),
-        }
-    }
-
-    async fn prepare_uot_stream<T: ?Sized + Send + Sync + 'static>(
-        node: &Node,
-        runtime: Option<&Arc<NodeRuntime>>,
-        target: SocketAddr,
-        domain: Option<&str>,
-        timeout: Duration,
-        project: fn(Arc<StreamUotTransport>) -> Arc<T>,
-    ) -> anyhow::Result<PreparedUdpTransport<T>> {
-        anyhow::ensure!(
-            node.vmess().unwrap().udp_enabled(),
-            "UDP not supported for this VMess node"
-        );
-        let header = Self::uot_header(node, false)?;
-        let request = uot::request(false, target, domain)?;
-        let (carrier, preparation) = Self::prepare_transport(node, runtime, timeout).await?;
-        let handoff = super::chain::native_udp_writer_handoff(node);
-        let domain = domain.map(Box::<str>::from);
-        Ok(PreparedUdpTransport::new(async move {
-            let stream = VmessStream::commit_uot(carrier, header, || preparation.commit())?;
-            Ok(project(Arc::new(StreamUotTransport::new(
-                Box::new(stream),
-                target,
-                domain.as_deref(),
-                request,
-                handoff,
-                None,
-            ))))
-        }))
-    }
-
-    async fn open_uot_over(
-        node: &Node,
-        carrier: Box<dyn AsyncReadWrite>,
-        target: SocketAddr,
-        domain: Option<&str>,
-        options: TunnelDialOptions,
-    ) -> anyhow::Result<Arc<StreamUotTransport>> {
-        if !node.supports_tunneled_udp() {
-            return Err(super::TunnelUnsupported("vmess udp").into());
-        }
-        let header = Self::uot_header(node, true)?;
-        let request = uot::request(false, target, domain)?;
-        let carrier = super::transport::wrap_tunnel(node, carrier, options).await?;
-        let exit = super::chain::UDP_EXIT_HOP.try_with(|exit| *exit).ok();
-        let stream = VmessStream::start_uot(carrier, header, None)?;
-        let stream = super::chain::locate_udp_exit_stream(Box::new(stream));
-        Ok(Arc::new(StreamUotTransport::new(
-            stream, target, domain, request, None, exit,
-        )))
-    }
 }
 
 fn uuid(node: &Node) -> anyhow::Result<uuid::Uuid> {
@@ -802,99 +696,6 @@ impl TcpOutbound for VmessHandler {
             target_domain,
             ambiguous_header_io,
         )
-    }
-}
-
-#[async_trait]
-impl PacketOutbound for VmessHandler {
-    async fn dial_udp_transport(
-        &self,
-        node: &Node,
-        target: SocketAddr,
-        domain: Option<&str>,
-        timeout: Duration,
-    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        Self::prepare_uot_stream(node, None, target, domain, timeout, |t| {
-            t as Arc<dyn PacketTransport>
-        })
-        .await?
-        .commit()
-        .await
-    }
-
-    async fn dial_udp_transport_runtime(
-        &self,
-        runtime: Arc<NodeRuntime>,
-        target: SocketAddr,
-        domain: Option<&str>,
-        timeout: Duration,
-    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        self.dial_udp_transport_speculative_runtime(runtime, target, domain, timeout)
-            .await?
-            .commit()
-            .await
-    }
-
-    async fn dial_udp_transport_speculative_runtime(
-        &self,
-        runtime: Arc<NodeRuntime>,
-        target: SocketAddr,
-        domain: Option<&str>,
-        timeout: Duration,
-    ) -> anyhow::Result<PreparedUdpTransport> {
-        Self::prepare_uot_stream(
-            &runtime.node,
-            Some(&runtime),
-            target,
-            domain,
-            timeout,
-            |t| t as Arc<dyn PacketTransport>,
-        )
-        .await
-    }
-
-    async fn dial_udp_over(
-        &self,
-        runtime: Arc<NodeRuntime>,
-        carrier: Box<dyn AsyncReadWrite>,
-        target: SocketAddr,
-        domain: Option<&str>,
-        options: TunnelDialOptions,
-    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        Ok(Self::open_uot_over(&runtime.node, carrier, target, domain, options).await?)
-    }
-}
-
-#[async_trait]
-impl SharedSourceOutbound for VmessHandler {
-    async fn prepare_shared_source(
-        &self,
-        runtime: Arc<NodeRuntime>,
-        target: SocketAddr,
-        domain: Option<&str>,
-        timeout: Duration,
-        _speculative: bool,
-    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
-        Self::prepare_uot_stream(
-            &runtime.node,
-            Some(&runtime),
-            target,
-            domain,
-            timeout,
-            |t| t as Arc<dyn MultiTargetTransport>,
-        )
-        .await
-    }
-
-    async fn prepare_shared_source_over(
-        &self,
-        runtime: Arc<NodeRuntime>,
-        carrier: Box<dyn AsyncReadWrite>,
-        target: SocketAddr,
-        domain: Option<&str>,
-        options: TunnelDialOptions,
-    ) -> anyhow::Result<Arc<dyn MultiTargetTransport>> {
-        Ok(Self::open_uot_over(&runtime.node, carrier, target, domain, options).await?)
     }
 }
 
@@ -1040,188 +841,6 @@ impl BodyChunks {
         chunk.truncate(payload_len);
         Ok(chunk)
     }
-}
-
-/// Background task that encrypts client→server data and decrypts
-/// server→client data using the VMess AEAD chunking format.
-async fn vmess_relay(
-    server: Box<dyn AsyncReadWrite>,
-    client: &mut tokio::io::DuplexStream,
-    (header_wire, session): (Vec<u8>, Session),
-    pipe: &super::transport::relay_upload::Reader,
-    uploaded: &mut Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
-    tail: &mut Vec<u8>,
-    fence: Option<&RelayFence>,
-) -> anyhow::Result<()> {
-    let peer_end = super::transport::WsPeerEnd::for_stream(server.as_ref());
-    let omitted = AtomicBool::new(false);
-    let (mut server_read, mut server_write) = tokio::io::split(server);
-    let (mut client_read, mut client_write) = tokio::io::split(client);
-
-    let upload = async {
-        if fence.is_some() {
-            server_write.write_all(&header_wire).await?;
-            server_write.flush().await?;
-        } else {
-            super::transport::write_request(&mut server_write, &header_wire).await?;
-        }
-
-        let mut body = BodyChunks::new(&session.req_key, &session.req_iv)?;
-        let mut buf = vec![0u8; CHUNK_MAX_LEN];
-        let mut relayed = 0u64;
-        loop {
-            let n = match client_read.read(&mut buf).now_or_never() {
-                Some(read) => read?,
-                None => {
-                    server_write.flush().await?;
-                    if let Some(fence) = fence {
-                        fence.advance(relayed);
-                    }
-                    client_read.read(&mut buf).await?
-                }
-            };
-            if n == 0 {
-                break;
-            }
-            relayed += n as u64;
-            let chunk = body.seal_chunk(&buf[..n])?;
-            let writer = &mut server_write;
-            let bytes = &chunk;
-            pipe.forward(relayed, |flush| async move {
-                writer.write_all(bytes).await?;
-                if flush {
-                    writer.flush().await?;
-                    if let Some(fence) = fence {
-                        fence.advance(relayed);
-                    }
-                }
-                Ok::<_, std::io::Error>(())
-            })
-            .await?;
-        }
-        let term = body.seal_chunk(&[])?;
-        let mut remaining = term.as_slice();
-        let result = super::transport::relay_upload::scope(async {
-            server_write.write_all_buf(&mut remaining).await?;
-            server_write.flush().await
-        })
-        .await;
-        if let Err(error) = result {
-            if peer_end
-                .as_ref()
-                .is_some_and(|proof| proof.omitted(&error, term.len() - remaining.len()))
-            {
-                return Ok(true);
-            }
-            return Err(error.into());
-        }
-        if let Some(fence) = fence {
-            fence.advance(relayed);
-        }
-        if let Some(uploaded) = uploaded.take() {
-            let _ = uploaded.send(Ok(()));
-        }
-        Ok::<bool, anyhow::Error>(false)
-    };
-
-    let download = async {
-        let complete_header = read_response_header(&mut server_read, &session).await?;
-
-        let mut body = BodyChunks::new(&session.resp_key, &session.resp_iv)?;
-        let marker = loop {
-            let mut len_buf = [0u8; 2];
-            match server_read.read(&mut len_buf).await? {
-                0 => break None,
-                1 => {
-                    server_read.read_exact(&mut len_buf[1..]).await?;
-                }
-                _ => {}
-            }
-            let chunk_len = body.decode_len(len_buf) as usize;
-            // size == AEAD overhead is the server's termination chunk
-            // (AuthenticationReader.readInternal).
-            if chunk_len == GCM_TAG_LEN {
-                break peer_end
-                    .as_ref()
-                    .map(|_| body.into_terminator())
-                    .transpose()?;
-            }
-            if !(chunk_len > GCM_TAG_LEN && chunk_len <= CHUNK_MAX_LEN + GCM_TAG_LEN) {
-                return Err(crate::proxy::NodeFailure(
-                    anyhow::anyhow!("invalid VMess chunk size {chunk_len}")
-                        .context("VMess response body"),
-                )
-                .into());
-            }
-            let chunk = body.read_chunk(&mut server_read, chunk_len).await?;
-            let mut remaining = chunk.as_slice();
-            while tail.is_empty() && !remaining.is_empty() {
-                let write = std::future::poll_fn(|cx| {
-                    match Pin::new(&mut client_write).poll_write(cx, remaining) {
-                        Poll::Pending if omitted.load(Ordering::Relaxed) => Poll::Ready(None),
-                        result => result.map(Some),
-                    }
-                })
-                .await;
-                let Some(write) = write else {
-                    // Only the current record and the closed WS duplex can remain.
-                    tail.reserve_exact(remaining.len() + 65536);
-                    break;
-                };
-                let written = write?;
-                if written == 0 {
-                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
-                }
-                remaining = &remaining[written..];
-            }
-            tail.extend_from_slice(remaining);
-        };
-        if !omitted.load(Ordering::Relaxed) {
-            client_write.shutdown().await?;
-        }
-        Ok::<_, anyhow::Error>((complete_header, marker))
-    };
-
-    let (peer_ended, (complete_header, marker)) = {
-        let mut upload = std::pin::pin!(upload);
-        let mut download = std::pin::pin!(download);
-        tokio::select! {
-            result = &mut upload => {
-                let peer_ended = result?;
-                if peer_ended {
-                    omitted.store(true, Ordering::Relaxed);
-                }
-                // Repoll even if download last waited for space in the application duplex.
-                (peer_ended, download.await?)
-            }
-            result = &mut download => {
-                let response = result?;
-                (upload.await?, response)
-            }
-        }
-    };
-    if peer_ended {
-        if !complete_header {
-            return Err(crate::proxy::NodeFailure(anyhow::anyhow!(
-                "invalid VMess response header command length"
-            ))
-            .into());
-        }
-        if let Some((nonce, cipher)) = marker {
-            // Ordinary VMess readers accept the length alone as EOF. Only the
-            // peer-close exception needs proof of the entire empty record.
-            let mut tag = [0u8; GCM_TAG_LEN];
-            server_read.read_exact(&mut tag).await?;
-            cipher
-                .open_in_place(&nonce, &mut [], &tag, b"")
-                .map_err(|error| {
-                    crate::proxy::NodeFailure(anyhow::anyhow!(
-                        "VMess response terminator decrypt failed: {error}"
-                    ))
-                })?;
-        }
-    }
-    Ok(())
 }
 
 fn response_header_fault(error: anyhow::Error) -> anyhow::Error {

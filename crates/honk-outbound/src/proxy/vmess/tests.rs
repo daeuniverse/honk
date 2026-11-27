@@ -1,5 +1,6 @@
 use super::test_support::{HEADER_WIRE, fixed_session, hex};
 use super::*;
+use futures_util::FutureExt;
 use std::io;
 
 // Byte-level regression vectors produced by running the actual
@@ -301,7 +302,7 @@ async fn upload_batches_a_queued_burst_and_flushes_when_input_goes_idle() {
     let transport = RecordingTransport(recording.clone(), changed.clone());
     let header = b"request-header";
     let relay = tokio::spawn(async move {
-        vmess_relay(
+        relay::run(
             Box::new(transport),
             &mut relay_client,
             (header.to_vec(), fixed_session()),
