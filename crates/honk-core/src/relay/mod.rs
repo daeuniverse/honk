@@ -22,11 +22,23 @@ mod vision;
 
 #[cfg(test)]
 mod progress_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod remote_memory_tests;
 
 use self::drain::{CopyProgress, drain_idle};
 use futures::FutureExt;
+#[cfg(target_os = "linux")]
+use parking_lot::Mutex;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll, ready},
+};
+#[cfg(target_os = "linux")]
+use tokio::io::{AsyncBufRead, ReadBuf};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
@@ -306,13 +318,23 @@ const RELAY_BUF_SIZE: usize = u16::MAX as usize;
 // bulk flow, which uses the full frame size until an idle check window passes.
 const RELAY_BUF_MIN: usize = 8 * 1024;
 pub(crate) const COPY_BUFFER_MEMORY: usize = 2 * (RELAY_BUF_SIZE + RELAY_BUF_MIN);
+pub(crate) const REMOTE_COPY_BUFFER_MEMORY: usize = RELAY_BUF_SIZE + RELAY_BUF_MIN;
+const _: () = assert!(REMOTE_COPY_BUFFER_MEMORY * 2 == COPY_BUFFER_MEMORY);
 // Both directions are polled by one task. Only one can hold an old and new buffer
 // during replacement, leaving the other small-buffer allowance for both boxed timers.
 const _: () = assert!(2 * size_of::<tokio::time::Sleep>() <= RELAY_BUF_MIN);
+const _: () = assert!(size_of::<tokio::time::Sleep>() <= RELAY_BUF_MIN);
 
 // Idle check window before shrinking back to RELAY_BUF_MIN (60-120 s without
 // reads, avoiding churn across 30 s keepalives).
 const RELAY_BUF_IDLE_SHRINK: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn allocate_copy_buffer(size: usize) -> Vec<u8> {
+    let buffer = vec![0; size];
+    #[cfg(all(test, target_os = "linux"))]
+    remote_memory_tests::observe_buffer_allocation();
+    buffer
+}
 
 struct IdleShrink {
     sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
@@ -348,8 +370,9 @@ fn poll_idle_shrink(
             .reset(tokio::time::Instant::now() + RELAY_BUF_IDLE_SHRINK);
     }
     if should_shrink {
-        *buffer = vec![0; RELAY_BUF_MIN];
+        // The expanded buffer and its replacement use the entire remote allowance.
         *idle_shrink = None;
+        *buffer = allocate_copy_buffer(RELAY_BUF_MIN);
     }
 }
 
@@ -414,7 +437,7 @@ where
     // relay starts, independently of bytes read by this copy loop.
     wr.flush().await.map_err(write_error)?;
     {
-        let mut buffer = vec![0; RELAY_BUF_MIN];
+        let mut buffer = allocate_copy_buffer(RELAY_BUF_MIN);
         let mut idle_shrink: Option<IdleShrink> = None;
         let mut n = 0;
         loop {
@@ -464,10 +487,73 @@ where
                 progress.written.store(n, Ordering::Relaxed);
             }
             if read == buffer.len() && read < RELAY_BUF_SIZE {
-                buffer = vec![0; RELAY_BUF_SIZE];
+                buffer = allocate_copy_buffer(RELAY_BUF_SIZE);
             }
         }
     }
+    wr.flush().await.map_err(write_error)?;
+    wr.shutdown().await.map_err(write_error)
+}
+
+/// Copies directly from the source's retained slice and advances it only for
+/// bytes accepted by the writer.
+#[cfg(target_os = "linux")]
+async fn copy_buf_way<R, W>(
+    rd: &mut R,
+    wr: &mut W,
+    progress: &CopyProgress,
+    eof: &tokio::sync::Notify,
+    mut on_upload: impl FnMut(u64),
+) -> Result<(), RelayError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let read_error = |error| RelayError::new(error, true);
+    let write_error = |error| RelayError::new(error, false);
+    wr.flush().await.map_err(write_error)?;
+
+    let mut written_total = 0;
+    let mut seen_read = 0;
+    loop {
+        let written = std::future::poll_fn(|cx| {
+            let buf = match Pin::new(&mut *rd).poll_fill_buf(cx) {
+                Poll::Pending => {
+                    ready!(Pin::new(&mut *wr).poll_flush(cx)).map_err(write_error)?;
+                    return Poll::Pending;
+                }
+                Poll::Ready(result) => result.map_err(read_error)?,
+            };
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+
+            // A pending or short write can leave this same slice at the front.
+            let observed = written_total + buf.len() as u64;
+            if observed > seen_read {
+                seen_read = observed;
+                progress.read.store(observed, Ordering::Relaxed);
+            }
+            let n = ready!(Pin::new(&mut *wr).poll_write(cx, buf)).map_err(write_error)?;
+            if n == 0 {
+                return Poll::Ready(Err(write_error(io::ErrorKind::WriteZero.into())));
+            }
+            Pin::new(&mut *rd).consume(n);
+            Poll::Ready(Ok(n))
+        })
+        .await?;
+        if written == 0 {
+            eof.notify_one();
+            break;
+        }
+        let written = written as u64;
+        written_total += written;
+        on_upload(written);
+        progress.written.store(written_total, Ordering::Relaxed);
+        // Some codecs accept writes without touching a Tokio I/O budget.
+        tokio::task::consume_budget().await;
+    }
+
     wr.flush().await.map_err(write_error)?;
     wr.shutdown().await.map_err(write_error)
 }
@@ -506,17 +592,55 @@ where
 #[error("packet relay drain stalled")]
 pub(crate) struct DrainExpired;
 
+// The same task polls both halves. Each guard covers just one I/O poll.
 #[cfg(target_os = "linux")]
-pub(crate) async fn relay_remote_tcp<S1, S2>(
-    mut client: S1,
-    mut proxy: S2,
+struct ProxyRead<'a, S>(&'a Mutex<S>);
+
+#[cfg(target_os = "linux")]
+impl<S: AsyncRead + Unpin> AsyncRead for ProxyRead<'_, S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.0.lock()).poll_read(cx, buf)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ProxyWrite<'a, S>(&'a Mutex<S>);
+
+#[cfg(target_os = "linux")]
+impl<S: AsyncWrite + Unpin> AsyncWrite for ProxyWrite<'_, S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.0.lock()).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.0.lock()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.0.lock()).poll_shutdown(cx)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn relay_remote_tcp<R, W, S>(
+    (mut client_rd, mut client_wr): (R, W),
+    proxy: S,
     (client_addr, target_addr): (SocketAddr, SocketAddr),
     progress: &RelayProgress,
     accepted_download: impl Fn() -> u64 + Send,
 ) -> anyhow::Result<RelayStats>
 where
-    S1: AsyncRead + AsyncWrite + Send + Unpin,
-    S2: AsyncRead + AsyncWrite + Send + Unpin,
+    R: AsyncBufRead + Send + Unpin,
+    W: AsyncWrite + Send + Unpin,
+    S: AsyncRead + AsyncWrite + Send + Unpin,
 {
     let start = tokio::time::Instant::now();
     let mut first_response = progress.first_response.as_ref();
@@ -534,17 +658,25 @@ where
             callback(bytes, 0);
         }
     };
-    let result = copy_phase_with(
-        &mut client,
-        &mut proxy,
+    let proxy = Mutex::new(proxy);
+    let mut proxy_rd = ProxyRead(&proxy);
+    let mut proxy_wr = ProxyWrite(&proxy);
+    let upload = CopyProgress::default();
+    let download = CopyProgress::default();
+    let eof = tokio::sync::Notify::new();
+    let c2p = copy_buf_way(&mut client_rd, &mut proxy_wr, &upload, &eof, on_upload);
+    let p2c = copy_way(
+        &mut proxy_rd,
+        &mut client_wr,
+        &download,
+        &eof,
+        false,
         None,
-        on_reply,
-        on_upload,
-        accepted_download,
-    )
-    .await;
-    let _ = client.shutdown().now_or_never();
-    let _ = proxy.shutdown().now_or_never();
+        (on_reply, |_| {}),
+    );
+    let result = join_copy(c2p, p2c, &upload, &download, &eof, None, accepted_download).await;
+    let _ = client_wr.shutdown().now_or_never();
+    let _ = proxy.into_inner().shutdown().now_or_never();
     let result = match result {
         Ok((_, true)) => return Err(DrainExpired.into()),
         result => result.map(|(bytes, _)| bytes),
@@ -563,37 +695,12 @@ where
     S1: AsyncRead + AsyncWrite + Send + Unpin,
     S2: AsyncRead + AsyncWrite + Send + Unpin,
 {
-    copy_phase_with(client, proxy, park, || {}, |_| {}, || 0)
-        .await
-        .map(|(bytes, _)| bytes)
-}
-
-async fn copy_phase_with<S1, S2>(
-    client: &mut S1,
-    proxy: &mut S2,
-    park: Option<&Park<'_>>,
-    on_reply: impl FnMut(),
-    on_upload: impl FnMut(u64),
-    accepted_download: impl Fn() -> u64,
-) -> Result<((u64, u64), bool), RelayError>
-where
-    S1: AsyncRead + AsyncWrite + Send + Unpin,
-    S2: AsyncRead + AsyncWrite + Send + Unpin,
-{
     let (mut cr, mut cw) = tokio::io::split(client);
     let (mut pr, mut pw) = tokio::io::split(proxy);
     let upload = CopyProgress::default();
     let download = CopyProgress::default();
     let eof = tokio::sync::Notify::new();
-    let c2p = copy_way(
-        &mut cr,
-        &mut pw,
-        &upload,
-        &eof,
-        true,
-        park,
-        (|| {}, on_upload),
-    );
+    let c2p = copy_way(&mut cr, &mut pw, &upload, &eof, true, park, (|| {}, |_| {}));
     let p2c = copy_way(
         &mut pr,
         &mut cw,
@@ -601,8 +708,22 @@ where
         &eof,
         false,
         park,
-        (on_reply, |_| {}),
+        (|| {}, |_| {}),
     );
+    join_copy(c2p, p2c, &upload, &download, &eof, park, || 0)
+        .await
+        .map(|(bytes, _)| bytes)
+}
+
+async fn join_copy(
+    c2p: impl Future<Output = Result<(), RelayError>>,
+    p2c: impl Future<Output = Result<(), RelayError>>,
+    upload: &CopyProgress,
+    download: &CopyProgress,
+    eof: &tokio::sync::Notify,
+    park: Option<&Park<'_>>,
+    accepted_download: impl Fn() -> u64,
+) -> Result<((u64, u64), bool), RelayError> {
     tokio::pin!(c2p, p2c);
     let parked = || park.is_some_and(Park::taken);
     let copy = async {
@@ -621,7 +742,7 @@ where
     let cutoff = async {
         // SPSC writes finish when queued, so also count the owner's later TCP writes.
         eof.notified().await;
-        drain::drain_copy_idle(&upload, &download, accepted_download).await;
+        drain::drain_copy_idle(upload, download, accepted_download).await;
     };
     // A pending codec can exhaust the copy task's budget before the timer is polled.
     let expired = tokio::select! {

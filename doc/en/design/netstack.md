@@ -182,6 +182,8 @@ For physical XDP `direct: endpoint` with a single device and exactly one queue p
 
 Remote TCP has one single-producer/single-consumer ring per direction, with 32 occupied chunks at most. Each shard shares one cache across its flows. Only fully funded 16 KiB chunks can be cached. A shard can retain at most 64 chunks and its share of one sixteenth of the root capture budget across all eligible shards. Small 4 KiB chunks return their credit on consumption. When a reservation fails, the owner releases cached chunks before retrying once. Closing the shard also releases the cache, including blocks returned by late readers.
 
+Worker Remote TCP borrows the current upload chunk until the outbound accepts its bytes. A short write consumes only that prefix. The download copy buffer grows from 8,192 to 65,535 bytes and shrinks after an idle window. Both Worker admission and Direct fallback reserve 73,727 bytes for the copy buffer and its idle timer.
+
 Worker epoll multiplexes queue, socket and wake descriptors. Software Direct handles validate the socket slot and generation. A reopened TCP flow can share a slab index with an older generation whose original output is still outstanding. The retirement callback runs after application close, protocol retirement (including TIME_WAIT), and return of that generation's last output.
 
 The coordinator retains both workers' relay fences before opening capture admission. On failure, both stop accepting relay work and their runtimes continue driving actual task joins. This does not release outstanding NIC descriptors or turn a retained worker into a joined thread.

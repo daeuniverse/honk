@@ -279,8 +279,10 @@ impl WorkerDirect {
     ) -> io::Result<impl Future<Output = RelayCompletion> + Send + 'a> {
         let direct_fallback = DirectFallback::new(&self.stats);
         let copy_credit = local
-            .reserve(relay::COPY_BUFFER_MEMORY)
+            .reserve(relay::REMOTE_COPY_BUFFER_MEMORY)
             .ok_or(io::ErrorKind::OutOfMemory)?;
+        #[cfg(test)]
+        crate::control::packet_endpoint::worker_copy_tests::observe(&copy_credit);
         let socket = TcpStream::from_std(socket)?;
         let mut progress = self.observer.copy_progress();
         let score = self.score.as_ref();
@@ -389,5 +391,121 @@ impl WorkerDirect {
             score.first_response_at(at);
         }
         self.observation.tcp_first_response();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::netstack::{CAPTURE_MEMORY, capture_realm};
+    use crate::control::packet_endpoint::worker_copy_tests::{
+        COPY_BYTES, CopyPressure, accept_local_syn,
+    };
+    use honk_netstack::MemoryBudget;
+    use std::task::{Context, Waker};
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_direct_fallback_copy_budget_boundary() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for headroom in [COPY_BYTES - 1, COPY_BYTES] {
+                let budget = MemoryBudget::new(CAPTURE_MEMORY);
+                let (realm, mut owners) = capture_realm(1280, 1, 2, 1, 1, &budget).unwrap();
+                let scope = realm.owner(0).unwrap().clone();
+                let owner = owners.pop().unwrap();
+                let mut driver = owner.hand_off();
+                driver.make_local(1).unwrap();
+                scope.open_admission_if(|| true).unwrap();
+
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let destination = listener.local_addr().unwrap();
+                let flow = accept_local_syn(&mut driver, destination);
+                let endpoints = (flow.peer_addr(), destination);
+                let local = flow.local().unwrap().clone();
+                let dialed = TcpStream::connect(destination).await.unwrap();
+                let (mut peer, _) = listener.accept().await.unwrap();
+                let progress = relay::RelayProgress {
+                    upload: Arc::default(),
+                    download: Arc::default(),
+                    outbound: None,
+                    first_response: None,
+                    on_transfer: None,
+                };
+                let (attach, mut observer) = DirectAttach::new(
+                    dialed.into_std().unwrap(),
+                    &progress,
+                    local.reserve_direct().unwrap(),
+                    false,
+                );
+                attach.reject();
+                let (snapshot, outcome) = poll_fn(|cx| observer.poll_update(cx)).await;
+                assert!(!snapshot.attached);
+                let Some(DirectOutcome::Fallback(socket)) = outcome else {
+                    panic!("Direct refusal must return the original socket");
+                };
+                let mut job = WorkerDirect {
+                    flow: TcpFlow::packet(flow, Arc::new(ConnectionTracker::new())),
+                    observer,
+                    close: None,
+                    score: None,
+                    observation: ConnectionObservation::begin(
+                        None,
+                        crate::observe::vocab::Network::Tcp,
+                        endpoints.0,
+                        endpoints.1,
+                    ),
+                    #[cfg(feature = "native-api")]
+                    relay_observer: None,
+                    stats: Arc::new(StatsManager::new()),
+                    outbound: ("direct".into(), OutboundKind::Builtin),
+                    endpoints,
+                };
+
+                // The original socket and observer are already live. The boxed fallback
+                // future and Tokio socket get their separate grant after the copy grant.
+                let baseline = budget.used();
+                let (grant, metadata) = {
+                    let pressure = CopyPressure::new(&budget, headroom);
+                    let close = CloseSignal::new();
+                    let fallback = job.fallback(&local, socket, Some(&close));
+                    let grant = pressure.granted();
+                    assert_eq!(grant, (headroom == COPY_BYTES).then_some(COPY_BYTES));
+                    drop(pressure);
+                    let metadata = match fallback {
+                        Err(error) => {
+                            assert_eq!(headroom, COPY_BYTES - 1);
+                            assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+                            0
+                        }
+                        Ok(copy) => {
+                            assert_eq!(headroom, COPY_BYTES);
+                            let metadata = budget.used().checked_sub(baseline + COPY_BYTES).unwrap();
+                            assert!(metadata > size_of::<TcpStream>());
+                            close.finish(true);
+                            assert!(matches!(copy.await, RelayCompletion::Closed));
+                            metadata
+                        }
+                    };
+                    (grant, metadata)
+                };
+                assert_eq!(budget.used(), baseline);
+                assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+
+                drop((job, local));
+                scope.shutdown(true);
+                driver.service_closing(&mut Context::from_waker(Waker::noop()), Instant::now());
+                assert!(owner.reclaim().await);
+                owner.run().await;
+                drop((driver, scope, realm));
+                assert_eq!(budget.used(), 0);
+                eprintln!(
+                    "worker_fallback_copy_budget headroom={headroom} grant={grant:?} metadata={metadata} final_used=0"
+                );
+            }
+        })
+        .await
+        .expect("refused Direct socket and Worker flow must retire and refund");
     }
 }

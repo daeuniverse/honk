@@ -1,4 +1,6 @@
 mod drain;
+#[cfg(target_os = "linux")]
+mod remote;
 
 use super::*;
 use std::io::{self, ErrorKind};

@@ -44,3 +44,4 @@ Added
 - Share geosite selector expansions between traffic and DNS rules and intern domain predicates by a compact content digest during routing compilation.
 - Add `packet-ebpf` for XDP/TUN without traditional TC or NFQUEUE. `ebpf` continues to enable all three datapaths via `legacy-tc`. Packet-only daemons reject TC configurations and external TC objects before datapath setup.
 - Drive eligible physical XDP Endpoint flows on their queue owner, share bounded Remote TCP buffers per shard, and retain outstanding output across TCP slot reuse.
+- Borrow worker Remote TCP upload chunks directly and halve the per-flow copy buffer reservation.

@@ -2556,8 +2556,9 @@ mod tests {
         let committed = {
             let enqueued = Arc::new(AtomicU64::new(0));
             let enqueued_writes = Arc::clone(&enqueued);
-            let client = relay::RelayIo::wrap(
-                &mut flow,
+            let (client_rd, client_wr) = flow.split_remote_mut().unwrap();
+            let client_wr = relay::RelayIo::wrap(
+                client_wr,
                 Arc::default(),
                 None,
                 None,
@@ -2567,7 +2568,7 @@ mod tests {
                 false,
             );
             let mut relay = std::pin::pin!(relay::relay_remote_tcp(
-                client,
+                (client_rd, client_wr),
                 proxy,
                 (syn.client, syn.original_dst),
                 &progress,

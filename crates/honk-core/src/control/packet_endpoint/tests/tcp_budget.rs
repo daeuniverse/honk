@@ -271,6 +271,81 @@ fn owned_packet_scoped_task_budget_refusal_relays_original_tcp_on_shared() {
     });
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn physical_worker_dispatch_copy_budget_boundary() {
+    use super::super::worker_copy_tests::{COPY_BYTES, CopyPressure, accept_local_syn};
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for headroom in [COPY_BYTES - 1, COPY_BYTES] {
+            let admit = headroom == COPY_BYTES;
+            let budget = MemoryBudget::new(CAPTURE_MEMORY);
+            let (realm, owners) = capture_realm(1280, 1, 2, 1, 1, &budget).unwrap();
+            let (plane, _health) = local_plane_with(|config| config.groups.clear()).await;
+            let draining = Arc::clone(&plane.drain_tracker);
+            let (endpoints, mut supervisor, mut drivers) =
+                PacketEndpoints::start_driven(plane, vec![(realm, owners)], 1, None, ScopeId::HOST)
+                    .await
+                    .unwrap();
+            let mut driver = drivers.pop().unwrap();
+            driver.make_local(1).unwrap();
+            drive(&mut driver, poll_fn(|cx| supervisor.poll_ready(cx)))
+                .await
+                .unwrap();
+
+            // Park before the handshake ACK so a started task holds its copy and task credits.
+            let flow = accept_local_syn(&mut driver, "203.0.113.9:443".parse().unwrap());
+            let completion = flow.worker_completion_credit().unwrap().bytes();
+            let slots = &endpoints.shared.tcp_slots;
+            let available = slots.available_permits();
+            let slot = Arc::clone(slots).try_acquire_owned().unwrap();
+            let baseline = budget.used();
+            // Completion is reserved before copy. The probe releases the competing charge
+            // after copy succeeds, so the scoped task funds its own future afterwards.
+            let pressure = CopyPressure::new(&budget, completion + headroom);
+            endpoints
+                .sender
+                .send(Work::Tcp(flow, slot, None))
+                .await
+                .unwrap();
+            drop(endpoints.sender.reserve_many(INGRESS_CAPACITY).await.unwrap());
+            let grant = pressure.granted();
+            assert_eq!(grant, admit.then_some(COPY_BYTES), "headroom {headroom}");
+            assert_eq!(draining.active_count(), usize::from(admit));
+            assert_eq!(slots.available_permits(), available - usize::from(admit));
+            drop(pressure);
+            let task = if admit {
+                let bytes = budget
+                    .used()
+                    .checked_sub(baseline + completion + COPY_BYTES)
+                    .unwrap();
+                assert!(bytes > 0);
+                bytes
+            } else {
+                assert_eq!(budget.used(), baseline);
+                0
+            };
+
+            endpoints.close();
+            let (plane, result) = poll_fn(|cx| {
+                driver.service_closing(cx, Instant::now());
+                supervisor.poll_join_plane(cx)
+            })
+            .await
+            .unwrap();
+            result.unwrap();
+            assert_eq!(draining.active_count(), 0);
+            assert_eq!(slots.available_permits(), available);
+            drop((plane, supervisor, endpoints, driver));
+            assert_eq!(budget.used(), 0);
+            eprintln!(
+                "worker_dispatch_copy_budget headroom={headroom} grant={grant:?} completion={completion} task={task} final_used=0"
+            );
+        }
+    })
+    .await
+    .expect("physical Worker admissions must retire and refund");
+}
+
 #[tokio::test]
 async fn auxiliary_pause_cancels_active_tcp_and_dns_and_drains_late_ingress() {
     tokio::time::timeout(Duration::from_secs(5), async {

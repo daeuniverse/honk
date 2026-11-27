@@ -1970,7 +1970,9 @@ impl EndpointRuntime {
                 io::Error::new(io::ErrorKind::OutOfMemory, "packet TCP completion capacity")
             })?;
             // A refused Direct transfer can still use the original socket over SPSC.
-            let copy = stream.reserve_memory(crate::relay::COPY_BUFFER_MEMORY)?;
+            let copy = stream.reserve_memory(crate::relay::REMOTE_COPY_BUFFER_MEMORY)?;
+            #[cfg(test)]
+            worker_copy_tests::observe(&copy);
             self.tcp_tasks.spawn_scoped_with(
                 |registration| {
                     let flow = flow.take().unwrap();
@@ -2389,6 +2391,10 @@ fn finish_packet_dns(
 
 mod maintenance;
 mod realm;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "packet_endpoint/tests/worker_copy.rs"]
+pub(super) mod worker_copy_tests;
 
 #[cfg(test)]
 mod tests;

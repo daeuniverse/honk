@@ -411,11 +411,18 @@ impl TcpFlow {
             score: remote.score.cloned(),
             accepted: 0,
         });
-        let mut result = {
+        let mut result = 'relay: {
+            let client = match packet.stream.split_remote_mut() {
+                Ok(halves) => halves,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionAborted => {
+                    break 'relay RelayCompletion::Closed;
+                }
+                Err(error) => break 'relay RelayCompletion::LocalError(error),
+            };
             let accepted_download = accounting.progress.clone();
             let operation = relay_until_close(
                 close,
-                relay::relay_remote_tcp(&mut packet.stream, proxy, endpoints, &progress, || {
+                relay::relay_remote_tcp(client, proxy, endpoints, &progress, || {
                     accepted_download.accepted()
                 }),
             );
