@@ -381,6 +381,39 @@ async fn shared_header_and_each_flow_have_separate_observation() {
     .unwrap();
 }
 
+#[cfg(feature = "owned-tasks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_closing_during_uot_publication_cancels_commit_without_header() {
+    let owner = Arc::new(crate::runtime::TaskOwner::production());
+    let (carrier, mut wire) = tokio::io::duplex(64);
+    let prepared = owner.task_scope().sync_scope(|| {
+        PreparedUdpTransport::new(async move {
+            let stream = VmessStream::commit_uot(
+                Box::new(carrier),
+                (b"header".to_vec(), fixed_session()),
+                || {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(owner.close())
+                    });
+                    Ok(())
+                },
+            )?;
+            Ok(Arc::new(stream))
+        })
+    });
+    let error = prepared.commit().await.unwrap_err();
+    assert_eq!(
+        crate::proxy::packet_rejection(&error),
+        Some(crate::proxy::PacketRejection::Cancelled)
+    );
+    let mut sent = Vec::new();
+    tokio::time::timeout(LIMIT, wire.read_to_end(&mut sent))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sent.is_empty());
+}
+
 #[tokio::test]
 async fn xhttp_speculative_winner_exchanges_data_and_losers_close_without_a_header() {
     use honk_config::node::{XhttpMode, XhttpOptions};

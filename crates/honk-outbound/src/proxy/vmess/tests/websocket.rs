@@ -47,8 +47,8 @@ async fn losing_socks_dial_drops_its_blocked_vmess_websocket_frame() {
         for cancel in [true, false] {
             let session = fixed_session();
             let mut upload = BodyChunks::new(&session.req_key, &session.req_iv).unwrap();
-            let hello_wire = upload.seal_chunk(&[5, 1, 0]);
-            let connect_wire = upload.seal_chunk(CONNECT);
+            let hello_wire = upload.seal_chunk(&[5, 1, 0]).unwrap();
+            let connect_wire = upload.seal_chunk(CONNECT).unwrap();
             let (physical, peer, blocked, open) = gated_ws_frame(connect_wire.clone());
             let (stream, peer) = tokio::join!(
                 transport::wrap_tunnel(&ws_node, physical, TunnelDialOptions::new(TIMEOUT)),
@@ -64,7 +64,7 @@ async fn losing_socks_dial_drops_its_blocked_vmess_websocket_frame() {
                 let hello = peer.next().await.unwrap().unwrap().into_data();
                 assert_eq!(hello.as_ref(), hello_wire);
                 let mut response = hex(RESP_HEADER_WIRE);
-                response.extend(reply.seal_chunk(&[5, 0]));
+                response.extend(reply.seal_chunk(&[5, 0]).unwrap());
                 peer.send(Message::Binary(response.into())).await.unwrap();
                 blocked.await.unwrap();
             };
@@ -82,7 +82,7 @@ async fn losing_socks_dial_drops_its_blocked_vmess_websocket_frame() {
                 assert!(events.lock().is_empty());
                 open.send(()).unwrap();
                 assert_eq!(peer.next().await.unwrap().unwrap().into_data().as_ref(), connect_wire);
-                peer.send(Message::Binary(reply.seal_chunk(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).into())).await.unwrap();
+                peer.send(Message::Binary(reply.seal_chunk(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap().into())).await.unwrap();
                 let _live = dial.await.unwrap();
                 assert_eq!(milestones(&events.lock(), Milestone::TargetRequestSent), 1);
                 assert_eq!(milestones(&events.lock(), Milestone::TargetConfirmed), 1);
@@ -101,8 +101,8 @@ async fn vmess_half_close_waits_for_the_ws_terminator_and_keeps_download_open() 
             let (mut app, mut peer) = one_byte_request(Box::new(wire), peer, route).await;
             let session = fixed_session();
             let mut upload = BodyChunks::new(&session.req_key, &session.req_iv).unwrap();
-            drop(upload.seal_chunk(b"q"));
-            let term = upload.seal_chunk(&[]);
+            drop(upload.seal_chunk(b"q").unwrap());
+            let term = upload.seal_chunk(&[]).unwrap();
             {
                 let mut closing = std::pin::pin!(app.shutdown());
                 tokio::select! {
@@ -166,7 +166,8 @@ async fn one_byte_request(
     let session = fixed_session();
     let request = BodyChunks::new(&session.req_key, &session.req_iv)
         .unwrap()
-        .seal_chunk(b"q");
+        .seal_chunk(b"q")
+        .unwrap();
     assert_eq!(
         peer.next().await.unwrap().unwrap().into_data().as_ref(),
         request
@@ -179,7 +180,7 @@ fn response(payload: &[u8]) -> (Vec<u8>, BodyChunks) {
     let mut body = BodyChunks::new(&session.resp_key, &session.resp_iv).unwrap();
     let mut wire = hex(RESP_HEADER_WIRE);
     for chunk in payload.chunks(CHUNK_MAX_LEN) {
-        wire.extend(body.seal_chunk(chunk));
+        wire.extend(body.seal_chunk(chunk).unwrap());
     }
     (wire, body)
 }
@@ -218,7 +219,7 @@ async fn peer_first_ws_close_finishes_vmess_and_preserves_the_unread_response() 
             let (mut wire, mut body) = response(&payload);
             if marker {
                 replace_command(&mut wire, 0, 9);
-                wire.extend(body.seal_chunk(&[]));
+                wire.extend(body.seal_chunk(&[]).unwrap());
             }
             let mut wire = bytes::Bytes::from(wire);
             let first = wire.split_to(wire.len() / 2);
@@ -341,9 +342,9 @@ async fn vmess_does_not_certify_an_incomplete_response_or_an_unproved_ws_close()
             match case {
                 "header" => wire.truncate(3),
                 "command extent" => replace_command(&mut wire, 1, 9),
-                "length" => wire.push(body.seal_chunk(b"next")[0]),
+                "length" => wire.push(body.seal_chunk(b"next").unwrap()[0]),
                 "ciphertext" | "bad tag" => {
-                    let mut bad = body.seal_chunk(b"next");
+                    let mut bad = body.seal_chunk(b"next").unwrap();
                     if case == "ciphertext" {
                         bad.pop();
                     } else {
@@ -355,7 +356,7 @@ async fn vmess_does_not_certify_an_incomplete_response_or_an_unproved_ws_close()
                 | "short terminal tag"
                 | "bad terminal tag"
                 | "bad tag after ordinary eof" => {
-                    let mut bad = body.seal_chunk(&[]);
+                    let mut bad = body.seal_chunk(&[]).unwrap();
                     match case {
                         "terminal length" => bad.truncate(2),
                         "short terminal tag" => bad.truncate(7),

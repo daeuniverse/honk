@@ -52,10 +52,7 @@ impl UploadPeer {
     ) -> Vec<u8> {
         let mut len = [0; 2];
         wire.read_exact(&mut len).await.unwrap();
-        let mut chunk = vec![0; self.0.decode_len(len) as usize];
-        wire.read_exact(&mut chunk).await.unwrap();
-        let len = self.0.open_chunk(&mut chunk).unwrap();
-        chunk.truncate(len);
-        chunk
+        let length = self.0.decode_len(len) as usize;
+        self.0.read_chunk(wire, length).await.unwrap()
     }
 }

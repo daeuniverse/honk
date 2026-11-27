@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
@@ -197,7 +197,7 @@ type RelayFailure = std::sync::Arc<std::sync::OnceLock<(std::io::ErrorKind, crat
 struct FlushFence {
     flushed: u64,
     closed: bool,
-    waiter: Option<(u64, oneshot::Sender<()>)>,
+    waiter: Option<(u64, Waker)>,
 }
 
 /// The relay owns closure even when its runtime aborts it before the first poll.
@@ -213,7 +213,8 @@ impl RelayFence {
             .is_some_and(|(end, _)| *end <= through)
             && let Some((_, wake)) = fence.waiter.take()
         {
-            let _ = wake.send(());
+            drop(fence);
+            wake.wake();
         }
     }
 }
@@ -222,7 +223,11 @@ impl Drop for RelayFence {
     fn drop(&mut self) {
         let mut fence = self.0.lock();
         fence.closed = true;
-        fence.waiter.take();
+        let waiter = fence.waiter.take();
+        drop(fence);
+        if let Some((_, wake)) = waiter {
+            wake.wake();
+        }
     }
 }
 
@@ -230,27 +235,24 @@ impl Drop for RelayFence {
 struct UotFlush {
     fence: Arc<parking_lot::Mutex<FlushFence>>,
     accepted: u64,
-    pending: Option<oneshot::Receiver<()>>,
 }
 
 impl UotFlush {
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        loop {
-            if let Some(rx) = &mut self.pending {
-                std::task::ready!(Pin::new(rx).poll(cx)).map_err(|_| io::ErrorKind::BrokenPipe)?;
-                self.pending = None;
-            }
-            let mut fence = self.fence.lock();
-            if self.accepted <= fence.flushed {
-                return Poll::Ready(Ok(()));
-            }
-            if fence.closed {
-                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
-            }
-            let (tx, rx) = oneshot::channel();
-            fence.waiter = Some((self.accepted, tx));
-            self.pending = Some(rx);
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut fence = self.fence.lock();
+        if self.accepted <= fence.flushed {
+            return Poll::Ready(Ok(()));
         }
+        if fence.closed {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        if let Some((end, wake)) = &mut fence.waiter {
+            *end = self.accepted;
+            wake.clone_from(cx.waker());
+        } else {
+            fence.waiter = Some((self.accepted, cx.waker().clone()));
+        }
+        Poll::Pending
     }
 }
 
@@ -278,6 +280,23 @@ impl VmessStream {
         gate: Option<oneshot::Receiver<()>>,
     ) -> anyhow::Result<Self> {
         Self::spawn(stream, request, Some(Box::default()), gate)
+    }
+
+    fn commit_uot(
+        carrier: Box<dyn AsyncReadWrite>,
+        header: (Vec<u8>, Session),
+        publish: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<Self> {
+        let (start, gate) = oneshot::channel();
+        let stream = Self::start_uot(carrier, header, Some(gate))?;
+        if start.is_closed() {
+            return Err(super::PacketRejection::Cancelled.into());
+        }
+        publish()?;
+        start
+            .send(())
+            .map_err(|_| super::PacketRejection::Cancelled)?;
+        Ok(stream)
     }
 
     fn spawn(
@@ -683,11 +702,7 @@ impl VmessHandler {
         let handoff = super::chain::native_udp_writer_handoff(node);
         let domain = domain.map(Box::<str>::from);
         Ok(PreparedUdpTransport::new(async move {
-            // Admit the task before publishing XHTTP, and release its header only after publication.
-            let (start, gate) = oneshot::channel();
-            let stream = VmessStream::start_uot(carrier, header, Some(gate))?;
-            preparation.commit()?;
-            let _ = start.send(());
+            let stream = VmessStream::commit_uot(carrier, header, || preparation.commit())?;
             Ok(project(Arc::new(StreamUotTransport::new(
                 Box::new(stream),
                 target,
@@ -949,7 +964,7 @@ struct BodyChunks {
     ctx: boring::aead::AeadCtx,
     iv: [u8; 16],
     size: ShakeSizeParser,
-    count: u16,
+    next: Option<u16>,
 }
 
 impl BodyChunks {
@@ -961,42 +976,69 @@ impl BodyChunks {
             )?,
             iv: *iv,
             size: ShakeSizeParser::new(iv),
-            count: 0,
+            next: Some(0),
         })
+    }
+
+    fn take_nonce(&mut self) -> io::Result<[u8; 12]> {
+        let count = self.next.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "VMess AES-GCM nonce budget exhausted",
+            )
+        })?;
+        self.next = count.checked_add(1);
+        Ok(chunk_nonce(&self.iv, count))
+    }
+
+    fn into_terminator(mut self) -> io::Result<([u8; 12], boring::aead::AeadCtx)> {
+        Ok((self.take_nonce()?, self.ctx))
     }
 
     /// Seal one chunk: masked length field + AEAD(payload). An empty
     /// payload is the request-body termination chunk (Xray's outbound
     /// writes an empty MultiBuffer on upload EOF; without it the server
     /// keeps waiting for more request data).
-    fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
+    fn seal_chunk(&mut self, payload: &[u8]) -> io::Result<Vec<u8>> {
         debug_assert!(payload.len() <= CHUNK_MAX_LEN);
+        let nonce = self.take_nonce()?;
         let mut out = Vec::with_capacity(2 + payload.len() + GCM_TAG_LEN);
         out.extend_from_slice(&self.size.encode_len((payload.len() + GCM_TAG_LEN) as u16));
         out.extend_from_slice(payload);
         out.resize(out.len() + GCM_TAG_LEN, 0);
         let (body, tag) = out[2..].split_at_mut(payload.len());
         self.ctx
-            .seal_in_place(&chunk_nonce(&self.iv, self.count), body, tag, b"")
-            .expect("AES-128-GCM seal");
-        self.count = self.count.wrapping_add(1);
-        out
+            .seal_in_place(&nonce, body, tag, b"")
+            .map_err(io::Error::other)?;
+        Ok(out)
     }
 
     fn decode_len(&mut self, encoded: [u8; 2]) -> u16 {
         self.size.decode_len(encoded)
     }
 
-    /// Decrypt a chunk in place (ciphertext+tag → plaintext prefix) and
-    /// return the plaintext length.
-    fn open_chunk(&mut self, ct: &mut [u8]) -> anyhow::Result<usize> {
-        anyhow::ensure!(ct.len() >= GCM_TAG_LEN, "short VMess chunk");
-        let (body, tag) = ct.split_at_mut(ct.len() - GCM_TAG_LEN);
+    async fn read_chunk(
+        &mut self,
+        reader: &mut (impl AsyncRead + Unpin),
+        length: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        let nonce = self.take_nonce()?;
+        let payload_len = length
+            .checked_sub(GCM_TAG_LEN)
+            .ok_or_else(|| anyhow::anyhow!("short VMess chunk"))?;
+        let mut chunk = vec![0; length];
+        reader.read_exact(&mut chunk).await?;
+        let (body, tag) = chunk.split_at_mut(payload_len);
         self.ctx
-            .open_in_place(&chunk_nonce(&self.iv, self.count), body, tag, b"")
-            .map_err(|e| anyhow::anyhow!("VMess response chunk decrypt failed: {e}"))?;
-        self.count = self.count.wrapping_add(1);
-        Ok(body.len())
+            .open_in_place(&nonce, body, tag, b"")
+            .map_err(|e| {
+                crate::proxy::NodeFailure(
+                    anyhow::anyhow!("VMess response chunk decrypt failed: {e}")
+                        .context("VMess response body"),
+                )
+            })?;
+        chunk.truncate(payload_len);
+        Ok(chunk)
     }
 }
 
@@ -1042,7 +1084,7 @@ async fn vmess_relay(
                 break;
             }
             relayed += n as u64;
-            let chunk = body.seal_chunk(&buf[..n]);
+            let chunk = body.seal_chunk(&buf[..n])?;
             let writer = &mut server_write;
             let bytes = &chunk;
             pipe.forward(relayed, |flush| async move {
@@ -1057,7 +1099,7 @@ async fn vmess_relay(
             })
             .await?;
         }
-        let term = body.seal_chunk(&[]);
+        let term = body.seal_chunk(&[])?;
         let mut remaining = term.as_slice();
         let result = super::transport::relay_upload::scope(async {
             server_write.write_all_buf(&mut remaining).await?;
@@ -1101,7 +1143,8 @@ async fn vmess_relay(
             if chunk_len == GCM_TAG_LEN {
                 break peer_end
                     .as_ref()
-                    .map(|_| (chunk_nonce(&body.iv, body.count), body.ctx));
+                    .map(|_| body.into_terminator())
+                    .transpose()?;
             }
             if !(chunk_len > GCM_TAG_LEN && chunk_len <= CHUNK_MAX_LEN + GCM_TAG_LEN) {
                 return Err(crate::proxy::NodeFailure(
@@ -1110,12 +1153,8 @@ async fn vmess_relay(
                 )
                 .into());
             }
-            let mut ct = vec![0u8; chunk_len];
-            server_read.read_exact(&mut ct).await?;
-            let n = body
-                .open_chunk(&mut ct)
-                .map_err(|error| crate::proxy::NodeFailure(error.context("VMess response body")))?;
-            let mut remaining = &ct[..n];
+            let chunk = body.read_chunk(&mut server_read, chunk_len).await?;
+            let mut remaining = chunk.as_slice();
             while tail.is_empty() && !remaining.is_empty() {
                 let write = std::future::poll_fn(|cx| {
                     match Pin::new(&mut client_write).poll_write(cx, remaining) {
