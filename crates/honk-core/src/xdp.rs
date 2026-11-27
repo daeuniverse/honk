@@ -1,6 +1,7 @@
 //! One Linux capture owner for every selected RX queue and one routing domain.
 //! Physical links are owned by FDs: exit detaches them and the kernel resumes forwarding; UMEM stays until exit.
 
+mod active;
 mod aux_tasks;
 mod config;
 mod forward;
@@ -29,11 +30,12 @@ pub(crate) mod timens;
 mod topology;
 pub(crate) mod worker;
 use crate::control::poll_budget::BusyInterval;
+use active::{TurnBudget, run_active_epoll_loop};
 use polling::runtime::polling_segment_stop;
 use polling::{AdaptivePoll, ContextDigest};
 
 #[cfg(test)]
-use crate::control::netstack::capture_scope;
+use crate::control::netstack::{capture_realm, capture_scope};
 use crate::control::{
     ControlPlane,
     core_forward::{
@@ -42,7 +44,8 @@ use crate::control::{
     },
     netstack::{
         CAPTURE_MEMORY, CAPTURE_WIDE_BULK_FRAMES, DirectRelayFence, MaterializedOutput,
-        OutputLease, OutputOwner, PacketDriver, PacketRealm, PacketScope, capture_realm,
+        OutputLease, OutputOwner, PacketDriver, PacketRealm, PacketScope,
+        capture_realm_for_workers,
     },
     packet_endpoint::{EndpointAdmission, PacketEndpointOwner, PacketEndpoints, PacketReceive},
 };
@@ -86,8 +89,10 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant, SystemTime},
 };
+#[cfg(test)]
 use tokio::io::unix::AsyncFd;
 use topology::{CapturePlan, CaptureTopology, TopologyEvent};
+use worker::epoll::{self, WorkerEpoll};
 
 const PENDING: usize = 64;
 const PEERS: usize = 4096;
@@ -316,10 +321,9 @@ fn fold_capture_result(failure: &mut Option<anyhow::Error>, result: anyhow::Resu
     }
 }
 
-fn joined_plane(
-    joined: anyhow::Result<(ControlPlane, anyhow::Result<()>)>,
-    failure: &mut Option<anyhow::Error>,
-) -> Option<ControlPlane> {
+type EndpointJoin = anyhow::Result<(ControlPlane, anyhow::Result<()>)>;
+
+fn joined_plane(joined: EndpointJoin, failure: &mut Option<anyhow::Error>) -> Option<ControlPlane> {
     match joined {
         Ok((plane, result)) => {
             fold_capture_result(failure, result);
@@ -334,7 +338,8 @@ fn joined_plane(
 
 struct Runtime {
     devices: Vec<Device>,
-    topology: AsyncFd<CaptureTopology>,
+    topology: CaptureIo<CaptureTopology>,
+    topology_readable: bool,
     topology_lost: bool,
     link_check_at: Instant,
     capture_plan: Option<CapturePlan>,
@@ -382,26 +387,74 @@ struct Runtime {
 }
 
 impl Runtime {
+    fn prepare_local_workers(&mut self, secondary: &mut [Realm]) -> io::Result<()> {
+        let eligible = |realm: &Realm| {
+            self.endpoints
+                .realm(realm.driver.scope())
+                .expect("prepared physical realm")
+                .tracks_tcp()
+        };
+        let total_pools = self
+            .realms
+            .iter()
+            .chain(secondary.iter())
+            .filter(|r| eligible(r))
+            .count();
+        for realm in self
+            .realms
+            .iter_mut()
+            .chain(secondary.iter_mut())
+            .filter(|r| eligible(r))
+        {
+            realm.driver.make_local(total_pools)?;
+        }
+        Ok(())
+    }
+
+    fn widen_local_workers(&mut self, secondary: &mut [Realm]) {
+        for primary in self.realms.iter_mut().filter(|r| r.driver.is_local()) {
+            if let Some(other) = secondary
+                .iter_mut()
+                .find(|r| r.realm_id == primary.realm_id && r.driver.is_local())
+            {
+                let (_, frames) = device_sizing(self.devices[primary.device].info.mtu);
+                PacketDriver::widen_local_pair(&mut primary.driver, &mut other.driver, frames);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn arm_local_workers(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        let now = Instant::now();
+        for realm in &mut self.realms {
+            realm.driver.poll_local_io(cx, now)?;
+        }
+        Ok(())
+    }
+
     fn relay_candidates(
         &self,
         direct: Option<DirectProfile>,
     ) -> impl Iterator<Item = (&PacketRealm, usize, &DeviceInfo)> {
-        self.realms.iter().filter_map(move |realm| {
-            let packet = self
-                .endpoints
-                .realm(realm.driver.scope())
-                .expect("prepared physical realm");
-            let info = self.devices[realm.device].info.as_ref();
-            let members = realm.members.len();
-            direct_relay_eligible(
-                direct,
-                self.workers.workers,
-                packet.owners().len(),
-                members,
-                info.direct_relay_physical,
-            )
-            .then_some((packet, members, info))
-        })
+        self.realms
+            .iter()
+            .filter(|realm| !realm.driver.is_local())
+            .filter_map(move |realm| {
+                let packet = self
+                    .endpoints
+                    .realm(realm.driver.scope())
+                    .expect("prepared physical realm");
+                let info = self.devices[realm.device].info.as_ref();
+                let members = realm.members.len();
+                direct_relay_eligible(
+                    direct,
+                    self.workers.workers,
+                    packet.owners().len(),
+                    members,
+                    info.direct_relay_physical,
+                )
+                .then_some((packet, members, info))
+            })
     }
 
     fn activate_capture(
@@ -531,6 +584,19 @@ impl Runtime {
     }
 
     fn sample_queues(&self) {
+        let mut pressure = [0u64; 3];
+        for owner in &self.realms {
+            if let Some(realm) = self.endpoints.realm(owner.driver.scope()) {
+                pressure[0] = pressure[0].saturating_add(realm.ownership_dir_full());
+                for scope in realm.owners() {
+                    if let Some((udp_full, remote_blocked)) = scope.local_counters() {
+                        pressure[1] = pressure[1].saturating_add(udp_full);
+                        pressure[2] = pressure[2].saturating_add(remote_blocked);
+                    }
+                }
+            }
+        }
+        self.diagnostics.sample_worker_pressure(pressure);
         sample_queues(&self.devices, &self.diagnostics);
     }
 
@@ -554,7 +620,7 @@ impl Runtime {
         let mut outstanding = false;
         for queue in queues {
             let port = queue.io.get_mut();
-            port.complete(release_completed)?;
+            port.complete(|done| release_completed_on(&mut self.realms, done))?;
             if kick_until.is_some_and(|deadline| Instant::now() < deadline) {
                 port.kick_outstanding_tx()?;
             }
@@ -682,10 +748,18 @@ impl Runtime {
         &mut self,
         cx: &mut Context<'_>,
         timer: Pin<&mut Option<tokio::time::Sleep>>,
+        secondary: &mut [Realm],
     ) -> Poll<()> {
         let now = Instant::now();
-        let more = self.service_scopes(cx, now);
-        let deadline = self.scope_deadline();
+        let mut more = self.service_scopes(cx, now);
+        for realm in secondary.iter_mut() {
+            more |= realm.driver.service(cx, now);
+        }
+        let deadline = self
+            .scope_deadline()
+            .into_iter()
+            .chain(secondary.iter().filter_map(|realm| realm.driver.deadline()))
+            .min();
         poll_deadline(timer, if more { Some(now) } else { deadline }, now, cx)
     }
 
@@ -762,6 +836,7 @@ impl Drop for Runtime {
             device.vlan_offload.abandon();
             device.attachment.take();
         }
+        fail_local_applications(&mut self.realms);
         self.endpoints.close();
         if std::thread::panicking() {
             std::mem::forget((
@@ -852,7 +927,7 @@ fn verify_link_fds(gateway: Option<&GatewayPublisher>, devices: &[Device]) -> io
 }
 
 fn current_topology(
-    topology: &mut AsyncFd<CaptureTopology>,
+    topology: &mut CaptureIo<CaptureTopology>,
     gateway: Option<&GatewayPublisher>,
     devices: &[Device],
     lost: &mut bool,
@@ -945,7 +1020,7 @@ pub(crate) async fn join_endpoints(
     mut poll_io: impl FnMut(&mut Context<'_>) -> Poll<anyhow::Result<()>>,
     started: Instant,
     warned: &mut bool,
-) -> anyhow::Result<anyhow::Result<(ControlPlane, anyhow::Result<()>)>> {
+) -> anyhow::Result<EndpointJoin> {
     loop {
         tokio::select! {
             result = poll_fn(|cx| owner.poll_join_plane(cx)) => return Ok(result),
@@ -965,6 +1040,7 @@ pub(crate) async fn join_endpoints(
     }
 }
 
+#[cfg(test)]
 /// What woke one wait of the started device owner.
 enum Turn<R, J> {
     Joined(J),
@@ -973,6 +1049,7 @@ enum Turn<R, J> {
     Shutdown,
 }
 
+#[cfg(test)]
 /// One device-owner wait. A pending policy-reader acquisition is polled beside device/scope
 /// service, the supervisor join and shutdown, never ahead of them. It stays pinned in
 /// `reader` across turns, keeping its place in the publication lock queue.
@@ -994,8 +1071,8 @@ async fn turn<R, J>(
     }
 }
 
-/// The production non-closing owner iteration, also used by the owned-kernel fixture.
-/// Policy guards end synchronously; only then may this owner yield its executor.
+#[cfg(test)]
+/// Drive the policy and device futures on the async kernel fixture's executor.
 async fn owner_step<'policy, R>(
     runtime: &mut Runtime,
     owner: &mut PacketEndpointOwner,
@@ -1004,20 +1081,12 @@ async fn owner_step<'policy, R>(
     shutdown: &crate::control::ShutdownIntent,
     mut timer: Pin<&mut Option<tokio::time::Sleep>>,
     mut notification: Pin<&mut tokio::sync::futures::OwnedNotified>,
-) -> anyhow::Result<Option<anyhow::Result<(ControlPlane, anyhow::Result<()>)>>>
+) -> anyhow::Result<Option<EndpointJoin>>
 where
     R: Future<Output = PolicyRead<'policy>>,
 {
     let mut failure = None;
-    if runtime.pressure.sample(
-        Instant::now(),
-        runtime.core.as_ref(),
-        runtime.waiting.len(),
-        runtime.pending.len(),
-        runtime.workers.peer_count(),
-    ) {
-        runtime.sample_queues();
-    }
+    runtime.sample_owner_pressure(Instant::now());
     if reader.is_none() && runtime.core.is_some() && runtime.core_due(Instant::now()) {
         reader.set(acquire());
     }
@@ -1032,17 +1101,7 @@ where
     .await
     {
         Turn::Joined(result) => return Ok(Some(result)),
-        Turn::Read(read) => {
-            let had_clock = runtime.polling.last_clock.is_some();
-            runtime.polling.boundary(0, 0);
-            if runtime.polling.clock_requires_policy_recheck(had_clock) {
-                runtime.policy_recheck = true;
-            } else if let Err(error) = runtime.resolve(&read) {
-                failure.get_or_insert(error);
-            }
-            drop(read);
-            runtime.observe_polling_round();
-        }
+        Turn::Read(read) => failure = runtime.service_policy_read(read).err(),
         Turn::Serviced(Err(error)) => {
             tracing::error!(%error, "XDP owner failed closed");
             failure = Some(error);
@@ -1097,6 +1156,7 @@ async fn run_capture(
     pname_support: crate::ebpf::PnameSupportCell,
     shared_runtime: tokio::runtime::Handle,
     capture: &mut Option<(Arc<worker::Shared>, PacketEndpoints)>,
+    primary_relay: &mut Option<tokio::runtime::Runtime>,
 ) -> (Option<ControlPlane>, anyhow::Result<()>) {
     *pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
     let config = plane.config_handle().read().await.as_ref().clone();
@@ -1109,7 +1169,8 @@ async fn run_capture(
         .expect("validated XDP polling consumer");
     let notification = polling_publication.notification();
     tokio::pin!(notification);
-    let prepared = match prepare(&plane, &config, Arc::clone(&admission)).await {
+    let prepared = match prepare(&plane, &config, Arc::clone(&admission), CapturePoll::Epoll).await
+    {
         Ok(prepared) => prepared,
         Err(error) => return (Some(plane), Err(error)),
     };
@@ -1213,6 +1274,7 @@ async fn run_capture(
     let mut runtime = Runtime {
         devices: std::mem::take(&mut devices.0),
         topology,
+        topology_readable: true,
         topology_lost: false,
         capture_plan: Some(capture_plan),
         capture_plan_memory: Some(plan_memory),
@@ -1262,19 +1324,27 @@ async fn run_capture(
         .datapath
         .as_ref()
         .and_then(|datapath| datapath.direct);
+    if let Err(error) = runtime.prepare_local_workers(&mut remote_realms) {
+        workers.failed(0, error.into());
+    }
     let relay_candidate = runtime.relay_candidates(direct).next().is_some();
     let aux_startup = runtime.start_auxiliary(auxiliary, &mut drivers, &shared_runtime);
     assert!(
         drivers.is_empty(),
         "every prepared scope has its exact service owner"
     );
-    let mut relay_setup =
-        (relay_candidate && workers.workers == 2).then(|| workers.defer_secondary_ready());
+    let deferred = remote_realms.iter().any(|r| r.driver.is_local());
+    let mut setup = (workers.workers == 2 && (deferred || relay_candidate))
+        .then(|| workers.defer_secondary_ready());
     if workers.workers == 2 {
         match worker::Worker::start(
             Arc::clone(&workers),
             &mut runtime.devices,
-            remote_realms,
+            if deferred {
+                Vec::new()
+            } else {
+                std::mem::take(&mut remote_realms)
+            },
             runtime.endpoints.clone(),
             remote_inbox,
             runtime.core.is_some(),
@@ -1292,16 +1362,16 @@ async fn run_capture(
     // The drivers already exist: a failed start's supervisor cleanup waits on their service.
     let startup_failure = wait_capture_startup(
         &workers,
-        relay_setup.is_some(),
+        setup.is_some(),
         &shutdown,
         |cx| owner.poll_ready(cx),
-        |cx| runtime.poll_scopes(cx, timer.as_mut()),
+        |cx| runtime.poll_scopes(cx, timer.as_mut(), &mut remote_realms),
     )
     .await
     .err();
     let activate = if startup_failure.is_some() {
         drop(aux_startup);
-        Ok(())
+        Ok(None)
     } else {
         async {
             runtime.revalidate_gateway_zones()?;
@@ -1310,8 +1380,8 @@ async fn run_capture(
                 topology.ipv4_broadcasts() == runtime.topology.get_ref().ipv4_broadcasts(),
                 "XDP broadcast classification changed before publication"
             );
-            // SAFETY: the watcher owns a stable descriptor until AsyncFd drops it.
-            runtime.topology = unsafe { AsyncFd::register(topology) }.map_err(io::Error::from)?;
+            runtime.topology = CaptureIo::Epoll(topology);
+            let epoll = runtime.register_worker_epoll()?;
             for device in &mut runtime.devices {
                 let id = device.publish_programs(
                     runtime.gateway.as_deref(),
@@ -1338,17 +1408,22 @@ async fn run_capture(
             runtime.rebuild_polling_context();
             *runtime.pname_support.write() = source_support;
             if relay_candidate {
-                workers.prepare_relays(&runtime.polling_budget)?;
+                *primary_relay = workers.prepare_relays(&runtime.polling_budget)?;
             }
-            if let Some(setup) = relay_setup.take() {
-                setup.send(()).map_err(|_| {
-                    anyhow::anyhow!("XDP secondary stopped before relay registration")
-                })?;
+            if let Some(setup) = setup.take() {
+                // Both native watch sets and gateway/relay grants now exist. Grow a local pair
+                // together while both unused drivers are still in the coordinator's custody.
+                runtime.widen_local_workers(&mut remote_realms);
+                setup
+                    .send(std::mem::take(&mut remote_realms))
+                    .map_err(|_| {
+                        anyhow::anyhow!("XDP secondary stopped before final registration")
+                    })?;
                 poll_fn(|cx| workers.all_ready(cx)).await?;
             }
             // Mandatory startup reservations must fit before either output window grows.
             if workers.workers == 2 && !runtime.endpoints.is_closing() {
-                for realm in &runtime.realms {
+                for realm in runtime.realms.iter().filter(|r| !r.driver.is_local()) {
                     let (_, base_bulk_frames) =
                         device_sizing(runtime.devices[realm.device].info.mtu);
                     runtime
@@ -1369,12 +1444,19 @@ async fn run_capture(
             } else {
                 runtime.activate_capture(&shutdown, direct)?;
             }
-            runtime.activate_auxiliary(aux_startup, &shutdown).await
+            runtime.activate_auxiliary(aux_startup, &shutdown).await?;
+            Ok(Some(epoll))
         }
         .await
     };
-    drop(relay_setup);
-    let mut failure = startup_failure.or_else(|| activate.err());
+    drop(setup);
+    // Startup may have failed before handoff. Return these unused driver rights to their
+    // joined endpoint owners before closing capture and waiting for those owners.
+    drop(remote_realms);
+    let (epoll, mut failure) = match activate {
+        Ok(poll) => (poll, startup_failure),
+        Err(error) => (None, Some(error)),
+    };
     runtime.capture_plan.take();
     runtime.capture_plan_memory.take();
     if failure.is_none() {
@@ -1388,41 +1470,35 @@ async fn run_capture(
         }
     }
     let mut warned = false;
-    // One clone of the existing registration; each acquisition yields real guards only.
-    let authority = runtime.core.as_ref().map(RoutedCore::authority);
-    let reader = None;
-    tokio::pin!(reader);
-    let joined = loop {
-        if owner.is_joined() {
-            // Failed endpoint readiness already collected the supervisor and its startup error.
-            break Some(None);
-        }
-        if failure.is_some() || shutdown.requested() {
-            break None;
-        }
-        match owner_step(
-            &mut runtime,
-            &mut owner,
-            reader.as_mut(),
-            || authority.as_ref().map(|authority| authority.read_policy()),
-            &shutdown,
-            timer.as_mut(),
-            notification.as_mut(),
-        )
-        .await
-        {
-            Ok(Some(result)) => break Some(joined_plane(result, &mut failure)),
-            Ok(None) => {}
+    let joined = if owner.is_joined() {
+        Some(None)
+    } else if let Some(epoll) = &epoll {
+        // Polling async channels from a synchronous loop must not inherit an exhaustible Tokio task budget.
+        let outcome = tokio::task::unconstrained(async {
+            run_active_epoll_loop(
+                &mut runtime,
+                &mut owner,
+                &shutdown,
+                epoll,
+                notification.as_mut(),
+            )
+        })
+        .await;
+        match outcome {
+            Ok(joined) => joined.map(|result| joined_plane(result, &mut failure)),
             Err(error) => {
-                failure.get_or_insert(error);
+                tracing::error!(%error, "XDP owner failed closed");
+                fold_capture_result(&mut failure, Err(error));
+                None
             }
         }
+    } else {
+        None
     };
-    // Release any queued Core reader before revoking the gateway publisher.
-    reader.set(None);
     let close_started = Instant::now();
     if let Err(error) = runtime.close_capture(&backend).await {
         tracing::error!(%error, "XDP capture close failed; retaining runtime and supervisor until process exit");
+        fail_local_applications(&mut runtime.realms);
         fold_capture_result(&mut failure, Err(error));
         fold_capture_result(&mut failure, owner.fail_control().await);
         runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
@@ -1442,6 +1518,7 @@ async fn run_capture(
             Ok(joined) => joined_plane(joined, &mut failure),
             Err(error) => {
                 tracing::error!(%error, "XDP terminal I/O failed; retaining runtime and supervisor until process exit");
+                fail_local_applications(&mut runtime.realms);
                 fold_capture_result(&mut failure, Err(error));
                 runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
                 std::mem::forget((runtime, owner));
@@ -1461,6 +1538,7 @@ async fn run_capture(
     .await
     {
         tracing::error!(%error, "XDP terminal drain failed; retaining owners and UMEM until process exit");
+        fail_local_applications(&mut runtime.realms);
         fold_capture_result(&mut failure, Err(error.into()));
         runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
         fold_capture_result(&mut failure, owner.fail_control().await);
@@ -1470,6 +1548,7 @@ async fn run_capture(
     if let Some(worker) = &mut runtime.worker
         && let Err(error) = worker.join().await
     {
+        fail_local_applications(&mut runtime.realms);
         fold_capture_result(&mut failure, Err(error));
         runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
         std::mem::forget((runtime, plane));
@@ -1478,6 +1557,7 @@ async fn run_capture(
     runtime.sample_queues();
     let ports_ready = runtime.ports_ready_for_backend_teardown();
     if !ports_ready {
+        fail_local_applications(&mut runtime.realms);
         fold_capture_result(
             &mut failure,
             Err(anyhow::anyhow!(
@@ -1512,7 +1592,7 @@ type RealmPlan = (Ingress, usize, LogicalLink, ScopeId);
 
 struct PreparedRuntime {
     devices: Vec<Device>,
-    topology: AsyncFd<CaptureTopology>,
+    topology: CaptureIo<CaptureTopology>,
     capture_plan: CapturePlan,
     plan_memory: MemoryReservation,
     gateway: Option<Arc<GatewayPublisher>>,

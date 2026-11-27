@@ -24,6 +24,8 @@ pub struct DeviceInfo {
     /// Direct sysfs uppers, not proof that any descendant is safe to capture.
     pub upper_ifindices: Vec<u32>,
     pub queues: Vec<u32>,
+    /// A device-backed Ethernet member, not the veth capture test profile.
+    pub physical_member: bool,
     pub mtu: u32,
     pub mac: [u8; 6],
     pub xdp_features: u64,
@@ -94,6 +96,7 @@ impl DeviceInfo {
             xdp_features,
             zerocopy_max_segments,
             vlan_metadata,
+            physical_member: physical,
             direct_relay_physical: physical && i40e_physical_function(&path, &driver),
         })
     }
@@ -150,6 +153,7 @@ impl DeviceInfo {
         if fresh.ifindex != self.ifindex
             || fresh.upper_ifindices != self.upper_ifindices
             || fresh.queues != self.queues
+            || fresh.physical_member != self.physical_member
             || fresh.mtu != self.mtu
             || fresh.mac != self.mac
             || fresh.xdp_features & !NDO_XMIT_FEATURES != self.xdp_features & !NDO_XMIT_FEATURES
@@ -525,6 +529,7 @@ mod tests {
             xdp_features: 3 | 32,
             zerocopy_max_segments: 0,
             vlan_metadata: false,
+            physical_member: true,
             direct_relay_physical: true,
         }
     }
@@ -538,6 +543,18 @@ mod tests {
         };
         assert!(candidate.validate_recheck(&unproven).is_ok());
         assert!(!unproven.supports_direct_relay_now());
+
+        let virtual_member = DeviceInfo {
+            physical_member: false,
+            ..unproven
+        };
+        assert_eq!(
+            candidate
+                .validate_recheck(&virtual_member)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
     }
 
     #[test]

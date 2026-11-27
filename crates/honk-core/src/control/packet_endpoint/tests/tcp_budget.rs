@@ -157,9 +157,9 @@ async fn dispatch_charge(
             .unwrap();
     let driver = drivers.first_mut().unwrap();
     if let Some(owner) = parked_owner {
-        let sole_scope = driver.sole_owner().unwrap();
-        assert!(sole_scope.same_owner(&scope));
-        sole_scope
+        let driver_scope = driver.owner_scope();
+        assert!(driver_scope.same_owner(&scope));
+        driver_scope
             .publish_direct_relay_runtime(owner.clone(), DirectRelayFence::new(&budget).unwrap())
             .unwrap();
     }

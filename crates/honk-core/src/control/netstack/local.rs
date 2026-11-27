@@ -2,7 +2,10 @@
 use super::*;
 use crate::connection_tracker::CloseSignal;
 use crate::sniffing::{MAX_CLIENT_HELLO_SIZE, SNIFF_TIMEOUT, SniffResult};
-use crate::xdp::worker::PeerHold;
+use crate::xdp::worker::{
+    PeerHold,
+    direct::{DirectAttach, DirectReactor},
+};
 use futures::task::AtomicWaker;
 use honk_netstack::{StreamError, TcpState};
 use remote::RemoteChunkPool;
@@ -20,6 +23,7 @@ const QUOTA: usize = 256 << 10;
 const CLOSE: u8 = 1;
 const ABORT: u8 = 2;
 const ADMITTED: u8 = 4;
+const DIRECT_CLAIMED: u8 = 8;
 const ESTABLISHED: u8 = 1;
 const TERMINAL: u8 = 2;
 const RETIRED: u8 = 4;
@@ -101,7 +105,8 @@ impl LocalShared {
     pub(super) fn deliver_callbacks(&self) {
         let mut outcome = Ok(());
         loop {
-            let Some((flow, callback)) = self.callbacks.lock().pop_front() else {
+            let retired = self.callbacks.lock().pop_front();
+            let Some((flow, callback)) = retired else {
                 break;
             };
             if let Some(cb) = callback {
@@ -200,6 +205,7 @@ pub(super) enum LocalTurn {
 pub(crate) struct LocalOwner {
     pub(super) inner: Inner,
     pub(super) turn: LocalTurn,
+    direct: DirectReactor,
     flows: FlowIdMap<Binding>,
     tuples: HashMap<(SocketAddr, SocketAddr), FlowId>,
     retiring: Vec<FlowId>,
@@ -213,6 +219,7 @@ pub(crate) struct LocalOwner {
 struct Binding {
     handle: LocalFlow,
     remote: Option<remote::RemoteOwner>,
+    direct: bool,
     closing: bool,
     deadline: Option<Instant>,
     sniff: Option<oneshot::Sender<io::Result<SniffResult>>>,
@@ -245,6 +252,7 @@ enum Request {
         Option<remote::RemoteCounters>,
         oneshot::Sender<io::Result<remote::RemoteEndpoint>>,
     ),
+    Direct(DirectAttach, Option<oneshot::Sender<io::Result<()>>>),
 }
 
 struct LocalRetirement {
@@ -304,6 +312,30 @@ impl LocalFlow {
     pub(crate) fn abort(&self) {
         self.set(ABORT);
     }
+    pub(crate) fn cancel_direct(&self) {
+        // Exact retirement also resolves CloseSignal. Never reset a flow whose pump
+        // already published its final close, even if that notification wins the race.
+        if self
+            .0
+            .flags
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |flags| {
+                (flags & (CLOSE | ABORT) == 0).then_some(flags | ABORT)
+            })
+            .is_ok()
+        {
+            self.0.wake_by_ref();
+        }
+    }
+    fn claim_direct(&self) -> bool {
+        // This transition and cancel_direct's ABORT share one modification order.
+        // Only a successful claim may hand the buffered prefix and socket to the pump.
+        self.0
+            .flags
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |flags| {
+                (flags & (CLOSE | ABORT | DIRECT_CLAIMED) == 0).then_some(flags | DIRECT_CLAIMED)
+            })
+            .is_ok()
+    }
     pub(crate) fn close(&self) {
         if self.0.flags.fetch_or(CLOSE, Ordering::AcqRel) & CLOSE == 0 {
             self.0.wake_by_ref();
@@ -314,6 +346,9 @@ impl LocalFlow {
     }
     pub(crate) fn reserve(&self, bytes: usize) -> Option<MemoryReservation> {
         self.0.scope.upgrade()?.local.get()?.reserve(bytes)
+    }
+    pub(crate) fn reserve_direct(&self) -> Option<MemoryReservation> {
+        DirectAttach::credit(|bytes| self.reserve(bytes))
     }
     pub(super) fn set_retirement_callback(
         &self,
@@ -409,6 +444,36 @@ impl LocalFlow {
     ) -> io::Result<remote::RemoteEndpoint> {
         self.request(|done| Request::Remote(counters, done)).await
     }
+    pub(crate) fn submit_direct(&self, attach: DirectAttach) -> io::Result<()> {
+        self.queue_direct(attach, None)
+    }
+    #[cfg(test)]
+    pub(crate) async fn attach_direct(&self, attach: DirectAttach) -> io::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.queue_direct(attach, Some(tx))?;
+        rx.await.map_err(|_| self.unavailable())?
+    }
+    fn queue_direct(
+        &self,
+        attach: DirectAttach,
+        done: Option<oneshot::Sender<io::Result<()>>>,
+    ) -> io::Result<()> {
+        let mut request = self.0.request.lock();
+        if !self.can_bind() || self.0.flags.load(Ordering::Acquire) & (CLOSE | ABORT) != 0 {
+            drop(request);
+            attach.cancel();
+            return Err(self.unavailable());
+        }
+        if request.is_some() {
+            drop(request);
+            attach.reject();
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        *request = Some(Request::Direct(attach, done));
+        drop(request);
+        self.0.wake_by_ref();
+        Ok(())
+    }
 }
 
 fn new_local_ledger(
@@ -482,6 +547,7 @@ impl PacketDriver {
             parked.rights = Rights::Abandoned;
         }
         shared.pool.close();
+        owner.direct.close();
         shared.shutdown(true);
         for binding in owner.flows.values_mut() {
             let state = &binding.handle.0;
@@ -497,7 +563,10 @@ impl PacketDriver {
             if let Some(remote) = binding.remote.take() {
                 remote.fail(StreamError::Reset);
             }
-            drop(state.request.lock().take());
+            let request = state.request.lock().take();
+            if let Some(Request::Direct(attach, _)) = request {
+                attach.cancel();
+            }
             binding.sniff.take();
             state.detached.store(true, Ordering::Release);
             state.changed.notify_waiters();
@@ -519,6 +588,20 @@ impl PacketDriver {
             owner.complete(queued, output.bytes.take());
         }
         true
+    }
+    #[cfg(test)]
+    pub(crate) fn local_direct_attached(
+        &self,
+        client: SocketAddr,
+        destination: SocketAddr,
+    ) -> bool {
+        self.local.as_ref().is_some_and(|owner| {
+            owner
+                .tuples
+                .get(&(client, destination))
+                .and_then(|id| owner.flows.get(id))
+                .is_some_and(|binding| binding.direct)
+        })
     }
     pub(crate) fn make_local(&mut self, total_pools: usize) -> io::Result<()> {
         let shared = &self.scope.0;
@@ -572,6 +655,7 @@ impl PacketDriver {
             })
             .ok_or_else(capacity)?;
         let memory = pool.reserve(bytes).ok_or_else(capacity)?;
+        let direct = DirectReactor::new(guard.half_open.len(), |bytes| pool.reserve(bytes))?;
         // The parked scope still owns plain SourceWork counters and its original join right.
         // A closed ledger refuses all shared output grants while the physical device owns its pool.
         let ledger_config = FrameConfig {
@@ -678,6 +762,7 @@ impl PacketDriver {
         self.local = Some(Box::new(LocalOwner {
             inner,
             turn: LocalTurn::Idle,
+            direct,
             flows: FlowIdMap::with_capacity_and_hasher(slots, Default::default()),
             tuples: HashMap::with_capacity(slots),
             retiring: Vec::with_capacity(slots),
@@ -782,7 +867,8 @@ impl PacketDriver {
     pub(crate) fn poll_accept_local(&mut self) -> io::Result<Option<(SynInfo, FlowIo)>> {
         let owner = self.local.as_mut().ok_or_else(closed)?;
         let inner = &mut owner.inner;
-        if inner.closing {
+        let local = self.scope.0.local.get().expect("local driver");
+        if inner.closing || local.shutdown.load(Ordering::Acquire) != 0 {
             return Ok(None);
         }
         let Some(stack) = inner.stack.as_mut() else {
@@ -791,12 +877,16 @@ impl PacketDriver {
         let Some(syn) = stack.poll_accept() else {
             return Ok(None);
         };
-        let local = self.scope.0.local.get().expect("local driver");
         let Some(memory) = local.reserve(FLOW_SIGNAL_BYTES) else {
             inner.reap_pending = true;
             stack.tcp_refuse(syn.id, honk_netstack::Refuse::Drop);
             return Ok(None);
         };
+        if local.shutdown.load(Ordering::Acquire) != 0 {
+            inner.reap_pending = true;
+            stack.tcp_refuse(syn.id, honk_netstack::Refuse::Drop);
+            return Ok(None);
+        }
         if stack.tcp_accept(syn.id, AcceptOpts::default()).is_err() {
             stack.tcp_abort(syn.id);
             stack.tcp_close(syn.id);
@@ -831,6 +921,7 @@ impl PacketDriver {
             Binding {
                 handle,
                 remote: None,
+                direct: false,
                 closing: false,
                 deadline: None,
                 sniff: None,
@@ -848,7 +939,53 @@ impl PacketDriver {
             .as_ref()
             .is_some_and(|owner| owner.turn != LocalTurn::Idle)
     }
+    #[cfg(all(test, feature = "native-api"))]
+    pub(crate) fn has_submitted_direct(&self) -> bool {
+        self.local.as_ref().is_some_and(|owner| {
+            owner.flows.values().any(|binding| {
+                matches!(
+                    binding.handle.0.request.lock().as_ref(),
+                    Some(Request::Direct(_, None))
+                )
+            })
+        })
+    }
+    #[cfg(all(test, feature = "native-api"))]
+    pub(crate) fn close_local_direct(&mut self) {
+        self.local.as_mut().expect("local driver").direct.close();
+    }
+    pub(crate) fn bind_worker_epoll(
+        &mut self,
+        epoll: Arc<crate::xdp::worker::epoll::BudgetedEpollFd>,
+        realm_index: usize,
+    ) -> io::Result<()> {
+        if let Some(owner) = &mut self.local {
+            owner.direct.bind_worker_epoll(epoll, realm_index)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn direct_socket_ready(&mut self, token: u64, events: u32) {
+        if let Some(owner) = &mut self.local {
+            owner.direct.socket_ready(token, events);
+        }
+    }
+    pub(crate) fn direct_epoll_waiters(&self) -> usize {
+        self.local
+            .as_ref()
+            .map_or(0, |owner| owner.direct.epoll_waiters())
+    }
     pub(crate) fn poll_local_io(&mut self, cx: &mut Context<'_>, now: Instant) -> io::Result<bool> {
+        let ready = match &mut self.local {
+            Some(owner) => owner.direct.poll_ready(cx)?,
+            None => return Ok(false),
+        };
+        Ok(self.poll_local_io_sync(cx, now)? || ready)
+    }
+    pub(crate) fn poll_local_io_sync(
+        &mut self,
+        cx: &mut Context<'_>,
+        now: Instant,
+    ) -> io::Result<bool> {
         let Some(owner) = self.local.as_deref_mut() else {
             return Ok(false);
         };
@@ -859,10 +996,37 @@ impl PacketDriver {
         let standalone = owner.turn == LocalTurn::Idle;
         owner.start_turn(&self.scope, now, Some(cx));
         let more = owner.dispatch(&self.scope, now);
+        let socket = if owner.inner.stack.is_some() {
+            let mut turn = owner.direct.begin_service().inspect_err(|_| {
+                if standalone {
+                    owner.turn = LocalTurn::Idle;
+                }
+            })?;
+            while let Some((id, publish)) = owner.direct.next_finished(
+                owner.inner.stack.as_mut().expect("live local stack"),
+                now,
+                &mut turn,
+            ) {
+                let binding = owner.flows.get_mut(&id).expect("attached Direct flow");
+                binding.closing = true;
+                binding.handle.0.flags.fetch_or(CLOSE, Ordering::Release);
+                let slot = owner.inner.slot(id).expect("attached Direct slot");
+                if slot.app_open {
+                    slot.app_open = false;
+                    owner.inner.stack.as_mut().unwrap().tcp_close(id);
+                    owner.retiring.push(id);
+                    owner.reap_retiring(&self.scope, owner.retiring.len() - 1);
+                }
+                publish();
+            }
+            turn.worked
+        } else {
+            false
+        };
         if standalone {
             self.deadline = owner.finish_turn(&self.scope, cx, now);
         }
-        Ok(more)
+        Ok(more || socket)
     }
 }
 
@@ -1153,6 +1317,7 @@ impl LocalOwner {
     }
     fn abort(&mut self, shared: &LocalShared) {
         shared.pool.close();
+        self.direct.close();
         self.inner.abort();
         for binding in self.flows.values_mut() {
             binding
@@ -1169,25 +1334,25 @@ impl LocalOwner {
     }
     fn dispatch(&mut self, scope: &PacketScope, now: Instant) -> bool {
         let shared = scope.0.local.get().expect("local owner");
-        let mut more = false;
-        for n in 1..=BATCH {
-            if !shared.has_ready.load(Ordering::Acquire) {
-                break;
-            }
+        if shared.has_ready.load(Ordering::Acquire) {
             let mut queue = shared.ready.lock();
-            let Some(id) = queue.pop_front() else {
-                break;
-            };
-            if queue.is_empty() {
-                shared.has_ready.store(false, Ordering::Release);
+            if let Some(first) = queue.pop_front() {
+                let mut batch = [first; BATCH];
+                let rest = queue.len().min(BATCH - 1);
+                for (cell, id) in batch[1..1 + rest].iter_mut().zip(queue.drain(..rest)) {
+                    *cell = id;
+                }
+                shared.has_ready.store(!queue.is_empty(), Ordering::Release);
+                drop(queue);
+                for &id in &batch[..1 + rest] {
+                    if let Some(flow) = self.flows.get(&id) {
+                        flow.handle.0.queued.swap(false, Ordering::AcqRel);
+                    }
+                    self.service_flow(scope, id, Ready::default(), now, false);
+                }
             }
-            drop(queue);
-            if let Some(flow) = self.flows.get(&id) {
-                flow.handle.0.queued.store(false, Ordering::Release);
-            }
-            self.service_flow(scope, id, Ready::default(), now, false);
-            more |= n == BATCH;
         }
+        let mut more = false;
         if self
             .inner
             .stack
@@ -1201,6 +1366,7 @@ impl LocalOwner {
             let Some((id, ready)) = self.inner.stack.as_mut().and_then(Stack::poll_event) else {
                 break;
             };
+            self.direct.mark_ready(id);
             self.service_flow(scope, id, ready, now, false);
             more |= n == BATCH;
         }
@@ -1215,7 +1381,8 @@ impl LocalOwner {
             more |= n == BATCH;
         }
         self.reap(scope);
-        more
+        // Servicing a request can re-enqueue it after the batch was detached.
+        more || shared.has_ready.load(Ordering::Acquire)
     }
     fn service_flow(
         &mut self,
@@ -1225,11 +1392,18 @@ impl LocalOwner {
         now: Instant,
         timed: bool,
     ) {
+        // Steady Direct readiness goes straight to the reactor; no binding mutex or metadata round trip.
         let Some(binding) = self.flows.get_mut(&id) else {
             return;
         };
+        if !ready.is_empty() && binding.direct {
+            return;
+        }
         let handle = binding.handle.clone();
-        let flags = handle.0.flags.fetch_and(CLOSE, Ordering::AcqRel);
+        let flags = handle
+            .0
+            .flags
+            .fetch_and(CLOSE | DIRECT_CLAIMED, Ordering::AcqRel);
         binding.closing |= flags & CLOSE != 0;
         let state = self.inner.stack.as_ref().and_then(|s| s.tcp_state(id));
         if (ready.contains(Ready::CONNECTED)
@@ -1240,6 +1414,7 @@ impl LocalOwner {
         }
         if flags & ABORT != 0 {
             handle.0.status.fetch_or(CANCELLED, Ordering::Release);
+            self.direct.abort(id);
             if let Some(s) = &mut self.inner.stack {
                 s.tcp_abort(id);
             }
@@ -1275,9 +1450,48 @@ impl LocalOwner {
                 && !binding.closing
                 && !self.inner.closing
                 && (!terminal || readable)
+                && !binding.direct
                 && binding.remote.is_none()
                 && binding.sniff.is_none();
             match request {
+                Request::Direct(attach, done) => {
+                    if available && done.as_ref().is_some_and(oneshot::Sender::is_closed) {
+                        // The original waiter withdrew before the socket or any prefix was used.
+                        attach.reject();
+                    } else if !available || attach.cancelled() || !handle.claim_direct() {
+                        attach.cancel();
+                        if let Some(done) = done {
+                            let _ = done.send(Err(closed()));
+                        }
+                    } else {
+                        match self.direct.attach(id, attach, now) {
+                            Ok(()) => {
+                                binding.direct = true;
+                                if let Some(slot) = self.inner.slot(id) {
+                                    slot.rx_admitted = true;
+                                }
+                                if done.is_some_and(|done| done.send(Ok(())).is_err()) {
+                                    self.direct.abort(id);
+                                    handle.abort();
+                                }
+                            }
+                            Err(attach) => {
+                                let flags =
+                                    handle.0.flags.fetch_and(!DIRECT_CLAIMED, Ordering::AcqRel);
+                                let error = if flags & (ABORT | CLOSE) != 0 {
+                                    attach.cancel();
+                                    closed()
+                                } else {
+                                    attach.reject();
+                                    io::ErrorKind::WouldBlock.into()
+                                };
+                                if let Some(done) = done {
+                                    let _ = done.send(Err(error));
+                                }
+                            }
+                        }
+                    }
+                }
                 Request::Sniff(done) => {
                     if available {
                         binding.sniff = Some(done);
@@ -1364,6 +1578,7 @@ impl LocalOwner {
             }
         }
         if binding.closing && can_close && self.inner.slot(id).is_some_and(|slot| slot.app_open) {
+            self.direct.abort(id);
             if let Some(stack) = &mut self.inner.stack {
                 if binding
                     .remote
@@ -1464,7 +1679,10 @@ impl LocalOwner {
                 }
             }
             flow.mark_terminal();
-            drop(flow.0.request.lock().take());
+            let request = flow.0.request.lock().take();
+            if let Some(Request::Direct(attach, _)) = request {
+                attach.cancel();
+            }
             let cb = flow.0.callback.lock().take().map(|p| p.callback);
             let mut callbacks = shared.callbacks.lock();
             let wake = callbacks.is_empty();
@@ -1514,7 +1732,7 @@ impl LocalOwner {
             // A standalone begin_turn has no Context. A producer may have raced registration.
             cx.waker().wake_by_ref();
         }
-        if self.dispatch(scope, now) {
+        if self.dispatch(scope, now) || self.direct.has_pending_work() {
             cx.waker().wake_by_ref();
         }
         let rescan = self
@@ -1564,6 +1782,7 @@ impl LocalOwner {
         [
             self.inner.stack.as_ref().and_then(Stack::poll_timeout),
             self.writer_retry,
+            self.direct.deadline(),
             self.deadlines.first_key_value().map(|(&(at, _), _)| at),
         ]
         .into_iter()
@@ -2069,6 +2288,274 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn remote_drain_expiry_aborts_full_tx_after_zero_window_fin() {
+        use crate::relay::{self, DrainExpired, RelayProgress};
+        use crate::xdp::{ReturnPath, worker::PeerAuthority};
+        use honk_netstack::wire::parse_ip;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // The retained FIN acknowledgement may occupy a bulk frame; payload must still have credit.
+        let (scope, owner, mut driver) = physical_with_bulk(2);
+        let now = Instant::now();
+        let mut cx = Context::from_waker(Waker::noop());
+        let budget = scope.budget();
+        let authority = PeerAuthority::new(Arc::new(AtomicBool::new(true)), &budget).unwrap();
+        let path = ReturnPath {
+            realm: 1,
+            device: 0,
+            mac: [2; 6],
+            vlan_tci: [7, 0],
+            vlan_proto: [0x8100, 0],
+            vlan_count: 1,
+        };
+        let retain = |source, pending| authority.retain(scope.scope(), source, path, now, pending);
+        let (syn, mut flow) = accept_with_peer(&mut driver, now, 41322, retain);
+        let id = syn.id;
+        driver.service(&mut cx, now);
+        let syn_ack = take(&mut driver, TxClass::Control);
+        let tcp_of = |output: &OutputLease| {
+            assert_eq!(output.flow_id(), Some(id));
+            assert_eq!(
+                output
+                    .peer_hold()
+                    .filter(PeerHold::learned)
+                    .map(|peer| (peer.address(), peer.original_path())),
+                Some((syn.client.ip(), path))
+            );
+            let packet = output.packet();
+            let ip = parse_ip(packet).unwrap();
+            assert_eq!((ip.src, ip.dst), (syn.original_dst.ip(), syn.client.ip()));
+            let segment = &packet[ip.payload];
+            assert!(tcp::verify_checksum(ip.src, ip.dst, segment));
+            let (header, len) = tcp::parse(segment).unwrap();
+            assert_eq!(len, segment.len());
+            assert_eq!(header.src_port, syn.original_dst.port());
+            assert_eq!(header.dst_port, syn.client.port());
+            header
+        };
+        let header = tcp_of(&syn_ack);
+        assert_eq!(header.flags, tcp::SYN | tcp::ACK);
+        assert_eq!(header.ack, 101);
+        let server_seq = header.seq.wrapping_add(1);
+        syn_ack.release();
+        let send = |driver: &mut PacketDriver, flags| {
+            let mut packet = [0; 80];
+            let length = tcp::emit_packet(
+                &mut packet,
+                syn.client.ip(),
+                syn.original_dst.ip(),
+                &tcp::Header {
+                    src_port: syn.client.port(),
+                    dst_port: syn.original_dst.port(),
+                    seq: 101,
+                    ack: server_seq,
+                    flags,
+                    window: 0,
+                    urgent: 0,
+                    options: Default::default(),
+                },
+                [&[], &[]],
+            )
+            .unwrap();
+            let (rx, report, _) = driver
+                .receive_realm_timed(&packet[..length], now, now, &mut None, false, retain)
+                .unwrap();
+            assert_eq!(rx, Rx::Consumed);
+            assert!(report.taken_over);
+        };
+        {
+            let mut established = std::pin::pin!(flow.local().unwrap().wait_established());
+            assert!(futures::poll!(&mut established).is_pending());
+            send(&mut driver, tcp::ACK);
+            driver.finish_turn(&mut cx, now);
+            assert!(matches!(
+                futures::poll!(&mut established),
+                Poll::Ready(Ok(()))
+            ));
+        }
+        {
+            let mut attach = std::pin::pin!(flow.attach_remote());
+            assert!(futures::poll!(&mut attach).is_pending());
+            driver.service(&mut cx, now);
+            attach.await.unwrap();
+        }
+        let poll_packet = |driver: &mut PacketDriver, cx: &mut Context<'_>| {
+            for class in [TxClass::Control, TxClass::Bulk] {
+                let mut out = [None];
+                match driver.poll_outputs_class(cx, class, &mut out) {
+                    Poll::Ready(Some(1)) => return Poll::Ready(out[0].take().unwrap()),
+                    Poll::Pending => (),
+                    other => panic!("unexpected {class:?} output state: {other:?}"),
+                }
+            }
+            Poll::Pending
+        };
+        async fn on_owner_wake<T>(
+            mut service: impl FnMut(&mut Context<'_>) -> Poll<T>,
+        ) -> Result<T, tokio::time::error::Elapsed> {
+            struct OutputWake(Notify);
+            impl Wake for OutputWake {
+                fn wake(self: Arc<Self>) {
+                    self.wake_by_ref();
+                }
+                fn wake_by_ref(self: &Arc<Self>) {
+                    self.0.notify_one();
+                }
+            }
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            for _ in 0..BATCH {
+                let signal = Arc::new(OutputWake(Notify::new()));
+                let waker = Waker::from(Arc::clone(&signal));
+                if let Poll::Ready(output) = service(&mut Context::from_waker(&waker)) {
+                    return Ok(output);
+                }
+                // The deadline may poll the notification, never another device turn.
+                tokio::time::timeout_at(deadline, signal.0.notified()).await?;
+            }
+            panic!("owner woke without producing output");
+        }
+        let next_packet = async |driver: &mut PacketDriver| {
+            on_owner_wake(|cx| {
+                driver.service(cx, now);
+                poll_packet(driver, cx)
+            })
+            .await
+        };
+        send(&mut driver, tcp::FIN | tcp::ACK);
+        let held = next_packet(&mut driver).await.expect("FIN acknowledgement");
+        let ack = tcp_of(&held);
+        assert_eq!((ack.flags, ack.ack), (tcp::ACK, 102));
+        assert!(poll_packet(&mut driver, &mut cx).is_pending());
+        assert_eq!(
+            driver
+                .local
+                .as_ref()
+                .unwrap()
+                .inner
+                .stack
+                .as_ref()
+                .unwrap()
+                .tcp_state(id),
+            Some(TcpState::CloseWait)
+        );
+
+        let accepted = flow.remote_progress().unwrap();
+        let mut retirement = flow.retirement();
+        let before = budget.used();
+        let (proxy, mut upstream) = tokio::io::duplex(256 << 10);
+        upstream.write_all(&vec![7; 256 << 10]).await.unwrap();
+        let progress = RelayProgress {
+            upload: Arc::new(AtomicU64::new(0)),
+            download: Arc::new(AtomicU64::new(0)),
+            outbound: None,
+            first_response: None,
+            on_transfer: None,
+        };
+        let committed = {
+            let mut relay = std::pin::pin!(relay::relay_remote_tcp(
+                &mut flow,
+                proxy,
+                (syn.client, syn.original_dst),
+                &progress,
+                || accepted.snapshot().0,
+            ));
+            assert!(futures::poll!(&mut relay).is_pending());
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), upstream.read_u8())
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::UnexpectedEof,
+            );
+            // Fill both buffering frontiers without advancing the packet clock or opening the window.
+            for _ in 0..4 {
+                driver.service(&mut cx, now);
+                assert!(futures::poll!(&mut relay).is_pending());
+            }
+            driver.service(&mut cx, now);
+            let committed = accepted.snapshot().0;
+            assert!(committed > 0);
+            assert!(
+                driver.local.as_ref().unwrap().flows[&id]
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .tx_pending()
+            );
+            assert!(progress.download.load(Ordering::Relaxed) > committed);
+            let ledger = &mut driver.local.as_mut().unwrap().inner.ledger;
+            let spare = ledger
+                .reserve_tx(TxClass::Bulk)
+                .expect("independent bulk credit");
+            ledger.cancel_tx(spare).unwrap();
+            assert!(poll_packet(&mut driver, &mut cx).is_pending());
+            assert!(budget.used() > before);
+            let error = tokio::time::timeout(Duration::from_secs(2), relay)
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(error.is::<DrainExpired>());
+            committed
+        };
+
+        flow.abort();
+        let reset = next_packet(&mut driver).await.expect("abort reset");
+        assert_ne!(tcp_of(&reset).flags & tcp::RST, 0);
+        let owned_outputs = |driver: &PacketDriver| {
+            driver
+                .local
+                .as_ref()
+                .unwrap()
+                .inner
+                .ledger
+                .outstanding_tx()
+                .filter(|output| output.owner == Some(id))
+                .count()
+        };
+        assert_eq!(owned_outputs(&driver), 2);
+        assert!(futures::poll!(std::pin::pin!(retirement.wait())).is_pending());
+        reset.release();
+        driver.service(&mut cx, now);
+        assert_eq!(owned_outputs(&driver), 1);
+        assert!(accepted.finished());
+        assert_eq!(accepted.snapshot().0, committed);
+        scope.0.local.get().unwrap().drain_pool();
+        assert!(budget.used() <= before);
+        assert!(futures::poll!(std::pin::pin!(retirement.wait())).is_pending());
+        held.release();
+        driver.service(&mut cx, now);
+        scope.0.local.get().unwrap().deliver_callbacks();
+        tokio::time::timeout(Duration::from_secs(1), retirement.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owned_outputs(&driver), 0);
+        scope.shutdown(true);
+        driver.service_closing(&mut cx, now);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), owner.reclaim())
+                .await
+                .unwrap()
+        );
+        owner.run().await;
+
+        let mut silent_turns = 0;
+        let silent = on_owner_wake(|_| {
+            silent_turns += 1;
+            if silent_turns == 1 {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        })
+        .await;
+        assert!(silent.is_err(), "deadline supplied a device turn");
+        assert_eq!(silent_turns, 1);
+    }
 
     #[tokio::test]
     async fn dropped_tcp_handoff_wakes_only_after_original_output_returns() {
@@ -2504,9 +2991,11 @@ mod source_work_tests {
     use super::*;
     use crate::xdp::{ReturnPath, worker::PeerAuthority};
     use honk_netstack::wire::{self, tcp};
+    use std::time::Duration;
 
     mod bulk_retirement;
     mod pressure;
+    mod ready_dispatch;
 
     fn input(
         client: SocketAddr,
@@ -2602,7 +3091,7 @@ mod source_work_tests {
         driver.make_local(1).unwrap();
         let now = Instant::now();
         let destination = "203.0.113.2:443".parse().unwrap();
-        let authority = PeerAuthority::new(Arc::new(AtomicBool::new(true)));
+        let authority = PeerAuthority::new(Arc::new(AtomicBool::new(true)), &budget).unwrap();
         let mut flow_peers = Vec::new();
         let mut cx = Context::from_waker(Waker::noop());
         for n in 0..1008 {
@@ -2707,7 +3196,7 @@ mod source_work_tests {
         let mut driver = owner.hand_off();
         driver.make_local(1).unwrap();
         let now = Instant::now();
-        let authority = PeerAuthority::new(Arc::new(AtomicBool::new(true)));
+        let authority = PeerAuthority::new(Arc::new(AtomicBool::new(true)), &budget).unwrap();
         let client = "192.0.2.1:45000".parse().unwrap();
         let destination = "203.0.113.2:53".parse().unwrap();
         let mut packet = [0; 128];
@@ -2733,6 +3222,518 @@ mod source_work_tests {
         assert!(!report.taken_over && !report.qualified_rx && work.is_none());
         driver.service_closing(&mut Context::from_waker(Waker::noop()), now);
         assert!(owner.reclaim().await);
+        owner.run().await;
+    }
+
+    fn direct_pair(
+        budget: &Arc<MemoryBudget>,
+    ) -> (
+        DirectAttach,
+        crate::xdp::worker::direct::DirectObserver,
+        crate::relay::RelayProgress,
+        tokio::net::TcpStream,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        server.set_nonblocking(true).unwrap();
+        let progress = crate::relay::RelayProgress {
+            upload: Arc::new(AtomicU64::new(0)),
+            download: Arc::new(AtomicU64::new(0)),
+            outbound: None,
+            first_response: None,
+            on_transfer: None,
+        };
+        let (binding, observer) = DirectAttach::new(
+            socket,
+            &progress,
+            DirectAttach::credit(|bytes| budget.reserve(bytes)).unwrap(),
+            true,
+        );
+        (
+            binding,
+            observer,
+            progress,
+            tokio::net::TcpStream::from_std(server).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn submit_direct_finishes_and_retires_without_duplicate_close_wake() {
+        use crate::xdp::worker::direct::DirectOutcome;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (scope, owner, mut driver) = super::tests::physical();
+        let authority = PeerAuthority::new(Arc::new(true.into()), &scope.0.budget).unwrap();
+        let now = Instant::now();
+        let client = "192.0.2.1:45000".parse().unwrap();
+        let dst = "203.0.113.2:443".parse().unwrap();
+        let (mut flow, ack) = accept(&mut driver, &authority, client, dst, now);
+        let local = flow.local().unwrap().clone();
+        let (done, mut retired) = oneshot::channel();
+        flow.set_retirement_callback(move || done.send(()).unwrap())
+            .unwrap();
+        receive(
+            &mut driver,
+            &authority,
+            &input(client, dst, 101, ack, tcp::ACK | tcp::FIN, b"a"),
+            now,
+        );
+        let wake = Arc::new(TurnWake::default());
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        driver.finish_turn(&mut cx, now);
+        let (attach, mut observer, progress, mut server) = direct_pair(&scope.0.budget);
+        server.shutdown().await.unwrap();
+        local.submit_direct(attach).unwrap();
+        assert!(observer.poll_update(&mut cx).is_pending());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            poll_fn(|cx| {
+                if driver.poll_local_io(cx, now).unwrap() {
+                    cx.waker().wake_by_ref();
+                }
+                while let Poll::Ready((snapshot, outcome)) = observer.poll_update(cx) {
+                    if let Some(outcome) = outcome {
+                        assert!(snapshot.attached);
+                        assert!(matches!(outcome, DirectOutcome::Finished(Ok(_))));
+                        return Poll::Ready(());
+                    }
+                }
+                Poll::Pending
+            }),
+        )
+        .await
+        .unwrap();
+        let mut delivered = Vec::new();
+        server.read_to_end(&mut delivered).await.unwrap();
+        assert_eq!(delivered, b"a");
+        assert_eq!(progress.upload.load(Ordering::Relaxed), 1);
+        assert_ne!(local.0.flags.load(Ordering::Acquire) & CLOSE, 0);
+        assert!(
+            !driver
+                .local
+                .as_mut()
+                .unwrap()
+                .inner
+                .slot(flow.flow_id())
+                .unwrap()
+                .app_open
+        );
+        let shared = scope.0.local.get().unwrap();
+        shared.wake.register(&waker);
+        wake.0.store(false, Ordering::Relaxed);
+        local.cancel_direct();
+        assert_eq!(local.0.flags.load(Ordering::Acquire) & ABORT, 0);
+        let mut retiring = std::pin::pin!(flow.retire());
+        assert!(retiring.as_mut().poll(&mut cx).is_pending());
+        assert!(!wake.0.load(Ordering::Relaxed));
+        let mut bytes = [0; 1280];
+        let mut fin = loop {
+            let MaterializedOutput::Packet(output) = driver
+                .materialize_into(now, TxClass::Control, &mut bytes)
+                .unwrap()
+            else {
+                panic!("expected TCP FIN");
+            };
+            let ip = wire::parse_ip(&bytes[..output.owner.len()]).unwrap();
+            let (header, _) = tcp::parse(&bytes[ip.payload]).unwrap();
+            if header.flags & tcp::FIN != 0 {
+                assert_eq!(header.seq, ack);
+                break output.owner;
+            }
+            let mut owner = output.owner;
+            driver.complete_local(&mut owner);
+        };
+        receive(
+            &mut driver,
+            &authority,
+            &input(client, dst, 103, ack.wrapping_add(1), tcp::ACK, b""),
+            now,
+        );
+        driver.finish_turn(&mut cx, now);
+        shared.deliver_callbacks();
+        assert!(retired.try_recv().is_err());
+        assert!(driver.complete_local(&mut fin));
+        driver.finish_turn(&mut cx, now);
+        shared.deliver_callbacks();
+        retired.try_recv().unwrap();
+        retiring.await.unwrap();
+        scope.shutdown(true);
+        driver.service_closing(&mut cx, now);
+        assert!(owner.reclaim().await);
+        owner.run().await;
+    }
+
+    #[tokio::test]
+    async fn direct_cancel_after_flag_snapshot_prevents_first_upload() {
+        use crate::xdp::worker::direct::DirectOutcome;
+        use std::sync::Barrier;
+        use tokio::io::AsyncReadExt;
+
+        let (scope, owner, mut driver) = super::tests::physical();
+        let budget = &scope.0.budget;
+        let authority = PeerAuthority::new(Arc::new(true.into()), budget).unwrap();
+        let now = Instant::now();
+        let client = "192.0.2.1:45000".parse().unwrap();
+        let dst = "203.0.113.2:443".parse().unwrap();
+        let (flow, ack) = accept(&mut driver, &authority, client, dst, now);
+        let payload = b"already buffered before cancellation";
+        receive(
+            &mut driver,
+            &authority,
+            &input(client, dst, 101, ack, tcp::ACK, payload),
+            now,
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        driver.finish_turn(&mut cx, now);
+        let id = flow.flow_id();
+        let local = flow.local().unwrap();
+        let (attach, mut observer, progress, mut peer) = direct_pair(budget);
+        local.submit_direct(attach).unwrap();
+
+        let owner_state = driver.local.as_deref_mut().unwrap();
+        let gate = Barrier::new(2);
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                // Hold the real request until service_flow has consumed the ADMITTED flag.
+                // From that instruction to the claim it cannot process a second ABORT.
+                let request = local.0.request.lock();
+                local.mark_rx_admitted();
+                gate.wait();
+                let until = Instant::now() + Duration::from_secs(5);
+                while local.0.flags.load(Ordering::Acquire) & ADMITTED != 0 {
+                    assert!(Instant::now() < until, "worker did not consume its flags");
+                    std::thread::yield_now();
+                }
+                local.cancel_direct();
+                drop(request);
+            });
+            gate.wait();
+            owner_state.service_flow(&scope, id, Ready::default(), now, false);
+        });
+
+        // A request serviced at the last dispatch slot is followed by this pump turn,
+        // before any queued cancellation is dispatched. Exercise the actual writev path.
+        let stack = owner_state.inner.stack.as_mut().unwrap();
+        owner_state.direct.service(stack, now).unwrap();
+        assert_eq!(progress.upload.load(Ordering::Relaxed), 0);
+        let (parts, count, _) = stack.tcp_peek_rx(id, payload.len()).unwrap();
+        assert!(
+            parts[..count]
+                .iter()
+                .flat_map(|part| part.iter())
+                .eq(payload)
+        );
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), peer.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(matches!(
+            observer.poll_update(&mut cx),
+            Poll::Ready((snapshot, Some(DirectOutcome::Cancelled))) if !snapshot.attached
+        ));
+        assert!(!driver.local_direct_attached(client, dst));
+        drop(flow);
+        scope.shutdown(true);
+        driver.service_closing(&mut cx, now);
+        assert!(owner.reclaim().await);
+        owner.run().await;
+    }
+
+    #[tokio::test]
+    async fn busy_submit_and_withdrawn_attach_return_their_original_sockets() {
+        use crate::xdp::worker::direct::DirectOutcome;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (scope, owner, mut driver) = super::tests::physical();
+        let budget = &scope.0.budget;
+        let authority = PeerAuthority::new(Arc::new(true.into()), budget).unwrap();
+        let now = Instant::now();
+        let client = "192.0.2.1:45000".parse().unwrap();
+        let dst = "203.0.113.2:443".parse().unwrap();
+        let (flow, ack) = accept(&mut driver, &authority, client, dst, now);
+        receive(
+            &mut driver,
+            &authority,
+            &input(client, dst, 101, ack, tcp::ACK, b""),
+            now,
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        driver.finish_turn(&mut cx, now);
+        let local = flow.local().unwrap();
+        let (attach, first, _, one) = direct_pair(budget);
+        let mut waiting = Box::pin(local.attach_direct(attach));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        let (attach, second, _, two) = direct_pair(budget);
+        assert_eq!(
+            local.submit_direct(attach).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(waiting);
+        driver.poll_local_io(&mut cx, now).unwrap();
+        assert!(!driver.local_direct_attached(client, dst));
+        for (mut observer, mut peer, byte) in [(first, one, 1), (second, two, 2)] {
+            let Poll::Ready((snapshot, Some(DirectOutcome::Fallback(socket)))) =
+                observer.poll_update(&mut cx)
+            else {
+                panic!("lost preattach socket");
+            };
+            assert!(!snapshot.attached);
+            let mut socket = tokio::net::TcpStream::from_std(socket).unwrap();
+            socket.write_all(&[byte]).await.unwrap();
+            assert_eq!(peer.read_u8().await.unwrap(), byte);
+            assert!(observer.poll_update(&mut cx).is_pending());
+        }
+        drop(flow);
+        scope.shutdown(true);
+        driver.service_closing(&mut cx, now);
+        assert!(owner.reclaim().await);
+        owner.run().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_open_turn_refuses_queued_direct_and_remote_attaches() {
+        for abort in [false, true] {
+            for post_rx in [false, true] {
+                let (scope, owner, mut driver) = super::tests::physical();
+                let budget = &scope.0.budget;
+                let authority =
+                    PeerAuthority::new(Arc::new(AtomicBool::new(true)), budget).unwrap();
+                let now = Instant::now();
+                let dst = "203.0.113.2:443".parse().unwrap();
+                let clients = ["192.0.2.1:45000", "192.0.2.2:45000"].map(|s| s.parse().unwrap());
+                let [(direct, direct_ack), (mut remote, remote_ack)] =
+                    clients.map(|client| accept(&mut driver, &authority, client, dst, now));
+                let ids = [direct.flow_id(), remote.flow_id()];
+                for (client, ack) in clients.into_iter().zip([direct_ack, remote_ack]) {
+                    receive(
+                        &mut driver,
+                        &authority,
+                        &input(client, dst, 101, ack, tcp::ACK, b""),
+                        now,
+                    );
+                }
+                let mut cx = Context::from_waker(Waker::noop());
+                driver.finish_turn(&mut cx, now);
+                driver.begin_local_turn(&cx, now);
+                let (binding, mut observer, _progress, _server) = direct_pair(budget);
+                let mut direct_start = Box::pin(direct.local().unwrap().attach_direct(binding));
+                let mut remote_start = Box::pin(remote.attach_remote());
+                assert!(futures::poll!(&mut direct_start).is_pending());
+                assert!(futures::poll!(&mut remote_start).is_pending());
+                scope.shutdown(abort);
+
+                if post_rx {
+                    driver.poll_local_io(&mut cx, now).unwrap();
+                } else {
+                    driver.finish_turn(&mut cx, now);
+                }
+                for result in [
+                    futures::poll!(&mut direct_start),
+                    futures::poll!(&mut remote_start),
+                ] {
+                    assert!(
+                        matches!(result, Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionAborted)
+                    );
+                }
+                let Poll::Ready((
+                    snapshot,
+                    Some(crate::xdp::worker::direct::DirectOutcome::Cancelled),
+                )) = observer.poll_update(&mut cx)
+                else {
+                    panic!("rejected Direct socket")
+                };
+                assert!(!snapshot.attached);
+                let inner = &mut driver.local.as_mut().unwrap().inner;
+                assert!(inner.closing);
+                assert_eq!(inner.aborted, abort);
+                if !abort {
+                    for id in ids {
+                        assert!(!inner.slot(id).unwrap().rx_admitted);
+                    }
+                }
+                drop((direct_start, remote_start));
+                drop((direct, remote));
+                scope.shutdown(true);
+                driver.service_closing(&mut cx, now);
+                assert!(owner.reclaim().await);
+                owner.run().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_worker_wakes_live_apps_without_returning_device_debt() {
+        let budget = MemoryBudget::new(32 << 20);
+        let (realm, mut owners) = capture_realm(1280, 64, 1, 1, 1, &budget).unwrap();
+        let owner = owners.pop().unwrap();
+        let scope = realm.owners()[0].clone();
+        let mut driver = owner.hand_off();
+        driver.make_local(1).unwrap();
+        let now = Instant::now();
+        let authority = PeerAuthority::new(Arc::new(AtomicBool::new(true)), &budget).unwrap();
+        let client = "192.0.2.1:45000".parse().unwrap();
+        let destination = "203.0.113.2:443".parse().unwrap();
+        let (mut flow, ack) = accept(&mut driver, &authority, client, destination, now);
+        let (pending_flow, _) = accept(
+            &mut driver,
+            &authority,
+            "192.0.2.2:45000".parse().unwrap(),
+            destination,
+            now,
+        );
+        let mut pending = Box::pin(pending_flow.local().unwrap().wait_established());
+        assert!(futures::poll!(&mut pending).is_pending());
+        let local = flow.local().unwrap().clone();
+        let (tx, mut retirement) = oneshot::channel();
+        flow.set_retirement_callback(move || {
+            let _ = tx.send(());
+        })
+        .unwrap();
+        let mut establishing = Box::pin(local.wait_established());
+        assert!(futures::poll!(&mut establishing).is_pending());
+        // Pull these SYN-ACKs before the first flow's payload queues a data ACK.
+        let direct_client = "192.0.2.3:45000".parse().unwrap();
+        let remote_client = "192.0.2.4:45000".parse().unwrap();
+        let (direct, direct_ack) = accept(&mut driver, &authority, direct_client, destination, now);
+        let (mut remote, remote_ack) =
+            accept(&mut driver, &authority, remote_client, destination, now);
+        receive(
+            &mut driver,
+            &authority,
+            &input(client, destination, 101, ack, tcp::ACK, b"abc"),
+            now,
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        driver.finish_turn(&mut cx, now);
+        establishing.await.unwrap();
+        receive(
+            &mut driver,
+            &authority,
+            &input(direct_client, destination, 101, direct_ack, tcp::ACK, b""),
+            now,
+        );
+        receive(
+            &mut driver,
+            &authority,
+            &input(remote_client, destination, 101, remote_ack, tcp::ACK, b""),
+            now,
+        );
+        driver.finish_turn(&mut cx, now);
+
+        let (binding, mut observer, progress, mut server) = direct_pair(&budget);
+        let mut direct_start = Box::pin(direct.local().unwrap().attach_direct(binding));
+        let mut remote_start = Box::pin(remote.attach_remote());
+        assert!(futures::poll!(&mut direct_start).is_pending());
+        assert!(futures::poll!(&mut remote_start).is_pending());
+        let shared = scope.0.local.get().unwrap();
+        assert!(shared.has_ready.load(Ordering::Acquire));
+        // The requests woke the previous waker. Finishing below BATCH must wake the new
+        // device waker for the Direct pump queued by dispatch.
+        let wake = Arc::new(TurnWake::default());
+        let waker = Waker::from(Arc::clone(&wake));
+        driver.finish_turn(&mut Context::from_waker(&waker), now);
+        assert!(wake.0.load(Ordering::Relaxed));
+        assert!(!shared.has_ready.load(Ordering::Acquire));
+        direct_start.await.unwrap();
+        remote_start.await.unwrap();
+        assert!(driver.local_direct_attached(direct_client, destination));
+        wake.0.store(false, Ordering::Relaxed);
+        driver.finish_turn(&mut Context::from_waker(&waker), now);
+        assert!(wake.0.load(Ordering::Relaxed), "pending Direct work alone");
+        remote.mark_rx_admitted();
+        driver.begin_local_turn(&cx, now);
+        driver.begin_turn(now);
+        receive(
+            &mut driver,
+            &authority,
+            &input(direct_client, destination, 101, direct_ack, tcp::ACK, b"rx"),
+            now,
+        );
+        driver.poll_local_io(&mut cx, now).unwrap();
+        assert_eq!(progress.upload.load(Ordering::Relaxed), 2);
+        driver.finish_turn(&mut cx, now);
+        let remote_packet = input(remote_client, destination, 101, remote_ack, tcp::ACK, b"r");
+        let report = receive(&mut driver, &authority, &remote_packet, now);
+        assert!(report.taken_over && report.qualified_rx);
+        driver.poll_local_io(&mut cx, now).unwrap();
+        let mut remote_byte = [0];
+        tokio::io::AsyncReadExt::read_exact(&mut remote, &mut remote_byte)
+            .await
+            .unwrap();
+        assert_eq!(&remote_byte, b"r");
+        let mut delivered = [0; 2];
+        tokio::io::AsyncReadExt::read_exact(&mut server, &mut delivered)
+            .await
+            .unwrap();
+        assert_eq!(&delivered, b"rx");
+        let mut remote_buf = [0; 1];
+        let mut remote_read = Box::pin(tokio::io::AsyncReadExt::read(&mut remote, &mut remote_buf));
+        assert!(futures::poll!(&mut remote_read).is_pending());
+
+        let mut attach = Box::pin(flow.attach_remote());
+        assert!(futures::poll!(&mut attach).is_pending());
+        let sender = scope.datagram_sender("203.0.113.2:53".parse().unwrap());
+        let mut reply = Box::pin(sender.send_to(b"funded TX", client));
+        assert!(futures::poll!(&mut reply).is_pending());
+        driver.begin_turn(now);
+        assert_eq!(reply.await.unwrap(), 9);
+        let mut exported = [None];
+        assert!(matches!(
+            driver.poll_outputs_class(&mut cx, TxClass::Bulk, &mut exported),
+            Poll::Ready(Some(1))
+        ));
+        let held = exported[0].take().unwrap();
+        driver.fail_local_applications();
+        let (_, direct_outcome) = poll_fn(|cx| observer.poll_update(cx)).await;
+        assert!(matches!(
+            direct_outcome,
+            Some(crate::xdp::worker::direct::DirectOutcome::Cancelled)
+        ));
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                tokio::io::AsyncReadExt::read(&mut server, &mut byte)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            remote_read.await.unwrap_err().kind(),
+            io::ErrorKind::ConnectionReset
+        );
+        assert_eq!(attach.await.unwrap_err().kind(), io::ErrorKind::Other);
+        assert_eq!(pending.await.unwrap_err().kind(), io::ErrorKind::Other);
+        assert_eq!(local.wait().await.unwrap_err().kind(), io::ErrorKind::Other);
+        assert!(matches!(
+            retirement.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(!owner.reclaim().await);
+        assert!(!scope.0.inner.lock().finished);
+        assert_eq!(
+            driver
+                .local
+                .as_ref()
+                .unwrap()
+                .inner
+                .ledger
+                .outstanding_tx()
+                .count(),
+            1
+        );
+        assert!(scope.retains_tcp(client, destination));
+        assert!(held.packet().ends_with(b"funded TX"));
+        drop((held, pending_flow, flow, direct, remote, driver));
         owner.run().await;
     }
 }

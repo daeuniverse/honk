@@ -17,16 +17,44 @@ pub(super) enum Retained {
     },
 }
 
-pub(super) fn release_completed(completed: &mut [Option<&mut Retained>]) {
+pub(super) fn fail_local_applications(realms: &mut [Realm]) {
+    for realm in realms {
+        realm.driver.fail_local_applications();
+    }
+}
+
+pub(super) fn release_completed_on(realms: &mut [Realm], completed: &mut [Option<&mut Retained>]) {
     let mut outputs: [Option<&mut OutputOwner>; 64] = std::array::from_fn(|_| None);
     let mut count = 0;
+    let mut last = None;
     for owner in completed.iter_mut().filter_map(Option::take) {
         if let Retained::Endpoint(output) = owner {
+            let scope = output.scope();
+            let index = match last {
+                Some((key, index)) if key == scope => index,
+                _ => {
+                    let index = realms
+                        .iter()
+                        .position(|r| r.driver.is_local() && r.driver.scope() == scope);
+                    last = Some((scope, index));
+                    index
+                }
+            };
+            if index.is_some_and(|i| realms[i].driver.complete_local(output)) {
+                continue;
+            }
             outputs[count] = Some(output);
             count += 1;
         }
     }
-    OutputOwner::release_batch(&mut outputs[..count]);
+    if count != 0 {
+        OutputOwner::release_batch(&mut outputs[..count]);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn release_completed(completed: &mut [Option<&mut Retained>]) {
+    release_completed_on(&mut [], completed);
 }
 
 impl ReturnPath {

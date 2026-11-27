@@ -287,6 +287,7 @@ mod tests {
                 xdp_features: 3,
                 zerocopy_max_segments: 0,
                 vlan_metadata: false,
+                physical_member: true,
                 direct_relay_physical: true,
             },
         };

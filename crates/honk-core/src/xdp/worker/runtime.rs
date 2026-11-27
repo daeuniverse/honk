@@ -1,21 +1,25 @@
+use super::epoll::{TOKEN_DIRECT_BIT, WorkerEpoll};
 use super::*;
+use std::task::Waker;
 
 impl WorkerRuntime {
-    pub(super) async fn run(&mut self) -> anyhow::Result<()> {
+    pub(super) fn run(
+        &mut self,
+        relay_runtime: &mut Option<tokio::runtime::Runtime>,
+    ) -> anyhow::Result<()> {
+        let watches = self.devices.iter().map(|device| device.queues.len()).sum();
+        let epoll = WorkerEpoll::new(&self.polling_budget, watches)?;
+        let wake = Waker::from(Arc::clone(&epoll.wake));
+        let mut cx = Context::from_waker(&wake);
         for device in &mut self.devices {
-            for i in 0..device.queues.len() {
+            for queue in &mut device.queues {
                 if self.shared.is_closing() {
                     break;
                 }
-                // Registration takes the Port by value. Restore its original slot, including
-                // on failure, before any fallible FILL or kick; the thread retains every FD.
-                let queue = device.queues.swap_remove(i);
-                let (io, registered) = queue.io.register();
-                let last = device.queues.len();
-                device.queues.push(Queue { io, ..queue });
-                device.queues.swap(i, last);
-                registered?;
-                let port = device.queues[i].io.get_mut();
+                queue
+                    .io
+                    .watch_queue(&epoll, device.index, queue.id as usize)?;
+                let port = queue.io.get_mut();
                 if !self.shared.is_closing() {
                     port.refill()?;
                 }
@@ -24,101 +28,150 @@ impl WorkerRuntime {
                 }
             }
         }
-        let shared = Arc::clone(&self.shared);
-        let setup = {
-            let mut state = shared.states[1].lock();
-            state.queues_registered = true;
-            state.relay_setup.take()
-        };
-        // Keep serving even while the supervisor is starting. Its failed startup needs these
-        // drivers, and optional fences must wait for the last mandatory capture reservation.
-        let drive = self.drive();
-        tokio::pin!(drive);
-        if let Some(setup) = setup {
-            shared.wake_worker(0);
-            let permission = tokio::select! {
-                result = &mut drive => return result,
-                permission = setup => permission,
-            };
-            if permission.is_err() {
-                return drive.await;
-            }
-        }
-        shared.ready(1);
-        drive.await
+        self.bind_realms(&epoll, &mut cx)?;
+        self.drive(&epoll, &mut cx, relay_runtime)?;
+        futures::executor::block_on(self.shared.join_secondary_relays());
+        self.close_sockets()
     }
 
-    async fn drive(&mut self) -> anyhow::Result<()> {
-        let wake = Arc::clone(&self.shared.wake[1]);
-        let notification = wake.notified();
-        tokio::pin!(notification);
-        let timer = None;
-        tokio::pin!(timer);
+    fn bind_realms(&mut self, epoll: &WorkerEpoll, cx: &mut Context<'_>) -> io::Result<()> {
+        let now = Instant::now();
+        for (index, realm) in self.realms.iter_mut().enumerate() {
+            realm
+                .driver
+                .bind_worker_epoll(Arc::clone(&epoll.fd), index)?;
+            realm.driver.poll_local_io_sync(cx, now)?;
+        }
+        Ok(())
+    }
+
+    fn drive(
+        &mut self,
+        epoll: &WorkerEpoll,
+        cx: &mut Context<'_>,
+        relay_runtime: &mut Option<tokio::runtime::Runtime>,
+    ) -> anyhow::Result<()> {
+        let mut setup = {
+            let mut state = self.shared.states[1].lock();
+            state.queues_registered = true;
+            state.startup.take()
+        };
+        if setup.is_some() {
+            // Queue registration and final driver/relay readiness have distinct startup fences.
+            self.shared.wake_worker(0);
+        } else {
+            self.shared.ready(1);
+        }
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; BATCH];
+        let mut ready = 0;
+        let mut turns = TurnBudget::native();
         loop {
-            notification.as_mut().enable();
-            let serviced = poll_fn(|cx| -> Poll<anyhow::Result<bool>> {
-                let (closing, stop, drain_until) = {
-                    let state = self.shared.states[1].lock();
-                    (self.shared.is_closing(), state.stop, state.drain.deadline())
-                };
-                let (mut progress, outstanding) = if closing {
-                    let draining = drain_until.is_some_and(|deadline| Instant::now() < deadline);
-                    let (progress, outstanding, mailbox_closed) =
-                        self.poll_closing(cx, draining)?;
-                    if stop && !outstanding && mailbox_closed {
-                        return Poll::Ready(Ok(false));
+            #[cfg(test)]
+            if self
+                .shared
+                .close_before_secondary_drain
+                .swap(false, Ordering::AcqRel)
+            {
+                self.shared.begin_close();
+            }
+            // XSK events only wake this pass since it already examines every queue.
+            for event in &events[..ready] {
+                let token = event.u64;
+                if token & TOKEN_DIRECT_BIT != 0 {
+                    let index = ((token >> 56) & 0x7f) as usize;
+                    if let Some(realm) = self.realms.get_mut(index) {
+                        realm.driver.direct_socket_ready(token, event.events);
                     }
-                    (progress, outstanding)
-                } else {
-                    (self.poll_service(cx)?, false)
-                };
-                if notification.as_mut().poll(cx).is_ready() {
-                    notification.set(wake.notified());
-                    progress = true;
                 }
-                if progress {
-                    return Poll::Ready(Ok(true));
+            }
+            if epoll.wake.is_pending() {
+                epoll.wake.drain()?;
+            }
+            // AtomicWaker::wake takes the registration. Rearm after clearing old wakes,
+            // before observing close, quiesce or stop, including when already closing.
+            self.shared.wakers[1].register(cx.waker());
+            if let Some(permission) = &mut setup
+                && let Poll::Ready(permission) = Pin::new(permission).poll(cx)
+            {
+                setup = None;
+                if let Ok(realms) = permission {
+                    if !realms.is_empty() {
+                        debug_assert!(self.realms.is_empty());
+                        self.realms = realms;
+                        self.bind_realms(epoll, cx)?;
+                    }
+                    if !self.shared.is_closing() {
+                        *relay_runtime = self.shared.start_secondary_relays()?;
+                        self.shared.ready(1);
+                    }
                 }
-                let now = Instant::now();
-                let retry = if closing {
-                    outstanding
-                } else {
-                    self.needs_service_retry()
+            }
+
+            let closing = self.shared.is_closing();
+            turns.charge();
+            let (progress, outstanding, drain_until) = if closing {
+                let (stop, drain_until) = {
+                    let state = self.shared.states[1].lock();
+                    (state.stop, state.drain.deadline())
                 };
-                let deadline = self
-                    .next_deadline(now, retry)
-                    .into_iter()
-                    .chain(drain_until.filter(|&deadline| outstanding && now < deadline))
-                    .min();
-                let result = poll_deadline(timer.as_mut(), deadline, now, cx).map(|()| Ok(true));
-                #[cfg(test)]
-                if !closing && !retry && result.is_pending() {
-                    let driver_deadline = self
+                let draining = drain_until.is_some_and(|deadline| Instant::now() < deadline);
+                let (progress, outstanding, mailbox_closed) = self.poll_closing(cx, draining)?;
+                if stop && !outstanding && mailbox_closed {
+                    return Ok(());
+                }
+                (progress, outstanding, drain_until)
+            } else {
+                (self.poll_service(cx, &mut turns)?, false, None)
+            };
+            if progress || epoll.wake.is_pending() {
+                ready = turns.poll_events(epoll, &self.realms, &mut events)?;
+                if turns.exhausted() {
+                    turns = TurnBudget::native();
+                }
+                continue;
+            }
+
+            turns = TurnBudget::native();
+            let now = Instant::now();
+            let retry = if closing {
+                outstanding
+            } else {
+                self.needs_service_retry()
+            };
+            let deadline = self
+                .next_deadline(now, retry)
+                .into_iter()
+                .chain(drain_until.filter(|&deadline| outstanding && now < deadline))
+                .min();
+            #[cfg(test)]
+            {
+                let control = self.shared.secondary_test_control();
+                let wait = polling::testing::PendingWait {
+                    reading: false,
+                    driver_deadline: self
                         .realms
                         .iter()
                         .filter_map(|realm| realm.driver.protocol_deadline())
-                        .min();
-                    self.shared.secondary_test_control().note_driver_timer_wait(
-                        driver_deadline,
-                        timer
-                            .as_ref()
-                            .get_ref()
-                            .as_ref()
-                            .map(tokio::time::Sleep::deadline),
-                        !self.needs_service_retry(),
-                        self.realms
-                            .iter()
-                            .any(|realm| realm.pending.iter().any(Option::is_some)),
-                    );
-                }
-                result
-            })
-            .await?;
-            if !serviced {
-                self.shared.join_secondary_relays().await;
-                return self.close_sockets();
+                        .min(),
+                    armed_deadline: deadline.map(tokio::time::Instant::from_std),
+                    idle_ports: !retry && !self.needs_service_retry(),
+                    pending_outputs: self
+                        .realms
+                        .iter()
+                        .any(|realm| realm.pending.iter().any(Option::is_some)),
+                };
+                control.note_pending(wait);
+                control.note_driver_timer_wait(
+                    wait.driver_deadline,
+                    wait.armed_deadline,
+                    !closing && wait.idle_ports,
+                    wait.pending_outputs,
+                );
             }
-            tokio::task::yield_now().await;
+            let result = epoll.wait(deadline, now, &mut events);
+            #[cfg(test)]
+            self.shared.secondary_test_control().clear_pending();
+            ready = result?;
         }
     }
 
@@ -149,7 +202,7 @@ impl WorkerRuntime {
             .flat_map(|device| &mut device.queues)
         {
             let port = queue.io.get_mut();
-            progress |= port.complete(release_completed)? != 0;
+            progress |= port.complete(|done| release_completed_on(&mut self.realms, done))? != 0;
             let counters = port.counters();
             if counters.submitted != counters.completed {
                 outstanding = true;
@@ -179,6 +232,8 @@ impl WorkerRuntime {
             if entering {
                 realm.pending = [None, None];
             }
+            realm.driver.begin_local_turn(cx, now);
+            progress |= realm.driver.poll_local_io_sync(cx, now)?;
             progress |= realm.driver.service_closing(cx, now);
         }
         Ok((progress, outstanding, mailbox_closed))
@@ -216,7 +271,28 @@ impl WorkerRuntime {
         interval: Option<&BusyInterval>,
     ) -> anyhow::Result<bool> {
         let now = Instant::now();
-        self.shared.wakers[1].register(cx.waker());
+        for realm in &mut self.realms {
+            realm.driver.begin_local_turn(cx, now);
+        }
+        let result = self.poll_turn(cx, interval, now);
+        for realm in &mut self.realms {
+            if realm.driver.local_turn_open() {
+                if result.is_err() {
+                    realm.driver.interrupt_turn(cx);
+                } else {
+                    realm.driver.finish_turn(cx, now);
+                }
+            }
+        }
+        result
+    }
+
+    fn poll_turn(
+        &mut self,
+        cx: &mut Context<'_>,
+        interval: Option<&BusyInterval>,
+        now: Instant,
+    ) -> anyhow::Result<bool> {
         let mut progress = false;
         let deadline = interval.and_then(|_| self.next_deadline(now, self.needs_service_retry()));
         for _ in 0..BATCH {
@@ -230,7 +306,12 @@ impl WorkerRuntime {
                 Poll::Ready(Some(envelope)) => envelope,
                 _ => break,
             };
-            match envelope.receive_endpoint(&self.shared, &self.endpoints, now) {
+            let local = self
+                .realms
+                .iter_mut()
+                .find(|r| r.realm_id == envelope.path.realm && r.driver.is_local())
+                .map(|r| &mut r.driver);
+            match envelope.receive_endpoint(&self.shared, &self.endpoints, now, local) {
                 Ok(report) if report.qualified_rx => {
                     qualify_packet(&mut self.qualified_rx, &mut self.qualification_unavailable);
                 }
@@ -266,18 +347,20 @@ impl WorkerRuntime {
                     device_index
                 };
                 let queue = &mut device.queues[queue_index];
-                arm_read(&queue.io, cx)?;
                 let port = queue.io.get_mut();
-                progress |= port.complete(release_completed)? != 0;
+                progress |=
+                    port.complete(|done| release_completed_on(&mut self.realms, done))? != 0;
                 if self.shared.admission.load(Ordering::Acquire) && !self.shared.is_closing() {
                     let shared = &self.shared;
                     let endpoints = &self.endpoints;
                     let placements = &self.placements.entries;
+                    let realms = &mut self.realms;
                     let staging = &mut self.staging;
                     let mixed = self.mixed;
                     let qualified = &mut self.qualified_rx;
                     let unavailable = &mut self.qualification_unavailable;
                     let mut failure = None;
+                    let mut local_peer = None;
                     let received = receive_batch(
                         port,
                         BATCH,
@@ -352,6 +435,11 @@ impl WorkerRuntime {
                                     (now, now),
                                     path,
                                     mixed,
+                                    realms
+                                        .iter_mut()
+                                        .find(|r| r.realm_id == path.realm && r.driver.is_local())
+                                        .map(|r| &mut r.driver),
+                                    &mut local_peer,
                                 )?;
                                 if report.qualified_rx {
                                     qualify_packet(qualified, unavailable);
@@ -399,6 +487,7 @@ impl WorkerRuntime {
             let realm_index = (start_realm + offset) % self.realms.len();
             self.tx_realm = (realm_index + 1) % self.realms.len();
             let realm = &mut self.realms[realm_index];
+            progress |= realm.driver.poll_local_io_sync(cx, now)?;
             if realm.members.len() > 1 {
                 realm.driver.service(cx, now);
                 if self.shared.is_closing() {
@@ -506,7 +595,7 @@ fn service_output(
     }
     let (work, kick) = port.transmit_batch(|port| -> anyhow::Result<usize> {
         let mut serviced = 0;
-        for (class_index, class) in [TxClass::Control, TxClass::Bulk].into_iter().enumerate() {
+        for class in [TxClass::Control, TxClass::Bulk] {
             if shared.is_closing() {
                 break;
             }
@@ -527,40 +616,14 @@ fn service_output(
                 }
                 _ => 0,
             };
-            for output in &mut outputs[..count] {
-                let output = output.take().unwrap();
-                let path = pending_path.or_else(|| output.peer_hold().and_then(|hold| hold.path()));
-                let Some(path) = path else {
-                    serviced += 1;
-                    continue;
-                };
-                let header = realm.output_header(
-                    path,
-                    realm.link.path.physical_ifindex,
-                    output.packet()[0] >> 4 == 6,
-                )?;
-                if !port.tx_packet_credit(class, header.len() + output.packet().len()) {
-                    realm.pending[class_index] = Some((output, path));
-                    break;
-                }
-                port.transmit_with(
-                    class,
-                    header.len() + output.packet().len(),
-                    Retained::Endpoint(output.into_owner()),
-                    |owner, target| {
-                        let Retained::Endpoint(owner) = owner else {
-                            unreachable!()
-                        };
-                        fill_output(
-                            target,
-                            &header,
-                            owner
-                                .packet()
-                                .ok_or_else(|| io::Error::other("missing CPU packet"))?,
-                        )
-                    },
-                )?;
-                serviced += 1;
+            if realm.transmit_cpu_outputs(
+                port,
+                class,
+                realm.link.path.physical_ifindex,
+                pending_path,
+                &mut outputs[..count],
+            )? {
+                serviced += count;
             }
         }
         Ok(serviced)

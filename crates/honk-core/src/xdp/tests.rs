@@ -17,6 +17,8 @@ fn direct_relay_requires_matching_physical_owners_and_one_endpoint_member() {
         (endpoint, 1, 1, 1, false),
         (endpoint, 2, 2, 1, false),
         (endpoint, 2, 1, 1, true),
+        (endpoint, 1, 2, 1, true),
+        (endpoint, 2, 3, 1, true),
         (endpoint, 3, 3, 1, true),
         (endpoint, 0, 0, 1, true),
         (endpoint, 2, 2, 2, true),
@@ -92,6 +94,7 @@ fn readonly_admission_reports_foreign_xdp_and_mode_failure_together() {
         xdp_features: 3,
         zerocopy_max_segments: 0,
         vlan_metadata: false,
+        physical_member: true,
         direct_relay_physical: true,
     };
     let issues: Vec<_> = member_admission_issues(

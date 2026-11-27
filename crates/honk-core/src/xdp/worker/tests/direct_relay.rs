@@ -42,7 +42,13 @@ struct Capture {
 }
 
 impl Capture {
-    async fn ready(primary: &TokioRuntime) -> Self {
+    fn ready(parent: &TokioRuntime) -> (Self, TokioRuntime) {
+        let mut primary = None;
+        let capture = run(parent, Self::start(&mut primary));
+        (capture, primary.expect("funded primary relay runtime"))
+    }
+
+    async fn start(primary: &mut Option<TokioRuntime>) -> Self {
         let budget = MemoryBudget::new(CAPTURE_MEMORY);
         let admission = Arc::new(AtomicBool::new(false));
         let (shared, [_, receiver]) = Shared::new(2, 1500, 2, &budget, admission.clone()).unwrap();
@@ -107,12 +113,28 @@ impl Capture {
                 .all_ready(&mut Context::from_waker(std::task::Waker::noop()))
                 .is_pending()
         );
-        {
-            let _entered = primary.enter();
-            shared.prepare_relays(&budget).unwrap();
+        let control = worker.test_control();
+        while control.pending_wait().is_none() {
+            tokio::task::yield_now().await;
         }
-        setup.send(()).unwrap();
+        *primary = shared.prepare_relays(&budget).unwrap();
+        assert!(setup.send(Vec::new()).is_ok());
         poll_fn(|cx| shared.all_ready(cx)).await.unwrap();
+        let owners = shared.relays.get().unwrap();
+        let first = owners.primary.handle.get().unwrap().id();
+        let second = owners
+            .secondary
+            .as_ref()
+            .unwrap()
+            .handle
+            .get()
+            .unwrap()
+            .id();
+        let control = tokio::runtime::Handle::current().id();
+        assert_eq!(first, primary.as_ref().unwrap().handle().id());
+        assert_ne!(first, control);
+        assert_ne!(second, control);
+        assert_ne!(first, second);
         Self {
             shared,
             realm,
@@ -126,8 +148,7 @@ impl Capture {
         }
     }
 
-    fn activate(&self, primary: &TokioRuntime) -> anyhow::Result<()> {
-        let _entered = primary.enter();
+    fn activate(&self) -> anyhow::Result<()> {
         // The fixture supplies only the final physical eligibility observation.
         self.shared.activate(
             &self.shutdown,
@@ -137,8 +158,7 @@ impl Capture {
         )
     }
 
-    fn fail_before_open(&self, primary: &TokioRuntime) -> anyhow::Error {
-        let _entered = primary.enter();
+    fn fail_before_open(&self) -> anyhow::Error {
         let mut failure = None;
         let candidates = std::iter::once((&self.realm, 1, true)).chain(std::iter::from_fn(|| {
             // The last PF has published both bindings; the final open has not committed.
@@ -195,6 +215,8 @@ impl Capture {
                 (now, now),
                 path(),
                 false,
+                None,
+                &mut None,
             )
             .unwrap();
     }
@@ -245,18 +267,16 @@ impl Capture {
         }
     }
 
-    fn park_secondary(&self) -> sync_channel::Sender<()> {
+    fn park_relay(&self, shard: usize) -> sync_channel::Sender<()> {
         let (parked, entered) = sync_channel::channel();
         let (resume, resumed) = sync_channel::channel();
-        let secondary = self
-            .shared
-            .relays
-            .get()
-            .unwrap()
-            .secondary
-            .as_ref()
-            .unwrap();
-        secondary.0.get().unwrap().spawn(async move {
+        let owners = self.shared.relays.get().unwrap();
+        let owner = match shard {
+            0 => &owners.primary,
+            1 => owners.secondary.as_ref().unwrap(),
+            _ => unreachable!(),
+        };
+        owner.handle.get().unwrap().spawn(async move {
             parked.send(()).unwrap();
             let _ = resumed.recv_timeout(WAIT * 2);
         });
@@ -423,24 +443,55 @@ impl Flow {
 
 #[test]
 fn both_shards_relay_bytes_and_fin_on_their_own_runtime() {
-    let (parent, primary, observer) = (runtime(), runtime(), runtime());
-    let mut capture = run(&parent, Capture::ready(&primary));
+    let (parent, observer) = (runtime(), runtime());
+    let (mut capture, primary) = Capture::ready(&parent);
     let budget = capture.realm.owners()[0].budget();
-    capture.activate(&primary).unwrap();
+    capture.activate().unwrap();
     let first = run(&parent, capture.connect(0));
     let second = run(&parent, capture.connect(1));
-    // A misplaced socket cannot exchange these bytes on either of the two parked runtimes.
-    let parked = capture.park_secondary();
-    run(&primary, first.exchange(&mut capture));
+    // Only the original shard can exchange payload and FIN with its sibling and parent parked.
+    let parked = capture.park_relay(1);
+    run(&observer, first.exchange(&mut capture));
     parked.send(()).unwrap();
+    let parked = capture.park_relay(0);
     run(&observer, second.exchange(&mut capture));
+    parked.send(()).unwrap();
     capture.shared.begin_close();
     capture.endpoints.close();
     capture.assert_closed();
     run(&parent, capture.join_endpoints());
     run(&primary, capture.worker.join()).unwrap();
+    drop(primary);
     drop(capture);
     assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn secondary_mailbox_runs_while_legacy_scheduler_is_parked() {
+    if crate::test_support::run_exact_in_child(
+        "HONK_XDP_PARKED_LEGACY_RELAY_CHILD",
+        "xdp::worker::tests::direct_relay::secondary_mailbox_runs_while_legacy_scheduler_is_parked",
+    ) {
+        return;
+    }
+    let (parent, observer) = (runtime(), runtime());
+    let (mut capture, _primary) = Capture::ready(&parent);
+    capture.activate().unwrap();
+    let parked = capture.park_relay(1);
+    let control = capture.worker.test_control();
+    run(&observer, async {
+        while control.pending_wait().is_none() {
+            tokio::task::yield_now().await;
+        }
+    });
+    // The actual capture loop must wake and read the mailbox while legacy scheduling stalls.
+    let failure = run(&observer, capture.secondary_error());
+    capture.assert_closed();
+    assert!(failure.to_string().contains("coordinator-only ingress"));
+    assert!(!capture.shared.states[1].lock().exited);
+    parked.send(()).unwrap();
+    capture.endpoints.close();
+    run(&parent, capture.join_endpoints());
 }
 
 #[test]
@@ -451,11 +502,12 @@ fn secondary_error_after_ready_or_live_relay_closes_admission() {
     ) {
         return;
     }
-    let (parent, primary, observer) = (runtime(), runtime(), runtime());
+    let (parent, observer) = (runtime(), runtime());
     for open in [false, true] {
-        let mut capture = run(&parent, Capture::ready(&primary));
+        let (mut capture, primary) = Capture::ready(&parent);
+        let parked = capture.park_relay(0);
         let flow = open.then(|| {
-            capture.activate(&primary).unwrap();
+            capture.activate().unwrap();
             let flow = run(&parent, capture.connect(1));
             drop(run(&observer, flow.upload(&capture, false)));
             flow
@@ -464,13 +516,14 @@ fn secondary_error_after_ready_or_live_relay_closes_admission() {
         let error = if open {
             run(&parent, capture.secondary_error())
         } else {
-            capture.fail_before_open(&primary)
+            capture.fail_before_open()
         };
         capture.assert_closed();
         if let Some(flow) = &flow {
             // The primary is still parked. Only the failed secondary can finish this socket.
             run(&parent, flow.eof());
         }
+        parked.send(()).unwrap();
         let custody = (capture.shared.clone(), capture.endpoints.clone());
         let (_, terminal) = with_parent(&parent, || {
             run(
@@ -503,12 +556,18 @@ fn coordinator_unwind_waits_for_secondary_socket_and_parent_join() {
     ) {
         return;
     }
-    let (parent, primary, observer) = (runtime(), runtime(), runtime());
-    let mut capture = run(&parent, Capture::ready(&primary));
-    capture.activate(&primary).unwrap();
-    let flow = run(&parent, capture.connect(1));
+    for shard in [1, 0] {
+        unwind_with_parked_relay(shard);
+    }
+}
+
+fn unwind_with_parked_relay(shard: usize) {
+    let (parent, observer) = (runtime(), runtime());
+    let (mut capture, primary) = Capture::ready(&parent);
+    capture.activate().unwrap();
+    let flow = run(&parent, capture.connect(shard));
     drop(run(&observer, flow.upload(&capture, false)));
-    let parked = capture.park_secondary();
+    let parked = capture.park_relay(shard);
     let upstream = flow.upstream_socket();
     let custody = (capture.shared.clone(), capture.endpoints.clone());
     let outcome =
@@ -517,7 +576,7 @@ fn coordinator_unwind_waits_for_secondary_socket_and_parent_join() {
     run(&primary, async {
         assert!(
             futures::poll!(&mut terminal).is_pending(),
-            "terminal result escaped the live secondary relay"
+            "terminal result escaped live relay {shard}"
         );
     });
     assert!(capture.endpoints.is_closing());

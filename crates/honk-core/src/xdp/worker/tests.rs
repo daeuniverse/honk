@@ -26,7 +26,7 @@ async fn physical_udp_close_during_source_validation_retires_cleanly() {
         PacketEndpoints::new(plane, vec![(scope.clone(), owners.pop().unwrap())], 4)
             .await
             .unwrap();
-    let peers = PeerAuthority::new(Arc::new(AtomicBool::new(true)));
+    let peers = PeerAuthority::new(Arc::new(true.into()), &budget).unwrap();
     let tuple = source(41000, None);
     let mut packet = [0; 128];
     let len = wire::udp::emit_packet(&mut packet, tuple.src, tuple.dst, b"in flight").unwrap();
@@ -74,7 +74,7 @@ async fn physical_peer_slots_reap_across_a_hole_and_relearn() {
         PacketEndpoints::new(plane, vec![(scope.clone(), owners.pop().unwrap())], 1)
             .await
             .unwrap();
-    let peers = PeerAuthority::new(Arc::new(AtomicBool::new(true)));
+    let peers = PeerAuthority::new(Arc::new(true.into()), &budget).unwrap();
     let now = Instant::now();
     let destination = source(41000, None).dst;
     let sender = scope.datagram_sender(destination);
@@ -135,13 +135,13 @@ async fn physical_peer_slots_reap_across_a_hole_and_relearn() {
         assert_eq!(scope.peer_hold(high.ip()).unwrap().original_path(), moved);
     }
     assert_eq!(old_reply.peer_hold().unwrap().original_path(), path());
-    let high_holds = peers
+    let high_slot = peers
         .slots
         .lock()
         .iter()
-        .find(|peer| peer.address == high.ip())
-        .unwrap()
-        .holds;
+        .position(|peer| peer.address == high.ip())
+        .unwrap();
+    let high_holds = peers.pin_count(high_slot);
     assert_eq!(high_holds, 2, "one realm slot and one exported reply");
 
     let newcomer = client(18);
@@ -203,7 +203,8 @@ fn envelope(shared: &Shared, number: u8, scope: ScopeId, at: Instant) -> Envelop
     let first = [number; 4];
     let last = [number + 1; 3];
     let metadata = [number + 2; 8];
-    let cell = shared.copy(&[&first, &last], &metadata).unwrap();
+    let mut cell = shared.pool.take().unwrap();
+    cell.copy(&[&first, &last], &metadata).unwrap();
     Envelope {
         ingress: Ingress {
             scope,
@@ -246,7 +247,7 @@ fn whole_scatter_handoff_is_fifo_and_processing_keeps_the_global_cell() {
         );
     }
     assert!(
-        shared.pool.take().is_none(),
+        matches!(shared.handoff_cell(1, true, || 23), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
         "queued and processing storage share the same 64 cells"
     );
     let processing = first.try_recv().unwrap();
@@ -283,12 +284,19 @@ fn whole_scatter_handoff_is_fifo_and_processing_keeps_the_global_cell() {
         "a full destination returns the actual owned envelope"
     );
     drop(refused);
-    assert_eq!(diagnostics.json(true)["cross_worker_handoffs"], "96");
+    let full = diagnostics.json(true);
+    assert_eq!(full["cross_worker_handoffs"], "96");
+    assert_eq!(
+        full["handoffs"][0][0],
+        serde_json::json!({"packets":"64", "l3_bytes":"448", "refused":"1", "refused_l3_bytes":"7"})
+    );
+    assert_eq!(full["handoffs"][1][0]["l3_bytes"], "224");
+    assert_eq!(full["handoffs"][1][1]["refused_l3_bytes"], "23");
 }
 
 #[test]
 fn bond_peer_moves_future_replies_without_rewriting_retained_output() {
-    let peers = PeerAuthority::new(Arc::new(AtomicBool::new(true)));
+    let peers = PeerAuthority::isolated(Arc::new(true.into()));
     let scope = ScopeId::allocate().unwrap();
     let now = Instant::now();
     let original = peers
@@ -315,7 +323,7 @@ fn bond_peer_moves_future_replies_without_rewriting_retained_output() {
 
 #[test]
 fn peer_holds_keep_original_qos_and_prevent_identity_replacement() {
-    let peers = PeerAuthority::new(Arc::new(AtomicBool::new(true)));
+    let peers = PeerAuthority::isolated(Arc::new(true.into()));
     let scope = ScopeId::allocate().unwrap();
     let now = Instant::now();
     let original = peers
@@ -399,8 +407,81 @@ fn peer_holds_keep_original_qos_and_prevent_identity_replacement() {
 }
 
 #[test]
+fn exported_peer_can_finish_during_topology_work_and_holds_its_charge() {
+    let budget = MemoryBudget::new(1 << 20);
+    let peers = PeerAuthority::new(Arc::new(true.into()), &budget).unwrap();
+    let scope = ScopeId::allocate().unwrap();
+    let original = peers
+        .retain(
+            scope,
+            source(4000, Some(tcp::SYN)),
+            path(),
+            Instant::now(),
+            false,
+        )
+        .unwrap();
+    let (sent, received) = sync_channel::channel();
+    let observed = std::thread::scope(|threads| {
+        let guard = peers.slots.lock();
+        threads.spawn(|| {
+            let exported = original.clone();
+            let snapshot = exported.original_path();
+            drop(exported);
+            let _ = sent.send(snapshot);
+        });
+        let observed = received.recv_timeout(Duration::from_secs(3));
+        drop(guard);
+        observed
+    });
+    assert_eq!(
+        observed.expect("output pin and return must not wait for topology"),
+        path()
+    );
+    drop(peers);
+    assert!(
+        budget.used() > 0,
+        "a retained peer still owns its metadata and counter storage"
+    );
+    drop(original);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn full_peer_table_reuses_only_unpinned_slots_and_never_wraps() {
+    let peers = PeerAuthority::isolated(Arc::new(true.into()));
+    let scope = ScopeId::allocate().unwrap();
+    let now = Instant::now();
+    let learn = |n: usize| {
+        let mut original = source(41000, Some(tcp::SYN));
+        original.src = SocketAddr::from(([198, 18, (n >> 8) as u8, n as u8], 41000));
+        peers.retain(scope, original, path(), now, false)
+    };
+    let mut live: Vec<_> = (0..PEERS).map(|n| learn(n).unwrap()).collect();
+    let exported = live[0].clone();
+    let (slot, generation) = (exported.slot, exported.generation);
+    drop(live.swap_remove(0));
+    assert!(learn(PEERS).is_none());
+    drop(exported);
+    let replacement = learn(PEERS).unwrap();
+    assert_eq!(
+        (replacement.slot, replacement.generation),
+        (slot, generation + 1)
+    );
+    drop(replacement);
+    assert_eq!(peers.pin_count(slot), 0);
+    // Exercise the real increment at its unreachable-in-memory arithmetic boundary.
+    peers.pins[slot].store(usize::MAX - 1, Ordering::Relaxed);
+    assert!(peers.pin(slot, true).is_some());
+    assert!(peers.pin(slot, true).is_none());
+    assert_eq!(peers.pin_count(slot), usize::MAX);
+    peers.invalidate();
+    assert_eq!(peers.revision.load(Ordering::Acquire), u64::MAX);
+    peers.pins[slot].store(0, Ordering::Relaxed);
+}
+
+#[test]
 fn checked_peer_reuses_one_timestamp_until_another_worker_moves_the_path() {
-    let peers = PeerAuthority::new(Arc::new(AtomicBool::new(true)));
+    let peers = PeerAuthority::isolated(Arc::new(true.into()));
     let scope = ScopeId::allocate().unwrap();
     let now = Instant::now();
     let ack = source(4000, Some(tcp::ACK));
@@ -455,7 +536,7 @@ fn checked_peer_reuses_one_timestamp_until_another_worker_moves_the_path() {
             let slots = peers.slots.lock();
             assert_eq!(slots[original.slot].path, moved);
             assert_eq!(slots[original.slot].last_seen, later);
-            assert_eq!(slots[original.slot].holds, 1);
+            assert_eq!(peers.pin_count(original.slot), 1);
         }
         assert_eq!(
             peers.confirm_tcp::<false>(&original, scope, ack, path(), now, &mut checked),
@@ -603,6 +684,8 @@ async fn physical_tcp_placement_follows_rx_and_recovers_migrated_scatter_quotes_
                     (at, at),
                     path,
                     false,
+                    None,
+                    &mut None,
                 )
                 .unwrap()
         };
@@ -624,7 +707,9 @@ async fn physical_tcp_placement_follows_rx_and_recovers_migrated_scatter_quotes_
             assert!(
                 matches!(&queued.payload, Payload::Endpoint { owner, .. } if owner.worker() == worker)
             );
-            queued.receive_endpoint(&shared, &endpoints, at).unwrap();
+            queued
+                .receive_endpoint(&shared, &endpoints, at, None)
+                .unwrap();
         };
         let owner = usize::from(members == 1);
         let first = syn(client, destination);
@@ -676,7 +761,7 @@ async fn physical_tcp_placement_follows_rx_and_recovers_migrated_scatter_quotes_
         let [head, tail] = ipv4_halves(&data);
         input(1, &[&head]);
         let head = inboxes[0].try_recv().unwrap();
-        shared.dispatch_envelope(&endpoints, head).unwrap();
+        shared.dispatch_envelope(&endpoints, head, None).unwrap();
         input(0, &[&tail]);
         if owner != 0 {
             deliver(&mut inboxes, owner, &data);
@@ -864,7 +949,7 @@ fn calibration_requires_both_actual_owner_contexts_and_changes_with_either() {
 #[test]
 fn peer_unwind_closes_common_admission_before_refunding_identity() {
     let admission = Arc::new(AtomicBool::new(true));
-    let peers = PeerAuthority::new(Arc::clone(&admission));
+    let peers = PeerAuthority::isolated(Arc::clone(&admission));
     let scope = ScopeId::allocate().unwrap();
     let hold = peers
         .retain(
@@ -881,14 +966,24 @@ fn peer_unwind_closes_common_admission_before_refunding_identity() {
     }));
     assert!(result.is_err());
     assert!(!admission.load(Ordering::Acquire));
-    assert_eq!(peers.slots.lock()[0].holds, 0);
+    assert_eq!(peers.pin_count(0), 0);
 }
 
 #[tokio::test]
 async fn quiescence_waits_for_worker_to_seal_its_mailbox() {
+    quiesce_mailbox(true).await;
+}
+
+#[tokio::test]
+async fn idle_secondary_rearms_quiesce_after_begin_close_during_wake_drain() {
+    quiesce_mailbox(false).await;
+}
+
+async fn quiesce_mailbox(close_before_start: bool) {
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
     let admission = Arc::new(AtomicBool::new(true));
     let (shared, [_, receiver]) = Shared::new(2, 128, 2, &budget, Arc::clone(&admission)).unwrap();
+    let permit = shared.senders[1].clone().try_reserve_owned().unwrap();
     assert!(
         shared
             .placements
@@ -906,8 +1001,9 @@ async fn quiescence_waits_for_worker_to_seal_its_mailbox() {
             .await
             .unwrap();
 
-    shared.begin_close();
-    assert!(!admission.load(Ordering::Acquire));
+    if close_before_start {
+        shared.begin_close();
+    }
     let quiescing = poll_fn(|cx| shared.poll_quiesced(cx));
     tokio::pin!(quiescing);
     assert!(futures::poll!(quiescing.as_mut()).is_pending());
@@ -924,9 +1020,26 @@ async fn quiescence_waits_for_worker_to_seal_its_mailbox() {
         shutdown,
     )
     .unwrap();
+    if !close_before_start {
+        let control = worker.test_control();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while control.pending_wait().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Force begin_close into the first pass after idle, before it drains old wakes.
+        shared
+            .close_before_secondary_drain
+            .store(true, Ordering::Release);
+        shared.wake_worker(1);
+    }
     tokio::time::timeout(Duration::from_secs(5), shared.senders[1].closed())
         .await
         .unwrap();
+    // Once the receiver closes, this pass has already sampled an unarmed drain.
+    assert!(!admission.load(Ordering::Acquire));
     assert!(futures::poll!(quiescing.as_mut()).is_pending());
     shared.quiesce(Instant::now() + Duration::from_secs(5));
     tokio::time::timeout(Duration::from_secs(5), quiescing)
@@ -936,13 +1049,22 @@ async fn quiescence_waits_for_worker_to_seal_its_mailbox() {
 
     let rejected = shared.send(1, envelope(&shared, 7, scope.scope(), Instant::now()));
     assert!(rejected.is_err());
+    drop(rejected);
     assert!(!shared.states[1].lock().exited);
     endpoints.close();
     supervisor.run().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), worker.join())
+    let mut joining = std::pin::pin!(worker.join());
+    assert!(
+        futures::poll!(joining.as_mut()).is_pending(),
+        "a producer's reserved mailbox slot keeps the closed receiver nonterminal"
+    );
+    let late = envelope(&shared, 8, scope.scope(), Instant::now());
+    drop(permit.send(late));
+    tokio::time::timeout(Duration::from_secs(5), joining)
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(shared.pool.free.lock().len(), CELLS);
 }
 
 #[test]

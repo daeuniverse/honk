@@ -21,8 +21,9 @@ async fn physical_syn_admission_reclaims_completed_udp_task_credit() {
     }));
     completed.await.unwrap();
     assert!(!endpoints.can_batch_tcp());
+    let peers =
+        PeerAuthority::new(Arc::new(std::sync::atomic::AtomicBool::new(true)), &budget).unwrap();
     let ceiling = budget.reserve(budget.limit() - budget.used()).unwrap();
-    let peers = PeerAuthority::new(Arc::new(std::sync::atomic::AtomicBool::new(true)));
     let path = ReturnPath {
         realm: 1,
         device: 0,

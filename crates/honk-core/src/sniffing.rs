@@ -128,27 +128,18 @@ pub async fn sniff_tcp(stream: &mut (impl AsyncRead + Unpin)) -> SniffResult {
     result
 }
 
-/// Classify bytes still owned by the packet Stack. `done` marks EOF, error or expiry.
+/// Inspect the packet stack's prefix without consuming application bytes.
 #[cfg(target_os = "linux")]
 pub(crate) fn sniff_packet_tcp(data: &[u8], done: bool) -> Option<SniffResult> {
     let data = &data[..data.len().min(MAX_CLIENT_HELLO_SIZE)];
-    let data = if data.is_empty() {
-        return done.then(SniffResult::unknown);
-    } else if is_http_request_prefix(data) {
-        match data.windows(4).position(|window| window == b"\r\n\r\n") {
-            Some(end) => &data[..end + 4],
-            None if !done && data.len() < MAX_CLIENT_HELLO_SIZE => return None,
-            None => data,
-        }
+    if !done && data.len() < sniff_required_len(data) {
+        return None;
+    }
+    let data = if is_http_request_prefix(data) {
+        data.windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map_or(data, |end| &data[..end + 4])
     } else {
-        let required = if data[0] == 0x16 {
-            sniff_required_len(data)
-        } else {
-            5
-        };
-        if !done && data.len() < required {
-            return None;
-        }
         data
     };
     Some(classify_tcp(data))
@@ -480,39 +471,61 @@ fn is_valid_hostname(hostname: &str) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) fn build_tls_client_hello(sni: &str) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&0x0303u16.to_be_bytes());
-    body.extend_from_slice(&[0; 32]);
-    body.extend_from_slice(&[0; 4]); // session, cipher-suites and compression lengths
-    let name_len = u16::try_from(sni.len()).unwrap();
-    body.extend_from_slice(&(9 + name_len).to_be_bytes()); // extensions length
-    body.extend_from_slice(&0x0000u16.to_be_bytes()); // server_name extension
-    body.extend_from_slice(&(5 + name_len).to_be_bytes());
-    body.extend_from_slice(&(3 + name_len).to_be_bytes()); // server name list
-    body.push(0); // host_name
-    body.extend_from_slice(&name_len.to_be_bytes());
-    body.extend_from_slice(sni.as_bytes());
-
-    let mut record = vec![0x16, 3, 3];
-    record.extend_from_slice(&(4 + u16::try_from(body.len()).unwrap()).to_be_bytes());
-    record.push(0x01); // ClientHello
-    record.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
-    record.extend_from_slice(&body);
-    record
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
+    /// Build a minimal TLS ClientHello with SNI.
+    fn build_tls_client_hello(sni: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // SNI extension
+        let sni_bytes = sni.as_bytes();
+        let sni_list_data_len = 3 + sni_bytes.len(); // type(1) + name_len(2) + name
+        let sni_ext_data_len = 2 + sni_list_data_len; // list_len_field(2) + list_data
+        let sni_ext_len = sni_ext_data_len;
+
+        // Extensions
+        let mut extensions = Vec::new();
+        // SNI extension
+        extensions.extend_from_slice(&0x0000u16.to_be_bytes()); // type
+        extensions.extend_from_slice(&(sni_ext_len as u16).to_be_bytes()); // length
+        extensions.extend_from_slice(&(sni_list_data_len as u16).to_be_bytes());
+        extensions.push(0x00); // name type: hostname
+        extensions.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes()); // name length
+        extensions.extend_from_slice(sni_bytes); // hostname
+
+        // Handshake body
+        let mut handshake = Vec::new();
+        handshake.push(0x01); // ClientHello
+        handshake.extend_from_slice(&0u32.to_be_bytes()[1..]); // 3-byte length placeholder
+        handshake.extend_from_slice(&0x0303u16.to_be_bytes()); // TLS 1.2
+        handshake.extend_from_slice(&[0u8; 32]); // random
+        handshake.push(0x00); // session ID length = 0
+        handshake.extend_from_slice(&0u16.to_be_bytes()); // cipher suites length = 0
+        handshake.push(0x00); // compression length = 0
+        handshake.extend_from_slice(&(extensions.len() as u16).to_be_bytes()); // extensions length
+        handshake.extend_from_slice(&extensions);
+
+        // Fix handshake length
+        let handshake_body_len = handshake.len() - 4; // minus type + 3-byte length
+
+        handshake[1] = ((handshake_body_len >> 16) & 0xff) as u8;
+        handshake[2] = ((handshake_body_len >> 8) & 0xff) as u8;
+        handshake[3] = (handshake_body_len & 0xff) as u8;
+
+        // TLS Record
+        buf.push(0x16); // Handshake
+        buf.extend_from_slice(&0x0303u16.to_be_bytes()); // TLS 1.2
+        buf.extend_from_slice(&(handshake.len() as u16).to_be_bytes()); // record length
+        buf.extend_from_slice(&handshake);
+
+        buf
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn packet_sniff_leaves_unknown_ascii_and_incomplete_tls_unconsumed() {
-        let unknown = sniff_packet_tcp(b"hello", false).unwrap();
-        assert_eq!(unknown.traffic_type, TrafficType::Unknown);
-        assert!(unknown.buffered.is_empty());
+    fn borrowed_sniff_waits_for_the_header_and_keeps_the_payload() {
         let hello = build_tls_client_hello("fragmented.example");
         assert!(sniff_packet_tcp(&hello[..9], false).is_none());
         assert!(
@@ -523,6 +536,11 @@ mod tests {
         );
         let result = sniff_packet_tcp(&hello, false).unwrap();
         assert_eq!(result.domain.as_deref(), Some("fragmented.example"));
+        assert!(result.buffered.is_empty());
+
+        let request = b"POST / HTTP/1.1\r\nHost: example.test\r\n\r\n\xff";
+        let result = sniff_packet_tcp(request, false).unwrap();
+        assert_eq!(result.domain.as_deref(), Some("example.test"));
         assert!(result.buffered.is_empty());
     }
 

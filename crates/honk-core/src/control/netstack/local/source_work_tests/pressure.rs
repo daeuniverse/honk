@@ -9,7 +9,7 @@ async fn local_tcp_admission_reclaims_idle_chunks_once() {
         let (scope, owner, mut driver) = super::super::tests::physical();
         let shared = scope.0.local.get().unwrap();
         let budget = &scope.0.budget;
-        let authority = PeerAuthority::new(Arc::new(true.into()));
+        let authority = PeerAuthority::new(Arc::new(true.into()), budget).unwrap();
         let now = Instant::now();
         let client = "192.0.2.1:45001".parse().unwrap();
         let next = "192.0.2.2:45002".parse().unwrap();
@@ -54,10 +54,8 @@ async fn local_tcp_admission_reclaims_idle_chunks_once() {
         if !before_syn {
             assert!(receive(&mut driver, &authority, &syn, now).taken_over);
         }
-        let occupied = budget
-            .reserve(budget.limit().saturating_sub(budget.used()))
-            .unwrap();
-        assert_eq!(budget.limit().saturating_sub(budget.used()), 0);
+        let occupied = budget.reserve(budget.limit() - budget.used()).unwrap();
+        assert_eq!(budget.used(), budget.limit());
         if before_syn {
             assert!(receive(&mut driver, &authority, &syn, now).taken_over);
         }

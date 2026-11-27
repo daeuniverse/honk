@@ -1290,6 +1290,26 @@ impl PacketEndpoints {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn accept_local_ready(&self, driver: &mut PacketDriver) -> io::Result<()> {
+        if self.shared.is_closing() || !driver.has_pending_accept_local() {
+            return Ok(());
+        }
+        for _ in 0..INGRESS_CAPACITY {
+            let Ok(slot) = Arc::clone(&self.shared.tcp_slots).try_acquire_owned() else {
+                break;
+            };
+            let Ok(permit) = self.sender.try_reserve() else {
+                break;
+            };
+            let Some((_, flow)) = driver.poll_accept_local()? else {
+                break;
+            };
+            permit.send(Work::Tcp(flow, slot, None));
+        }
+        Ok(())
+    }
+
     /// Called by a capture owner only after every device has activated its real gate.
     /// Supervisor/UDP readiness alone is not a daemon capture-ready observation.
     pub fn capture_ready(&self) -> io::Result<()> {
@@ -1717,7 +1737,7 @@ impl EndpointRuntime {
                         let guard = ConnectionGuard::new(Arc::clone(&self.plane.drain_tracker));
                         let mut auxiliary = auxiliary;
                         let owner = flow.direct_relay_runtime()
-                            .filter(|_| auxiliary.is_none())
+                            .filter(|_| auxiliary.is_none() && !flow.is_local_worker())
                             .and_then(|owner| owner.with_completion_credit(&self.shared.budget));
                         let mut connection = Some((handle.clone(), permit, guard, flow));
                         let buffers = crate::relay::COPY_BUFFER_MEMORY + crate::sniffing::SNIFF_MEMORY;
@@ -1769,6 +1789,13 @@ impl EndpointRuntime {
                                             let (handle, permit, guard, flow) = connection.take().unwrap();
                                             async move {
                                                 let (_permit, _guard) = (permit, guard);
+                                                #[cfg(target_os = "linux")]
+                                                let mut flow = flow;
+                                                #[cfg(target_os = "linux")]
+                                                if flow.local().is_some() && let Err(error) = flow.attach_remote().await {
+                                                    tracing::debug!(%error, "packet TCP attachment refused");
+                                                    return;
+                                                }
                                                 if let Err(error) = handle.serve_packet_connection(flow).await {
                                                     tracing::debug!(%error, "packet TCP endpoint ended");
                                                 }

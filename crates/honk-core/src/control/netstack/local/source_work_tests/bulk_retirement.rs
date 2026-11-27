@@ -82,7 +82,7 @@ async fn bulk_external_cancellation_waits_for_original_outputs() {
     assert!(reclaim.as_mut().poll(&mut cx).is_pending());
 
     let now = Instant::now();
-    let authority = PeerAuthority::new(Arc::new(AtomicBool::new(true)));
+    let authority = PeerAuthority::new(Arc::new(AtomicBool::new(true)), &budget).unwrap();
     let destination = SocketAddr::from(([203, 0, 113, 2], 443));
     let callbacks: Arc<[AtomicUsize; FLOW_COUNT]> =
         Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));

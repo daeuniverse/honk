@@ -179,6 +179,7 @@ pub(super) async fn prepare(
     plane: &ControlPlane,
     config: &Config,
     admission: Arc<AtomicBool>,
+    mode: CapturePoll,
 ) -> anyhow::Result<PreparedRuntime> {
     let datapath = config
         .datapath
@@ -440,8 +441,7 @@ pub(super) async fn prepare(
     let mut placements = worker::Placements::new(realm_keys.len(), &budget)?;
     let (namespace, links) = fib?;
     let topology = topology.context("capture topology was not checked")?;
-    // SAFETY: the watcher keeps its descriptor until AsyncFd drops it.
-    let topology = unsafe { AsyncFd::register(topology) }.map_err(io::Error::from)?;
+    let topology = mode.wrap(topology)?;
     let polling_prefix = ContextDigest::platform(&budget);
     tracing::debug!(
         used = budget.used(),
@@ -648,11 +648,9 @@ pub(super) async fn prepare(
             let observed = port.counters();
             let observed_rings = port.rings();
             let io = if id % u32::from(datapath.effective_workers()) == 0 {
-                let (io, registered) = QueueIo::Prepared(port).register();
-                registered?;
-                io
+                mode.wrap(port)?
             } else {
-                QueueIo::Prepared(port)
+                QueueIo::Epoll(port)
             };
             queues.push(Queue {
                 id,
@@ -723,12 +721,21 @@ pub(super) async fn prepare(
                 .iter()
                 .map(|index| devices[*index].info.queues.len()),
         );
-        let (realm, owners) = capture_realm(
+        // A local reactor owns exactly one actual queue of a single physical member.
+        let local = direct_relay_eligible(
+            datapath.direct,
+            datapath.effective_workers(),
+            device.info.queues.len(),
+            members.len(),
+            device.info.physical_member,
+        );
+        let (realm, owners) = capture_realm_for_workers(
             link.mtu,
             realm_count,
             scope_bulk_frames,
             worker_count,
             members.len(),
+            local,
             &budget,
         )?;
         realm.install_admission_fence(Arc::clone(&admission))?;

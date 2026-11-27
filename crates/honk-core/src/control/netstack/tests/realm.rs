@@ -54,7 +54,7 @@ async fn physical_tcp_batch_checks_each_ack_and_flushes_before_reset() {
     let (realm, owners) = capture_realm(1280, 1, 16, 1, 1, &budget).unwrap();
     let scope = realm.owner(0).unwrap();
     let now = Instant::now();
-    let peers = PeerAuthority::new(Arc::new(true.into()));
+    let peers = PeerAuthority::new(Arc::new(true.into()), &budget).unwrap();
     let (path, flow, reply) = physical_synack(&realm, &peers, now);
     let client = flow.peer_addr();
     let server = decode(&reply).0.seq.wrapping_add(1);
@@ -221,7 +221,7 @@ async fn physical_tcp_batch_preserves_exported_output() {
         let scope = realm.owner(0).unwrap();
         assert_eq!(scope.0.workers, workers);
         let now = Instant::now();
-        let peers = PeerAuthority::new(Arc::new(true.into()));
+        let peers = PeerAuthority::new(Arc::new(true.into()), &budget).unwrap();
         let (path, mut flow, synack) = physical_synack(&realm, &peers, now);
         let original = synack.packet().to_vec();
         let server = decode(&synack).0.seq.wrapping_add(1);
@@ -321,7 +321,7 @@ async fn physical_tcp_batch_retries_moved_peer_with_pending_output_once() {
         let budget = MemoryBudget::new(CAPTURE_MEMORY);
         let (realm, owners) = capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
         let scope = realm.owner(0).unwrap();
-        let peers = PeerAuthority::new(Arc::new(true.into()));
+        let peers = PeerAuthority::new(Arc::new(true.into()), &budget).unwrap();
         let now = Instant::now();
         let (path, mut flow, synack) = physical_synack(&realm, &peers, now);
         let server = decode(&synack).0.seq.wrapping_add(1);
@@ -348,7 +348,7 @@ async fn physical_tcp_batch_retries_moved_peer_with_pending_output_once() {
             peers.saturate_revision_for_test();
         }
         let before = scope.stats().unwrap();
-        let foreign_peers = PeerAuthority::new(Arc::new(true.into()));
+        let foreign_peers = PeerAuthority::new(Arc::new(true.into()), &budget).unwrap();
         let mut batch = None;
         let warm = RealmRxBatch::receive_sharded(
             &mut batch,

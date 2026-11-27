@@ -160,7 +160,11 @@ impl WorkerRuntime {
             .min()
     }
 
-    pub(super) fn poll_service(&mut self, cx: &mut Context<'_>) -> anyhow::Result<bool> {
+    pub(super) fn poll_service(
+        &mut self,
+        cx: &mut Context<'_>,
+        turns: &mut TurnBudget,
+    ) -> anyhow::Result<bool> {
         if self.shared.is_closing() {
             return Ok(false);
         }
@@ -185,6 +189,9 @@ impl WorkerRuntime {
             || self.context_recheck
         {
             self.polling.leave("closing_or_clock_change");
+            return Ok(initial);
+        }
+        if turns.poll_due(&self.realms) {
             return Ok(initial);
         }
         let now = Instant::now();
@@ -250,6 +257,7 @@ impl WorkerRuntime {
                 break "closing";
             }
             self.polling.enter();
+            turns.charge();
             if let Err(error) = self.poll(cx, Some(&interval)) {
                 failure = Some(error);
                 break "device_failure";
@@ -266,6 +274,9 @@ impl WorkerRuntime {
             }
             if !self.needs_service_retry() {
                 break "no_pollable_work";
+            }
+            if turns.poll_due(&self.realms) {
+                break "bounded_segment_limit";
             }
         };
         match interval.finish() {

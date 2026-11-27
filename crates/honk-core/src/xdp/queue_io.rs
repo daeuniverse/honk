@@ -1,53 +1,82 @@
 use super::*;
 
-pub(super) enum QueueIo {
-    Prepared(Port<Retained>),
-    Registered(AsyncFd<Port<Retained>>),
+#[derive(Clone, Copy)]
+pub(super) enum CapturePoll {
+    Epoll,
+    #[cfg(test)]
+    Driven,
 }
 
-impl QueueIo {
-    pub(super) fn register(self) -> (Self, io::Result<()>) {
-        let Self::Prepared(port) = self else {
-            return (self, Ok(()));
-        };
-        // SAFETY: the socket stays owned until this registration is consumed.
-        match unsafe { AsyncFd::register(port) } {
-            Ok(io) => (Self::Registered(io), Ok(())),
-            Err(error) => {
-                let (port, error) = error.into_parts();
-                (Self::Prepared(port), Err(error))
+pub(super) enum CaptureIo<T: AsRawFd> {
+    Epoll(T),
+    #[cfg(test)]
+    Driven(AsyncFd<T>),
+}
+
+impl CapturePoll {
+    pub(super) fn wrap<T: AsRawFd>(self, io: T) -> io::Result<CaptureIo<T>> {
+        match self {
+            Self::Epoll => Ok(CaptureIo::Epoll(io)),
+            #[cfg(test)]
+            Self::Driven => {
+                // SAFETY: the owned capture descriptor is stable until this registration ends.
+                unsafe { AsyncFd::register(io) }
+                    .map(CaptureIo::Driven)
+                    .map_err(io::Error::from)
             }
         }
     }
-    pub(super) fn get_ref(&self) -> &Port<Retained> {
+}
+
+impl<T: AsRawFd> CaptureIo<T> {
+    pub(super) fn get_ref(&self) -> &T {
         match self {
-            Self::Prepared(port) => port,
-            Self::Registered(io) => io.get_ref(),
+            Self::Epoll(io) => io,
+            #[cfg(test)]
+            Self::Driven(io) => io.get_ref(),
         }
     }
-    pub(super) fn get_mut(&mut self) -> &mut Port<Retained> {
+
+    pub(super) fn get_mut(&mut self) -> &mut T {
         match self {
-            Self::Prepared(port) => port,
-            Self::Registered(io) => io.get_mut(),
+            Self::Epoll(io) => io,
+            #[cfg(test)]
+            Self::Driven(io) => io.get_mut(),
         }
     }
-    pub(super) fn into_inner(self) -> Port<Retained> {
+
+    pub(super) fn into_inner(self) -> T {
         match self {
-            Self::Prepared(port) => port,
-            Self::Registered(io) => io.into_inner(),
+            Self::Epoll(io) => io,
+            #[cfg(test)]
+            Self::Driven(io) => io.into_inner(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn arm_driven(&self, cx: &mut Context<'_>) -> io::Result<bool> {
+        match self {
+            Self::Driven(io) => arm_read(io, cx),
+            Self::Epoll(_) => Ok(false),
         }
     }
 }
 
-impl std::ops::Deref for QueueIo {
-    type Target = AsyncFd<Port<Retained>>;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Registered(io) => io,
-            Self::Prepared(_) => panic!("Port not registered on owner runtime"),
-        }
+pub(super) type QueueIo = CaptureIo<Port<Retained>>;
+
+impl QueueIo {
+    pub(super) fn watch_queue(
+        &self,
+        poll: &WorkerEpoll,
+        device: usize,
+        queue: usize,
+    ) -> io::Result<()> {
+        let token = epoll::TOKEN_XSK_BASE | ((device as u64) << 32) | queue as u64;
+        poll.add_fd(self.get_ref().as_raw_fd(), READ_EDGE, token)
     }
 }
+
+pub(super) const READ_EDGE: u32 = (libc::EPOLLIN | libc::EPOLLET) as u32;
 
 pub(super) fn diagnostics(
     devices: &[Device],
@@ -137,6 +166,7 @@ fn l3_segments_at<'a>(
     None
 }
 
+#[cfg(test)]
 /// Tokio takes the reader waker when it delivers readiness and a cached Ready installs none,
 /// so a single clear can park an empty pass with nothing to wake it. Pending registers this
 /// task (or schedules a coop-budget continuation) before the caller drains.
@@ -229,8 +259,13 @@ impl Runtime {
                 }
                 return Poll::Ready(Err(anyhow::anyhow!("XDP publication admission closed")));
             }
-            let readable =
-                arm_read(&self.topology, cx).inspect_err(|_| self.topology_lost = true)?;
+            let readable = std::mem::take(&mut self.topology_readable);
+            #[cfg(test)]
+            let readable = self
+                .topology
+                .arm_driven(cx)
+                .inspect_err(|_| self.topology_lost = true)?
+                || readable;
             // A Core queue-zero RX callback can submit a cached decision without visiting resolve().
             let full = readable
                 || (self.core.is_some()
@@ -282,6 +317,9 @@ impl Runtime {
             }
             self.maintain_gateway(now)?;
         }
+        for realm in &mut self.realms {
+            realm.driver.begin_local_turn(cx, now);
+        }
         let mut progress = self.poll_handoffs(cx, now)?;
         self.round_cut_short = false;
         let deadline = interval.and_then(|_| self.next_deadline(now, !reading));
@@ -324,13 +362,15 @@ impl Runtime {
                     device_index
                 };
                 let queue = &mut device.queues[queue_index];
+                #[cfg(test)]
                 if !self.closing
-                    && let Err(error) = arm_read(&queue.io, cx)
+                    && let Err(error) = queue.io.arm_driven(cx)
                 {
                     return Poll::Ready(Err(error.into()));
                 }
                 let port = queue.io.get_mut();
-                progress += match port.complete(release_completed) {
+                progress += match port.complete(|done| release_completed_on(&mut self.realms, done))
+                {
                     Ok(count) => count,
                     Err(error) => {
                         return Poll::Ready(Err(error.into()));
@@ -348,13 +388,14 @@ impl Runtime {
                     let staging = &mut self.staging;
                     let endpoints = &self.endpoints;
                     let pressure = &mut self.pressure.counters;
-                    let realms = &self.realms;
+                    let realms = &mut self.realms;
                     let qualified_rx = &mut self.qualified_rx;
                     let qualification_unavailable = &mut self.qualification_unavailable;
                     let mut failure = None;
                     let ifindex = device.info.ifindex;
                     let metadata_len = if capture.vlan_metadata { METADATA_LEN } else { 0 };
                     let limit = if queue.id == 0 { queue_zero_batch } else { BATCH };
+                    let mut local_peer = None;
                     let received = worker::receive_batch(port, limit, metadata_len, |batch, segments, metadata, same_port| {
                         if failure.is_some() { return; }
                         let capture_metadata = if capture.vlan_metadata {
@@ -366,8 +407,9 @@ impl Runtime {
                             return;
                         };
                         if decoded.destination_mac[0] & 1 != 0 { batch.take(); return; }
-                        let Some(realm) = realms.iter().find(|realm| realm.members.contains(&device_index) && realm.link.path.vlan_count == decoded.vlan_count
+                        let Some(realm_index) = realms.iter().position(|realm| realm.members.contains(&device_index) && realm.link.path.vlan_count == decoded.vlan_count
                             && realm.link.path.vlan_proto == decoded.vlan_proto && realm.link.path.vlan_tci.iter().zip(decoded.vlan_tci).all(|(configured, captured)| configured & 0x0fff == captured & 0x0fff)) else { batch.take(); return; };
+                        let realm = &realms[realm_index];
                         if decoded.destination_mac != realm.link.mac { batch.take(); return; }
                         let scope = realm.driver.scope();
                         let ingress = realm.ingress;
@@ -444,10 +486,14 @@ impl Runtime {
                             }
                         }
                         let result = (|| {
-                            let Some(owner) = realm.driver.sole_owner() else {
-                                let physical = endpoints.realm(scope).ok_or_else(|| io::Error::other("unregistered physical realm"))?;
-                                return workers.physical_endpoint(batch, endpoints, physical, 0, ingress, &l3[..count], view, staging, (now, Instant::now()), path, core.is_some());
-                            };
+                            let physical = endpoints.realm(scope).ok_or_else(|| io::Error::other("unregistered physical realm"))?;
+                            let driver = &mut realms[realm_index].driver;
+                            if driver.is_local() || physical.owners().len() != 1 {
+                                let service_at = if driver.is_local() { now } else { Instant::now() };
+                                let local = driver.is_local().then_some(driver);
+                                return workers.physical_endpoint(batch, endpoints, physical, 0, ingress, &l3[..count], view, staging, (now, service_at), path, core.is_some(), local, &mut local_peer);
+                            }
+                            let owner = &physical.owners()[0];
                             let bytes = if count == 1 { l3[0] } else {
                                 batch.take();
                                 if decoded.l3_len > staging.len() || view.copy_to(0..decoded.l3_len, &mut staging[..decoded.l3_len]).is_none() { return Ok(PacketReceive::default()); }
@@ -455,7 +501,7 @@ impl Runtime {
                             };
                             if matches!(wire::parse_ip(bytes), Err(wire::ParseError::Fragment)) {
                                 batch.take();
-                                return workers.endpoint_fragment(endpoints, scope, bytes, now, path);
+                                return workers.endpoint_fragment(endpoints, scope, bytes, now, path, None);
                             }
                             // Keep the scalar pre-lock timestamp even when batch admission falls back.
                             let service_at = Instant::now();
@@ -492,7 +538,11 @@ impl Runtime {
             self.rx_queue = 0;
         }
         for realm in &mut self.realms {
-            if !self.closing && realm.generated.is_none() && realm.driver.service(cx, now) {
+            if !self.closing
+                && !realm.driver.is_local()
+                && realm.generated.is_none()
+                && realm.driver.service(cx, now)
+            {
                 progress += 1;
             }
         }
@@ -506,10 +556,19 @@ impl Runtime {
             }
             let realm_count = self.realms.len();
             let realm = &mut self.realms[realm_index];
+            progress += usize::from(match &self.topology {
+                CaptureIo::Epoll(_) => realm.driver.poll_local_io_sync(cx, now)?,
+                #[cfg(test)]
+                CaptureIo::Driven(_) => realm.driver.poll_local_io(cx, now)?,
+            });
             if self.closing {
                 progress += usize::from(realm.driver.service_closing(cx, now));
                 finalized[realm_index] = true;
                 continue;
+            }
+            if realm.driver.is_local() && realm.generated.is_none() {
+                progress += usize::from(realm.driver.service(cx, now));
+                finalized[realm_index] = true;
             }
             if realm.members.len() > 1 {
                 let devices = &mut self.devices;
@@ -626,7 +685,13 @@ impl Runtime {
             progress += finish_transmit(work, kick)?;
         }
         for (index, realm) in self.realms.iter_mut().enumerate() {
-            if !finalized[index] && realm.generated.is_some() {
+            if finalized[index] {
+                continue;
+            }
+            if self.closing {
+                progress += usize::from(realm.driver.poll_local_io(cx, now)?);
+                progress += usize::from(realm.driver.service_closing(cx, now));
+            } else if realm.generated.is_some() || realm.driver.local_turn_open() {
                 realm.driver.finish_turn(cx, now);
             }
         }

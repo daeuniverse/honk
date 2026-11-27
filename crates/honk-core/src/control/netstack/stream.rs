@@ -114,6 +114,17 @@ impl FlowIo {
         self.remote.as_ref().map(RemoteEndpoint::progress)
     }
 
+    pub(in crate::control) fn is_local_worker(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.physical.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
     pub fn scope(&self) -> ScopeId {
         self.scope.scope()
     }

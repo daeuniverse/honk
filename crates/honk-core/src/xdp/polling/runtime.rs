@@ -3,7 +3,7 @@ use crate::control::{
     ShutdownIntent,
     poll_budget::{BusyInterval, PollSettlement},
 };
-use crate::xdp::{Runtime, poll_deadline};
+use crate::xdp::{Runtime, TurnBudget, poll_deadline};
 use honk_config::datapath::InterfaceRole;
 use honk_xsk::{FRAME_SIZE, device::FeatureQuery};
 use std::{
@@ -348,6 +348,43 @@ impl Runtime {
         reading: bool,
         notification: Pin<&mut OwnedNotified>,
     ) -> Poll<anyhow::Result<()>> {
+        match self.service_turn(
+            cx,
+            shutdown,
+            reading,
+            notification,
+            &mut TurnBudget::tokio(),
+        ) {
+            Ok(false) => {}
+            result => {
+                timer.set(None);
+                return Poll::Ready(result.map(|_| ()));
+            }
+        }
+        let now = Instant::now();
+        let result = poll_deadline(
+            timer.as_mut(),
+            self.next_deadline(now, !reading && !self.closing),
+            now,
+            cx,
+        )
+        .map(Ok);
+        #[cfg(test)]
+        if result.is_pending() {
+            self.polling_test_pending(reading && !self.closing, timer.as_ref());
+        }
+        result
+    }
+
+    pub(in crate::xdp) fn service_turn(
+        &mut self,
+        cx: &mut Context<'_>,
+        shutdown: &ShutdownIntent,
+        reading: bool,
+        notification: Pin<&mut OwnedNotified>,
+        turns: &mut TurnBudget,
+    ) -> anyhow::Result<bool> {
+        turns.charge();
         if self.polling.poll_change(notification, cx) {
             self.workers.wake_worker(1);
         }
@@ -370,36 +407,25 @@ impl Runtime {
             self.policy_recheck = true;
             self.context_recheck = true;
             self.service_scopes(cx, Instant::now());
-            timer.set(None);
-            return Poll::Ready(Ok(()));
+            return Ok(true);
         }
         let initial = self.poll_io(cx, None, shutdown, reading);
         self.observe_polling_round();
         let useful_turn = match initial {
-            Poll::Ready(Err(error)) => {
-                timer.set(None);
-                return Poll::Ready(Err(error));
+            Poll::Ready(result) => {
+                result?;
+                true
             }
-            Poll::Ready(Ok(())) => true,
             Poll::Pending => false,
         };
         if self.closing {
-            if useful_turn {
-                timer.set(None);
-                return Poll::Ready(Ok(()));
-            }
-            let now = Instant::now();
-            let result =
-                poll_deadline(timer.as_mut(), self.next_deadline(now, false), now, cx).map(Ok);
-            #[cfg(test)]
-            if result.is_pending() {
-                self.polling_test_pending(false, timer.as_ref());
-            }
-            return result;
+            return Ok(useful_turn);
         }
         if shutdown.requested() || self.policy_recheck {
-            timer.set(None);
-            return Poll::Ready(Ok(()));
+            return Ok(true);
+        }
+        if turns.poll_due(&self.realms) {
+            return Ok(useful_turn);
         }
         let now = Instant::now();
         let deadline = self.next_deadline(now, !reading);
@@ -447,6 +473,7 @@ impl Runtime {
                     break reason;
                 }
                 self.polling.enter();
+                turns.charge();
                 let result = self.poll_io(cx, Some(&interval), shutdown, reading);
                 let progressed = self.observe_polling_round();
                 if let Poll::Ready(Err(error)) = result {
@@ -464,6 +491,9 @@ impl Runtime {
                 }
                 if !self.has_pollable_obligation() {
                     break "no_pollable_work";
+                }
+                if turns.poll_due(&self.realms) {
+                    break "bounded_segment_limit";
                 }
             };
             #[cfg(test)]
@@ -500,20 +530,8 @@ impl Runtime {
                     .map(|queue| queue.io.get_ref().counters().rx)
                     .sum(),
             });
-            timer.set(None);
-            return Poll::Ready(failure.map_or(Ok(()), Err));
+            return failure.map_or(Ok(true), Err);
         }
-        if useful_turn {
-            timer.set(None);
-            return Poll::Ready(Ok(()));
-        }
-        let now = Instant::now();
-        let result =
-            poll_deadline(timer.as_mut(), self.next_deadline(now, !reading), now, cx).map(Ok);
-        #[cfg(test)]
-        if result.is_pending() {
-            self.polling_test_pending(reading, timer.as_ref());
-        }
-        result
+        Ok(useful_turn)
     }
 }

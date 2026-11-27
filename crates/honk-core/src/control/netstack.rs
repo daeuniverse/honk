@@ -44,7 +44,7 @@ mod realm_receive;
 pub(in crate::control) mod remote;
 #[cfg(target_os = "linux")]
 pub(in crate::control) use fragment_peer::{FragmentPeer, fragment_offset_zero};
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) use realm::capture_realm;
 #[cfg(target_os = "linux")]
 pub(crate) use realm::capture_realm_for_workers;
@@ -2202,11 +2202,6 @@ impl PacketDriver {
             return DrivingInner::Local(&mut owner.inner);
         }
         DrivingInner::Shared(self.scope.0.inner.lock())
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn sole_owner(&self) -> Option<&PacketScope> {
-        (self.scope.0.workers == 1).then_some(&self.scope)
     }
 
     pub(crate) fn scope(&self) -> ScopeId {

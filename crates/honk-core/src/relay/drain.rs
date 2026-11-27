@@ -21,8 +21,12 @@ impl CopyProgress {
     }
 }
 
-pub(super) async fn drain_copy_idle(upload: &CopyProgress, download: &CopyProgress) {
-    let progress = || (upload.snapshot(), download.snapshot());
+pub(super) async fn drain_copy_idle(
+    upload: &CopyProgress,
+    download: &CopyProgress,
+    accepted_download: impl Fn() -> u64,
+) {
+    let progress = move || (upload.snapshot(), download.snapshot(), accepted_download());
     let mut last = progress();
     let mut now = Instant::now();
     let mut deadline = now + DRAIN_DEADLINE;

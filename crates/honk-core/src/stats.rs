@@ -625,11 +625,22 @@ pub(crate) mod xdp {
         dns_bank: std::sync::Weak<crate::xdp::gateway::dns::GatewayDnsBank>,
     }
 
+    #[derive(Debug, Default)]
+    struct HandoffCounts {
+        packets: AtomicU64,
+        bytes: AtomicU64,
+        refused: AtomicU64,
+        refused_bytes: AtomicU64,
+    }
+
     #[derive(Debug)]
     pub(crate) struct Diagnostics {
         state: Mutex<State>,
         count: usize,
-        cross_worker_handoffs: AtomicU64,
+        handoffs: [[HandoffCounts; 2]; 2],
+        worker_pressure: [AtomicU64; 3],
+        pub(super) direct_attach_fallback: AtomicU64,
+        pub(super) direct_attach_fallback_failed: AtomicU64,
         _memory: MemoryReservation,
     }
 
@@ -666,7 +677,10 @@ pub(crate) mod xdp {
                     dns_bank: std::sync::Weak::new(),
                 }),
                 count,
-                cross_worker_handoffs: AtomicU64::new(0),
+                handoffs: Default::default(),
+                worker_pressure: Default::default(),
+                direct_attach_fallback: AtomicU64::new(0),
+                direct_attach_fallback_failed: AtomicU64::new(0),
                 _memory: memory,
             }))
         }
@@ -719,10 +733,29 @@ pub(crate) mod xdp {
             self.state.lock().queues[index].sample(at, socket, rings);
         }
 
-        pub(crate) fn record_worker_handoff(&self) {
-            let _ =
-                self.cross_worker_handoffs
-                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1));
+        pub(crate) fn sample_worker_pressure(&self, counters: [u64; 3]) {
+            for (counter, value) in self.worker_pressure.iter().zip(counters) {
+                counter.store(value, Ordering::Relaxed);
+            }
+        }
+
+        pub(crate) fn record_worker_handoff(
+            &self,
+            destination: usize,
+            endpoint: bool,
+            bytes: usize,
+            accepted: bool,
+        ) {
+            let counts = &self.handoffs[destination][usize::from(endpoint)];
+            let (packets, octets) = if accepted {
+                (&counts.packets, &counts.bytes)
+            } else {
+                (&counts.refused, &counts.refused_bytes)
+            };
+            let _ = packets.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1));
+            let _ = octets.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(bytes as u64))
+            });
         }
 
         pub(crate) fn lifecycle(&self, lifecycle: Lifecycle) {
@@ -750,9 +783,9 @@ pub(crate) mod xdp {
             let mut rows = Vec::new();
             let mut remaining = 64 * 1024
                 - if bank.is_some() || decisions.is_some() {
-                    4096
+                    5120
                 } else {
-                    1024
+                    2048
                 };
             if full {
                 let mut encoded = Vec::new();
@@ -770,9 +803,27 @@ pub(crate) mod xdp {
                     rows.push(row);
                 }
             }
+            let mut total = 0u64;
+            let handoffs = self.handoffs.each_ref().map(|kinds| {
+                kinds.each_ref().map(|counts| {
+                    let packets = counts.packets.load(Ordering::Relaxed);
+                    total = total.saturating_add(packets);
+                    json!({
+                        "packets": packets.to_string(),
+                        "l3_bytes": counts.bytes.load(Ordering::Relaxed).to_string(),
+                        "refused": counts.refused.load(Ordering::Relaxed).to_string(),
+                        "refused_l3_bytes": counts.refused_bytes.load(Ordering::Relaxed).to_string(),
+                    })
+                })
+            });
             let mut value = json!({
                 "state": lifecycle.as_str(), "queue_count": self.count,
-                "cross_worker_handoffs": self.cross_worker_handoffs.load(Ordering::Relaxed).to_string(),
+                "cross_worker_handoffs": total.to_string(), "handoffs": handoffs,
+                "ownership_dir_full": self.worker_pressure[0].load(Ordering::Relaxed).to_string(),
+                "udp_reply_queue_full": self.worker_pressure[1].load(Ordering::Relaxed).to_string(),
+                "remote_backpressure": self.worker_pressure[2].load(Ordering::Relaxed).to_string(),
+                "direct_attach_fallback": self.direct_attach_fallback.load(Ordering::Relaxed).to_string(),
+                "direct_attach_fallback_failed": self.direct_attach_fallback_failed.load(Ordering::Relaxed).to_string(),
                 "dns_projection_state": dns.state.label(),
                 "dns_projection_reason": if let DnsProjectionState::Fallback(reason) = dns.state { Some(reason) } else { None },
                 "dns_projection_counters": dns.counters,
@@ -1013,6 +1064,24 @@ impl StatsManager {
             #[cfg(feature = "native-api")]
             counter_since: std::time::SystemTime::now(),
             warm_marks: DashMap::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn record_direct_attach_fallback(&self, remote_bound: bool) {
+        if let Some(state) = self.xdp.read().as_ref() {
+            let _ = state.direct_attach_fallback.try_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |n| n.checked_add(1),
+            );
+            if !remote_bound {
+                let _ = state.direct_attach_fallback_failed.try_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |n| n.checked_add(1),
+                );
+            }
         }
     }
 

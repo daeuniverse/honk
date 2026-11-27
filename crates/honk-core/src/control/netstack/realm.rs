@@ -238,7 +238,7 @@ impl Drop for HalfOpenHold {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn capture_realm(
     mtu: u32,
     realms: usize,

@@ -1,7 +1,8 @@
 use super::*;
 use crate::control::netstack::{RealmRxBatch, TcpClaim};
-use futures::FutureExt as _;
 mod adaptive;
+pub(crate) mod direct;
+pub(crate) mod epoll;
 mod runtime;
 #[cfg(test)]
 mod startup_tests;
@@ -9,7 +10,8 @@ mod startup_tests;
 mod tests;
 use parking_lot::Mutex;
 use std::sync::OnceLock;
-use tokio::sync::{Notify, mpsc};
+use std::sync::atomic::AtomicUsize;
+use tokio::sync::mpsc;
 
 pub(crate) const CELLS: usize = 64;
 pub(super) const THREAD_STACK: usize = 2 << 20;
@@ -21,7 +23,6 @@ struct PeerSlot {
     scope: ScopeId,
     path: ReturnPath,
     generation: u64,
-    holds: usize,
     last_seen: Instant,
     conflict: Option<Instant>,
 }
@@ -32,13 +33,13 @@ impl PeerSlot {
         authority: &PeerAuthority,
         path: ReturnPath,
         now: Instant,
-        opens: bool,
+        can_relearn: bool,
         rst: bool,
         pending: bool,
     ) -> bool {
         let changed = self.conflict.is_some() || (!pending && !rst && self.path != path);
         if !self.path.same_identity(path) || self.conflict.is_some() {
-            if rst || !opens || self.holds != 0 {
+            if rst || !can_relearn {
                 return false;
             }
             if !self
@@ -64,19 +65,13 @@ impl PeerSlot {
         }
         true
     }
-
-    fn pin(&mut self, authority: &PeerAuthority) -> Option<()> {
-        self.holds = self.holds.checked_add(1)?;
-        if self.holds == usize::MAX {
-            authority.invalidate();
-        }
-        Some(())
-    }
 }
 
 #[derive(Debug)]
 pub(crate) struct PeerAuthority {
     slots: Mutex<Vec<PeerSlot>>,
+    pins: Box<[AtomicUsize]>,
+    _memory: MemoryReservation,
     admission: Arc<AtomicBool>,
     revision: std::sync::atomic::AtomicU64,
 }
@@ -121,7 +116,7 @@ impl PeerHold {
     #[cfg(test)]
     pub(crate) fn for_test(address: IpAddr, path: ReturnPath) -> Self {
         Self::unlearned(
-            PeerAuthority::new(Arc::new(AtomicBool::new(true))),
+            PeerAuthority::isolated(Arc::new(AtomicBool::new(true))),
             address,
             path,
         )
@@ -142,11 +137,10 @@ impl Clone for PeerHold {
         if !self.learned() {
             return Self::unlearned(Arc::clone(&self.authority), self.address, self.path);
         }
-        let mut peers = self.authority.slots.lock();
-        let peer = &mut peers[self.slot];
-        assert_eq!(peer.generation, self.generation);
-        peer.pin(&self.authority)
-            .expect("peer hold count exhausted");
+        // The existing hold prevents this slot from being recycled before the increment.
+        self.authority
+            .pin(self.slot, true)
+            .expect("invalid peer pin count");
         Self {
             authority: Arc::clone(&self.authority),
             slot: self.slot,
@@ -165,27 +159,61 @@ impl Drop for PeerHold {
         if !self.learned() {
             return;
         }
-        let mut peers = self.authority.slots.lock();
-        let peer = &mut peers[self.slot];
-        assert_eq!(peer.generation, self.generation);
-        peer.holds = peer.holds.checked_sub(1).expect("peer hold underflow");
+        self.authority.pins[self.slot]
+            .try_update(Ordering::Release, Ordering::Relaxed, |n| n.checked_sub(1))
+            .expect("peer hold underflow");
     }
 }
 
 impl PeerAuthority {
-    pub(crate) fn new(admission: Arc<AtomicBool>) -> Arc<Self> {
-        Arc::new(Self {
+    const STORAGE: usize = size_of::<Self>()
+        + 2 * size_of::<usize>()
+        + PEERS * (size_of::<PeerSlot>() + size_of::<AtomicUsize>());
+
+    pub(crate) fn new(
+        admission: Arc<AtomicBool>,
+        budget: &Arc<MemoryBudget>,
+    ) -> io::Result<Arc<Self>> {
+        let memory = budget
+            .reserve(Self::STORAGE)
+            .ok_or_else(|| io::Error::other("XDP peer storage capacity"))?;
+        Ok(Arc::new(Self {
             slots: Mutex::new(Vec::with_capacity(PEERS)),
+            pins: (0..PEERS).map(|_| AtomicUsize::new(0)).collect(),
+            _memory: memory,
             admission,
             revision: 0.into(),
-        })
+        }))
     }
 
-    // All writers hold the slots mutex. Saturation permanently disables optimistic reuse.
+    #[cfg(test)]
+    pub(crate) fn isolated(admission: Arc<AtomicBool>) -> Arc<Self> {
+        Self::new(admission, &MemoryBudget::new(Self::STORAGE)).unwrap()
+    }
+
+    fn pin_count(&self, slot: usize) -> usize {
+        self.pins[slot].load(Ordering::Acquire)
+    }
+
+    fn pin(&self, slot: usize, require_live: bool) -> Option<()> {
+        self.pins[slot]
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                if require_live && n == 0 {
+                    return None;
+                }
+                if n == usize::MAX - 1 {
+                    self.revision.store(u64::MAX, Ordering::Release);
+                }
+                n.checked_add(1)
+            })
+            .ok()
+            .map(|_| ())
+    }
+
     fn invalidate(&self) {
-        let revision = self.revision.load(Ordering::Relaxed);
-        self.revision
-            .store(revision.saturating_add(1), Ordering::Release);
+        let _ = self
+            .revision
+            .try_update(Ordering::Release, Ordering::Relaxed, |n| n.checked_add(1));
     }
 
     #[cfg(test)]
@@ -219,7 +247,14 @@ impl PeerAuthority {
             .iter()
             .position(|peer| peer.scope == scope && peer.address == address)
         {
-            if !peers[slot].observe(self, path, now, opens, rst, pending) {
+            if !peers[slot].observe(
+                self,
+                path,
+                now,
+                opens && self.pin_count(slot) == 0,
+                rst,
+                pending,
+            ) {
                 return None;
             }
             slot
@@ -234,8 +269,8 @@ impl PeerAuthority {
                 peers
                     .iter()
                     .enumerate()
-                    .filter(|(_, peer)| {
-                        peer.holds == 0
+                    .filter(|(slot, peer)| {
+                        self.pin_count(*slot) == 0
                             && peer.conflict.is_none_or(|at| {
                                 now.saturating_duration_since(at) >= PEER_CONFLICT_HOLD
                             })
@@ -253,7 +288,6 @@ impl PeerAuthority {
                 scope,
                 path,
                 generation,
-                holds: 0,
                 last_seen: now,
                 conflict: None,
             };
@@ -265,8 +299,8 @@ impl PeerAuthority {
             self.invalidate();
             slot
         };
-        let peer = &mut peers[slot];
-        peer.pin(self)?;
+        let peer = &peers[slot];
+        self.pin(slot, false)?;
         Some(PeerHold {
             authority: Arc::clone(self),
             slot,
@@ -316,10 +350,11 @@ impl PeerAuthority {
         if peer.scope != scope || peer.generation != held.generation {
             return Ok(false);
         }
+        let pins = self.pin_count(held.slot);
         if SHARDED {
             if peer.address != held.address
-                || peer.holds == 0
-                || peer.holds == usize::MAX
+                || pins == 0
+                || pins == usize::MAX
                 || peer.conflict.is_some()
             {
                 return Ok(false);
@@ -328,7 +363,7 @@ impl PeerAuthority {
                 return Err(PeerPathChanged);
             }
             peer.last_seen = peer.last_seen.max(now);
-        } else if !peer.observe(self, path, now, false, false, false) || peer.holds == usize::MAX {
+        } else if !peer.observe(self, path, now, false, false, false) || pins == usize::MAX {
             return Ok(false);
         }
         *checked = Some(PeerObservation {
@@ -349,18 +384,18 @@ impl PeerAuthority {
         address: IpAddr,
         path: ReturnPath,
     ) -> io::Result<Option<PeerHold>> {
-        let mut peers = self.slots.lock();
+        let peers = self.slots.lock();
         let Some(slot) = peers
             .iter()
             .position(|peer| peer.scope == scope && peer.address == address)
         else {
             return Ok(Some(PeerHold::unlearned(Arc::clone(self), address, path)));
         };
-        let peer = &mut peers[slot];
+        let peer = &peers[slot];
         if !peer.path.same_identity(path) || peer.conflict.is_some() {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
-        peer.pin(self)
+        self.pin(slot, false)
             .ok_or_else(|| io::Error::other("peer hold exhausted"))?;
         Ok(Some(PeerHold {
             authority: Arc::clone(self),
@@ -434,8 +469,6 @@ impl CellPool {
                             * (THREAD_STACK + 256 * 1024 + size_of::<WorkerRuntime>())
                         + ports * 4096
                         + size_of::<Shared>()
-                        + size_of::<PeerAuthority>()
-                        + PEERS * size_of::<PeerSlot>()
                         + 65536,
                 )
             })
@@ -549,7 +582,7 @@ impl Drain {
 struct State {
     ready: bool,
     queues_registered: bool,
-    relay_setup: Option<tokio::sync::oneshot::Receiver<()>>,
+    startup: Option<tokio::sync::oneshot::Receiver<Vec<Realm>>>,
     activated: bool,
     drain: Drain,
     stop: bool,
@@ -558,15 +591,46 @@ struct State {
 }
 
 struct RelayOwners {
-    primary: (tokio::runtime::Handle, Arc<DirectRelayFence>),
-    secondary: Option<(OnceLock<tokio::runtime::Handle>, Arc<DirectRelayFence>)>,
+    primary: RelayOwner,
+    secondary: Option<RelayOwner>,
+}
+
+struct RelayOwner {
+    handle: OnceLock<tokio::runtime::Handle>,
+    fence: Arc<DirectRelayFence>,
+    _runtime_memory: MemoryReservation,
+}
+
+impl RelayOwner {
+    fn reserve(budget: &Arc<MemoryBudget>) -> io::Result<Self> {
+        Ok(Self {
+            handle: OnceLock::new(),
+            fence: DirectRelayFence::new(budget)?,
+            _runtime_memory: budget
+                .reserve(THREAD_STACK + 256 * 1024)
+                .ok_or(io::ErrorKind::OutOfMemory)?,
+        })
+    }
+
+    fn start(&self, name: &'static str) -> io::Result<tokio::runtime::Runtime> {
+        // A legacy child must keep running while its capture thread blocks in epoll.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name(name)
+            .thread_stack_size(THREAD_STACK)
+            .enable_all()
+            .build()?;
+        self.handle
+            .set(runtime.handle().clone())
+            .expect("one relay runtime per owner");
+        Ok(runtime)
+    }
 }
 
 pub(super) struct Shared {
     pool: Arc<CellPool>,
     senders: [mpsc::Sender<Envelope>; 2],
     states: [Mutex<State>; 2],
-    wake: [Arc<Notify>; 2],
     admission: Arc<AtomicBool>,
     relays: OnceLock<RelayOwners>,
     pub(super) auxiliary: OnceLock<super::aux_tasks::AuxTasks>,
@@ -580,6 +644,8 @@ pub(super) struct Shared {
     context_changed: [AtomicBool; 2],
     #[cfg(test)]
     secondary_test_control: OnceLock<Arc<polling::testing::Control>>,
+    #[cfg(test)]
+    close_before_secondary_drain: AtomicBool,
 }
 
 impl Shared {
@@ -597,8 +663,7 @@ impl Shared {
                 pool: CellPool::new(extent, workers, ports, budget)?,
                 senders: [send0, send1],
                 states: std::array::from_fn(|_| Mutex::new(State::default())),
-                wake: std::array::from_fn(|_| Arc::new(Notify::new())),
-                peers: PeerAuthority::new(Arc::clone(&admission)),
+                peers: PeerAuthority::new(Arc::clone(&admission), budget)?,
                 admission,
                 relays: OnceLock::new(),
                 auxiliary: OnceLock::new(),
@@ -611,6 +676,8 @@ impl Shared {
                 context_changed: std::array::from_fn(|_| AtomicBool::new(true)),
                 #[cfg(test)]
                 secondary_test_control: OnceLock::new(),
+                #[cfg(test)]
+                close_before_secondary_drain: AtomicBool::new(false),
             }),
             [receive0, receive1],
         ))
@@ -624,27 +691,41 @@ impl Shared {
     }
 
     // Reserve the complete set before handing any fence to a worker or publishing a scope.
-    pub(super) fn prepare_relays(&self, budget: &Arc<MemoryBudget>) -> io::Result<()> {
+    pub(super) fn prepare_relays(
+        &self,
+        budget: &Arc<MemoryBudget>,
+    ) -> io::Result<Option<tokio::runtime::Runtime>> {
         let reserve = || -> io::Result<RelayOwners> {
-            let primary = (
-                tokio::runtime::Handle::current(),
-                DirectRelayFence::new(budget)?,
-            );
+            let primary = RelayOwner::reserve(budget)?;
             let secondary = match self.workers {
                 1 => None,
-                2 => Some((OnceLock::new(), DirectRelayFence::new(budget)?)),
+                2 => Some(RelayOwner::reserve(budget)?),
                 _ => return Err(io::Error::other("invalid XDP relay owner count")),
             };
             Ok(RelayOwners { primary, secondary })
         };
-        match reserve() {
-            Ok(owners) => self
-                .relays
-                .set(owners)
-                .map_err(|_| io::Error::other("XDP relay owners already reserved")),
-            Err(error) if error.kind() == io::ErrorKind::OutOfMemory => Ok(()),
-            Err(error) => Err(error),
-        }
+        let owners = match reserve() {
+            Ok(owners) => owners,
+            Err(error) if error.kind() == io::ErrorKind::OutOfMemory => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        self.relays
+            .set(owners)
+            .map_err(|_| io::Error::other("XDP relay owners already reserved"))?;
+        self.relays
+            .get()
+            .expect("reserved relay owners")
+            .primary
+            .start("honk-xdp-relay0")
+            .map(Some)
+    }
+
+    fn start_secondary_relays(&self) -> io::Result<Option<tokio::runtime::Runtime>> {
+        self.relays
+            .get()
+            .and_then(|relays| relays.secondary.as_ref())
+            .map(|owner| owner.start("honk-xdp-relay1"))
+            .transpose()
     }
 
     fn publish_relays(
@@ -662,10 +743,11 @@ impl Shared {
         let secondary = relays
             .secondary
             .as_ref()
-            .map(|(handle, fence)| {
-                handle
+            .map(|secondary| {
+                secondary
+                    .handle
                     .get()
-                    .map(|handle| (handle, fence))
+                    .map(|handle| (handle, &secondary.fence))
                     .ok_or_else(|| io::Error::other("XDP secondary relay owner not ready"))
             })
             .transpose()?;
@@ -675,8 +757,13 @@ impl Shared {
         }
         let _start = shutdown.lock_capture_start()?;
         owners[0].publish_direct_relay_runtime(
-            relays.primary.0.clone(),
-            Arc::clone(&relays.primary.1),
+            relays
+                .primary
+                .handle
+                .get()
+                .ok_or_else(|| io::Error::other("XDP primary relay owner not ready"))?
+                .clone(),
+            Arc::clone(&relays.primary.fence),
         )?;
         if let Some((handle, fence)) = secondary {
             owners[1].publish_direct_relay_runtime(handle.clone(), Arc::clone(fence))?;
@@ -686,9 +773,9 @@ impl Shared {
 
     fn close_relays(&self) {
         if let Some(relays) = self.relays.get() {
-            relays.primary.1.close();
-            if let Some((_, fence)) = &relays.secondary {
-                fence.close();
+            relays.primary.fence.close();
+            if let Some(secondary) = &relays.secondary {
+                secondary.fence.close();
             }
         }
     }
@@ -696,53 +783,53 @@ impl Shared {
     async fn close_and_join_relays(&self) {
         self.close_relays();
         if let Some(relays) = self.relays.get() {
-            relays.primary.1.join_closed().await;
-            if let Some((_, fence)) = &relays.secondary {
-                fence.join_closed().await;
+            relays.primary.fence.join_closed().await;
+            if let Some(secondary) = &relays.secondary {
+                secondary.fence.join_closed().await;
             }
         }
     }
 
     // Boxing the returned envelope would allocate when packet dispatch is full.
     #[allow(clippy::result_large_err)]
-    pub(super) fn send(&self, destination: usize, mut envelope: Envelope) -> Result<(), Envelope> {
-        match self.senders[destination].try_send(envelope) {
-            Ok(()) => {
-                if let Some(diagnostics) = self.diagnostics.get() {
-                    diagnostics.record_worker_handoff();
-                }
-                self.wake[destination].notify_one();
-                self.wakers[destination].wake();
-                Ok(())
-            }
-            Err(error) => {
-                envelope = error.into_inner();
-                Err(envelope)
-            }
+    pub(super) fn send(&self, destination: usize, envelope: Envelope) -> Result<(), Envelope> {
+        let bytes = envelope
+            .body
+            .as_ref()
+            .map_or(envelope.l3_length, |body| body.bytes().len());
+        let endpoint = matches!(envelope.payload, Payload::Endpoint { .. });
+        let sent = self.senders[destination].try_send(envelope);
+        if let Some(diagnostics) = self.diagnostics.get() {
+            diagnostics.record_worker_handoff(destination, endpoint, bytes, sent.is_ok());
         }
+        sent.map_err(|error| error.into_inner())
     }
 
-    pub(super) fn copy(&self, segments: &[&[u8]], metadata: &[u8]) -> io::Result<Cell> {
-        let mut cell = self
-            .pool
-            .take()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
-        cell.copy(segments, metadata)?;
-        Ok(cell)
+    fn handoff_cell(
+        &self,
+        destination: usize,
+        endpoint: bool,
+        bytes: impl FnOnce() -> usize,
+    ) -> io::Result<Cell> {
+        self.pool.take().ok_or_else(|| {
+            if let Some(diagnostics) = self.diagnostics.get() {
+                diagnostics.record_worker_handoff(destination, endpoint, bytes(), false);
+            }
+            io::Error::from(io::ErrorKind::WouldBlock)
+        })
     }
 
     pub(super) fn wake_worker(&self, worker: usize) {
-        self.wake[worker].notify_one();
         self.wakers[worker].wake();
     }
 
     async fn join_secondary_relays(&self) {
-        if let Some((_, fence)) = self
+        if let Some(secondary) = self
             .relays
             .get()
             .and_then(|relays| relays.secondary.as_ref())
         {
-            fence.close_and_join().await;
+            secondary.fence.close_and_join().await;
         }
     }
 
@@ -750,9 +837,9 @@ impl Shared {
         self.closing.load(Ordering::Acquire)
     }
 
-    pub(super) fn defer_secondary_ready(&self) -> tokio::sync::oneshot::Sender<()> {
+    pub(super) fn defer_secondary_ready(&self) -> tokio::sync::oneshot::Sender<Vec<Realm>> {
         let (send, receive) = tokio::sync::oneshot::channel();
-        self.states[1].lock().relay_setup = Some(receive);
+        self.states[1].lock().startup = Some(receive);
         send
     }
 
@@ -804,6 +891,10 @@ impl Shared {
         {
             self.begin_close();
             return Err(error.into());
+        }
+        // An RX edge can arrive while admission is closed. Recheck those same rings on open.
+        if self.workers == 2 {
+            self.wake_worker(1);
         }
         Ok(())
     }
@@ -912,13 +1003,21 @@ pub(super) fn admit(workers: u8, infos: &[DeviceInfo]) -> anyhow::Result<()> {
     Ok(())
 }
 
+impl PacketBody {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Core(packet) => packet.as_ref(),
+            Self::Reassembled(packet) => packet.as_ref(),
+        }
+    }
+}
+
 impl Envelope {
     pub(super) fn ip(&self) -> &[u8] {
-        match &self.body {
-            Some(PacketBody::Core(packet)) => packet.as_ref(),
-            Some(PacketBody::Reassembled(packet)) => packet.as_ref(),
-            None => &self.cell.packet()[self.l3_offset..self.l3_offset + self.l3_length],
-        }
+        self.body.as_ref().map_or_else(
+            || &self.cell.packet()[self.l3_offset..self.l3_offset + self.l3_length],
+            PacketBody::bytes,
+        )
     }
 
     fn receive_endpoint(
@@ -926,6 +1025,7 @@ impl Envelope {
         shared: &Shared,
         endpoints: &PacketEndpoints,
         now: Instant,
+        driver: Option<&mut PacketDriver>,
     ) -> io::Result<PacketReceive> {
         let Payload::Endpoint {
             owner,
@@ -946,6 +1046,7 @@ impl Envelope {
             self.path,
             admission,
             check_output,
+            driver,
         )
     }
 }
@@ -1029,7 +1130,7 @@ impl Shared {
         admission: Option<EndpointAdmission>,
     ) -> io::Result<PacketReceive> {
         self.receive_with_output_check(
-            endpoints, owner, packet, ingress_at, service_at, path, admission, false,
+            endpoints, owner, packet, ingress_at, service_at, path, admission, false, None,
         )
     }
 
@@ -1045,37 +1146,53 @@ impl Shared {
         path: ReturnPath,
         admission: Option<EndpointAdmission>,
         force_output_check: bool,
+        driver: Option<&mut PacketDriver>,
     ) -> io::Result<PacketReceive> {
         let previous = wire::packet_addresses(packet)
             .ok()
-            .and_then(|(source, _)| owner.peer_hold(source));
+            .and_then(|(source, _)| match &driver {
+                Some(local) => local.local_peer_hold(source),
+                None => owner.peer_hold(source),
+            });
         let check_output = force_output_check
             || previous
                 .as_ref()
                 .and_then(PeerHold::path)
                 .is_some_and(|old| old != path);
-        endpoints.receive_on_timed(
-            owner,
-            packet,
-            ingress_at,
-            service_at,
-            admission,
-            check_output,
-            |source, pending| {
-                let hold = self
-                    .peers
-                    .retain(owner.scope(), source, path, ingress_at, pending)?;
-                if pending {
-                    previous
-                        .as_ref()
-                        .filter(|held| held.address() == source.src.ip())
-                        .cloned()
-                        .or(Some(hold))
-                } else {
-                    Some(hold)
-                }
-            },
-        )
+        let retain = |source: honk_netstack::ValidatedSource, pending| {
+            let hold = self
+                .peers
+                .retain(owner.scope(), source, path, ingress_at, pending)?;
+            if pending {
+                previous
+                    .as_ref()
+                    .filter(|held| held.address() == source.src.ip())
+                    .cloned()
+                    .or(Some(hold))
+            } else {
+                Some(hold)
+            }
+        };
+        match driver {
+            Some(local) => endpoints.receive_local_on_timed(
+                local,
+                packet,
+                ingress_at,
+                service_at,
+                admission,
+                check_output,
+                retain,
+            ),
+            None => endpoints.receive_on_timed(
+                owner,
+                packet,
+                ingress_at,
+                service_at,
+                admission,
+                check_output,
+                retain,
+            ),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1092,15 +1209,34 @@ impl Shared {
         times: (Instant, Instant),
         path: ReturnPath,
         mixed: bool,
+        mut driver: Option<&mut PacketDriver>,
+        checked: &mut Option<PeerObservation<'a>>,
     ) -> io::Result<PacketReceive> {
-        let fixed = if realm.queue_affine() {
+        let mut check_output = false;
+        if let Some(owner) = driver.as_deref_mut()
+            && endpoints.can_batch_tcp()
+            && let [packet] = segments
+        {
+            match owner.try_local_established(packet, times, path, &self.peers, checked) {
+                Ok(Some(report)) => return Ok(report),
+                Ok(None) => {}
+                Err(_) => check_output = true,
+            }
+        }
+        let fixed = if let Some(owner) = driver.as_deref() {
+            if realm.owners().len() == 1 || locally_retained_tcp(owner, view) {
+                Some((&realm.owners()[local], None))
+            } else {
+                Some(realm.dispatch_owner(local, view)?)
+            }
+        } else if realm.queue_affine() {
             None
         } else {
             Some(realm.dispatch_owner(local, view)?)
         };
         let tentative = fixed.as_ref().map_or(local, |(owner, _)| owner.worker());
-        let mut check_output = false;
-        if tentative == local
+        if driver.is_none()
+            && tentative == local
             && !mixed
             && let [packet] = segments
         {
@@ -1157,7 +1293,7 @@ impl Shared {
             bytes
         };
         if matches!(wire::parse_ip(packet), Err(wire::ParseError::Fragment)) {
-            return self.endpoint_fragment(endpoints, realm.scope(), packet, times.0, path);
+            return self.endpoint_fragment(endpoints, realm.scope(), packet, times.0, path, driver);
         }
         self.receive_with_output_check(
             endpoints,
@@ -1168,6 +1304,7 @@ impl Shared {
             path,
             None,
             check_output,
+            driver,
         )
     }
 
@@ -1183,7 +1320,11 @@ impl Shared {
         payload: Payload,
         claim: Option<TcpClaim>,
     ) -> io::Result<PacketReceive> {
-        let cell = self.copy(segments, &[])?;
+        let mut cell =
+            self.handoff_cell(target, matches!(payload, Payload::Endpoint { .. }), || {
+                segments.iter().map(|s| s.len()).sum()
+            })?;
+        cell.copy(segments, &[])?;
         let peer = if matches!(payload, Payload::Ingress)
             && matches!(
                 wire::parse_ip(cell.packet()),
@@ -1218,18 +1359,25 @@ impl Shared {
         fragment: &[u8],
         ingress_at: Instant,
         path: ReturnPath,
+        mut driver: Option<&mut PacketDriver>,
     ) -> io::Result<PacketReceive> {
         let realm = endpoints
             .realm(scope)
             .ok_or_else(|| io::Error::other("unregistered physical realm"))?;
         let peer = self.fragment_peer(scope, fragment, path)?;
-        let (packet, peer) = match endpoints.reassemble_for_dispatch_on(
-            &realm.owners()[0],
-            fragment,
-            ingress_at,
-            Instant::now(),
-            peer,
-        ) {
+        let completed = match driver.as_deref_mut() {
+            Some(local) => {
+                local.reassemble_for_dispatch_with_peer(fragment, ingress_at, Instant::now(), peer)
+            }
+            None => endpoints.reassemble_for_dispatch_on(
+                &realm.owners()[0],
+                fragment,
+                ingress_at,
+                Instant::now(),
+                peer,
+            ),
+        };
+        let (packet, peer) = match completed {
             Ok(Some(packet)) => packet,
             Ok(None) | Err(_) => return Ok(PacketReceive::default()),
         };
@@ -1237,7 +1385,7 @@ impl Shared {
         let ingress_at = packet.completion_ingress();
         let (owner, claim) = realm.dispatch_owner(0, PacketView::from_slice(packet.as_ref()))?;
         if owner.worker() == 0 {
-            return self.receive(
+            return self.receive_with_output_check(
                 endpoints,
                 owner,
                 packet.as_ref(),
@@ -1245,6 +1393,8 @@ impl Shared {
                 Instant::now(),
                 path,
                 None,
+                false,
+                driver,
             );
         }
         let envelope = Envelope {
@@ -1252,7 +1402,7 @@ impl Shared {
             scope,
             path,
             ingress_at,
-            cell: self.pool.take().ok_or(io::ErrorKind::WouldBlock)?,
+            cell: self.handoff_cell(owner.worker(), true, || packet.as_ref().len())?,
             body: Some(PacketBody::Reassembled(packet)),
             peer,
             l3_offset: 0,
@@ -1270,16 +1420,6 @@ impl Shared {
     }
 
     pub(super) fn ready(&self, worker: u8) {
-        if worker == 1
-            && let Some((handle, _)) = self
-                .relays
-                .get()
-                .and_then(|relays| relays.secondary.as_ref())
-        {
-            handle
-                .set(tokio::runtime::Handle::current())
-                .expect("one secondary runtime");
-        }
         self.states[worker as usize].lock().ready = true;
         self.wake_worker(0);
     }
@@ -1321,6 +1461,27 @@ impl Shared {
         }
         Ok(())
     }
+}
+
+// Placement only: the Stack still verifies the full transport header and checksum.
+fn locally_retained_tcp(driver: &PacketDriver, view: PacketView<'_>) -> bool {
+    let Ok(ip) = view.parse_ip() else {
+        return false;
+    };
+    if ip.proto != wire::PROTO_TCP || ip.payload.len() < 4 {
+        return false;
+    }
+    let mut ports = [0; 4];
+    if view
+        .copy_to(ip.payload.start..ip.payload.start + 4, &mut ports)
+        .is_none()
+    {
+        return false;
+    }
+    driver.local_retains_tcp(
+        (ip.src, u16::from_be_bytes([ports[0], ports[1]])).into(),
+        (ip.dst, u16::from_be_bytes([ports[2], ports[3]])).into(),
+    )
 }
 
 struct WorkerDevice {
@@ -1422,66 +1583,61 @@ impl Worker {
                     .lock()
                     .take()
                     .expect("one physical owner handoff");
-                let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        thread_shared.failed(1, error.into());
-                        std::mem::forget((owned, realms, endpoints, receiver));
-                        return;
-                    }
+                let mut worker = WorkerRuntime {
+                    shared: Arc::clone(&thread_shared),
+                    placements,
+                    devices: owned,
+                    realms,
+                    endpoints,
+                    receiver,
+                    mixed,
+                    staging: vec![0; 65536],
+                    sampled: Instant::now(),
+                    closing: false,
+                    polling,
+                    polling_prefix: ContextDigest::platform(&polling_budget),
+                    polling_budget,
+                    polling_affinity: None,
+                    context_revision: 0,
+                    context_recheck: true,
+                    qualified_rx: 0,
+                    qualification_unavailable: false,
+                    shutdown,
+                    rx_device: 0,
+                    rx_queue: 0,
+                    tx_realm: 0,
                 };
-                runtime.block_on(async move {
-                    let mut worker = WorkerRuntime {
-                        shared: Arc::clone(&thread_shared),
-                        placements,
-                        devices: owned,
-                        realms,
-                        endpoints,
-                        receiver,
-                        mixed,
-                        staging: vec![0; 65536],
-                        sampled: Instant::now(),
-                        closing: false,
-                        polling,
-                        polling_prefix: ContextDigest::platform(&polling_budget),
-                        polling_budget,
-                        polling_affinity: None,
-                        context_revision: 0,
-                        context_recheck: true,
-                        qualified_rx: 0,
-                        qualification_unavailable: false,
-                        shutdown,
-                        rx_device: 0,
-                        rx_queue: 0,
-                        tx_realm: 0,
-                    };
-                    let result = std::panic::AssertUnwindSafe(worker.run())
-                        .catch_unwind()
-                        .await;
-                    let failure = match result {
-                        Ok(Ok(())) => None,
-                        Ok(Err(error)) => Some(error),
-                        Err(_) => Some(anyhow::anyhow!(
-                            "XDP worker 1 panicked; retaining actual owners"
-                        )),
-                    };
-                    if let Some(error) = failure {
-                        thread_shared.failed(1, error);
-                        thread_shared.join_secondary_relays().await;
-                        std::mem::forget(worker);
-                        std::future::pending::<()>().await;
+                let mut relay_runtime = None;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker.run(&mut relay_runtime)
+                }));
+                let failure = match result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error),
+                    Err(_) => Some(anyhow::anyhow!(
+                        "XDP worker 1 panicked; retaining actual owners"
+                    )),
+                };
+                if let Some(error) = failure {
+                    thread_shared.failed(1, error);
+                    fail_local_applications(&mut worker.realms);
+                    std::mem::forget(worker);
+                    futures::executor::block_on(thread_shared.join_secondary_relays());
+                    loop {
+                        std::thread::park();
                     }
-                    thread_shared.states[1].lock().exited = true;
-                    thread_shared.wake_worker(0);
-                });
+                }
+                drop(relay_runtime);
+                thread_shared.states[1].lock().exited = true;
+                thread_shared.wake_worker(0);
             });
         let thread = match thread {
             Ok(thread) => thread,
             Err(error) => {
-                std::mem::forget(pending.lock().take());
+                if let Some((owned, mut realms, endpoints, receiver)) = pending.lock().take() {
+                    fail_local_applications(&mut realms);
+                    std::mem::forget((owned, realms, endpoints, receiver));
+                }
                 return Err(error);
             }
         };
@@ -1562,9 +1718,10 @@ impl Shared {
             );
         }
         let placement = self.placement(scope)?;
-        let cell = cell
-            .or_else(|| self.pool.take())
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+        let cell = match cell {
+            Some(cell) => cell,
+            None => self.handoff_cell(1, true, || packet.as_ref().len())?,
+        };
         let envelope = Envelope {
             _claim: claim,
             ingress: placement.ingress,
@@ -1591,19 +1748,29 @@ impl Shared {
         &self,
         endpoints: &PacketEndpoints,
         mut envelope: Envelope,
+        mut driver: Option<&mut PacketDriver>,
     ) -> io::Result<PacketReceive> {
         if matches!(
             wire::parse_ip(envelope.ip()),
             Err(wire::ParseError::Fragment)
         ) {
             let placement = self.placement(envelope.scope)?;
-            let (packet, peer) = match endpoints.reassemble_for_dispatch_on(
-                placement.realm.owner(0).unwrap(),
-                envelope.ip(),
-                envelope.ingress_at,
-                Instant::now(),
-                envelope.peer.clone(),
-            ) {
+            let completed = match driver.as_deref_mut() {
+                Some(local) => local.reassemble_for_dispatch_with_peer(
+                    envelope.ip(),
+                    envelope.ingress_at,
+                    Instant::now(),
+                    envelope.peer.clone(),
+                ),
+                None => endpoints.reassemble_for_dispatch_on(
+                    placement.realm.owner(0).unwrap(),
+                    envelope.ip(),
+                    envelope.ingress_at,
+                    Instant::now(),
+                    envelope.peer.clone(),
+                ),
+            };
+            let (packet, peer) = match completed {
                 Ok(Some(packet)) => packet,
                 Ok(None) | Err(_) => return Ok(PacketReceive::default()),
             };
@@ -1622,7 +1789,7 @@ impl Shared {
         let (owner, claim) =
             realm.dispatch_owner(preferred, PacketView::from_slice(envelope.ip()))?;
         if owner.worker() == 0 {
-            return self.receive(
+            return self.receive_with_output_check(
                 endpoints,
                 owner,
                 envelope.ip(),
@@ -1630,6 +1797,8 @@ impl Shared {
                 Instant::now(),
                 envelope.path,
                 None,
+                false,
+                driver,
             );
         }
         envelope._claim = claim;
@@ -1662,9 +1831,14 @@ impl Runtime {
                 progress += 1;
                 continue;
             }
+            let local = self
+                .realms
+                .iter_mut()
+                .find(|r| r.realm_id == envelope.path.realm && r.driver.is_local())
+                .map(|r| &mut r.driver);
             let result = match envelope.payload {
                 Payload::Endpoint { .. } => {
-                    envelope.receive_endpoint(&self.workers, &self.endpoints, now)
+                    envelope.receive_endpoint(&self.workers, &self.endpoints, now, local)
                 }
                 Payload::Ingress => {
                     if let Some(core) = &mut self.core
@@ -1721,7 +1895,8 @@ impl Runtime {
                         }
                         Ok(PacketReceive::default())
                     } else {
-                        self.workers.dispatch_envelope(&self.endpoints, envelope)
+                        self.workers
+                            .dispatch_envelope(&self.endpoints, envelope, local)
                     }
                 }
             };
@@ -1834,32 +2009,29 @@ pub(super) async fn run_coordinator(
                 .lock()
                 .take()
                 .expect("one coordinator plane handoff");
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let _ = send.send((Some(plane), Err(error.into())));
-                    return;
-                }
-            };
+            // The caller keeps driving Tokio I/O, timers and spawned tasks while capture
+            // occupies this thread. Cold capture futures still run on the coordinator.
             let mut capture = None;
-            let outcome = runtime.block_on(
-                std::panic::AssertUnwindSafe(super::run_capture(
+            let mut primary_relay = None;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime_handle.block_on(super::run_capture(
                     plane,
                     thread_admission,
                     pname_support,
-                    runtime_handle,
+                    runtime_handle.clone(),
                     &mut capture,
+                    &mut primary_relay,
                 ))
-                .catch_unwind(),
-            );
-            let result = runtime.block_on(finish_coordinator(outcome, capture.as_ref()));
+            }));
+            let result = runtime_handle.block_on(finish_coordinator(outcome, capture.as_ref()));
+            // Its children and their parents have joined; Tokio runtime destruction can block.
+            drop(primary_relay);
             let retained = result.0.is_none() && result.1.is_err();
             let _ = send.send(result);
             if retained {
-                runtime.block_on(std::future::pending::<()>());
+                loop {
+                    std::thread::park();
+                }
             }
         }) {
         Ok(thread) => thread,

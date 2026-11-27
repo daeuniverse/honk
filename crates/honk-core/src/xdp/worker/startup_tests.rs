@@ -51,8 +51,8 @@ async fn endpoint_readiness_is_consumed_once_while_waiting_for_secondary() {
     assert!(matches!(futures::poll!(&mut startup), Poll::Ready(Ok(()))));
 }
 
-#[tokio::test]
-async fn partial_fence_budget_refunds_first_owner_and_publishes_neither() {
+#[test]
+fn partial_fence_budget_refunds_first_owner_and_publishes_neither() {
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
     let workers = shared(2, &budget);
     let shutdown = ShutdownIntent::default();
@@ -61,22 +61,28 @@ async fn partial_fence_budget_refunds_first_owner_and_publishes_neither() {
     let before_drop = budget.used();
     drop(probe);
     let one_fence = before_drop - budget.used();
-    let pressure = budget
-        .reserve(budget.limit() - budget.used() - one_fence)
-        .unwrap();
-    let before = budget.used();
-    workers.prepare_relays(&budget).unwrap();
-    assert_eq!(budget.used(), before);
-    workers.publish_relays(&realm, &shutdown).unwrap();
-    assert!(workers.relays.get().is_none());
-    assert!(
-        realm
-            .owners()
-            .iter()
-            .all(|scope| !scope.direct_relay_published())
-    );
-    drop(pressure);
-    workers.prepare_relays(&budget).unwrap();
+    let owner = RelayOwner::reserve(&budget).unwrap();
+    let before_drop = budget.used();
+    drop(owner);
+    let one_owner = before_drop - budget.used();
+    for available in [one_fence, one_owner] {
+        let pressure = budget
+            .reserve(budget.limit() - budget.used() - available)
+            .unwrap();
+        let before = budget.used();
+        assert!(workers.prepare_relays(&budget).unwrap().is_none());
+        assert_eq!(budget.used(), before);
+        workers.publish_relays(&realm, &shutdown).unwrap();
+        assert!(workers.relays.get().is_none());
+        assert!(
+            realm
+                .owners()
+                .iter()
+                .all(|scope| !scope.direct_relay_published())
+        );
+        drop(pressure);
+    }
+    let _primary = workers.prepare_relays(&budget).unwrap().unwrap();
     assert!(
         workers.publish_relays(&realm, &shutdown).is_err(),
         "secondary has not registered its runtime"
@@ -89,12 +95,13 @@ async fn partial_fence_budget_refunds_first_owner_and_publishes_neither() {
     );
 }
 
-#[tokio::test]
-async fn shutdown_winning_before_publication_leaves_both_relay_owners_unbound() {
+#[test]
+fn shutdown_winning_before_publication_leaves_both_relay_owners_unbound() {
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
     let workers = shared(2, &budget);
     let (realm, _owners) = capture_realm(1500, 16, 16, 2, 1, &budget).unwrap();
-    workers.prepare_relays(&budget).unwrap();
+    let _primary = workers.prepare_relays(&budget).unwrap().unwrap();
+    let _secondary = workers.start_secondary_relays().unwrap().unwrap();
     workers.ready(1);
 
     let shutdown = ShutdownIntent::default();
@@ -109,7 +116,10 @@ async fn shutdown_winning_before_publication_leaves_both_relay_owners_unbound() 
             .any(PacketScope::direct_relay_published),
         "shutdown published relay owners"
     );
-    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "shutdown requested before XDP activation"
+    );
     assert!(!workers.admission.load(Ordering::Acquire));
 }
 
@@ -132,7 +142,7 @@ async fn close_and_activation_orders_keep_capture_closed() {
     assert!(!before.admission.load(Ordering::Acquire));
 
     let late = shared(1, &budget);
-    late.prepare_relays(&budget).unwrap();
+    let primary = late.prepare_relays(&budget).unwrap().unwrap();
     let packet = endpoints.realm(id).unwrap();
     let probe = std::iter::once_with(|| {
         late.failed(0, anyhow::anyhow!("failed during final PF check"));
@@ -144,12 +154,20 @@ async fn close_and_activation_orders_keep_capture_closed() {
     );
     assert!(!late.admission.load(Ordering::Acquire));
     assert!(!packet.owners()[0].direct_relay_published());
+    tokio::task::spawn_blocking(move || drop(primary))
+        .await
+        .unwrap();
 
-    let after = shared(1, &budget);
+    let after = shared(2, &budget);
+    after.ready(1);
+    let poll = WorkerEpoll::new(&budget, 0).unwrap();
+    after.wakers[1].register(&std::task::Waker::from(Arc::clone(&poll.wake)));
+    assert!(!poll.wake.is_pending());
     after
         .activate(&shutdown, &endpoints, None, std::iter::empty())
         .unwrap();
     assert!(after.admission.load(Ordering::Acquire));
+    assert!(poll.wake.is_pending());
     // An external backend can close the raw gate after publication. Startup is one-shot.
     after.admission.store(false, Ordering::Release);
     assert!(

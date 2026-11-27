@@ -320,7 +320,7 @@ async fn start_runtime(
     let backend = plane.policy_backend_handle();
     let active_plan = plane.active_routing_plan_handle();
     let diagnostics_generation = plane.diagnostics_handle();
-    let prepared = prepare(&plane, config, Arc::clone(&admission)).await?;
+    let prepared = prepare(&plane, config, Arc::clone(&admission), CapturePoll::Driven).await?;
     let PreparedRuntime {
         devices,
         topology,
@@ -401,6 +401,7 @@ async fn start_runtime(
     let mut runtime = Runtime {
         devices,
         topology,
+        topology_readable: false,
         capture_plan: Some(capture_plan),
         capture_plan_memory: Some(plan_memory),
         topology_lost: false,
@@ -446,14 +447,22 @@ async fn start_runtime(
         context_revision: 0,
         _memory: Some(memory),
     };
+    runtime.prepare_local_workers(&mut remote_realms)?;
+    poll_fn(|cx| Poll::Ready(runtime.arm_local_workers(cx))).await?;
     let aux_startup =
         runtime.start_auxiliary(auxiliary, &mut drivers, &tokio::runtime::Handle::current());
     assert!(drivers.is_empty());
+    let deferred = remote_realms.iter().any(|r| r.driver.is_local());
+    let setup = deferred.then(|| runtime.workers.defer_secondary_ready());
     if runtime.workers.workers == 2 {
         runtime.worker = Some(worker::Worker::start(
             Arc::clone(&runtime.workers),
             &mut runtime.devices,
-            remote_realms,
+            if deferred {
+                Vec::new()
+            } else {
+                std::mem::take(&mut remote_realms)
+            },
             runtime.endpoints.clone(),
             remote_inbox,
             runtime.core.is_some(),
@@ -468,10 +477,10 @@ async fn start_runtime(
     tokio::pin!(timer);
     wait_capture_startup(
         &readiness,
-        false,
+        deferred,
         &shutdown,
         |cx| owner.poll_ready(cx),
-        |cx| runtime.poll_scopes(cx, timer.as_mut()),
+        |cx| runtime.poll_scopes(cx, timer.as_mut(), &mut remote_realms),
     )
     .await?;
     for device in &mut runtime.devices {
@@ -486,8 +495,7 @@ async fn start_runtime(
     }
     let topology = runtime.admit_final_topology()?;
     ensure!(topology.ipv4_broadcasts() == runtime.topology.get_ref().ipv4_broadcasts());
-    // SAFETY: production and the fixture retain the watcher's stable descriptor.
-    runtime.topology = unsafe { AsyncFd::register(topology) }.map_err(io::Error::from)?;
+    runtime.topology = CapturePoll::Driven.wrap(topology)?;
     if runtime.gateway.is_none() {
         for device in &runtime.devices {
             runtime.topology.get_mut().expect_program(
@@ -531,6 +539,13 @@ async fn start_runtime(
     runtime.capture_plan_memory.take();
     runtime.rebuild_polling_context();
     *runtime.pname_support.write() = source_support;
+    if let Some(setup) = setup {
+        runtime.widen_local_workers(&mut remote_realms);
+        setup
+            .send(remote_realms)
+            .map_err(|_| anyhow::anyhow!("secondary registration failed"))?;
+        poll_fn(|cx| readiness.all_ready(cx)).await?;
+    }
     if defer_gateway {
         return Ok((runtime, owner));
     }

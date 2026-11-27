@@ -101,13 +101,13 @@ pub fn is_ignorable_connection_error(err: &std::io::Error) -> bool {
 pub(crate) struct ClientIoError;
 
 #[derive(Debug)]
-struct RelayError {
+pub(crate) struct RelayError {
     error: std::io::Error,
     client: bool,
 }
 
 impl RelayError {
-    fn new(error: std::io::Error, client_side: bool) -> Self {
+    pub(crate) fn new(error: std::io::Error, client_side: bool) -> Self {
         let client = client_side
             && matches!(
                 error.kind(),
@@ -123,7 +123,7 @@ impl RelayError {
         Self { error, client }
     }
 
-    fn into_anyhow(self) -> anyhow::Error {
+    pub(crate) fn into_anyhow(self) -> anyhow::Error {
         let error = anyhow::Error::new(self.error);
         if self.client {
             error.context(ClientIoError)
@@ -402,6 +402,7 @@ async fn copy_way<R, W>(
     eof: &tokio::sync::Notify,
     upload: bool,
     park: Option<&Park<'_>>,
+    (mut on_read, mut on_write): (impl FnMut(), impl FnMut(u64)),
 ) -> Result<(), RelayError>
 where
     R: AsyncRead + Unpin,
@@ -449,6 +450,7 @@ where
                 eof.notify_one();
                 break;
             }
+            on_read();
             progress.read.store(n + read as u64, Ordering::Relaxed);
             let mut rest = &buffer[..read];
             while !rest.is_empty() {
@@ -458,6 +460,7 @@ where
                 }
                 rest = &rest[written..];
                 n += written as u64;
+                on_write(written as u64);
                 progress.written.store(n, Ordering::Relaxed);
             }
             if read == buffer.len() && read < RELAY_BUF_SIZE {
@@ -498,6 +501,57 @@ where
     relay_outcome(result, start, client_addr, target_addr)
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, thiserror::Error)]
+#[error("packet relay drain stalled")]
+pub(crate) struct DrainExpired;
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn relay_remote_tcp<S1, S2>(
+    mut client: S1,
+    mut proxy: S2,
+    (client_addr, target_addr): (SocketAddr, SocketAddr),
+    progress: &RelayProgress,
+    accepted_download: impl Fn() -> u64 + Send,
+) -> anyhow::Result<RelayStats>
+where
+    S1: AsyncRead + AsyncWrite + Send + Unpin,
+    S2: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    let start = tokio::time::Instant::now();
+    let mut first_response = progress.first_response.as_ref();
+    let on_reply = move || {
+        if let Some(callback) = first_response.take() {
+            callback();
+        }
+    };
+    let on_upload = |bytes| {
+        progress.upload.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(outbound) = &progress.outbound {
+            outbound.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+        if let Some(callback) = &progress.on_transfer {
+            callback(bytes, 0);
+        }
+    };
+    let result = copy_phase_with(
+        &mut client,
+        &mut proxy,
+        None,
+        on_reply,
+        on_upload,
+        accepted_download,
+    )
+    .await;
+    let _ = client.shutdown().now_or_never();
+    let _ = proxy.shutdown().now_or_never();
+    let result = match result {
+        Ok((_, true)) => return Err(DrainExpired.into()),
+        result => result.map(|(bytes, _)| bytes),
+    };
+    relay_outcome(result, start, client_addr, target_addr)
+}
+
 /// Copies both directions until they finish or, with an armed `park`, until
 /// one direction takes it. A parked phase shuts nothing down.
 async fn copy_phase<S1, S2>(
@@ -509,13 +563,46 @@ where
     S1: AsyncRead + AsyncWrite + Send + Unpin,
     S2: AsyncRead + AsyncWrite + Send + Unpin,
 {
+    copy_phase_with(client, proxy, park, || {}, |_| {}, || 0)
+        .await
+        .map(|(bytes, _)| bytes)
+}
+
+async fn copy_phase_with<S1, S2>(
+    client: &mut S1,
+    proxy: &mut S2,
+    park: Option<&Park<'_>>,
+    on_reply: impl FnMut(),
+    on_upload: impl FnMut(u64),
+    accepted_download: impl Fn() -> u64,
+) -> Result<((u64, u64), bool), RelayError>
+where
+    S1: AsyncRead + AsyncWrite + Send + Unpin,
+    S2: AsyncRead + AsyncWrite + Send + Unpin,
+{
     let (mut cr, mut cw) = tokio::io::split(client);
     let (mut pr, mut pw) = tokio::io::split(proxy);
     let upload = CopyProgress::default();
     let download = CopyProgress::default();
     let eof = tokio::sync::Notify::new();
-    let c2p = copy_way(&mut cr, &mut pw, &upload, &eof, true, park);
-    let p2c = copy_way(&mut pr, &mut cw, &download, &eof, false, park);
+    let c2p = copy_way(
+        &mut cr,
+        &mut pw,
+        &upload,
+        &eof,
+        true,
+        park,
+        (|| {}, on_upload),
+    );
+    let p2c = copy_way(
+        &mut pr,
+        &mut cw,
+        &download,
+        &eof,
+        false,
+        park,
+        (on_reply, |_| {}),
+    );
     tokio::pin!(c2p, p2c);
     let parked = || park.is_some_and(Park::taken);
     let copy = async {
@@ -532,20 +619,21 @@ where
         Ok::<(), RelayError>(())
     };
     let cutoff = async {
-        // Reset the idle budget only for byte movement at the copy boundary.
+        // SPSC writes finish when queued, so also count the owner's later TCP writes.
         eof.notified().await;
-        drain::drain_copy_idle(&upload, &download).await;
+        drain::drain_copy_idle(&upload, &download, accepted_download).await;
     };
     // A pending codec can exhaust the copy task's budget before the timer is polled.
-    tokio::select! {
+    let expired = tokio::select! {
         biased;
-        result = copy => result?,
-        () = tokio::task::unconstrained(cutoff) => (),
-    }
-    Ok((
+        result = copy => { result?; false },
+        () = tokio::task::unconstrained(cutoff) => true,
+    };
+    let bytes = (
         upload.written.load(Ordering::Relaxed),
         download.written.load(Ordering::Relaxed),
-    ))
+    );
+    Ok((bytes, expired))
 }
 
 fn relay_outcome(
@@ -647,6 +735,7 @@ mod tests {
                 &tokio::sync::Notify::new(),
                 true,
                 None,
+                (|| {}, |_| {}),
             )
             .await
             .unwrap();
@@ -703,6 +792,7 @@ mod tests {
             &tokio::sync::Notify::new(),
             true,
             None,
+            (|| {}, |_| {}),
         )
         .await
         .unwrap();
@@ -795,6 +885,7 @@ mod tests {
             &tokio::sync::Notify::new(),
             true,
             None,
+            (|| {}, |_| {}),
         )
         .await
         .unwrap();

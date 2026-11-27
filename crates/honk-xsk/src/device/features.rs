@@ -670,6 +670,7 @@ mod gateway_tests {
             xdp_features: 3 | 8 | 32,
             zerocopy_max_segments: 8,
             vlan_metadata: false,
+            physical_member: true,
             direct_relay_physical: true,
         }
     }

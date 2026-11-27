@@ -36,12 +36,13 @@ impl PacketEndpoints {
 
     #[cfg(target_os = "linux")]
     fn auxiliary_driver_scope(&self, driver: &PacketDriver) -> io::Result<ScopeId> {
-        let owner = driver
-            .sole_owner()
-            .filter(|owner| owner.is_auxiliary())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "auxiliary driver required")
-            })?;
+        let owner = driver.owner_scope();
+        if !owner.is_auxiliary() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "auxiliary driver required",
+            ));
+        }
         self.check_owner(owner)?;
         Ok(owner.scope())
     }
@@ -153,6 +154,69 @@ impl PacketEndpoints {
             result => result,
         }
     }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn receive_local_on_timed(
+        &self,
+        driver: &mut PacketDriver,
+        packet: &[u8],
+        ingress_at: Instant,
+        service_at: Instant,
+        mut admission: Option<EndpointAdmission>,
+        check_output: bool,
+        on_source: impl FnMut(ValidatedSource, bool) -> Option<crate::xdp::worker::PeerHold>,
+    ) -> io::Result<PacketReceive> {
+        let owner = driver.owner_scope();
+        self.check_owner(owner)?;
+        if owner.is_host() || owner.is_auxiliary() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "physical receive requires a physical owner",
+            ));
+        }
+        let scope = owner.scope();
+        self.shared.udp_pool.reap_tasks();
+        let receive = |admission: &mut Option<EndpointAdmission>| {
+            driver.receive_realm_timed(
+                packet,
+                ingress_at,
+                service_at,
+                admission,
+                check_output,
+                on_source,
+            )
+        };
+        let (rx, received, physical) = if admission.is_some()
+            && wire::parse_ip(packet).is_ok_and(|ip| ip.proto == wire::PROTO_TCP)
+        {
+            EndpointAdmission::commit_pending(&mut admission, scope, receive)?
+        } else {
+            receive(&mut admission)
+        }?;
+        let result = self.dispatch_received::<true>(
+            driver.owner_scope(),
+            packet,
+            rx,
+            received,
+            None,
+            admission,
+            None,
+            physical.as_ref(),
+            None,
+        );
+        self.accept_local_ready(driver)?;
+        match result {
+            Err(error)
+                if error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<DatagramAdmissionClosed>()) =>
+            {
+                Ok(received)
+            }
+            result => result,
+        }
+    }
 }
 
 impl PacketRealm {
@@ -170,19 +234,24 @@ impl PacketRealm {
         let (worker, claim) = match ip.proto {
             wire::PROTO_UDP => (self.worker_for_udp(ip.src), None),
             wire::PROTO_TCP => {
-                let mut ports = [0; 14];
-                if ip.payload.len() < ports.len()
+                let mut header = [0; 14];
+                let needed = if self.queue_affine() { header.len() } else { 4 };
+                if ip.payload.len() < needed
                     || view
-                        .copy_to(ip.payload.start..ip.payload.start + ports.len(), &mut ports)
+                        .copy_to(
+                            ip.payload.start..ip.payload.start + needed,
+                            &mut header[..needed],
+                        )
                         .is_none()
                 {
                     return Ok((&self.owners()[0], None));
                 }
                 self.tcp_dispatch(
                     local,
-                    SocketAddr::new(ip.src, u16::from_be_bytes([ports[0], ports[1]])),
-                    SocketAddr::new(ip.dst, u16::from_be_bytes([ports[2], ports[3]])),
-                    ports[13] & (wire::tcp::SYN | wire::tcp::ACK | wire::tcp::RST | wire::tcp::FIN)
+                    SocketAddr::new(ip.src, u16::from_be_bytes([header[0], header[1]])),
+                    SocketAddr::new(ip.dst, u16::from_be_bytes([header[2], header[3]])),
+                    header[13]
+                        & (wire::tcp::SYN | wire::tcp::FIN | wire::tcp::RST | wire::tcp::ACK)
                         == wire::tcp::SYN,
                 )?
             }
@@ -227,9 +296,7 @@ impl PacketRealm {
         let source = SocketAddr::new(quote.dst, quote.dst_port);
         let destination = SocketAddr::new(quote.src, quote.src_port);
         if self.queue_affine() {
-            self.owners()
-                .iter()
-                .position(|owner| owner.retains_tcp(source, destination))
+            self.retained_affine_worker(source, destination)
                 .unwrap_or(0)
         } else {
             self.worker_for_tcp(source, destination)
