@@ -1403,6 +1403,8 @@ fn validate_downloaded_asset(kind: &str, bytes: &[u8]) -> anyhow::Result<()> {
 mod scan_tests {
     use super::*;
 
+    mod interning;
+
     #[cfg(feature = "native-api")]
     #[test]
     fn captured_geo_metadata_survives_disk_replacement() {
