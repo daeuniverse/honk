@@ -9,6 +9,7 @@ fn spec(v4: bool, v6: bool) -> TunSpec<'static> {
     TunSpec {
         name: "honk0",
         mtu: 1500,
+        queues: 1,
         address4: v4.then_some(Ipv4Addr::new(198, 18, 0, 1)),
         address6: v6.then(|| "fd00:100::1".parse().unwrap()),
         table: 202,
@@ -30,13 +31,18 @@ fn bytes(ip: IpAddr) -> Vec<u8> {
     }
 }
 
-fn link(index: u32, name: &str, kind: Option<&str>, flags: u32, arphrd: u16) -> Link {
+fn link_body(index: u32, name: &str, flags: u32, arphrd: u16) -> Vec<u8> {
     let mut body = vec![0; 16];
     body[2..4].copy_from_slice(&arphrd.to_ne_bytes());
     body[4..8].copy_from_slice(&index.to_ne_bytes());
     body[8..12].copy_from_slice(&flags.to_ne_bytes());
     attribute(&mut body, 3, format!("{name}\0").as_bytes());
     attribute(&mut body, 4, &1500u32.to_ne_bytes());
+    body
+}
+
+fn link(index: u32, name: &str, kind: Option<&str>, flags: u32, arphrd: u16) -> Link {
+    let mut body = link_body(index, name, flags, arphrd);
     if let Some(kind) = kind {
         let mut info = Vec::new();
         attribute(&mut info, 1, format!("{kind}\0").as_bytes());
@@ -45,6 +51,17 @@ fn link(index: u32, name: &str, kind: Option<&str>, flags: u32, arphrd: u16) -> 
     let mut parsed = Snapshot::default();
     parsed.push(16, &body).unwrap();
     parsed.links.pop().unwrap()
+}
+
+fn tun_link_body(name: &str, data: &[&[u8]]) -> Vec<u8> {
+    let mut body = link_body(17, name, 0x110d1, libc::ARPHRD_NONE);
+    let mut info = Vec::new();
+    for data in data {
+        attribute(&mut info, 2 | 0x8000, data);
+    }
+    attribute(&mut info, 1, b"tun\0");
+    attribute(&mut body, 18, &info);
+    body
 }
 
 fn address(index: u32, ip: IpAddr, owned: bool) -> Address {
@@ -394,11 +411,96 @@ fn tun_resources_and_main_routes_cannot_borrow_foreign_authority() {
 }
 
 #[test]
+fn tun_queue_counts_report_exact_owned_state() {
+    let spec = TunSpec {
+        queues: 3,
+        ..spec(true, false)
+    };
+    let mut snapshot = fixture(&spec, Some(TunStage::Active));
+    for (active, disabled, admitted) in [
+        (None, None, false),
+        (Some(3u32), None, false),
+        (Some(0), Some(3u32), false),
+        (Some(2), Some(0), false),
+        (Some(3), Some(1), false),
+        (Some(3), Some(0), true),
+    ] {
+        let mut data = Vec::new();
+        if let Some(active) = active {
+            attribute(&mut data, 8, &active.to_ne_bytes());
+        }
+        if let Some(disabled) = disabled {
+            attribute(&mut data, 9, &disabled.to_ne_bytes());
+        }
+        snapshot.links.pop().unwrap();
+        snapshot
+            .push(16, &tun_link_body(spec.name, &[&data]))
+            .unwrap();
+        let facts = snapshot.tun_readback(&spec, 17).unwrap();
+        assert!(facts.link);
+        assert_eq!(facts.num_queues, active);
+        assert_eq!(facts.num_disabled_queues, disabled);
+        assert_eq!(facts.matches_queues(spec.queues), admitted);
+        assert_eq!(
+            admit(&snapshot, &spec, Some(TunStage::Active)).is_ok(),
+            admitted
+        );
+    }
+    snapshot.links.last_mut().unwrap().name = Some(interface_name(b"replacement").unwrap());
+    let replaced = snapshot.tun_readback(&spec, 17).unwrap();
+    assert!(replaced.link);
+    assert_eq!(replaced.num_queues, None);
+    assert_eq!(replaced.num_disabled_queues, None);
+    assert!(!replaced.matches_queues(3));
+    assert!(!replaced.matches_queues(1));
+}
+
+#[test]
+fn tun_queue_counts_reject_duplicate_and_malformed_attributes() {
+    for kind in [8, 9] {
+        let mut data = Vec::new();
+        attribute(&mut data, kind, &3u32.to_ne_bytes());
+        attribute(&mut data, kind, &3u32.to_ne_bytes());
+        assert!(
+            Snapshot::default()
+                .push(16, &tun_link_body("honk0", &[&data]))
+                .is_err()
+        );
+    }
+    for (kind, value) in [
+        (8, &[0; 2][..]),
+        (9, &[0; 8][..]),
+        (8 | 0x4000, &[0; 4][..]),
+    ] {
+        let mut data = Vec::new();
+        attribute(&mut data, kind, value);
+        assert!(
+            Snapshot::default()
+                .push(16, &tun_link_body("honk0", &[&data]))
+                .is_err()
+        );
+    }
+    for data in [&[&[][..], &[][..]][..], &[&[1, 2, 3][..]][..]] {
+        let invalid = tun_link_body("honk0", data);
+        assert!(Snapshot::default().push(16, &invalid).is_err());
+    }
+    let mut info = Vec::new();
+    attribute(&mut info, 1, b"tun\0");
+    attribute(&mut info, 2 | 0x4000, &[]);
+    let mut invalid = link_body(17, "honk0", 0x110d1, libc::ARPHRD_NONE);
+    attribute(&mut invalid, 18, &info);
+    assert!(Snapshot::default().push(16, &invalid).is_err());
+}
+
+#[test]
 fn tun_cleanup_retains_foreign_slots_and_recognizes_detached_owned_rules() {
     let spec = spec(true, true);
     let mut snapshot = fixture(&spec, Some(TunStage::Active));
     let live = snapshot.tun_readback(&spec, 17).unwrap();
     assert!(live.link);
+    assert_eq!(live.num_queues, None);
+    assert_eq!(live.num_disabled_queues, None);
+    assert!(live.matches_queues(1));
     assert_eq!(
         live.routes.iter().filter(|entry| entry.4.is_some()).count(),
         4
@@ -520,6 +622,7 @@ fn tun_spec_rejects_inexact_keys_before_constructing_ownership() {
             ..good
         },
         TunSpec { mtu: 1279, ..good },
+        TunSpec { queues: 0, ..good },
         TunSpec {
             rule_priority: u32::MAX,
             ..good

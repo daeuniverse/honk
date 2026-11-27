@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use honk_netstack::{MemoryBudget, MemoryReservation};
 
-use crate::bpf::{attributes, wait_netlink};
+use crate::bpf::{attributes, raw_attributes, wait_netlink};
 
 mod auxiliary;
 pub use auxiliary::{AuxLinkInfo, AuxLinkWatch, HostLinkChange};
@@ -20,6 +20,10 @@ pub use auxiliary::{AuxLinkInfo, AuxLinkWatch, HostLinkChange};
 const IFLA_GSO_IPV4_MAX_SIZE: u16 = 63;
 const IFLA_GRO_IPV4_MAX_SIZE: u16 = 64;
 const LEGACY_OFFLOAD_MAX_SIZE: u32 = 65_536;
+const IFLA_TUN_NUM_QUEUES: u16 = 8;
+const IFLA_TUN_NUM_DISABLED_QUEUES: u16 = 9;
+const NLA_F_NET_BYTEORDER: u16 = 1 << 14;
+const NLA_TYPE_MASK: u16 = 0x3fff;
 
 const MAX_OBJECTS: usize = 65_536;
 const RTNL_BUFFER_BYTES: usize = 65_536;
@@ -48,6 +52,7 @@ const TUN_CAPTURE_METRIC: u32 = 1024;
 pub struct TunSpec<'a> {
     pub name: &'a str,
     pub mtu: u32,
+    pub queues: u8,
     pub address4: Option<Ipv4Addr>,
     pub address6: Option<Ipv6Addr>,
     pub table: u32,
@@ -106,11 +111,29 @@ pub enum TunStage {
 pub struct TunReadback {
     /// Some link, of any identity, still has the recorded ifindex.
     pub link: bool,
+    /// The recorded ifindex still names the expected TUN link.
+    pub owned_tun: bool,
+    /// Active queue count. Linux omits both counts for a single-queue TUN.
+    pub num_queues: Option<u32>,
+    pub num_disabled_queues: Option<u32>,
     pub addresses: Vec<(IpAddr, u8)>,
     /// Every capture-table route as `(table, destination, prefix, metric, key)`.
     pub routes: Vec<(u32, IpAddr, u8, u32, Option<TunRoute>)>,
     /// Every rule of either family in `[P, P+4]` as `(ipv6, priority, key)`.
     pub rules: Vec<(bool, u32, Option<TunRule>)>,
+}
+
+impl TunReadback {
+    /// Checks the expected active count and requires zero disabled queues.
+    /// Single-queue TUN may omit both counts.
+    pub fn matches_queues(&self, expected: u8) -> bool {
+        self.owned_tun && tun_queues_match(expected, self.num_queues, self.num_disabled_queues)
+    }
+}
+
+fn tun_queues_match(expected: u8, active: Option<u32>, disabled: Option<u32>) -> bool {
+    (expected == 1 && active.is_none() && disabled.is_none())
+        || (expected != 0 && active == Some(u32::from(expected)) && disabled == Some(0))
 }
 
 impl TunSpec<'_> {
@@ -186,6 +209,7 @@ impl TunSpec<'_> {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'.' | b'-'))
             || matches!(self.name, "lo" | "auto")
             || !(1280..=65535).contains(&self.mtu)
+            || self.queues == 0
             || self.address4.is_some_and(|ip| {
                 ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() || ip.is_link_local()
             })
@@ -237,7 +261,7 @@ impl TunSpec<'_> {
                 })
         {
             return Err(unsupported(
-                "invalid TUN name, addresses, mark, table, priority range or capture prefixes",
+                "invalid TUN name, queues, addresses, mark, table, priority range or capture prefixes",
             ));
         }
         interface_name(name)
@@ -712,6 +736,7 @@ enum WatchState {
 struct TunWatch {
     name: String,
     mtu: u32,
+    queues: u8,
     address4: Option<Ipv4Addr>,
     address6: Option<Ipv6Addr>,
     table: u32,
@@ -725,6 +750,7 @@ impl TunWatch {
         TunSpec {
             name: &self.name,
             mtu: self.mtu,
+            queues: self.queues,
             address4: self.address4,
             address6: self.address6,
             table: self.table,
@@ -786,6 +812,7 @@ impl Topology {
                     spec: TunWatch {
                         name: spec.name.to_owned(),
                         mtu: spec.mtu,
+                        queues: spec.queues,
                         address4: spec.address4,
                         address6: spec.address6,
                         table: spec.table,
@@ -1470,6 +1497,8 @@ struct Link {
     tx_queues: u32,
     vlan: Option<(u16, u16)>,
     bond: Option<(u8, u8)>,
+    tun_queues: Option<u32>,
+    tun_disabled_queues: Option<u32>,
     big_tcp: bool,
     has_hardware_address: bool,
 }
@@ -1728,6 +1757,8 @@ impl Snapshot {
                     tx_queues: 0,
                     vlan: None,
                     bond: None,
+                    tun_queues: None,
+                    tun_disabled_queues: None,
                     big_tcp: false,
                     has_hardware_address: false,
                 };
@@ -1735,7 +1766,9 @@ impl Snapshot {
                 let mut seen = 0;
                 let mut seen_offload = 0;
                 let mut info_data = None;
-                attributes(&body[16..], |kind, value| {
+                let mut invalid_tun_info = false;
+                raw_attributes(&body[16..], |raw_kind, value| {
+                    let kind = raw_kind & NLA_TYPE_MASK;
                     match kind {
                         1 | 3 | 4 | 5 | 10 | libc::IFLA_TXQLEN | 18 | 31 | 32 => {
                             unique_attribute(&mut seen, kind)?
@@ -1775,14 +1808,21 @@ impl Snapshot {
                             link.master = exact_u32(value)?;
                         }
                         18 => {
+                            invalid_tun_info |= raw_kind & NLA_F_NET_BYTEORDER != 0;
                             let mut seen_info = 0;
-                            attributes(value, |kind, value| {
-                                if kind == 1 {
-                                    unique_attribute(&mut seen_info, kind)?;
-                                    link.kind = Some(netlink_name(value)?);
-                                }
-                                if kind == 2 {
-                                    info_data = Some(value);
+                            raw_attributes(value, |raw_kind, value| {
+                                let kind = raw_kind & NLA_TYPE_MASK;
+                                match kind {
+                                    1 => {
+                                        unique_attribute(&mut seen_info, kind)?;
+                                        invalid_tun_info |= raw_kind != kind;
+                                        link.kind = Some(netlink_name(value)?);
+                                    }
+                                    2 => {
+                                        invalid_tun_info |= info_data.replace(value).is_some()
+                                            || raw_kind & NLA_F_NET_BYTEORDER != 0;
+                                    }
+                                    _ => {}
                                 }
                                 Ok(())
                             })?;
@@ -1792,6 +1832,9 @@ impl Snapshot {
                     Ok(())
                 })?;
                 link.parent = parent;
+                if invalid_tun_info && link.kind == Some(interface_name(b"tun")?) {
+                    return Err(malformed("invalid TUN link info attributes"));
+                }
                 if let Some(data) = info_data {
                     if link.kind == Some(interface_name(b"vlan")?) {
                         let mut id = None;
@@ -1834,6 +1877,21 @@ impl Snapshot {
                             Ok(())
                         })?;
                         link.bond = mode.zip(hash);
+                    } else if link.kind == Some(interface_name(b"tun")?) {
+                        let mut seen = 0;
+                        raw_attributes(data, |kind, value| {
+                            let count = match kind & NLA_TYPE_MASK {
+                                IFLA_TUN_NUM_QUEUES => &mut link.tun_queues,
+                                IFLA_TUN_NUM_DISABLED_QUEUES => &mut link.tun_disabled_queues,
+                                _ => return Ok(()),
+                            };
+                            if kind & !NLA_TYPE_MASK != 0 {
+                                return Err(malformed("invalid TUN queue count attribute flags"));
+                            }
+                            unique_attribute(&mut seen, kind)?;
+                            *count = Some(exact_u32(value)?);
+                            Ok(())
+                        })?;
                     }
                 }
                 self.links.push(link);
@@ -2100,9 +2158,14 @@ impl Snapshot {
             }
         }
         if let Some(index) = ifindex {
-            if !self.tun_link(spec, index) {
+            let link = self
+                .links
+                .iter()
+                .find(|link| link.index == index && link.is_owned_tun(name, spec.mtu))
+                .ok_or_else(|| unsupported("owned TUN name, MTU, kind, flags or master changed"))?;
+            if !tun_queues_match(spec.queues, link.tun_queues, link.tun_disabled_queues) {
                 return Err(unsupported(
-                    "owned TUN name, MTU, kind, flags or master changed",
+                    "owned TUN active or disabled queue count changed",
                 ));
             }
         } else if self.links.iter().any(|link| link.name == Some(name)) {
@@ -2441,8 +2504,21 @@ impl Snapshot {
 
     fn tun_readback(&self, spec: &TunSpec<'_>, ifindex: u32) -> io::Result<TunReadback> {
         let expected_rules = spec.rules();
+        let mut links = self.links.iter().filter(|link| link.index == ifindex);
+        let link = links.next();
+        if links.next().is_some() {
+            return Err(malformed("duplicate TUN readback ifindex"));
+        }
+        let name = interface_name(spec.name.as_bytes())?;
+        let kind = interface_name(b"tun")?;
+        let tun = link.filter(|link| {
+            link.name == Some(name) && link.kind == Some(kind) && link.arphrd == libc::ARPHRD_NONE
+        });
         let mut readback = TunReadback {
-            link: self.links.iter().any(|link| link.index == ifindex),
+            link: link.is_some(),
+            owned_tun: tun.is_some(),
+            num_queues: tun.and_then(|link| link.tun_queues),
+            num_disabled_queues: tun.and_then(|link| link.tun_disabled_queues),
             addresses: self
                 .addresses
                 .iter()
@@ -3040,6 +3116,7 @@ mod tests {
         let spec = TunWatch {
             name: "tun0".into(),
             mtu: 1500,
+            queues: 1,
             address4: Some(Ipv4Addr::new(192, 0, 2, 1)),
             address6: None,
             table: 100,

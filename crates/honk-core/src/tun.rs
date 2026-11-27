@@ -1024,8 +1024,9 @@ async fn run_owned(
     } else {
         None
     };
-    let (setup, device, topology) = match TunSetup::prepare(
+    let (setup, devices, topology) = match TunSetup::prepare(
         &config,
+        1,
         #[cfg(feature = "packet-ebpf")]
         source.as_mut(),
     ) {
@@ -1042,6 +1043,9 @@ async fn run_owned(
             );
         }
     };
+    let [device]: [TunDevice; 1] = devices
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("single-queue TUN setup returned another count"));
     // SAFETY: these concrete owners never replace their descriptors while registered.
     let io = match unsafe { AsyncFd::register(device) } {
         Ok(io) => io,
@@ -1203,7 +1207,7 @@ async fn run_owned(
             .setup
             .as_mut()
             .unwrap()
-            .activate(runtime.io.as_ref().unwrap().get_ref())?;
+            .activate(std::iter::once(runtime.io.as_ref().unwrap().get_ref()))?;
         // SAFETY: the final watcher retains its subscribed descriptor unchanged.
         runtime.topology = unsafe { AsyncFd::register(topology) }.map_err(io::Error::from)?;
         ensure!(

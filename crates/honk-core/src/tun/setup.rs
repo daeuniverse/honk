@@ -29,17 +29,33 @@ use crate::state;
 
 const SOURCE_SHA: &str = env!("HONK_SOURCE_SHA");
 const RECEIPT_FORMAT: u32 = 1;
+const MAX_TUN_QUEUES: u8 = 8;
+const TUN_FLAGS: libc::c_int = libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_VNET_HDR;
 const OFFLOADS: libc::c_ulong =
     (libc::TUN_F_CSUM | libc::TUN_F_TSO4 | libc::TUN_F_TSO6) as libc::c_ulong;
+const VNET_SETTINGS: [(libc::Ioctl, libc::Ioctl, libc::c_int, &str); 2] = [
+    (
+        libc::TUNSETVNETHDRSZ,
+        libc::TUNGETVNETHDRSZ,
+        super::VNET_BYTES as libc::c_int,
+        "10-byte vnet header",
+    ),
+    (
+        libc::TUNSETVNETLE,
+        libc::TUNGETVNETLE,
+        1,
+        "little-endian vnet header",
+    ),
+];
 
 static INCARNATION: AtomicU64 = AtomicU64::new(0);
 
-/// The only descriptor of the daemon's TUN device; the non-persistent link
-/// exists exactly while it stays open. Never cloned or duplicated.
+/// Owns one nonpersistent TUN queue and its original numeric position.
 pub(crate) struct TunDevice {
     fd: OwnedFd,
     ifindex: u32,
     incarnation: u64,
+    queue: u8,
 }
 
 impl AsFd for TunDevice {
@@ -54,54 +70,18 @@ impl AsRawFd for TunDevice {
     }
 }
 
-/// `attached`: `TUNSETIFF` had attached a device, which the dropped
-/// descriptor then released.
-struct OpenError {
-    attached: bool,
-    error: io::Error,
-}
-
 impl TunDevice {
-    fn open(name: &str, incarnation: u64) -> Result<Self, OpenError> {
-        let refused = |error: io::Error| OpenError {
-            attached: false,
-            error,
-        };
-        let mut request = interface_request(name).map_err(refused)?;
-        let fd = open(
-            "/dev/net/tun",
-            OFlag::O_RDWR | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|errno| refused(errno.into()))?;
-        // The ioctl takes a C short; IFF_TUN_EXCL is its sign bit.
-        request.ifr_ifru.ifru_flags =
-            (libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_VNET_HDR | libc::IFF_TUN_EXCL)
-                as libc::c_short;
-        // SAFETY: TUNSETIFF reads and updates only this live, initialized ifreq.
-        if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &mut request) } < 0 {
-            return Err(refused(io::Error::last_os_error()));
-        }
-        Self::attached(fd, name, incarnation).map_err(|error| OpenError {
-            attached: true,
-            error,
-        })
-    }
-
-    fn attached(fd: OwnedFd, name: &str, incarnation: u64) -> io::Result<Self> {
-        verify_attachment(&fd, name)?;
+    pub(crate) fn new_auxiliary(name: &str) -> io::Result<Self> {
+        let fd = open_attachment(name, TUN_FLAGS | libc::IFF_TUN_EXCL)?;
+        let ifindex = read_attachment(&fd, name, false)?;
         configure_vnet(fd.as_raw_fd())?;
-        same_namespace(&fd)?;
-        let ifindex = nix::net::if_::if_nametoindex(name)?;
+        verify_vnet(fd.as_raw_fd())?;
         Ok(Self {
             fd,
             ifindex,
-            incarnation,
+            incarnation: 0,
+            queue: 0,
         })
-    }
-
-    pub(crate) fn new_auxiliary(name: &str) -> io::Result<Self> {
-        Self::open(name, 0).map_err(|failure| failure.error)
     }
 
     pub(crate) fn ifindex(&self) -> u32 {
@@ -109,12 +89,8 @@ impl TunDevice {
     }
 
     pub(crate) fn verify_auxiliary(&self, name: &str) -> anyhow::Result<()> {
-        same_namespace(&self.fd)?;
-        verify_attachment(&self.fd, name)?;
-        ensure!(
-            nix::net::if_::if_nametoindex(name)? == self.ifindex,
-            "private TUN ifindex changed"
-        );
+        let ifindex = read_attachment(&self.fd, name, false)?;
+        ensure!(ifindex == self.ifindex, "private TUN ifindex changed");
         Ok(())
     }
 
@@ -158,26 +134,37 @@ impl TunDevice {
     }
 }
 
-fn valid_attachment_flags(flags: libc::c_int) -> bool {
-    flags & !libc::IFF_TUN_EXCL == libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_VNET_HDR
+fn queue_flags(multi_queue: bool) -> libc::c_int {
+    TUN_FLAGS
+        | if multi_queue {
+            libc::IFF_MULTI_QUEUE
+        } else {
+            0
+        }
+}
+
+fn valid_attachment_flags(flags: libc::c_int, multi_queue: bool) -> bool {
+    flags & !libc::IFF_TUN_EXCL == queue_flags(multi_queue)
+}
+
+fn open_attachment(name: &str, flags: libc::c_int) -> io::Result<OwnedFd> {
+    let mut request = interface_request(name)?;
+    let fd = open(
+        "/dev/net/tun",
+        OFlag::O_RDWR | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    // The ioctl takes a C short; IFF_TUN_EXCL is its sign bit.
+    request.ifr_ifru.ifru_flags = flags as libc::c_short;
+    // SAFETY: TUNSETIFF reads and updates only this live, initialized ifreq.
+    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &mut request) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
 }
 
 fn configure_vnet(fd: RawFd) -> io::Result<()> {
-    for (set, get, expected, contract) in [
-        (
-            libc::TUNSETVNETHDRSZ,
-            libc::TUNGETVNETHDRSZ,
-            super::VNET_BYTES as libc::c_int,
-            "10-byte vnet header",
-        ),
-        (
-            libc::TUNSETVNETLE,
-            libc::TUNGETVNETLE,
-            1,
-            "little-endian vnet header",
-        ),
-    ] {
-        let value = expected;
+    for (set, _, value, contract) in VNET_SETTINGS {
         // SAFETY: each SET reads one initialized int and fd stays owned by the caller.
         if unsafe { libc::ioctl(fd, set, &value) } < 0 {
             return Err(io::Error::new(
@@ -185,6 +172,22 @@ fn configure_vnet(fd: RawFd) -> io::Result<()> {
                 format!("TUN requires {contract}: {}", io::Error::last_os_error()),
             ));
         }
+    }
+    // SAFETY: TUNSETOFFLOAD takes its offload mask by value.
+    if unsafe { libc::ioctl(fd, libc::TUNSETOFFLOAD, OFFLOADS) } < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "TUN requires checksum and TCPv4/TCPv6 segmentation: {}",
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_vnet(fd: RawFd) -> io::Result<()> {
+    for (_, get, expected, contract) in VNET_SETTINGS {
         let mut actual: libc::c_int = -1;
         // SAFETY: each GET writes one int while fd remains owned by the caller.
         if unsafe { libc::ioctl(fd, get, &mut actual) } < 0 {
@@ -203,20 +206,11 @@ fn configure_vnet(fd: RawFd) -> io::Result<()> {
             ));
         }
     }
-    // SAFETY: TUNSETOFFLOAD takes its offload mask by value.
-    if unsafe { libc::ioctl(fd, libc::TUNSETOFFLOAD, OFFLOADS) } < 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "TUN requires checksum and TCPv4/TCPv6 segmentation: {}",
-                io::Error::last_os_error()
-            ),
-        ));
-    }
     Ok(())
 }
 
-fn verify_attachment(fd: &OwnedFd, name: &str) -> io::Result<()> {
+fn read_attachment(fd: &OwnedFd, name: &str, multi_queue: bool) -> io::Result<u32> {
+    same_namespace(fd)?;
     // SAFETY: zero initializes every byte returned by TUNGETIFF.
     let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
     // SAFETY: the kernel writes only the initialized ifreq while fd stays owned.
@@ -230,15 +224,19 @@ fn verify_attachment(fd: &OwnedFd, name: &str) -> io::Result<()> {
         .iter()
         .map(|&byte| byte as u8)
         .take_while(|&byte| byte != 0);
-    if !actual.eq(name.bytes()) || !valid_attachment_flags(flags) {
+    if !request.ifr_name.contains(&0)
+        || !actual.eq(name.bytes())
+        || !valid_attachment_flags(flags, multi_queue)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "TUN attachment is not a single-queue IFF_TUN|IFF_NO_PI|IFF_VNET_HDR {name} (flags {flags:#x})"
+                "unexpected TUN attachment of {name}: flags {flags:#x}, expected {:#x}",
+                queue_flags(multi_queue)
             ),
         ));
     }
-    Ok(())
+    Ok(nix::net::if_::if_nametoindex(name)?)
 }
 
 fn interface_request(name: &str) -> io::Result<libc::ifreq> {
@@ -312,6 +310,7 @@ fn process_starttime() -> io::Result<u64> {
 struct Plan {
     name: String,
     mtu: u32,
+    queues: u8,
     address4: Option<Ipv4Addr>,
     address6: Option<Ipv6Addr>,
     table: u32,
@@ -321,15 +320,24 @@ struct Plan {
 }
 
 impl Plan {
-    fn from_config(config: &Config) -> anyhow::Result<Self> {
+    fn from_config(config: &Config, queues: u8) -> anyhow::Result<Self> {
         let tun = config
             .datapath
             .as_ref()
             .and_then(|datapath| datapath.tun.as_ref())
             .context("backend tun requires a datapath tun section")?;
+        ensure!(
+            (1..=MAX_TUN_QUEUES).contains(&queues),
+            "TUN device requires 1 to {MAX_TUN_QUEUES} queues"
+        );
+        ensure!(
+            queues == 1 || !tun.host_facts,
+            "TUN HostFacts requires one queue"
+        );
         Ok(Self {
             name: tun.name.clone(),
             mtu: u32::from(tun.mtu),
+            queues,
             address4: tun.address4,
             address6: tun.address6,
             table: tun.table,
@@ -347,6 +355,7 @@ impl Plan {
         TunSpec {
             name: &self.name,
             mtu: self.mtu,
+            queues: self.queues,
             address4: self.address4,
             address6: self.address6,
             table: self.table,
@@ -406,6 +415,7 @@ fn write_sysctl(key: &str, value: &str) -> Result<(), MutationError> {
 #[derive(Clone, Debug, PartialEq)]
 enum Resource {
     Link,
+    QueueAttach(u8),
     Sysctl { key: String, value: &'static str },
     Mtu(u32),
     Address(IpAddr),
@@ -467,6 +477,8 @@ struct Journal {
     incarnation: u64,
     name: String,
     ifindex: Option<u32>,
+    queues: u8,
+    observed_counts: Option<(Option<u32>, Option<u32>)>,
     entries: Vec<(Resource, State)>,
 }
 
@@ -501,6 +513,7 @@ impl Journal {
         nonce: u128,
         name: &str,
         incarnation: u64,
+        queues: u8,
     ) -> io::Result<Self> {
         let nonce = format!("{nonce:032x}");
         let starttime = process_starttime()?;
@@ -518,6 +531,8 @@ impl Journal {
             incarnation,
             name: name.to_owned(),
             ifindex: None,
+            queues,
+            observed_counts: None,
             entries: Vec::new(),
         };
         let written = journal
@@ -626,9 +641,26 @@ impl Journal {
     fn entry(&self, resource: &Resource, state: State) -> Value {
         let family = |ipv6: bool| if ipv6 { "inet6" } else { "inet" };
         let mut entry = match resource {
-            Resource::Link => json!({"kind": "link", "name": self.name, "ifindex": self.ifindex,
-                "flags": ["tun", "no_pi", "vnet_hdr", "exclusive"], "offloads": OFFLOADS,
-                "vnet_header_bytes": super::VNET_BYTES, "vnet_endian": "little", "persistent": false}),
+            Resource::Link => {
+                let flags: &[_] = if self.queues > 1 {
+                    &["tun", "no_pi", "vnet_hdr", "exclusive", "multi_queue"]
+                } else {
+                    &["tun", "no_pi", "vnet_hdr", "exclusive"]
+                };
+                json!({
+                    "kind": "link", "queue": 0, "name": self.name, "ifindex": self.ifindex,
+                    "flags": flags, "offloads": OFFLOADS, "vnet_header_bytes": super::VNET_BYTES,
+                    "vnet_endian": "little", "persistent": false, "expected_queues": self.queues,
+                    "expected_disabled_queues": 0,
+                    "observed_counts": self.observed_counts.map(|(active, disabled)| json!({
+                        "num_queues": active, "num_disabled_queues": disabled,
+                    })),
+                })
+            }
+            Resource::QueueAttach(queue) => json!({
+                "kind": "queue_attach", "queue": queue, "name": self.name, "ifindex": self.ifindex,
+                "flags": ["tun", "no_pi", "vnet_hdr", "multi_queue"],
+            }),
             Resource::Sysctl { key, value } => {
                 json!({"kind": "sysctl", "key": key, "value": value})
             }
@@ -773,10 +805,12 @@ impl TunSetup {
     /// subscribed after the last own change, so any notice on it is foreign.
     pub(super) fn prepare(
         config: &Config,
+        queues: u8,
         #[cfg(feature = "packet-ebpf")] source: Option<&mut super::source::Source>,
-    ) -> anyhow::Result<(Self, TunDevice, Topology)> {
+    ) -> anyhow::Result<(Self, Vec<TunDevice>, Topology)> {
         Self::prepare_in(
             config,
+            queues,
             honk_config::paths::data_dir(),
             #[cfg(feature = "packet-ebpf")]
             source,
@@ -785,15 +819,21 @@ impl TunSetup {
 
     fn prepare_in(
         config: &Config,
+        queues: u8,
         data_dir: &Path,
         #[cfg(feature = "packet-ebpf")] source: Option<&mut super::source::Source>,
-    ) -> anyhow::Result<(Self, TunDevice, Topology)> {
+    ) -> anyhow::Result<(Self, Vec<TunDevice>, Topology)> {
         ensure!(
             !SOURCE_SHA.is_empty(),
             "backend tun records the full source commit in its setup receipt, but this binary has none; \
              build from a Git checkout or set HONK_SOURCE_SHA to the 40-character commit when building from a source archive"
         );
-        let plan = Plan::from_config(config)?;
+        let plan = Plan::from_config(config, queues)?;
+        #[cfg(feature = "packet-ebpf")]
+        ensure!(
+            queues == 1 || source.is_none(),
+            "TUN source requires one queue"
+        );
         admit_all_rp_filter(plan.address4.is_some(), || {
             std::fs::read_to_string("/proc/sys/net/ipv4/conf/all/rp_filter")
         })?;
@@ -815,6 +855,7 @@ impl TunSetup {
             rand::random(),
             &plan.name,
             incarnation,
+            queues,
         )
         .context("create the TUN setup receipt")?;
         let mut setup = Self {
@@ -822,24 +863,34 @@ impl TunSetup {
             journal,
             netlink,
         };
-        match setup.install(
-            #[cfg(feature = "packet-ebpf")]
-            source,
-        ) {
-            Ok((device, guarded)) => {
+        let installed = setup.with_queues(open_attachment, read_attachment, |setup, devices| {
+            setup.install(
+                devices,
+                #[cfg(feature = "packet-ebpf")]
+                source,
+            )
+        });
+        match installed {
+            Ok((devices, guarded)) => {
                 drop(preflight);
-                Ok((setup, device, guarded))
+                Ok((setup, devices, guarded))
             }
-            // The device was dropped inside `install`, so its link is gone.
-            Err(error) => Err(setup.abandon(error)),
+            Err(error) => Err(setup.abandon(error, Self::readback)),
         }
     }
 
     fn install(
         &mut self,
+        devices: &[TunDevice],
         #[cfg(feature = "packet-ebpf")] source: Option<&mut super::source::Source>,
-    ) -> anyhow::Result<(TunDevice, Topology)> {
-        let device = self.create_link()?;
+    ) -> anyhow::Result<Topology> {
+        let device = &devices[0];
+        configure_vnet(device.as_raw_fd()).context("configure TUN vnet framing and offloads")?;
+        for device in devices {
+            verify_vnet(device.as_raw_fd())
+                .with_context(|| format!("read back TUN queue {} vnet framing", device.queue))?;
+        }
+        self.record_queue_counts(&self.readback()?)?;
         let ifindex = device.ifindex;
         #[cfg(feature = "packet-ebpf")]
         if let Some(source) = source {
@@ -883,54 +934,161 @@ impl TunSetup {
                 netlink.add_tun_rule(&rule, &name)
             })?;
         }
-        let guarded = Topology::admit_tun(&self.plan.spec(), ifindex, TunStage::Guarded)
-            .context("TUN guard admission")?;
-        Ok((device, guarded))
+        Topology::admit_tun(&self.plan.spec(), ifindex, TunStage::Guarded)
+            .context("TUN guard admission")
     }
 
-    fn create_link(&mut self) -> anyhow::Result<TunDevice> {
-        let index = self.write_ahead(Resource::Link)?;
-        match TunDevice::open(&self.plan.name, self.journal.incarnation) {
-            Ok(device) => {
-                self.journal.ifindex = Some(device.ifindex);
-                self.settle(index, State::Acknowledged)?;
-                Ok(device)
+    fn with_queues<T>(
+        &mut self,
+        mut open: impl FnMut(&str, libc::c_int) -> io::Result<OwnedFd>,
+        mut attachment: impl FnMut(&OwnedFd, &str, bool) -> io::Result<u32>,
+        install: impl FnOnce(&mut Self, &[TunDevice]) -> anyhow::Result<T>,
+    ) -> anyhow::Result<(Vec<TunDevice>, T)> {
+        let mut devices = Vec::with_capacity(usize::from(self.plan.queues));
+        let result = (|| {
+            for queue in 0..self.plan.queues {
+                let device = self
+                    .attach_queue(queue, &mut open, &mut attachment)
+                    .with_context(|| format!("attach TUN queue {queue}"))?;
+                devices.push(device);
             }
-            Err(OpenError { attached, error }) => {
-                let state = if !attached {
-                    State::Refused
-                } else if nix::net::if_::if_nametoindex(self.plan.name.as_str())
-                    == Err(Errno::ENODEV)
-                {
-                    State::Removed
-                } else {
-                    State::Intent
-                };
-                // A failed write here leaves the safer "intent" on disk.
-                let _ = self.settle(index, state);
-                Err(error).context("create the TUN device")
+            install(self, &devices)
+        })();
+        match result {
+            Ok(value) => Ok((devices, value)),
+            Err(error) => {
+                // Linux moves the last live queue into a closed queue's slot.
+                while let Some(device) = devices.pop() {
+                    drop(device);
+                }
+                Err(error)
             }
         }
+    }
+
+    fn attach_queue(
+        &mut self,
+        queue: u8,
+        open: impl FnOnce(&str, libc::c_int) -> io::Result<OwnedFd>,
+        attachment: impl FnOnce(&OwnedFd, &str, bool) -> io::Result<u32>,
+    ) -> anyhow::Result<TunDevice> {
+        let multi_queue = self.plan.queues > 1;
+        let (resource, flags) = if queue == 0 {
+            (
+                Resource::Link,
+                queue_flags(multi_queue) | libc::IFF_TUN_EXCL,
+            )
+        } else {
+            (Resource::QueueAttach(queue), queue_flags(multi_queue))
+        };
+        let entry = self.write_ahead(resource)?;
+        let fd = match open(&self.plan.name, flags) {
+            Ok(fd) => fd,
+            Err(error) => {
+                let _ = self.settle(entry, State::Refused);
+                return Err(error.into());
+            }
+        };
+        let identity = attachment(&fd, &self.plan.name, multi_queue).and_then(|ifindex| {
+            if ifindex == 0 || self.journal.ifindex.is_some_and(|owned| owned != ifindex) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "TUN queue ifindex {ifindex} differs from the owned ifindex {:?}",
+                        self.journal.ifindex
+                    ),
+                ));
+            }
+            Ok(ifindex)
+        });
+        let ifindex = match identity {
+            Ok(ifindex) => ifindex,
+            Err(error) => {
+                drop(fd);
+                if queue != 0
+                    || nix::net::if_::if_nametoindex(self.plan.name.as_str()) == Err(Errno::ENODEV)
+                {
+                    let _ = self.settle(entry, State::Removed);
+                }
+                return Err(error).context("read back the TUN attachment");
+            }
+        };
+        if queue == 0 {
+            self.journal.ifindex = Some(ifindex);
+        }
+        self.settle(entry, State::Acknowledged)?;
+        Ok(TunDevice {
+            fd,
+            ifindex,
+            incarnation: self.journal.incarnation,
+            queue,
+        })
     }
 
     /// Installs the capture routes and returns the final watcher, subscribed
     /// and fully admitted with them in place.
-    pub(super) fn activate(&mut self, device: &TunDevice) -> anyhow::Result<Topology> {
-        self.check_device(device)?;
-        let routes = self.plan.spec().capture_routes(device.ifindex);
-        for route in routes {
-            self.mutate(Resource::Route(route), |netlink| {
-                netlink.add_tun_route(&route)
-            })?;
+    pub(super) fn activate<'a>(
+        &mut self,
+        devices: impl ExactSizeIterator<Item = &'a TunDevice>,
+    ) -> anyhow::Result<Topology> {
+        self.check_sysctls()?;
+        let mut devices = devices.peekable();
+        let first = devices.peek().copied();
+        let before = self.journal.entries.len();
+        let result = self
+            .publish_capture(
+                devices,
+                |fd, name, multi_queue| {
+                    let ifindex = read_attachment(fd, name, multi_queue)?;
+                    verify_vnet(fd.as_raw_fd())?;
+                    Ok(ifindex)
+                },
+                Self::readback,
+                NlSock::add_tun_route,
+            )
+            .and_then(|ifindex| {
+                Topology::admit_tun(&self.plan.spec(), ifindex, TunStage::Active)
+                    .context("TUN capture admission")
+            });
+        result.map_err(|mut error| {
+            if self.journal.entries.len() > before
+                && let Some(first) = first
+                && let Err(cleanup) = self.close_capture(first)
+            {
+                error = error.context(cleanup);
+            }
+            error
+        })
+    }
+
+    fn publish_capture<'a>(
+        &mut self,
+        devices: impl ExactSizeIterator<Item = &'a TunDevice>,
+        attachment: impl FnMut(&OwnedFd, &str, bool) -> io::Result<u32>,
+        readback: impl FnOnce(&Self) -> anyhow::Result<TunReadback>,
+        mut add_route: impl FnMut(&mut NlSock, &TunRoute) -> Result<(), MutationError>,
+    ) -> anyhow::Result<u32> {
+        let ifindex = self.journal.ifindex.context("TUN link is not prepared")?;
+        self.check_capture(devices, attachment, readback)?;
+        for route in self.plan.spec().capture_routes(ifindex) {
+            self.mutate(Resource::Route(route), |netlink| add_route(netlink, &route))?;
         }
-        Topology::admit_tun(&self.plan.spec(), device.ifindex, TunStage::Active)
-            .context("TUN capture admission")
+        Ok(ifindex)
     }
 
     /// Removes the acknowledged capture routes so captured prefixes fall onto
     /// the guards. Rules and guards stay; unconfirmed routes leave with the link.
     pub(super) fn close_capture(&mut self, device: &TunDevice) -> anyhow::Result<()> {
-        self.check_device(device)?;
+        self.check_device(device, 0, read_attachment)?;
+        self.check_sysctls()?;
+        self.withdraw_capture(Self::readback, NlSock::del_tun_route)
+    }
+
+    fn withdraw_capture(
+        &mut self,
+        readback: impl FnOnce(&Self) -> anyhow::Result<TunReadback>,
+        mut del_route: impl FnMut(&mut NlSock, &TunRoute) -> Result<(), MutationError>,
+    ) -> anyhow::Result<()> {
         let active: Vec<usize> = (0..self.journal.entries.len())
             .filter(|&index| {
                 matches!(
@@ -948,7 +1106,7 @@ impl TunSetup {
         if active.is_empty() {
             return Ok(());
         }
-        let readback = self.readback()?;
+        let readback = readback(self)?;
         for &index in &active {
             ensure!(
                 slot(&readback, &self.journal.entries[index].0) == Slot::Exact,
@@ -958,17 +1116,25 @@ impl TunSetup {
         }
         for index in active {
             if let Resource::Route(route) = self.journal.entries[index].0 {
-                self.remove(index, |netlink| netlink.del_tun_route(&route))?;
+                self.remove(index, |netlink| del_route(netlink, &route))?;
             }
         }
         Ok(())
     }
 
-    /// Call after the only device descriptor closed. A normal stop removes
+    /// Call after closing every queue descriptor. A normal stop removes
     /// this instance's containment and receipt; otherwise both stay for the
     /// operator, as they do whenever ownership cannot be confirmed.
-    pub(super) fn finish(mut self, normal: bool) -> anyhow::Result<()> {
-        self.release_link()?;
+    pub(super) fn finish(self, normal: bool) -> anyhow::Result<()> {
+        self.finish_with_readback(normal, Self::readback)
+    }
+
+    fn finish_with_readback(
+        mut self,
+        normal: bool,
+        readback: impl FnOnce(&Self) -> anyhow::Result<TunReadback>,
+    ) -> anyhow::Result<()> {
+        self.release_link(readback)?;
         if normal {
             return self.remove_containment();
         }
@@ -979,8 +1145,12 @@ impl TunSetup {
     /// Preparation failed with the device already closed: until a capture
     /// rule may exist, this instance's changes are removed; after it, the
     /// containment stays.
-    fn abandon(mut self, error: anyhow::Error) -> anyhow::Error {
-        let cleanup = self.release_link().and_then(|()| {
+    fn abandon(
+        mut self,
+        error: anyhow::Error,
+        readback: impl FnOnce(&Self) -> anyhow::Result<TunReadback>,
+    ) -> anyhow::Error {
+        let cleanup = self.release_link(readback).and_then(|()| {
             if self.capture_admitted() {
                 self.retain();
                 Ok(())
@@ -1002,19 +1172,62 @@ impl TunSetup {
         })
     }
 
-    fn check_device(&self, device: &TunDevice) -> anyhow::Result<()> {
+    fn check_capture<'a>(
+        &mut self,
+        devices: impl ExactSizeIterator<Item = &'a TunDevice>,
+        mut attachment: impl FnMut(&OwnedFd, &str, bool) -> io::Result<u32>,
+        readback: impl FnOnce(&Self) -> anyhow::Result<TunReadback>,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            devices.len() == usize::from(self.plan.queues),
+            "TUN activation requires all {} owned queue descriptors",
+            self.plan.queues
+        );
+        for (queue, device) in devices.enumerate() {
+            self.check_device(device, queue, &mut attachment)?;
+        }
+        self.record_queue_counts(&readback(self)?)
+    }
+
+    fn record_queue_counts(&mut self, facts: &TunReadback) -> anyhow::Result<()> {
+        self.journal.observed_counts = Some((facts.num_queues, facts.num_disabled_queues));
+        self.journal
+            .persist()
+            .context("persist the TUN queue readback")?;
+        ensure!(
+            facts.matches_queues(self.plan.queues),
+            "TUN queue readback expected {} active and 0 disabled, got {:?} active and {:?} disabled (owned link present: {})",
+            self.plan.queues,
+            facts.num_queues,
+            facts.num_disabled_queues,
+            facts.owned_tun
+        );
+        Ok(())
+    }
+
+    fn check_device(
+        &self,
+        device: &TunDevice,
+        queue: usize,
+        attachment: impl FnOnce(&OwnedFd, &str, bool) -> io::Result<u32>,
+    ) -> anyhow::Result<()> {
         ensure!(
             Some(device.ifindex) == self.journal.ifindex
-                && device.incarnation == self.journal.incarnation,
-            "TUN device does not belong to this setup"
+                && device.incarnation == self.journal.incarnation
+                && usize::from(device.queue) == queue,
+            "TUN queue {queue} descriptor does not belong to this setup"
         );
-        verify_attachment(&device.fd, &self.plan.name)
-            .context("read back the owned TUN attachment")?;
-        same_namespace(&device.fd)?;
+        let ifindex = attachment(&device.fd, &self.plan.name, self.plan.queues > 1)
+            .with_context(|| format!("read back the owned TUN queue {queue} attachment"))?;
         ensure!(
-            nix::net::if_::if_nametoindex(self.plan.name.as_str())? == device.ifindex,
-            "TUN name no longer identifies the owned interface"
+            ifindex == device.ifindex,
+            "TUN queue {queue} now identifies ifindex {ifindex}, expected {}",
+            device.ifindex
         );
+        Ok(())
+    }
+
+    fn check_sysctls(&self) -> anyhow::Result<()> {
         for (key, value) in self.plan.sysctls() {
             ensure!(
                 std::fs::read_to_string(format!("/proc/sys/{key}"))?.trim() == value,
@@ -1030,19 +1243,29 @@ impl TunSetup {
             .context("read back TUN kernel resources")
     }
 
-    /// Confirms the kernel released the link with its descriptor, taking
-    /// everything scoped to it.
-    fn release_link(&mut self) -> anyhow::Result<()> {
+    /// Confirms the kernel released the link and its scoped objects.
+    fn release_link(
+        &mut self,
+        readback: impl FnOnce(&Self) -> anyhow::Result<TunReadback>,
+    ) -> anyhow::Result<()> {
         let Some(ifindex) = self.journal.ifindex else {
             return Ok(());
         };
-        let readback = self.readback()?;
-        let capture_left = readback.routes.iter().any(|(.., seen)| {
-            matches!(seen, Some(TunRoute { kind: TunRouteKind::Unicast { oif }, .. }) if *oif == ifindex)
+        let readback = readback(self)?;
+        let capture_left = self.journal.entries.iter().any(|(resource, state)| {
+            *state != State::Refused
+                && matches!(
+                    resource,
+                    Resource::Route(TunRoute {
+                        kind: TunRouteKind::Unicast { .. },
+                        ..
+                    })
+                )
+                && slot(&readback, resource) != Slot::Empty
         });
         ensure!(
             !readback.link && readback.addresses.is_empty() && !capture_left,
-            "TUN link {} (ifindex {ifindex}) outlived its descriptor; receipt {} retained",
+            "TUN link {} (ifindex {ifindex}), its addresses or capture slots are still present; receipt {} retained",
             self.plan.name,
             self.journal.path().display()
         );
