@@ -166,11 +166,7 @@ fn normalize_vmess(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &
         "multiplex",
         "sing-box VMess multiplex is unsupported",
     )?;
-    reject_enabled(
-        &mut source,
-        "udp_over_tcp",
-        "sing-box VMess UoT is unsupported",
-    )?;
+    normalize_uot(&mut source, &mut proxy, NodeProtocol::VMess)?;
     normalize_transport(&mut source, &mut proxy)?;
     normalize_tls(&mut source, &mut proxy)?;
     Ok(proxy)
@@ -182,7 +178,7 @@ fn normalize_vless(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &
     normalize_packet_network(&mut source, &mut proxy)?;
     let packet_encoding = source.remove("packet_encoding");
     let multiplex = normalize_vless_multiplex(&mut source, &mut proxy)?;
-    let uot = normalize_vless_uot(&mut source, &mut proxy)?;
+    let uot = normalize_uot(&mut source, &mut proxy, NodeProtocol::VLess)?;
     let packet_encoding = match packet_encoding {
         None | Some(Value::Null) if !multiplex && !uot => Some("xudp"),
         None | Some(Value::Null) => None,
@@ -402,33 +398,36 @@ fn normalize_vless_multiplex(
     Ok(true)
 }
 
-fn normalize_vless_uot(source: &mut Mapping, proxy: &mut Mapping) -> Result<bool, &'static str> {
+fn normalize_uot(
+    source: &mut Mapping,
+    proxy: &mut Mapping,
+    protocol: NodeProtocol,
+) -> Result<bool, &'static str> {
     let Some(value) = source.remove("udp_over_tcp") else {
         return Ok(false);
     };
-    let mut options = match value {
+    match value {
         Value::Bool(false) | Value::Null => return Ok(false),
-        Value::Bool(true) => Mapping::new(),
+        Value::Bool(true) => {}
         Value::Mapping(mut options) => {
             if !take_bool(&mut options, "enabled")?.unwrap_or(false) {
                 return Ok(false);
             }
-            options
+            if let Some(version) = options.remove("version")
+                && version.as_u64() != Some(2)
+            {
+                return Err("only sing-box UoT version 2 is supported");
+            }
+            if options
+                .values()
+                .any(|value| protocol == NodeProtocol::VMess || active(value))
+            {
+                return Err("unsupported sing-box UoT setting");
+            }
         }
-        _ => return Err("sing-box VLESS UoT settings must be boolean or an object"),
-    };
-    match options.remove("version") {
-        None => put(&mut options, "version", Value::Number(2.into())),
-        Some(version) if version.as_u64() == Some(2) => put(&mut options, "version", version),
-        Some(_) => return Err("only sing-box UoT version 2 is supported"),
+        _ => return Err("sing-box UoT settings must be boolean or an object"),
     }
-    reject_unknown_active(
-        &options,
-        &["version"],
-        "unsupported sing-box VLESS UoT setting",
-    )?;
-    put(&mut options, "enabled", Value::Bool(true));
-    put(proxy, "udp-over-tcp", Value::Mapping(options));
+    put(proxy, "udp-over-tcp", Value::Bool(true));
     Ok(true)
 }
 fn normalize_transport(source: &mut Mapping, proxy: &mut Mapping) -> Result<(), &'static str> {

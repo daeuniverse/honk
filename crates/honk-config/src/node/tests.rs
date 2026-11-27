@@ -1,5 +1,7 @@
 use super::*;
 
+const VMESS_GOLDEN_LINK: &str = "vmess://eyJwcyI6InZtZXNzIiwiYWRkIjoiZXhhbXBsZS5jb20iLCJwb3J0IjoiNDQzIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDEiLCJzY3kiOiJhdXRvIiwibmV0IjoidGNwIiwidGxzIjoidGxzIn0";
+
 #[test]
 fn test_group_policy_serde_lowercase() {
     assert_eq!(
@@ -47,6 +49,71 @@ fn test_group_policy_serde_rejects_legacy_honk() {
 }
 
 #[test]
+fn vmess_uot_identity_and_packet_permission_follow_the_effective_network() {
+    let mut node = Node::from_share_link(VMESS_GOLDEN_LINK).unwrap();
+    let legacy = node.id;
+    node.vmess_mut().unwrap().network = Some("tcp".into());
+    assert_eq!(node.derive_id(), legacy);
+    assert!(!node.supports_tunneled_udp());
+    let config = node.vmess_mut().unwrap();
+    config.udp_over_tcp = true;
+    assert!(!config.udp_enabled());
+    let restricted = node.derive_id();
+    assert_ne!(restricted, legacy);
+    node.vmess_mut().unwrap().network = None;
+    let enabled = node.derive_id();
+    assert_ne!(enabled, legacy);
+    assert_ne!(enabled, restricted);
+    for network in ["udp", "tcp,udp", " UDP , TCP "] {
+        node.vmess_mut().unwrap().network = Some(network.into());
+        assert_eq!(node.derive_id(), enabled);
+        assert!(node.supports_tunneled_udp());
+    }
+    node.tls_mut().unwrap().ech_enabled = true;
+    assert!(!node.supports_tunneled_udp());
+    node.tls_mut().unwrap().ech_enabled = false;
+    node.transport_mut().unwrap().transport = "xhttp".into();
+    assert!(!node.supports_tunneled_udp());
+}
+
+#[test]
+fn vmess_uot_flat_roundtrip_and_incompatible_field_warning() {
+    use crate::diagnostic::{DiagnosticSources, SafeValue, SettingPath};
+    use serde::de::DeserializeSeed;
+
+    let mut node = Node::from_share_link(VMESS_GOLDEN_LINK).unwrap();
+    assert!(
+        serde_json::to_value(&node)
+            .unwrap()
+            .get("udp_over_tcp")
+            .is_none()
+    );
+    node.vmess_mut().unwrap().udp_over_tcp = true;
+    node.id = node.derive_id();
+    let wire = serde_json::to_value(&node).unwrap();
+    assert_eq!(wire["udp_over_tcp"], true);
+    assert_eq!(serde_json::from_value::<Node>(wire).unwrap(), node);
+
+    let socks = Node::from_share_link("socks5://example.com:1080").unwrap();
+    let mut wire = serde_json::to_value(&socks).unwrap();
+    wire["udp_over_tcp"] = true.into();
+    let mut diagnostics = Vec::new();
+    let decoded = NodeSeed {
+        diagnostics: &mut diagnostics,
+        source: DiagnosticSources::new(None).root(),
+        setting: SettingPath::new("nodes"),
+    }
+    .deserialize(wire)
+    .unwrap();
+    assert_eq!(decoded, socks);
+    let [warning] = diagnostics.as_slice() else {
+        panic!("expected one stripped field")
+    };
+    assert_eq!(warning.code, "incompatible-node-fields");
+    assert_eq!(warning.value, SafeValue::Fields(vec!["udp_over_tcp"]));
+}
+
+#[test]
 fn test_protocol_identity_goldens() {
     let cases = [
         (
@@ -71,7 +138,7 @@ fn test_protocol_identity_goldens() {
         ),
         (
             "vmess",
-            "vmess://eyJwcyI6InZtZXNzIiwiYWRkIjoiZXhhbXBsZS5jb20iLCJwb3J0IjoiNDQzIiwiaWQiOiIwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDEiLCJzY3kiOiJhdXRvIiwibmV0IjoidGNwIiwidGxzIjoidGxzIn0",
+            VMESS_GOLDEN_LINK,
             "263e811a-31e9-572f-bb87-66f1fc63ce98",
         ),
         (

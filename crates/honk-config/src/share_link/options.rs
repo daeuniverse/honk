@@ -116,10 +116,10 @@ pub(super) fn parse_query(
     }
     if protocol != NodeProtocol::VLess
         && (query.contains_key("vless_mode")
-            || query.get("packetEncoding").is_some_and(|v| v != "none"))
+            || (!shadowrocket_vmess && query.get("packetEncoding").is_some_and(|v| v != "none")))
     {
         return Err(legacy(ConfigError::Parse(
-            "vless_mode/packetEncoding are valid only for VLESS share links".into(),
+            "unsupported vless_mode or packetEncoding for this share link".into(),
         )));
     }
     if shadowrocket_vmess {
@@ -443,6 +443,20 @@ pub(super) fn apply_protocol(
             }
         }
         OutboundConfig::Vmess(config) if shadowrocket => {
+            config.udp_over_tcp = match query.get("packetEncoding").map(String::as_str) {
+                None | Some("none") => false,
+                Some("uot-v2") => true,
+                Some(_) => {
+                    return Err(legacy(ConfigError::Parse(
+                        "unsupported VMess packetEncoding".into(),
+                    )));
+                }
+            };
+            if let Some(enabled) =
+                udp_permission(query).map_err(|reason| legacy(ConfigError::Parse(reason.into())))?
+            {
+                config.network = (!enabled).then(|| "tcp".into());
+            }
             config.encryption = vmess_cipher(
                 query.values("encryption").chain(query.values("scy")).chain(
                     query
@@ -583,6 +597,21 @@ fn apply_mtu(quic: &mut QuicOptions, query: &Query) {
     {
         quic.mtu = Some(mtu);
     }
+}
+
+fn udp_permission(query: &Query) -> Result<Option<bool>, &'static str> {
+    coalesce_equal(
+        query.values("udp").map(|value| {
+            if value == "1" || value.eq_ignore_ascii_case("true") {
+                Ok(Some(true))
+            } else if value == "0" || value.eq_ignore_ascii_case("false") {
+                Ok(Some(false))
+            } else {
+                Err("udp must be 1/true or 0/false")
+            }
+        }),
+        "conflicting udp parameters",
+    )
 }
 
 fn apply_vless(
@@ -762,19 +791,7 @@ fn apply_vless(
         }
     };
 
-    if let Some(enabled) = coalesce_equal(
-        query.values("udp").map(|value| {
-            if value == "1" || value.eq_ignore_ascii_case("true") {
-                Ok(Some(true))
-            } else if value == "0" || value.eq_ignore_ascii_case("false") {
-                Ok(Some(false))
-            } else {
-                Err("unsupported VLESS udp value (expected 1/true or 0/false)")
-            }
-        }),
-        "conflicting VLESS udp parameters",
-    )
-    .map_err(|_| {
+    if let Some(enabled) = udp_permission(query).map_err(|_| {
         invalid(
             &["network"],
             "VLESS udp must be 1/true or 0/false; repeated values must agree",

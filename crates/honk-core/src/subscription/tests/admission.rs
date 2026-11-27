@@ -562,6 +562,45 @@ fn official_sing_box_and_records_explicitly_reject_xhttp_with_salvage() {
 }
 
 #[test]
+fn vmess_uot_subscription_keeps_distinct_ids_and_salvages_valid_entries() {
+    let mut body = String::from("proxies:\n");
+    for fields in [
+        "name: old",
+        "name: bad, udp-over-tcp: {enabled: true, version: 1}",
+        "name: uot, udp-over-tcp: true",
+        "name: copy, udp_over_tcp: {enabled: true, version: 2}",
+        "name: restricted, udp-over-tcp: true, udp: false",
+    ] {
+        use std::fmt::Write;
+        writeln!(body, "  - {{type: vmess, server: example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111, {fields}}}").unwrap();
+    }
+    let mut diagnostics = Vec::new();
+    let nodes = parse_subscription_content_with_diagnostics(
+        &Subscription::default(),
+        &body,
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["old", "uot", "restricted"]
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|d| (d.entry_index, d.code))
+            .collect::<Vec<_>>(),
+        [
+            (Some(2), "unsupported-subscription-entry"),
+            (Some(4), "duplicate-subscription-entry")
+        ]
+    );
+}
+
+#[test]
 fn vmess_xhttp_tls_and_plain_entries_survive_subscription_dedup() {
     let mut fixture = serde_json::json!({"ps":"posture","add":"example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811","net":"xhttp"});
     let plain = format!(

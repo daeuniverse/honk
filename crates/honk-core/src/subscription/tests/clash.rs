@@ -46,10 +46,61 @@ fn clash_vmess_udp_claim_imports_the_tcp_node() {
         ["udp-claim", "tcp-only"]
     );
     assert_eq!(nodes[0].vmess().unwrap().network, None);
+    assert!(!nodes[0].vmess().unwrap().udp_over_tcp);
     assert_eq!(nodes[1].vmess().unwrap().network.as_deref(), Some("tcp"));
     assert!(!honk_outbound::descriptor::carries_udp(
         honk_outbound::descriptor::UdpPath::Own(&nodes[0])
     ));
+}
+
+#[test]
+fn clash_vmess_uot_only_imports_supported_wrappers() {
+    let parse = |options: &str| {
+        let body = format!(
+            "proxies:\n  - {{type: vmess, name: n, server: example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111, {options}}}"
+        );
+        parse_clash_subscription(&body, None)
+    };
+    for (options, uot, udp) in [
+        ("udp: true", false, false),
+        ("udp-over-tcp: false", false, false),
+        ("udp-over-tcp: true", true, true),
+        ("udp_over_tcp: {enabled: true, version: 0}", true, true),
+        ("udp-over-tcp: {enabled: true, version: 2}", true, true),
+        ("udp-over-tcp: true, udp: false", true, false),
+    ] {
+        let nodes = parse(options).unwrap();
+        let config = nodes[0].vmess().unwrap();
+        assert_eq!(
+            (config.udp_over_tcp, config.udp_enabled()),
+            (uot, udp),
+            "{options}"
+        );
+    }
+    for value in [
+        "{enabled: true, version: 1}",
+        "{enabled: true, version: '2'}",
+        "{enabled: 'true'}",
+        "'true'",
+        "0",
+        "[]",
+    ] {
+        assert!(parse(&format!("udp-over-tcp: {value}")).is_err(), "{value}");
+    }
+    for wrapper in [
+        "packet-encoding: xudp",
+        "packet-addr: true",
+        "xudp: true",
+        "mux: true",
+        "smux: {enabled: true}",
+        "multiplex: {enabled: true}",
+        "udp_over_tcp: false",
+    ] {
+        assert!(
+            parse(&format!("udp-over-tcp: true, {wrapper}")).is_err(),
+            "{wrapper}"
+        );
+    }
 }
 
 #[test]

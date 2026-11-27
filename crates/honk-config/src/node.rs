@@ -178,6 +178,7 @@ impl Node {
                     Ok(Some(true))
                 )
             }),
+            OutboundConfig::Vmess(config) => config.udp_enabled(),
             OutboundConfig::Vless(config) => {
                 config.multiplex == VlessMultiplex::Off
                     && config.udp_enabled()
