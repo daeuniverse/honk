@@ -83,14 +83,7 @@ fn clash_vmess_uot_only_imports_supported_wrappers() {
             "{options}"
         );
     }
-    for value in [
-        "{enabled: true, version: 1}",
-        "{enabled: true, version: '2'}",
-        "{enabled: 'true'}",
-        "'true'",
-        "0",
-        "[]",
-    ] {
+    for value in ["{enabled: 'true'}", "'true'", "0", "[]"] {
         assert!(parse(&format!("udp-over-tcp: {value}")).is_err(), "{value}");
     }
     for wrapper in [

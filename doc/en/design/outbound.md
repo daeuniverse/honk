@@ -35,6 +35,7 @@ Implementations are split into ordinary Rust modules:
 | --- | --- |
 | Proxy contracts | `proxy/{error,packet,outbound,registry}.rs` |
 | Protocol families | `proxy/shadowsocks/{mod,aead2022,stream}.rs`; `proxy/vless/{mod,handler,mux,cool,encryption}.rs` |
+| VMess | `proxy/vmess/uot.rs` prepares UoT streams. `proxy/vmess/relay.rs` relays encrypted records. VMess and Trojan open carriers through `transport::prepare_transport`. |
 | QUIC | `quic/{path_health,flow_control,metrics,endpoint,client,stream,boring}.rs` |
 | AnyTLS | `proxy/anytls/{padding,writer,overflow}.rs` |
 | Score and health | `group/score/{evidence,ranking,feedback}.rs`; `alive/{health,urltest}.rs` |
@@ -192,13 +193,10 @@ replay state is committed only after the address decodes. The outer socket stays
 connected to the server, so the server's own NAT behavior decides whether an
 unsolicited peer can reach the client.
 
-VMess and VLESS entries are compiled only with the `rprx` feature. The default
-`honk-core` and `honk-tool` feature sets enable it. Without `rprx`, these node
-forms still parse, but the registry contains no entry, and dials fail with the
-ordinary `No handler for protocol` refusal. Normal feature-off builds allocate
-no VLESS runtime pools or carrier semaphores. Unit builds keep backend-only
-coverage through `cfg(test)`; the feature-boundary integration test links the
-normal library to verify that distinction.
+`honk-core` and `honk-tool` enable `rprx` by default. Without it, VMess and VLESS nodes still parse.
+Ordinary UDP group selection skips these leaves. Dialing one directly returns `MissingProtocolHandler`.
+Feature-off builds allocate no VLESS runtime pools or carrier semaphores. `cfg(test)` keeps backend unit coverage.
+The feature-boundary integration test links the normal library.
 
 Unknown transports, invalid pins/REALITY keys, and reserved built-in names/protocols fail closed.
 
@@ -327,7 +325,7 @@ hostname: a CDN-fronted node keeps the edge IP as its address and names the
 distribution only in that header. The shared path therefore gives Trojan,
 VMess, and VLESS consistent TLS, REALITY, WS, gRPC, and XHTTP setup.
 
-VMess and VLESS use `StreamUotTransport` in `src/proxy/uot.rs` for non-connect UoT v2. The first write combines the UoT request with the first addressed datagram. A VMess send waits for the relay to flush the complete frame to its lower writer. Each flow owns its request observation. On a single-node XHTTP candidate, winner commit admits the relay task and publishes the carrier before releasing the VMess header.
+VMess and VLESS use `StreamUotTransport` in `src/proxy/uot.rs` for non-connect UoT v2. The first write combines the UoT request with the first addressed datagram. A confirmed VMess send waits for the relay to flush the complete frame to its immediate lower writer. Each flow owns its request observation. On a single-node XHTTP candidate, winner commit admits the relay task and publishes the carrier before releasing the VMess header.
 
 If a physical WebSocket peer closes normally before VMess can send its empty
 upload terminator, the relay can finish cleanly only after validating the
@@ -381,6 +379,7 @@ are retried.
 
 VMess records errors returned by its relay before closing the duplex half, so
 response-header and body-decoding failures reach the stream owner instead of EOF.
+Each direction of a VMess TCP stream or UoT association can use 65,536 AES-GCM record nonces. After the last one, the next record that needs a nonce returns `BrokenPipe`. Open a new session to continue with fresh keys.
 
 #### XHTTP carrier and logical-flow ownership
 

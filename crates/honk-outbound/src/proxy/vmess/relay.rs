@@ -6,8 +6,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Background task that encrypts client→server data and decrypts
-/// server→client data using the VMess AEAD chunking format.
 pub(super) async fn run(
     server: Box<dyn AsyncReadWrite>,
     client: &mut tokio::io::DuplexStream,

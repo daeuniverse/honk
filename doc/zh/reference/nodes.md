@@ -333,7 +333,7 @@ Auto、native、XUDP、Mux.Cool 与关闭 UDP 的节点 ID 不变。直接选择
 | --- | --- |
 | AnyTLS | 拒绝超过 16 KiB 的载荷，与 anytls-go 0.0.13 的中继缓冲区一致。非连接模式 UoT v2 逐数据报携带目的地和服务端的真实源地址。一条流服务一个客户端源的全部目的地；未经请求的回复也保留真实源地址。 |
 | Trojan | 每个客户端源使用一条 associate 流承载全部目的地，返回每个回复的真实源地址。配合服务端可获得 EIM/EIF 行为。各目的地共享队头阻塞，且流故障会影响全部目的地。 |
-| VMess UoT v2 | 同一客户端源的多个目的地共用一条 VMess TCP 流，每个数据报携带地址。回复保留真实对端地址，包括服务端允许转发的主动回包。与 sing-box 1.12.4 的回环测试覆盖了单跳 VMess 和 SOCKS5 → VMess 链。 |
+| VMess UoT v2 | 带地址的数据报通过 VMess TCP 流传输。与 sing-box 1.12.4 入站的回环测试覆盖单跳 VMess 和 SOCKS5 → VMess 链。 |
 
 SOCKS5 UDP ASSOCIATE 为每个客户端源保持一条控制 TCP 连接和一个中继 socket，该源的所有目的地共用它，并返回每个应答头中的真实远端对端。从未联系过的对端能否到达客户端取决于服务器：Dante 默认的 `udp.connectdst: yes` 仅在只使用过单一目的地期间才会连接其出站 socket。
 

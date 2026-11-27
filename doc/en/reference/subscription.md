@@ -288,6 +288,8 @@ Supported spelling aliases normalize before node identity is derived.
 
 Explicit disabled feature blocks are treated as disabled, not as unsupported active features. On VMess, `udp: true` alone keeps the TCP-only default. `udp: false` disables UDP even when UoT v2 is enabled. An explicit UDP restriction is rejected where the node model cannot preserve it.
 
+With VMess UoT enabled, a nonzero `alterId` (`alter_id` or `alter-id`) or an active unknown UoT option skips the entry with `unsupported-subscription-entry`. A noninteger `version`, including `"2"`, yields `malformed-subscription-entry`. With UoT off, Clash keeps TCP-only entries with a legacy `alterId`. The v2rayN JSON importer continues to ignore `aid`.
+
 TUIC permits an absent or empty password. Hysteria2 and Juicity accept an explicit `h3` ALPN matching their fixed runtime selection.
 
 Hysteria2 port-hopping aliases are resolved in this order: `ports`, `mport`, `port-hopping`, then `port_hopping`. Null, empty or whitespace-only text, and empty arrays supply no claim. Supplied strings, finite numbers, or arrays normalize `:` range separators to `-` and compare by their canonical nonzero port set, so equivalent spellings such as `["4000:5000", 6000]` and `6000,4000-5000` or adjacent ranges agree and retain the first non-absent alias's normalized spelling. Conflicting ranges or any invalid, empty-after-normalization, or duplicate-port alias reject the entry even beside a valid alias.
@@ -390,7 +392,7 @@ sing-box TLS is off when `tls` or `tls.enabled` is absent, so Trojan, Hysteria2,
 | Source-specific case | Import behavior |
 | --- | --- |
 | WebSocket `transport.headers` | `Host` remains a dedicated string field; repeated Host aliases reject. Other string values, including empty strings, are preserved; null is ignored and other types reject the entry. Names and values follow the [node header contract](./nodes.md#fields). |
-| VMess `udp_over_tcp` | `true` or `{ "enabled": true, "version": 2 }` enables UoT v2. An omitted version defaults to `2`. Any other explicit version on an enabled block rejects the entry. `network: tcp` disables UDP. |
+| VMess `udp_over_tcp` | honk accepts this extension in sing-box-shaped entries. `true` or an object with `enabled: true` enables UoT v2. The only accepted explicit version is `2`, also the default. `network: tcp` disables UDP. The sing-box 1.12 VMess inbound supports UoT v2. The official 1.12 VMess outbound schema omits this field. |
 | VLESS without an enabled H2MUX/UoT wrapper or explicit `packet_encoding` selecting another path | Single XUDP with UDP permitted. This is a sing-box import default, not the global meaning of Auto. |
 | Empty or omitted gRPC service name | Retain sing-box's empty service, not honk's `GunService` default. |
 | Hysteria2 `server_ports` without `server_port` | Use the first hopping port as the nominal endpoint. |

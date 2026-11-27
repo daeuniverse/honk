@@ -32,6 +32,7 @@
 | --- | --- |
 | Proxy 契约 | `proxy/{error,packet,outbound,registry}.rs` |
 | 协议族 | `proxy/shadowsocks/{mod,aead2022,stream}.rs`；`proxy/vless/{mod,handler,mux,cool,encryption}.rs` |
+| VMess | `proxy/vmess/uot.rs` 准备 UoT 流，`proxy/vmess/relay.rs` 中继加密记录。VMess 与 Trojan 共用 `transport::prepare_transport` 建立底层连接。 |
 | QUIC | `quic/{path_health,flow_control,metrics,endpoint,client,stream,boring}.rs` |
 | AnyTLS | `proxy/anytls/{padding,writer,overflow}.rs` |
 | Score 与健康 | `group/score/{evidence,ranking,feedback}.rs`；`alive/{health,urltest}.rs` |
@@ -176,12 +177,9 @@ source 的所有目的地。它只有一个连到服务端的带 mark socket 和
 功后提交。外层 socket 仍连接服务端，所以未经请求的对端能否到达客户端，取决于服务
 端自己的 NAT 行为。
 
-VMess 和 VLESS entry 只在 `rprx` feature 下编译，`honk-core` 和 `honk-tool` 的默
-认 feature 集启用了它。不带 `rprx` 时，这些节点形式仍能解析，但 registry 里没有
-对应的 entry，拨号会以普通的 `No handler for protocol` 拒绝。feature-off 构建不
-分配 VLESS runtime pool，也不分配 carrier semaphore。单元测试通过 `cfg(test)` 保
-留 backend 覆盖；feature 边界集成测试链接正常的 library，用来验证这两种构建的区
-别。
+`honk-core` 和 `honk-tool` 默认启用 `rprx`。关闭后仍可解析 VMess 和 VLESS 节点。
+普通 UDP 组选路会跳过这些叶子节点，直接拨号会返回 `MissingProtocolHandler`。
+该构建不会分配 VLESS 运行时池或载体信号量。`cfg(test)` 保留后端单元测试，功能边界集成测试链接常规构建的库。
 
 ## Runtime 所有权与 reload
 
@@ -294,7 +292,7 @@ TCP -> optional TLS or REALITY -> optional WebSocket, gRPC or XHTTP -> protocol 
 以边缘 IP 为地址，分发域名只出现在该 header 中。因此，同一条共享路径为 Trojan、
 VMess 和 VLESS 提供一致的 TLS、REALITY、WS、gRPC 和 XHTTP 建立过程。
 
-VMess 和 VLESS 共用 `src/proxy/uot.rs` 中的 `StreamUotTransport` 来处理非连接模式 UoT v2。首次写入合并 UoT 请求和带目的地址的首个数据报。VMess 会等中继对下层写入端完成整帧的 `flush` 才报告发送成功，各条流分别记录自己的请求。单跳 XHTTP 选定候选后，先准入中继任务并发布连接，再发送 VMess 请求头。
+VMess 和 VLESS 共用 `src/proxy/uot.rs` 中的 `StreamUotTransport` 来处理非连接模式 UoT v2。首次写入合并 UoT 请求和带目的地址的首个数据报。需要确认的 VMess 发送会等到中继对直接下层写入端完成整帧的 `flush`。各条流分别记录自己的请求。单跳 XHTTP 选定候选后，先准入中继任务并发布连接，再发送 VMess 请求头。
 
 如果物理 WebSocket 连接的对端先正常关闭，VMess 就无法再发送空的上行结束记录。
 只有在完整响应通过校验、所有业务字节都已转发时，中继才将其视为正常结束。
@@ -343,6 +341,7 @@ protobuf 单 bytes 字段 envelope。最多允许一个 16 KiB 的应用消息�
 
 VMess 在关闭 duplex 半边前记录 relay 返回的错误，使响应头及消息体解码
 失败传递到流 owner，而不是变成 EOF。
+VMess TCP 流和 UoT 关联的每个方向最多可用 65,536 个 AES-GCM 记录 nonce。用完后，下一条需要 nonce 的记录会返回 `BrokenPipe`。继续传输需要建立新会话，使用新密钥。
 
 #### XHTTP carrier 与逻辑流所有权
 

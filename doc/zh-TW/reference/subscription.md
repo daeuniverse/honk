@@ -295,6 +295,8 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 
 明確關閉的 feature block 按停用處理，honk 不會把它當成已啟用的不支援的 feature。VMess 單獨設定 `udp: true` 時仍只啟用 TCP。即使已啟用 UoT v2，`udp: false` 仍會停用 UDP。節點模型保留不了明確 UDP 限制時，honk 拒絕匯入。
 
+啟用 VMess UoT 時，非零 `alterId`（別名為 `alter_id`、`alter-id`）或 UoT 物件中生效的未知選項，會使該項目以 `unsupported-subscription-entry` 略過。非整數 `version`（包括字串 `"2"`）會得到 `malformed-subscription-entry`。停用 UoT 時，帶有舊版 `alterId` 的 Clash 項目仍可匯入為純 TCP 節點。v2rayN JSON 匯入器仍會忽略 `aid`。
+
 TUIC 允許省略密碼或使用空密碼。Hysteria2 和 Juicity 接受與執行時固定選擇一致的 `h3` ALPN。
 
 Hysteria2 埠跳躍別名按 `ports`、`mport`、`port-hopping`、`port_hopping` 的順序解析。null、空字串或純空白文字，以及空陣列不提供宣告。已提供的字串、有限數字或陣列會把範圍分隔符 `:` 正規化為 `-`，再按標準的非零埠集合比較，因此 `["4000:5000", 6000]` 與 `6000,4000-5000` 或相鄰區間這類等價寫法會視為一致，並保留第一個非空別名的正規化寫法。範圍衝突，或者任意別名無效、正規化後為空或包含重複埠時，即使同時存在有效別名，條目也會被拒絕。
@@ -397,7 +399,7 @@ TLS/SNI、REALITY、WebSocket/gRPC 升級 header、VLESS 封包選項，以及�
 | 來源特有情況 | 匯入行為 |
 | --- | --- |
 | WebSocket `transport.headers` | `Host` 保留為獨立的 string 欄位，重複的 Host 別名會被拒絕。其他 string 值原樣保留，空字串也算；null 忽略，其他型別會讓條目被拒絕。名稱和值遵循[節點 header 約定](./nodes.md#欄位)。 |
-| VMess `udp_over_tcp` | `true` 或 `{ "enabled": true, "version": 2 }` 會啟用 UoT v2。省略版本時使用 `2`，已啟用的物件若明確指定其他版本，該條目會遭拒。`network: tcp` 會停用 UDP。 |
+| VMess `udp_over_tcp` | 這是 honk 匯入 sing-box 格式項目時接受的擴充。`true` 或含 `enabled: true` 的物件會啟用 UoT v2，版本可省略或設為整數 `2`。`network: tcp` 停用 UDP。sing-box 1.12 的 VMess 入站支援 UoT v2，官方 1.12 VMess 出站設定沒有這個欄位。 |
 | VLESS 未啟用 H2MUX/UoT 封裝，且沒有明確 `packet_encoding` 選擇其他路徑 | 使用 Single XUDP 並允許 UDP。這是 sing-box 匯入的預設值，不是 Auto 的全域意義。 |
 | gRPC 服務名為空或省略 | 保留 sing-box 的空服務名，不使用 honk 的 `GunService` 預設值。 |
 | Hysteria2 提供 `server_ports`，未提供 `server_port` | 以第一個跳躍埠作為名義 endpoint。 |

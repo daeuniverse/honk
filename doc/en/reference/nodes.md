@@ -333,7 +333,7 @@ Identity is stable across rename, reload, and subscription refresh when the dial
 | --- | --- |
 | AnyTLS | Reject payloads above 16 KiB, matching anytls-go 0.0.13's relay buffer. Non-connect UoT v2 carries each datagram's destination and the server's real source address. One stream serves all destinations of a client source; unsolicited replies retain their real source. |
 | Trojan | One associate stream serves every destination of a client source and returns each reply's real source. A cooperating server can provide EIM/EIF behavior. Destinations share the stream's head-of-line blocking and fail together. |
-| VMess UoT v2 | A single VMess TCP stream carries addressed datagrams for multiple destinations of a client source. Replies carry the actual peer address, including unsolicited replies when the server permits them. Loopback tests against sing-box 1.12.4 cover both a single VMess node and a SOCKS5 → VMess chain. |
+| VMess UoT v2 | Addressed datagrams travel over a VMess TCP stream. Loopback tests with a sing-box 1.12.4 inbound cover a single VMess node and a SOCKS5 → VMess chain. |
 
 SOCKS5 UDP ASSOCIATE keeps one control TCP connection and one relay socket per client source, shared by every destination of that source. Each reply returns the real remote peer named in its header. Whether a peer the client never contacted can reach it depends on the server: Dante's default `udp.connectdst: yes` connects its outbound socket only while a single destination has been used.
 
