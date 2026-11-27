@@ -28,8 +28,11 @@ check_body() {
         # A bug report must carry a log; the field is read before code fences are dropped.
         (test("(?:^|\\n)### Relevant logs"; "i")) as $bug | field("Relevant logs") as $logs |
         gsub("(?:^|\\n)```[^\\n]*\\n[\\s\\S]*?\\n```[^\\n]*"; "") | . as $body |
-        # Issues opened from other forms or blank issues carry no human-responsible field.
-        if $kind == "issue" and (test("(?:^|\\n)### Human responsible"; "i") | not) then [] else
+        # Both issue forms carry a human-responsible field; an issue without one bypassed the forms.
+        if $kind == "issue" and (test("(?:^|\\n)### Human responsible"; "i") | not) then
+            [{en: "Open the issue from one of the issue forms; blank issues are not accepted.",
+              zh: "请使用 issue 模板提交，不接受空白 issue。"}]
+        else
         # Pull requests carry no name field; the first required box makes the author answer for the change.
         ([capture("(?:^|\\n)### Human responsible(?: /[^\\n]*)?\\n(?<human>[\\s\\S]*?)(?:\\n#{1,6} |\\z)"; "i") | .human][0]
             // "" | trim | ascii_downcase) as $human |
@@ -66,6 +69,10 @@ if jq -e '.user.type == "Bot" or (["OWNER", "MEMBER", "COLLABORATOR"] | index($A
     exit
 fi
 kind=$(jq -r 'if .pull_request then "pr" else "issue" end' <<< "$item")
+# Issues opened before the forms required a responsible human (#396) keep their original body.
+if [[ $kind == issue && $(jq -r .created_at <<< "$item") < 2026-10-30 ]]; then
+    exit
+fi
 failures=$(jq -r '.body // ""' <<< "$item" | check_body "$kind")
 label=template-violation
 marker='<!-- template-violation -->'
