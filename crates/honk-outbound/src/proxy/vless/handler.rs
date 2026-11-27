@@ -39,7 +39,7 @@ mod stream;
 #[cfg(test)]
 use crate::proxy::RuntimeOwnedIo;
 #[cfg(test)]
-use packet::{VlessConnectedTransport, VlessUotTransport};
+use packet::VlessConnectedTransport;
 
 use super::cool::VlessXudpTransport;
 #[cfg(test)]
