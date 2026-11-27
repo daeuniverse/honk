@@ -207,6 +207,16 @@ pub struct TcpStatsSnapshot {
     pub capacity_rejections: u64,
 }
 
+#[cfg(feature = "ebpf")]
+pub struct NfqueueServiceSample {
+    pub kernel_queue_depth: u64,
+    pub kernel_dropped: u64,
+    pub kernel_user_dropped: u64,
+    pub held_packets: usize,
+    pub held_peak: usize,
+    pub socket_receive_buffer_bytes: usize,
+}
+
 #[derive(Debug, Default)]
 struct UdpNfqueueStats {
     received: AtomicU64,
@@ -1264,23 +1274,28 @@ impl StatsManager {
         self.udp.slow_permit_closed.fetch_add(1, Ordering::Relaxed);
     }
     #[cfg(feature = "ebpf")]
-    pub fn update_udp_nfqueue_local_stats(&self, stats: honk_nfqueue::QueueLocalStats) {
+    pub fn update_udp_nfqueue_local_stats(
+        &self,
+        held_packets: usize,
+        held_peak: usize,
+        socket_receive_buffer_bytes: usize,
+    ) {
         self.udp
             .nfqueue
             .held_packets
-            .store(stats.held_packets as u64, Ordering::Relaxed);
+            .store(held_packets as u64, Ordering::Relaxed);
         self.udp
             .nfqueue
             .held_peak
-            .store(stats.held_peak as u64, Ordering::Relaxed);
+            .store(held_peak as u64, Ordering::Relaxed);
         self.udp
             .nfqueue
             .socket_receive_buffer_bytes
-            .store(stats.socket_receive_buffer_bytes as u64, Ordering::Relaxed);
+            .store(socket_receive_buffer_bytes as u64, Ordering::Relaxed);
     }
 
     #[cfg(feature = "ebpf")]
-    pub fn update_udp_nfqueue_service_stats(&self, stats: honk_nfqueue::QueueStats) {
+    pub fn update_udp_nfqueue_service_stats(&self, stats: NfqueueServiceSample) {
         self.udp
             .nfqueue
             .kernel_stats_available
@@ -1297,11 +1312,11 @@ impl StatsManager {
             .nfqueue
             .kernel_user_dropped
             .store(stats.kernel_user_dropped, Ordering::Relaxed);
-        self.update_udp_nfqueue_local_stats(honk_nfqueue::QueueLocalStats {
-            held_packets: stats.held_packets,
-            held_peak: stats.held_peak,
-            socket_receive_buffer_bytes: stats.socket_receive_buffer_bytes,
-        });
+        self.update_udp_nfqueue_local_stats(
+            stats.held_packets,
+            stats.held_peak,
+            stats.socket_receive_buffer_bytes,
+        );
     }
 
     #[cfg(feature = "ebpf")]
@@ -1867,7 +1882,7 @@ mod tests {
     #[test]
     fn nfqueue_kernel_stats_failures_are_visible() {
         let stats = StatsManager::new();
-        stats.update_udp_nfqueue_service_stats(honk_nfqueue::QueueStats {
+        stats.update_udp_nfqueue_service_stats(NfqueueServiceSample {
             kernel_queue_depth: 7,
             kernel_dropped: 2,
             kernel_user_dropped: 3,
@@ -1878,13 +1893,14 @@ mod tests {
         let available = stats.udp_snapshot().nfqueue;
         assert!(available.kernel_stats_available);
         assert_eq!(available.kernel_queue_depth, 7);
+        assert_eq!(available.kernel_dropped, 2);
+        assert_eq!(available.kernel_user_dropped, 3);
+        assert_eq!(available.held_packets, 4);
+        assert_eq!(available.held_peak, 5);
+        assert_eq!(available.socket_receive_buffer_bytes, 6);
         assert_eq!(available.kernel_stats_read_errors, 0);
 
-        stats.update_udp_nfqueue_local_stats(honk_nfqueue::QueueLocalStats {
-            held_packets: 1,
-            held_peak: 6,
-            socket_receive_buffer_bytes: 8192,
-        });
+        stats.update_udp_nfqueue_local_stats(1, 6, 8192);
         stats.record_udp_nfqueue_service_stats_error();
         let unavailable = stats.udp_snapshot().nfqueue;
         assert!(!unavailable.kernel_stats_available);

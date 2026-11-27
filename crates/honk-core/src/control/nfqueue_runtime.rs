@@ -636,14 +636,26 @@ impl ControlPlane {
                     }
                     _ = interval.tick() => {
                         sampler_queue.sample();
-                        sampler_stats.update_udp_nfqueue_local_stats(stats_reader.local_stats());
+                        let local = stats_reader.local_stats();
+                        sampler_stats.update_udp_nfqueue_local_stats(
+                            local.held_packets,
+                            local.held_peak,
+                            local.socket_receive_buffer_bytes,
+                        );
                         match stats_reader.stats().await {
                             Ok(sample) => {
                                 if unavailable {
                                     info!("NFQUEUE kernel statistics are available again");
                                 }
                                 unavailable = false;
-                                sampler_stats.update_udp_nfqueue_service_stats(sample);
+                                sampler_stats.update_udp_nfqueue_service_stats(crate::stats::NfqueueServiceSample {
+                                    kernel_queue_depth: sample.kernel_queue_depth,
+                                    kernel_dropped: sample.kernel_dropped,
+                                    kernel_user_dropped: sample.kernel_user_dropped,
+                                    held_packets: sample.held_packets,
+                                    held_peak: sample.held_peak,
+                                    socket_receive_buffer_bytes: sample.socket_receive_buffer_bytes,
+                                });
                             }
                             Err(error) => {
                                 sampler_stats.record_udp_nfqueue_service_stats_error();
