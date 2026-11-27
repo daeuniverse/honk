@@ -213,8 +213,8 @@ pub use mode::{ExcludeSet, Mode};
 pub use offload::{Csum, GsoKind, GsoRx, GsoTx, RxMeta, SourceContext, Transmit, TxCaps, TxCsum};
 pub use stack::{
     AccountedTransmit, BindError, Config, ConnectError, ConstructionError, DropReason, FlowId,
-    IovTransmit, Ready, ReceiveOptions, ReceiveOutcome, ReceiveReport, Rx, Stack, StackStats,
-    StreamError, TcpConsumeError, UdpError, ValidatedSource,
+    IovTransmit, MAX_ACCOUNTED_SHARDS, Ready, ReceiveOptions, ReceiveOutcome, ReceiveReport, Rx,
+    Stack, StackStats, StreamError, TcpConsumeError, UdpError, ValidatedSource,
 };
 pub use tcp::{TcpState, TcpStats};
 pub use udp_t::UdpRefuse;

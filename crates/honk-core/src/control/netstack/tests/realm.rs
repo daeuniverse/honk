@@ -21,6 +21,358 @@ fn udp_clients(realm: &PacketRealm) -> [SocketAddr; 2] {
     })
 }
 
+#[test]
+fn tun_realm_partitions_and_refunds_its_capture_budget() {
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let caps = TxCaps {
+        tso4: true,
+        ..TxCaps::NONE
+    };
+    for queues in [1, 2, 3, 8] {
+        let (realm, owners) = capture_tun_realm(1280, queues, caps, &budget).unwrap();
+        assert_eq!(realm.owners().len(), queues);
+        assert_eq!(owners.len(), queues);
+        assert!(!realm.queue_affine());
+        assert!(!realm.tracks_tcp());
+        let first = realm.owner(0).unwrap().0.inner.lock().resources.clone();
+        assert_eq!(first.is_some(), queues > 1);
+        for (worker, (scope, owner)) in realm.owners().iter().zip(&owners).enumerate() {
+            assert!(owner.owns(scope));
+            assert_eq!(scope.scope(), realm.scope());
+            assert_eq!(scope.worker(), worker);
+            let share = |n| n / queues + usize::from(worker < n % queues);
+            let inner = scope.0.inner.lock();
+            let ledger = inner.ledger.drain_state();
+            assert_eq!(ledger.control_free, share(CAPTURE_CONTROL_FRAMES));
+            assert_eq!(ledger.bulk_free, share(128));
+            assert_eq!(inner.waiters.len(), share(256));
+            assert_eq!(
+                inner.slots.len(),
+                share(1024) + ledger.control_free + ledger.bulk_free
+            );
+            assert_eq!(
+                inner.half_open.len(),
+                if queues == 1 { 0 } else { share(1024) }
+            );
+            assert_eq!(inner.frame_size, u16::MAX as usize);
+            assert_eq!(inner.cpu_tx_caps, caps);
+            assert!(inner.peers.is_empty());
+            assert!(inner.fragment_peers.is_empty());
+            if let Some(shared) = &first {
+                let resources = inner.resources.as_ref().unwrap();
+                assert!(Arc::ptr_eq(shared, resources));
+                assert!(!resources.tracks_tcp());
+            }
+        }
+        let required = budget.used();
+        drop((realm, owners, first));
+        assert_eq!(budget.used(), 0);
+        if queues == 1 {
+            let (scope, owner) =
+                capture_scope_with_output(1280, 1, 128, u16::MAX as usize, caps, &budget).unwrap();
+            let singleton = PacketRealm::singleton(scope).unwrap();
+            assert_eq!(budget.used(), required);
+            drop((singleton, owner));
+        }
+        let short = MemoryBudget::new(required - 1);
+        assert!(capture_tun_realm(1280, queues, caps, &short).is_err());
+        assert_eq!(short.used(), 0, "failed reservation must refund all owners");
+    }
+    for queues in [0, honk_netstack::MAX_ACCOUNTED_SHARDS + 1] {
+        assert!(capture_tun_realm(1280, queues, caps, &budget).is_err());
+    }
+    assert!(capture_realm_for_workers(1280, 1, 128, 3, 1, true, &budget).is_err());
+    assert_eq!(budget.used(), 0);
+}
+
+#[tokio::test]
+async fn tun_shards_keep_tcp_owner_through_time_wait_and_quoted_output() {
+    let now = Instant::now();
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    for queues in [1, 2, 3, 8] {
+        let (realm, owners) = capture_tun_realm(1280, queues, TxCaps::NONE, &budget).unwrap();
+        let worker = queues - 1;
+        let client = client_for(&realm, worker);
+        let destination: SocketAddr = "203.0.113.9:443".parse().unwrap();
+        let mapped = |address: SocketAddr| {
+            let IpAddr::V4(ip) = address.ip() else {
+                unreachable!()
+            };
+            SocketAddr::new(IpAddr::V6(ip.to_ipv6_mapped()), address.port())
+        };
+        assert_eq!(
+            realm.worker_for_tcp(mapped(client), mapped(destination)),
+            worker
+        );
+        let syn = segment(client, 100, 0, tcp::SYN, &[]);
+        let view = wire::PacketView::from_slice(&syn);
+        let barrier = std::sync::Barrier::new(queues);
+        std::thread::scope(|threads| {
+            for local in 0..queues {
+                let realm = &realm;
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    barrier.wait();
+                    let (owner, claim) = realm.dispatch_owner(local, view).unwrap();
+                    assert!(claim.is_none());
+                    assert_eq!(owner.worker(), worker);
+                });
+            }
+        });
+        let scope = realm.owner(worker).unwrap();
+        let (flow, server) = handshake(scope, now, client, 100);
+        let original = flow.flow_id();
+        drop(flow);
+        scope.drive(now);
+        let fin = output(scope);
+        assert_eq!(decode(&fin).0.flags, tcp::FIN | tcp::ACK);
+        fin.release();
+        let server = server.wrapping_add(1);
+        scope.receive(&segment(client, 101, server, tcp::ACK, &[]), now);
+        let late_fin = segment(client, 101, server, tcp::FIN | tcp::ACK, &[]);
+        let (selected, claim) = realm
+            .dispatch_owner(0, wire::PacketView::from_slice(&late_fin))
+            .unwrap();
+        assert!(selected.same_owner(scope) && claim.is_none());
+        selected.receive(&late_fin, now);
+        scope.drive(now);
+        let old_ack = output(scope);
+        let old_bytes = old_ack.packet().to_vec();
+        assert_eq!(old_ack.flow_id(), Some(original));
+        assert_eq!(scope.stats().unwrap().timewait_entries, 1);
+        let mut ptb = [0; 128];
+        let size = wire::icmp::emit_packet_too_big(
+            &mut ptb,
+            client.ip(),
+            destination.ip(),
+            1280,
+            old_ack.packet(),
+        )
+        .unwrap();
+        let (quoted, claim) = realm
+            .dispatch_owner(0, wire::PacketView::from_slice(&ptb[..size]))
+            .unwrap();
+        assert!(quoted.same_owner(scope) && claim.is_none());
+
+        let fresh = segment(client, 100_000, 0, tcp::SYN, &[]);
+        let (selected, claim) = realm
+            .dispatch_owner(0, wire::PacketView::from_slice(&fresh))
+            .unwrap();
+        assert!(selected.same_owner(scope) && claim.is_none());
+        assert_eq!(selected.receive(&fresh, now), Rx::Consumed);
+        let (_, replacement) = selected.poll_accept().unwrap();
+        assert_ne!(replacement.flow_id(), original);
+        assert_eq!(old_ack.packet(), old_bytes);
+        assert_eq!(old_ack.flow_id(), Some(original));
+        old_ack.release();
+        assert!(selected.retains_tcp(client, destination));
+        drop(replacement);
+        for owner in owners {
+            owner.shutdown().await;
+        }
+        drop(realm);
+        assert_eq!(budget.used(), 0);
+    }
+}
+
+#[test]
+fn tun_shards_enforce_one_half_open_ceiling() {
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, _owners) = capture_tun_realm(1280, 3, TxCaps::NONE, &budget).unwrap();
+    let resources: Vec<_> = realm
+        .owners()
+        .iter()
+        .map(|scope| scope.0.inner.lock().resources.clone().unwrap())
+        .collect();
+    let address = |source| IpAddr::from([192, 0, 2, source]);
+    let now = Instant::now();
+    let receive = |client| {
+        let packet = segment(client, 100, 0, tcp::SYN, &[]);
+        let (scope, claim) = realm
+            .dispatch_owner(0, wire::PacketView::from_slice(&packet))
+            .unwrap();
+        assert!(claim.is_none());
+        scope.receive(&packet, now)
+    };
+    let mut held = Vec::new();
+    for source in 1..=8 {
+        for index in 0..128 {
+            held.push(
+                resources[index % resources.len()]
+                    .reserve(address(source))
+                    .unwrap(),
+            );
+        }
+        if source == 1 {
+            assert_eq!(
+                receive(SocketAddr::new(address(source), 41000)),
+                Rx::Dropped(DropReason::HalfOpen),
+                "one source has 128 credits across all owners"
+            );
+        }
+    }
+    let new_client = SocketAddr::new(address(9), 41000);
+    assert_eq!(receive(new_client), Rx::Dropped(DropReason::HalfOpen));
+    drop(held.pop().unwrap());
+    assert_eq!(receive(new_client), Rx::Consumed);
+}
+
+#[tokio::test]
+async fn tun_shards_keep_udp_client_affinity_and_share_pending_bytes() {
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    for queues in [1, 2, 3, 8] {
+        let (realm, owners) = capture_tun_realm(1280, queues, TxCaps::NONE, &budget).unwrap();
+        let foreign: SocketAddr = "203.0.113.9:53".parse().unwrap();
+        let sender = realm.datagram_sender(foreign);
+        let clients: Vec<_> = (0..queues)
+            .map(|worker| {
+                (1..=254)
+                    .map(|last| SocketAddr::from(([192, 0, 2, last], 41000)))
+                    .find(|client| realm.worker_for_udp(client.ip()) == worker)
+                    .unwrap()
+            })
+            .collect();
+        for (worker, &client) in clients.iter().enumerate() {
+            let scope = realm.owner(worker).unwrap();
+            for (port, destination) in [
+                (51000, foreign),
+                (52000, "198.51.100.9:123".parse().unwrap()),
+            ] {
+                let mut packet = [0; 128];
+                let source = SocketAddr::new(client.ip(), port);
+                let n = wire::udp::emit_packet(&mut packet, source, destination, b"query").unwrap();
+                let (selected, claim) = realm
+                    .dispatch_owner(
+                        (worker + 1) % queues,
+                        wire::PacketView::from_slice(&packet[..n]),
+                    )
+                    .unwrap();
+                assert!(selected.same_owner(scope) && claim.is_none());
+            }
+            assert_eq!(sender.send_to(b"reply", client).await.unwrap(), 5);
+            let reply = output(scope);
+            assert_eq!(
+                wire::packet_addresses(reply.packet()).unwrap(),
+                (foreign.ip(), client.ip())
+            );
+            reply.release();
+            assert!(
+                realm
+                    .owners()
+                    .iter()
+                    .all(|scope| scope.poll_output(&mut context()).is_pending())
+            );
+        }
+        let payload = vec![7; 60_000];
+        let mut accepted = 0;
+        for index in 0..16 {
+            match sender.send_to(&payload, clients[index % queues]).await {
+                Ok(60_000) => accepted += 1,
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::OutOfMemory),
+                other => panic!("unexpected UDP admission: {other:?}"),
+            }
+        }
+        assert_eq!(
+            accepted, 8,
+            "one 512 KiB pending ceiling for {queues} owners"
+        );
+        drop(sender);
+        for owner in owners {
+            owner.shutdown().await;
+        }
+        drop(realm);
+        assert_eq!(budget.used(), 0);
+    }
+}
+
+#[tokio::test]
+async fn tun_sharded_write_retries_shared_icmp_and_eagain_keeps_the_record() {
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, owners) = capture_tun_realm(1280, 3, TxCaps::NONE, &budget).unwrap();
+    let now = Instant::now();
+    let clock = now + Duration::from_secs(60);
+    let mut drivers: Vec<_> = owners.iter().map(PacketOwner::hand_off).collect();
+    let shared = realm.owners()[0].0.inner.lock().resources.clone().unwrap();
+    shared.icmp.lock().1 = clock;
+    let clients: [_; 3] = std::array::from_fn(|worker| client_for(&realm, worker));
+    for index in 0..=6 {
+        let client = clients[index % clients.len()];
+        let packet = segment(client, 100, 0, tcp::SYN, &[]);
+        let (scope, claim) = realm
+            .dispatch_owner(0, wire::PacketView::from_slice(&packet))
+            .unwrap();
+        assert!(claim.is_none());
+        assert_eq!(scope.worker(), index % clients.len());
+        let driver = &mut drivers[scope.worker()];
+        assert_eq!(scope.receive(&packet, now), Rx::Consumed);
+        let id = {
+            let mut inner = scope.0.inner.lock();
+            let stack = inner.stack.as_mut().unwrap();
+            let id = stack.poll_accept().unwrap().id;
+            stack.tcp_refuse(id, honk_netstack::Refuse::IcmpAdminProhibited);
+            id
+        };
+        let credits = scope.0.inner.lock().ledger.drain_state();
+        let emitted = scope.stats().unwrap().tx_packets;
+        let mut blocked = None;
+        let mut received = None;
+        let mut limited = false;
+        for attempt in 0..4 {
+            let result = driver.write_tun(now, TxClass::Control, |header, parts, tx| {
+                assert!(index < 6, "the shared target burst is exhausted");
+                assert_eq!(tx.flow, Some(id));
+                let mut bytes = header.to_vec();
+                for part in parts {
+                    bytes.extend_from_slice(part);
+                }
+                if index == 0 && blocked.is_none() {
+                    blocked = Some((bytes, tx));
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                if let Some((original, metadata)) = &blocked {
+                    assert_eq!((&bytes, tx), (original, *metadata));
+                }
+                received = Some(bytes);
+                Ok(())
+            });
+            assert_eq!(scope.0.inner.lock().ledger.drain_state(), credits);
+            match result {
+                Ok(TunOutput::Progress) => continue,
+                Err(error) if index == 0 => {
+                    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                    assert!(blocked.is_some());
+                    assert_eq!(scope.stats().unwrap().tx_packets, emitted);
+                }
+                Ok(TunOutput::Packet(len)) => {
+                    assert_eq!(received.as_ref().unwrap().len(), len);
+                    break;
+                }
+                Ok(TunOutput::Idle) if index == 6 => {
+                    limited = true;
+                    break;
+                }
+                outcome => panic!("unexpected ICMP output on attempt {attempt}: {outcome:?}"),
+            }
+        }
+        if index < 6 {
+            let bytes = received.expect("NeedsIcmp retry must reach the TUN sink");
+            let ip = wire::parse_ip(&bytes).unwrap();
+            assert_eq!(ip.dst, client.ip());
+            assert_eq!(ip.proto, wire::PROTO_ICMP);
+            assert_eq!(&bytes[ip.payload][..2], [3, 13]);
+            assert_eq!(scope.stats().unwrap().tx_packets, emitted + 1);
+        } else {
+            assert!(limited, "the seventh refusal must drain without a packet");
+            assert_eq!(scope.stats().unwrap().tx_packets, emitted);
+        }
+        assert_eq!(shared.icmp.lock().1, clock);
+    }
+    drop(drivers);
+    for owner in owners {
+        owner.shutdown().await;
+    }
+}
+
 fn physical_synack(
     realm: &PacketRealm,
     peers: &Arc<PeerAuthority>,

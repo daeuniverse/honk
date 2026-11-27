@@ -285,6 +285,27 @@ pub(crate) fn capture_realm_for_workers(
     ))
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn capture_tun_realm(
+    mtu: u32,
+    queues: usize,
+    caps: TxCaps,
+    budget: &Arc<MemoryBudget>,
+) -> anyhow::Result<(PacketRealm, Vec<PacketOwner>)> {
+    let (scopes, owners) = capture_partition(
+        mtu,
+        1,
+        128,
+        queues,
+        u16::MAX as usize,
+        caps,
+        budget,
+        0,
+        false,
+    )?;
+    Ok((PacketRealm::from_owners(scopes, false)?, owners))
+}
+
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn capture_partition(
@@ -298,6 +319,12 @@ pub(super) fn capture_partition(
     members: usize,
     local: bool,
 ) -> anyhow::Result<(Vec<PacketScope>, Vec<PacketOwner>)> {
+    let physical = members != 0;
+    let max_workers = if physical {
+        2
+    } else {
+        honk_netstack::MAX_ACCOUNTED_SHARDS
+    };
     anyhow::ensure!(
         !local || members == 1,
         "local packet owners require one physical member"
@@ -307,17 +334,16 @@ pub(super) fn capture_partition(
         "each capture owner requires bulk progress credit"
     );
     anyhow::ensure!(
-        (1..=64).contains(&realms) && (1..=2).contains(&workers),
+        (1..=64).contains(&realms) && (1..=max_workers).contains(&workers),
         "invalid capture realm partition"
     );
     let scope = ScopeId::allocate().ok_or_else(|| invalid("scope identities exhausted"))?;
     let now = Instant::now();
-    let physical = members != 0;
     let slots = (4096 / realms).min(1024);
-    let resources = if physical {
-        // An exported generation may overlap its replacement. Reserve both incarnations
-        // and the in-flight ingress claims before constructing either worker.
+    let shared_realm = workers > 1 || physical;
+    let resources = if shared_realm {
         let directory_slots = if local {
+            // Exported generations can overlap their replacements and in-flight ingress claims.
             let per_worker_outputs = bulk_frames
                 .checked_add(CAPTURE_CONTROL_FRAMES)
                 .ok_or_else(capacity)?;

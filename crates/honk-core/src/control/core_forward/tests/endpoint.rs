@@ -47,7 +47,14 @@ fn commit_syn(
     admission: &mut Option<EndpointAdmission>,
 ) -> io::Result<Rx> {
     let result = EndpointAdmission::commit_pending(admission, scope.scope(), |admission| {
-        scope.receive_admitted_deferred_with_source(bytes, now, now, admission, false, |_, _| true)
+        scope.receive_timed_with_meta_source(
+            (bytes, honk_netstack::RxMeta::VERIFY),
+            now,
+            now,
+            admission,
+            false,
+            |_, _| true,
+        )
     })?;
     scope.after_receive();
     Ok(result.0)

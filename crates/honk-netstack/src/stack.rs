@@ -315,6 +315,9 @@ pub(crate) struct Control {
 }
 const CONTROL_LIMIT: usize = 128;
 
+/// Maximum number of owners in an accounted realm.
+pub const MAX_ACCOUNTED_SHARDS: usize = 8;
+
 /// A sharded owner borrows its realm's ICMP limiter only for actual ICMP output.
 pub enum AccountedTransmit {
     Packet(Transmit),
@@ -459,8 +462,9 @@ impl Stack {
         workers: usize,
         udp_pending: Arc<MemoryBudget>,
     ) -> Result<Self, ConstructionError> {
-        if !matches!(workers, 1 | 2)
+        if !(1..=MAX_ACCOUNTED_SHARDS).contains(&workers)
             || worker >= workers
+            || workers > CONTROL_LIMIT
             || udp_pending.limit() != crate::udp_t::MAX_PENDING_BYTES
         {
             return Err(ConstructionError::Capacity);

@@ -379,6 +379,45 @@ fn short_fragment_yields_to_a_smaller_control_and_retries_the_original() {
 }
 
 #[test]
+fn accounted_shards_partition_controls_and_reserve_reassembly_for_zero() {
+    let now = Instant::now();
+    let budget = crate::MemoryBudget::new(8 << 20);
+    let mut cfg = Config::new([81; 32]);
+    cfg.memory_limit = 512 << 10;
+    cfg.max_flows = 4;
+    cfg.shared_budget = Some(Arc::clone(&budget));
+    let pending = crate::MemoryBudget::new(crate::udp_t::MAX_PENDING_BYTES);
+    for workers in [1, 2, 3, MAX_ACCOUNTED_SHARDS] {
+        let mut controls = 0;
+        for worker in 0..workers {
+            let stack =
+                Stack::new_accounted_shard(cfg.clone(), now, 4, worker, workers, pending.clone())
+                    .unwrap();
+            let share = CONTROL_LIMIT / workers + usize::from(worker < CONTROL_LIMIT % workers);
+            assert_eq!(stack.control_limit(), share);
+            assert_eq!(stack.shard.as_ref().unwrap().reassembly_owner, worker == 0);
+            let limits = stack.cfg.fragment_limits;
+            if worker == 0 {
+                assert_eq!(limits.max_entries, cfg.fragment_limits.max_entries);
+                assert_eq!(limits.max_bytes, cfg.fragment_limits.max_bytes);
+            } else {
+                assert_eq!((limits.max_entries, limits.max_bytes), (0, 0));
+            }
+            controls += share;
+        }
+        assert_eq!(controls, CONTROL_LIMIT);
+        assert_eq!(budget.used(), 0);
+    }
+    for (worker, workers) in [(0, 0), (3, 3), (0, MAX_ACCOUNTED_SHARDS + 1)] {
+        assert!(matches!(
+            Stack::new_accounted_shard(cfg.clone(), now, 4, worker, workers, pending.clone()),
+            Err(ConstructionError::Capacity)
+        ));
+        assert_eq!(budget.used(), 0);
+    }
+}
+
+#[test]
 fn realm_control_capacity_and_icmp_target_burst_are_not_duplicated() {
     let now = Instant::now();
     let (mut stacks, budget, _) = shards(now, 4);

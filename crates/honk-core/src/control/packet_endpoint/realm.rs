@@ -90,6 +90,30 @@ impl PacketEndpoints {
         owner.reassemble_for_dispatch_with_peer(packet, ingress_at, service_at, peer)
     }
 
+    /// Receives an L3 TUN packet on the owner already selected by the device worker.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn receive_tun_on(
+        &self,
+        owner: &PacketScope,
+        packet: &[u8],
+        meta: RxMeta,
+        ingress_at: Instant,
+        service_at: Instant,
+        mut on_source: impl FnMut(ValidatedSource, bool) -> bool,
+    ) -> io::Result<PacketReceive> {
+        self.check_owner(owner)?;
+        self.receive_selected::<true>(
+            owner,
+            (packet, meta),
+            ingress_at,
+            service_at,
+            None,
+            None,
+            false,
+            |source, _, _, pending| on_source(source, pending),
+        )
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn can_batch_tcp(&self) -> bool {
         !self.is_closing() && !self.shared.udp_pool.has_completed_tasks()

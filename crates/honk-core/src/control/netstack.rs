@@ -45,12 +45,12 @@ mod realm_receive;
 pub(in crate::control) mod remote;
 #[cfg(target_os = "linux")]
 pub(in crate::control) use fragment_peer::{FragmentPeer, fragment_offset_zero};
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) use realm::capture_realm;
 #[cfg(target_os = "linux")]
 pub(crate) use realm::capture_realm_for_workers;
 use realm::{HalfOpenHold, RealmResources};
 pub(crate) use realm::{PacketRealm, PacketRealmPlan, TcpClaim};
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use realm::{capture_realm, capture_tun_realm};
 #[cfg(target_os = "linux")]
 pub(crate) use realm_receive::RealmRxBatch;
 #[cfg(target_os = "linux")]
@@ -780,6 +780,10 @@ impl PacketScope {
         self.0.worker
     }
 
+    pub(in crate::control) fn is_sharded(&self) -> bool {
+        self.0.workers > 1
+    }
+
     pub(crate) fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -957,8 +961,8 @@ impl PacketScope {
         check_output: bool,
         on_source: impl FnMut(honk_netstack::ValidatedSource, bool) -> bool,
     ) -> (Rx, super::packet_endpoint::PacketReceive) {
-        let result = self.receive_admitted_deferred_with_source(
-            packet,
+        let result = self.receive_timed_with_meta_source(
+            (packet, RxMeta::VERIFY),
             now,
             now,
             admission,
@@ -969,10 +973,10 @@ impl PacketScope {
         result
     }
 
-    pub(in crate::control) fn receive_admitted_deferred_with_source(
+    pub(in crate::control) fn receive_timed_with_meta_source(
         &self,
-        packet: &[u8],
-        now: Instant,
+        (packet, meta): (&[u8], RxMeta),
+        ingress_at: Instant,
         service_at: Instant,
         admission: &mut Option<super::packet_endpoint::EndpointAdmission>,
         check_output: bool,
@@ -985,8 +989,8 @@ impl PacketScope {
             let pending = check_output && inner.pending_source_output(packet);
             let (rx, report) = inner.receive_checked(
                 packet,
-                RxMeta::VERIFY,
-                now,
+                meta,
+                ingress_at,
                 service_at,
                 Some(admission),
                 |source| on_source(source, pending),
@@ -2500,7 +2504,7 @@ impl PacketDriver {
         {
             return Ok(TunOutput::Closed);
         }
-        debug_assert!(inner.resources.is_none() && self.scope.0.auxiliary.is_none());
+        debug_assert!(self.scope.0.auxiliary.is_none());
         let class_index = usize::from(class == TxClass::Bulk);
         if inner.exported_cpu[class_index] != 0 {
             return Ok(inner.tun_idle(class_index));
@@ -2532,23 +2536,39 @@ impl PacketDriver {
         };
         let state = &mut *reservation.inner;
         let max_len = state.frame_size;
-        let tx = state
-            .stack
-            .as_mut()
-            .expect("live driven stack")
-            .poll_transmit_iov(
-                now,
+        let caps = state.cpu_tx_caps;
+        let control = class == TxClass::Control;
+        let mut emit = |header: &[u8], parts: &[&[u8]], tx: Transmit| {
+            if tx.len == 0 || tx.len > max_len {
+                return Err(invalid("invalid scatter output extent"));
+            }
+            emit(header, parts, tx)
+        };
+        let stack = state.stack.as_mut().expect("live driven stack");
+        let mut tx = IovTransmit::Idle;
+        let mut service_at = now;
+        for _ in 0..3 {
+            tx = stack.poll_transmit_iov(service_at, max_len, caps, control, None, &mut emit)?;
+            if !matches!(tx, IovTransmit::NeedsIcmp) {
+                break;
+            }
+            let resources = state.resources.as_ref().expect("shared ICMP limiter");
+            // Retain scope-first lock ordering through the shared limiter transaction.
+            let mut icmp = resources.icmp.lock();
+            service_at = Instant::now().max(icmp.1);
+            icmp.1 = service_at;
+            tx = stack.poll_transmit_iov(
+                service_at,
                 max_len,
-                state.cpu_tx_caps,
-                class == TxClass::Control,
-                None,
-                |header, parts, tx| {
-                    if tx.len == 0 || tx.len > max_len {
-                        return Err(invalid("invalid scatter output extent"));
-                    }
-                    emit(header, parts, tx)
-                },
+                caps,
+                control,
+                Some(&mut icmp.0),
+                &mut emit,
             )?;
+            if !matches!(tx, IovTransmit::Idle) {
+                break;
+            }
+        }
         match tx {
             IovTransmit::Packet(tx) => {
                 // The protocol owner stayed live under this lock through the write. Record
@@ -2564,7 +2584,7 @@ impl PacketDriver {
             IovTransmit::Progress => Ok(TunOutput::Progress),
             IovTransmit::Idle | IovTransmit::Deferred => Ok(state.tun_idle(class_index)),
             IovTransmit::BufferTooSmall => Err(invalid("TUN output exceeds funded frame extent")),
-            IovTransmit::NeedsIcmp => unreachable!("standalone TUN owns its ICMP limiter"),
+            IovTransmit::NeedsIcmp => unreachable!("ICMP limiter supplied"),
         }
     }
 

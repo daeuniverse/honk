@@ -945,10 +945,10 @@ impl PacketEndpoints {
         (packet, meta): (&[u8], RxMeta),
         now: Instant,
         service_at: Instant,
-        mut admission: Option<EndpointAdmission>,
+        admission: Option<EndpointAdmission>,
         host: Option<&HostIngress>,
         check_output: bool,
-        mut on_source: impl FnMut(
+        on_source: impl FnMut(
             ValidatedSource,
             Option<SourceContext>,
             Option<&HostSourceFacts>,
@@ -981,6 +981,35 @@ impl PacketEndpoints {
         }
         let (scope, _claim) =
             self.execution_owner(scope, honk_netstack::wire::PacketView::from_slice(packet))?;
+        self.receive_selected::<REPORT>(
+            scope,
+            (packet, meta),
+            now,
+            service_at,
+            admission,
+            host,
+            check_output,
+            on_source,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn receive_selected<const REPORT: bool>(
+        &self,
+        scope: &PacketScope,
+        (packet, meta): (&[u8], RxMeta),
+        now: Instant,
+        service_at: Instant,
+        mut admission: Option<EndpointAdmission>,
+        host: Option<&HostIngress>,
+        check_output: bool,
+        mut on_source: impl FnMut(
+            ValidatedSource,
+            Option<SourceContext>,
+            Option<&HostSourceFacts>,
+            bool,
+        ) -> bool,
+    ) -> io::Result<PacketReceive> {
         #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
         if admission.is_some() && scope.is_gateway_host() {
             return Err(io::Error::new(
@@ -1008,13 +1037,9 @@ impl PacketEndpoints {
                         on_source(source, Some(context), Some(facts), pending)
                     },
                 )?
-            } else if admission.is_some()
-                || self
-                    .realm(scope.scope())
-                    .is_some_and(|realm| realm.owners().len() > 1)
-            {
-                let (rx, received) = scope.receive_admitted_deferred_with_source(
-                    packet,
+            } else if admission.is_some() || scope.is_sharded() {
+                let (rx, received) = scope.receive_timed_with_meta_source(
+                    (packet, meta),
                     now,
                     service_at,
                     admission,

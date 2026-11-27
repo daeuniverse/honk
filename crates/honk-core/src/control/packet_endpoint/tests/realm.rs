@@ -1,6 +1,177 @@
 use super::*;
 
 #[tokio::test]
+async fn tun_sharded_receive_preserves_routed_rxmeta_and_verifies_reassembly() {
+    use crate::control::netstack::{CAPTURE_MEMORY, capture_tun_realm};
+    use honk_netstack::{Csum, DropReason, Stack, TxCaps};
+
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, owners) = capture_tun_realm(1280, 3, TxCaps::NONE, &budget).unwrap();
+    let (plane, _health) = local_plane().await;
+    let (endpoints, mut supervisor, drivers) = PacketEndpoints::start(
+        plane,
+        vec![(realm.clone(), owners)],
+        4,
+        false,
+        None,
+        ScopeId::HOST,
+    )
+    .await
+    .unwrap();
+    assert!(drivers.is_empty());
+    std::future::poll_fn(|cx| supervisor.poll_ready(cx))
+        .await
+        .unwrap();
+
+    let client = (1..=254)
+        .map(|last| SocketAddr::from(([192, 0, 2, last], 41000)))
+        .find(|client| realm.worker_for_udp(client.ip()) == 2)
+        .unwrap();
+    let destination = "203.0.113.9:4444".parse().unwrap();
+    let owner = realm.owner(2).unwrap();
+    let now = Instant::now();
+    let mut packet = [0; 128];
+    let len = wire::udp::emit_packet(&mut packet, client, destination, b"offloaded").unwrap();
+    packet[len - 1] ^= 1;
+    let packet = &packet[..len];
+    let view = wire::PacketView::from_slice(packet);
+    let (selected, claim) = realm.dispatch_owner(0, view).unwrap();
+    assert!(selected.same_owner(owner));
+    assert!(claim.is_none());
+    assert_eq!(
+        endpoints
+            .receive_with_meta_source(
+                realm.scope(),
+                packet,
+                RxMeta::VERIFY,
+                now,
+                false,
+                |_, _| panic!("the ordinary checksum must reject these bytes"),
+            )
+            .unwrap(),
+        PacketReceive::default()
+    );
+    let meta = RxMeta {
+        csum: Csum::Partial {
+            start: wire::ipv4::HEADER_LEN as u16,
+            offset: 6,
+        },
+        gso: None,
+    };
+    let refuse = |source: ValidatedSource, pending: bool| {
+        assert_eq!((source.src, source.dst), (client, destination));
+        assert!(!pending);
+        false
+    };
+    let routed = endpoints
+        .receive_with_meta_source(realm.scope(), packet, meta, now, false, refuse)
+        .unwrap();
+    assert_eq!(routed.source.map(|source| source.src), Some(client));
+    let selected = endpoints
+        .receive_tun_on(
+            owner,
+            packet,
+            meta,
+            now,
+            now + Duration::from_millis(1),
+            refuse,
+        )
+        .unwrap();
+    assert_eq!(selected, routed);
+    assert_eq!(owner.stats().unwrap().rx_packets, 3);
+    assert_eq!(
+        owner.stats().unwrap().drops[DropReason::Checksum as usize],
+        1
+    );
+
+    let mut cfg = StackConfig::new([81; 32]);
+    cfg.mode = Mode::Transparent {
+        exclude: ExcludeSet::default(),
+    };
+    cfg.mtu = 1280;
+    let mut peer = Stack::new(cfg, now);
+    let fragment_meta = RxMeta {
+        csum: Csum::Valid,
+        gso: None,
+    };
+    for valid in [false, true] {
+        let mut first = [0; 1280];
+        let mut last = [0; 1280];
+        let first_len = peer
+            .udp_send_from(client, destination, &[83; 1600], &mut first)
+            .unwrap();
+        let last_len = peer.poll_transmit(now, &mut last).unwrap();
+        if !valid {
+            last[last_len - 1] ^= 1;
+        }
+        assert_eq!(
+            endpoints
+                .receive_with_meta_source(
+                    realm.scope(),
+                    &first[..first_len],
+                    fragment_meta,
+                    now,
+                    false,
+                    refuse,
+                )
+                .unwrap(),
+            PacketReceive::default()
+        );
+        let report = endpoints
+            .receive_with_meta_source(
+                realm.scope(),
+                &last[..last_len],
+                fragment_meta,
+                now,
+                false,
+                refuse,
+            )
+            .unwrap();
+        assert_eq!(
+            report.source.map(|source| source.src),
+            valid.then_some(client)
+        );
+    }
+    assert_eq!(owner.stats().unwrap().rx_packets, 5);
+    assert_eq!(
+        owner.stats().unwrap().drops[DropReason::Checksum as usize],
+        2
+    );
+    assert_eq!(realm.owner(0).unwrap().stats().unwrap().rx_packets, 0);
+    assert_eq!(realm.owner(1).unwrap().stats().unwrap().rx_packets, 0);
+    assert!(owner.peer_hold(client.ip()).is_none());
+
+    let client = "192.0.2.10:41000".parse().unwrap();
+    let destination = (44000..45000)
+        .map(|port| SocketAddr::new(destination.ip(), port))
+        .find(|&destination| realm.worker_for_tcp(client, destination) == 2)
+        .unwrap();
+    let mut syn = [0; 128];
+    let len = syn_packet(destination, &mut syn);
+    let ingress_at = Instant::now();
+    let service_at = ingress_at + honk_netstack::MAX_DEFERRED + Duration::from_secs(1);
+    let report = endpoints
+        .receive_tun_on(
+            owner,
+            &syn[..len],
+            RxMeta::VERIFY,
+            ingress_at,
+            service_at,
+            |_, _| true,
+        )
+        .unwrap();
+    assert_eq!(report.source.map(|source| source.src), Some(client));
+    assert_eq!(
+        owner.stats().unwrap().flows,
+        0,
+        "late service expires the original SYN"
+    );
+
+    endpoints.shutdown().await.unwrap();
+    supervisor.run().await.unwrap();
+}
+
+#[tokio::test]
 async fn physical_syn_admission_reclaims_completed_udp_task_credit() {
     use crate::control::netstack::{CAPTURE_MEMORY, capture_realm};
     use crate::xdp::{ReturnPath, worker::PeerAuthority};
