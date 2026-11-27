@@ -28,8 +28,9 @@ use honk_datapath::buffer::{FrameConfig, FrameLease, FrameLedger, TxClass};
 #[cfg(target_os = "linux")]
 use honk_netstack::IovTransmit;
 use honk_netstack::{
-    AcceptOpts, Config, DropReason, FlowId, MemoryBudget, MemoryReservation, Mode, Ready, Rx,
-    RxMeta, SourceContext, Stack, StackStats, SynInfo, Transmit, TxCaps, UdpError,
+    AcceptOpts, Config, DropReason, FlowId, MemoryBudget, MemoryReservation, Mode, Ready,
+    ReceiveOptions, Rx, RxMeta, SourceContext, Stack, StackStats, SynInfo, Transmit, TxCaps,
+    UdpError,
 };
 use parking_lot::{Mutex, MutexGuard};
 use tokio::sync::Notify;

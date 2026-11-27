@@ -166,13 +166,11 @@ fn fragment_dispatch_finishes_without_entering_owner_zero_transport() {
     assert!(!owner_zero.retains_fragment(first_report.fragment));
     assert_eq!(owner_zero.stats().flows, 0);
     assert!(owner_zero.poll_accept().is_none());
-    let (_, report) = owner_one.receive_with_realm_admission(
-        complete.completion_ingress(),
-        service_at,
+    let (_, report) = owner_one.receive_reported(
         &complete,
-        RxMeta::VERIFY,
-        |_| true,
-        |_| true,
+        ReceiveOptions::new(complete.completion_ingress(), RxMeta::VERIFY)
+            .with_realm(service_at, &mut |_| true),
+        |_, _| true,
     );
     assert!(matches!(report.outcome, ReceiveOutcome::TcpNew(_)));
     assert_eq!(owner_one.stats().half_open, 1);
@@ -314,13 +312,11 @@ fn fragment_transport_clock_uses_latest_input_in_both_processing_orders() {
             };
             let first_rx = if timed {
                 receiver
-                    .receive_with_realm_admission(
-                        first_at,
-                        service,
+                    .receive_reported(
                         initial,
-                        RxMeta::VERIFY,
-                        |_| true,
-                        |_| true,
+                        ReceiveOptions::new(first_at, RxMeta::VERIFY)
+                            .with_realm(service, &mut |_| true),
+                        |_, _| true,
                     )
                     .0
             } else {
@@ -329,13 +325,11 @@ fn fragment_transport_clock_uses_latest_input_in_both_processing_orders() {
             assert_eq!(first_rx, Rx::Consumed);
             let final_rx = if timed {
                 receiver
-                    .receive_with_realm_admission(
-                        final_at,
-                        service,
+                    .receive_reported(
                         final_input,
-                        RxMeta::VERIFY,
-                        |_| true,
-                        |_| true,
+                        ReceiveOptions::new(final_at, RxMeta::VERIFY)
+                            .with_realm(service, &mut |_| true),
+                        |_, _| true,
                     )
                     .0
             } else {

@@ -29,17 +29,11 @@
 //! also offer ordinary pulls for payload progress. Unused control-only queues allocate nothing.
 //! RACK bookkeeping pressure defers only its flow; other funded output remains eligible.
 //!
-//! [`Stack::receive_with_source`] reports a [`ValidatedSource`] only for the current completed,
-//! checksum-verified TCP/UDP packet, including shared reassembly completion. Its callback can
-//! install reverse delivery facts before protocol state mutation; false refuses the packet.
-//! This receipt is not handshake or kernel accepted-child proof. Ordinary receive APIs use a
-//! reporting-disabled specialization and retain their behavior without reporting allocation.
-//! [`Stack::receive_with_tcp_admission`] returns [`ReceiveReport`]: source validity and actual
-//! protocol acceptance, including the exact new passive [`FlowId`] for captured policy binding.
-//! Neither a new SYN nor protocol acceptance proves a successful outbound admission.
-//! [`Stack::receive_with_meta_tcp_admission`] combines the same report with driver [`RxMeta`]
-//! through the shared parser; Endpoint retains its strict metadata rejection.
-//! [`Stack::receive_with_context`] carries an embedding's opaque [`SourceContext`] through
+//! [`Stack::receive_reported`] runs the source gate on each completed, checksum-verified TCP/UDP
+//! packet before protocol mutation. Its [`ReceiveReport`] distinguishes verified source facts
+//! from protocol acceptance and identifies the exact new passive [`FlowId`]. [`Stack::receive`]
+//! specializes away reporting. [`ReceiveOptions`] selects local-device checksum metadata, realm
+//! admission and an optional immutable [`SourceContext`]. The context follows input through
 //! actual transport, fragment and output owners. TCP keeps its first snapshot and rejects
 //! foreign source lineages; a legal RFC 6191 reopen may bind a new source. Reassembly requires
 //! one exact snapshot and retains killed entries' identity until their actual removal.
@@ -115,12 +109,12 @@
 //! recycling a driver buffer (for AF_XDP, before returning its frame to FILL). Reassembled UDP
 //! instead yields [`Rx::TransparentOwned`], whose payload indexes its owned packet. Fragmented
 //! packets are reassembled within bounded limits ([`FragmentLimits`]); ICMP errors are rate limited
-//! ([`IcmpLimits`]). TCP data has already been copied into the ring when `receive_with` returns.
+//! ([`IcmpLimits`]). TCP data has already been copied into the ring when receive returns.
 //!
 //! # Offload
 //!
 //! A transparent driver reading a TUN device with `virtio_net_hdr` hands the stack what the
-//! kernel knows, through [`Stack::receive_with`] or [`Stack::receive_with_meta_tcp_admission`]
+//! kernel knows, through [`Stack::receive_reported`]
 //! and [`RxMeta`]. [`Csum::Verify`] (flags 0) is the only provenance [`Stack::receive`] and an
 //! endpoint stack know. [`Csum::Valid`]
 //! (`DATA_VALID`) says the checksum was verified already; [`Csum::Partial`] (`NEEDS_CSUM`,
@@ -219,8 +213,8 @@ pub use mode::{ExcludeSet, Mode};
 pub use offload::{Csum, GsoKind, GsoRx, GsoTx, RxMeta, SourceContext, Transmit, TxCaps, TxCsum};
 pub use stack::{
     AccountedTransmit, BindError, Config, ConnectError, ConstructionError, DropReason, FlowId,
-    IovTransmit, Ready, ReceiveOutcome, ReceiveReport, Rx, Stack, StackStats, StreamError,
-    TcpConsumeError, UdpError, ValidatedSource,
+    IovTransmit, Ready, ReceiveOptions, ReceiveOutcome, ReceiveReport, Rx, Stack, StackStats,
+    StreamError, TcpConsumeError, UdpError, ValidatedSource,
 };
 pub use tcp::{TcpState, TcpStats};
 pub use udp_t::UdpRefuse;

@@ -1,5 +1,43 @@
 use super::*;
 
+/// Checksum provenance and admission for one ingress packet.
+pub struct ReceiveOptions<'a> {
+    ingress_at: Instant,
+    meta: RxMeta,
+    context: Option<SourceContext>,
+    service_at: Option<Instant>,
+    on_half_open: Option<&'a mut dyn FnMut(IpAddr) -> bool>,
+}
+
+impl<'a> ReceiveOptions<'a> {
+    pub fn new(ingress_at: Instant, meta: RxMeta) -> Self {
+        Self {
+            ingress_at,
+            meta,
+            context: None,
+            service_at: None,
+            on_half_open: None,
+        }
+    }
+
+    /// Requires source storage funded by [`Stack::prepare_source_context`].
+    pub fn with_context(mut self, context: SourceContext) -> Self {
+        self.context = Some(context);
+        self
+    }
+
+    /// The realm services timers at `service_at` and reserves each new half-open before admission.
+    pub fn with_realm(
+        mut self,
+        service_at: Instant,
+        on_half_open: &'a mut dyn FnMut(IpAddr) -> bool,
+    ) -> Self {
+        self.service_at = Some(service_at);
+        self.on_half_open = Some(on_half_open);
+        self
+    }
+}
+
 pub(crate) struct SourceReport<'a, F> {
     source: Option<ValidatedSource>,
     pub(crate) context: Option<SourceContext>,
@@ -63,8 +101,7 @@ impl Stack {
             .prepare_sources(self.cfg.max_flows as usize, budget)
     }
 
-    /// Receives one IP packet whose checksum the stack verifies. Same as
-    /// [`Stack::receive_with`] with [`RxMeta::VERIFY`].
+    /// Receives one IP packet with verified checksums and reporting disabled.
     pub fn receive(&mut self, now: Instant, packet: &[u8]) -> Rx {
         self.now = now;
         self.counters.rx_packets += 1;
@@ -76,107 +113,30 @@ impl Stack {
         )
     }
 
-    /// Reports only this input's completed, checksum-verified TCP/UDP identity. The
-    /// callback runs before protocol state mutation/UDP dispatch; false refuses this
-    /// packet as NotForUs. A receipt is still a validity fact, not admission evidence.
-    pub fn receive_with_source(
+    /// Reports verified source facts before protocol mutation and the resulting TCP/UDP outcome.
+    /// A refused source still has a receipt. Reassembled packets and existing TCP flows carry
+    /// their original source context. Only transparent stacks accept driver checksum metadata.
+    pub fn receive_reported(
         &mut self,
-        now: Instant,
         packet: &[u8],
-        on_source: impl FnMut(ValidatedSource) -> bool,
-    ) -> (Rx, Option<ValidatedSource>) {
-        let (rx, report) = self.receive_with_tcp_admission(now, packet, on_source);
-        (rx, report.source)
-    }
-
-    /// Reports actual protocol acceptance and the exact newly created passive incarnation.
-    /// A source receipt alone is not acceptance evidence.
-    pub fn receive_with_tcp_admission(
-        &mut self,
-        now: Instant,
-        packet: &[u8],
-        on_source: impl FnMut(ValidatedSource) -> bool,
+        options: ReceiveOptions<'_>,
+        on_source: impl FnMut(ValidatedSource, Option<SourceContext>) -> bool,
     ) -> (Rx, ReceiveReport) {
-        self.receive_with_meta_tcp_admission(now, packet, RxMeta::VERIFY, on_source)
-    }
-
-    /// Reports source and protocol acceptance with the driver's checksum/offload metadata.
-    /// The validation and Endpoint restrictions are identical to [`Stack::receive_with`].
-    pub fn receive_with_meta_tcp_admission(
-        &mut self,
-        now: Instant,
-        packet: &[u8],
-        meta: RxMeta,
-        mut on_source: impl FnMut(ValidatedSource) -> bool,
-    ) -> (Rx, ReceiveReport) {
-        self.receive_reporting(now, packet, meta, None, |source, _| on_source(source))
-    }
-
-    /// Carries an embedding's immutable source identity through actual protocol owners.
-    /// Completed reassembly and existing TCP input report their original retained snapshot.
-    /// Call `prepare_source_context` first; unprepared input is refused without mutation.
-    pub fn receive_with_context(
-        &mut self,
-        now: Instant,
-        packet: &[u8],
-        meta: RxMeta,
-        context: SourceContext,
-        mut on_source: impl FnMut(ValidatedSource, SourceContext) -> bool,
-    ) -> (Rx, ReceiveReport) {
-        if !self.table.has_sources() {
+        if options.context.is_some() && !self.table.has_sources() {
             return (
                 self.drop_packet(DropReason::Capacity),
                 ReceiveReport::default(),
             );
         }
-        self.receive_reporting(now, packet, meta, Some(context), |source, context| {
-            on_source(
-                source,
-                context.expect("contextual input retains its source"),
-            )
-        })
-    }
-
-    fn receive_reporting(
-        &mut self,
-        now: Instant,
-        packet: &[u8],
-        meta: RxMeta,
-        context: Option<SourceContext>,
-        on_source: impl FnMut(ValidatedSource, Option<SourceContext>) -> bool,
-    ) -> (Rx, ReceiveReport) {
-        self.now = now;
+        self.now = options.ingress_at;
         self.counters.rx_packets += 1;
-        let mut report = SourceReport::new(context, on_source);
-        let rx = self.receive_packet::<true>(now, packet, meta, &mut report);
-        (
-            rx,
-            ReceiveReport {
-                source: report.source,
-                source_context: report.source_context,
-                outcome: report.outcome,
-            },
-        )
-    }
-
-    /// Physical shard receive; the caller services due timers and drains lifecycle deltas
-    /// before this call and after binding any returned `TcpNew` grant.
-    pub fn receive_with_realm_admission(
-        &mut self,
-        ingress_at: Instant,
-        service_at: Instant,
-        packet: &[u8],
-        meta: RxMeta,
-        mut on_source: impl FnMut(ValidatedSource) -> bool,
-        mut on_half_open: impl FnMut(IpAddr) -> bool,
-    ) -> (Rx, ReceiveReport) {
-        self.now = ingress_at;
-        self.counters.rx_packets += 1;
-        let mut report = SourceReport::new(None, |source, _| on_source(source));
-        report.half_open = Some(&mut on_half_open);
-        report.service_at = Some(service_at);
-        let rx = self.receive_packet::<true>(ingress_at, packet, meta, &mut report);
-        self.now = service_at;
+        let mut report = SourceReport::new(options.context, on_source);
+        report.half_open = options.on_half_open;
+        report.service_at = options.service_at;
+        let rx = self.receive_packet::<true>(options.ingress_at, packet, options.meta, &mut report);
+        if let Some(service_at) = options.service_at {
+            self.now = service_at;
+        }
         (
             rx,
             ReceiveReport {
@@ -199,18 +159,15 @@ impl Stack {
     ) -> Result<ReceiveReport, E> {
         let now = self.now;
         let mut deferred = None;
-        let (rx, report) = self.receive_with_realm_admission(
-            ingress_at,
-            service_at,
+        let (rx, report) = self.receive_reported(
             packet,
-            RxMeta::VERIFY,
-            |source| {
+            ReceiveOptions::new(ingress_at, RxMeta::VERIFY).with_realm(service_at, &mut |_| false),
+            |source, _| {
                 on_source(source).unwrap_or_else(|reason| {
                     deferred = Some(reason);
                     false
                 })
             },
-            |_| false,
         );
         if let Some(reason) = deferred
             && matches!(rx, Rx::Dropped(DropReason::NotForUs))
@@ -250,24 +207,6 @@ impl Stack {
         }
         self.reasm
             .push_for_dispatch_at(ingress_at, service_at, fragment)
-    }
-
-    /// Receives one IP packet with what the driver knows about it: a trusted L4 checksum
-    /// ([`Csum::Valid`], [`Csum::Partial`]) and/or a GRO or USO super-packet. Offload metadata is
-    /// accepted only in [`Mode::Transparent`]; an endpoint stack drops any packet that carries it
-    /// as [`DropReason::Unsupported`], so a WireGuard driver can never skip verification. A claim
-    /// the packet contradicts (a `Partial` that does not point at the L4 checksum field, a segment
-    /// size of 0, a TCP size on a UDP packet, super-packet metadata on a fragment or ICMP) is
-    /// [`DropReason::Malformed`]. The IP header checksum and every ICMP checksum are always
-    /// verified, and so is a datagram reassembled from fragments.
-    ///
-    /// A TCP super-packet enters the receive ring as one contiguous segment; only the delayed-ACK
-    /// cadence counts `ceil(len / size)` full frames (see `Tcb::receive_data`). A UDP super-packet
-    /// surfaces as one [`Rx::TransparentSplit`].
-    pub fn receive_with(&mut self, now: Instant, packet: &[u8], meta: RxMeta) -> Rx {
-        self.now = now;
-        self.counters.rx_packets += 1;
-        self.receive_packet::<false>(now, packet, meta, &mut SourceReport::new(None, |_, _| true))
     }
 
     fn receive_packet<const REPORT: bool>(

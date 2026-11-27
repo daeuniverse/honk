@@ -141,6 +141,28 @@ fn syn(now: Instant) -> (Stack, FlowId, Vec<u8>) {
 }
 
 #[test]
+fn deferred_realm_tcp_restores_clock_and_drop_accounting() {
+    let now = Instant::now();
+    let ([mut server, _], budget, _) = shards(now, 4);
+    let (_, _, packet) = syn(now);
+    let ingress = now + Duration::from_secs(1);
+    let service = ingress + Duration::from_secs(2);
+    let _ = server.receive_reported(&packet, ReceiveOptions::new(now, RxMeta::VERIFY), |_, _| {
+        false
+    });
+    let before = server.stats();
+    let charge = budget.used();
+    assert_eq!(
+        server.try_receive_realm_tcp(ingress, service, &packet, |_| Err("defer")),
+        Err("defer")
+    );
+    assert_eq!(server.now, now);
+    assert_eq!(server.stats(), before);
+    assert_eq!(budget.used(), charge);
+    assert!(server.poll_accept().is_none());
+}
+
+#[test]
 fn realm_half_open_grants_only_valid_new_syns_and_releases_before_transport_tails() {
     let now = Instant::now();
     let ([mut server, other], budget, _) = shards(now, 4);
@@ -151,16 +173,13 @@ fn realm_half_open_grants_only_valid_new_syns_and_releases_before_transport_tail
     let mut grants = 0;
     assert_eq!(
         server
-            .receive_with_realm_admission(
-                now,
-                now,
+            .receive_reported(
                 &bad,
-                RxMeta::VERIFY,
-                |_| true,
-                |_| {
+                ReceiveOptions::new(now, RxMeta::VERIFY).with_realm(now, &mut |_| {
                     grants += 1;
                     true
-                }
+                }),
+                |_, _| true
             )
             .0,
         Rx::Dropped(DropReason::Checksum)
@@ -168,35 +187,33 @@ fn realm_half_open_grants_only_valid_new_syns_and_releases_before_transport_tail
     assert_eq!(grants, 0);
     assert_eq!(
         server
-            .receive_with_realm_admission(now, now, &packet, RxMeta::VERIFY, |_| true, |_| false)
+            .receive_reported(
+                &packet,
+                ReceiveOptions::new(now, RxMeta::VERIFY).with_realm(now, &mut |_| false),
+                |_, _| true
+            )
             .0,
         Rx::Dropped(DropReason::HalfOpen)
     );
     assert_eq!(budget.used(), baseline);
-    let (_, report) = server.receive_with_realm_admission(
-        now,
-        now,
+    let (_, report) = server.receive_reported(
         &packet,
-        RxMeta::VERIFY,
-        |_| true,
-        |_| {
+        ReceiveOptions::new(now, RxMeta::VERIFY).with_realm(now, &mut |_| {
             grants += 1;
             true
-        },
+        }),
+        |_, _| true,
     );
     let ReceiveOutcome::TcpNew(id) = report.outcome else {
         panic!("valid new SYN")
     };
-    server.receive_with_realm_admission(
-        now,
-        now,
+    server.receive_reported(
         &packet,
-        RxMeta::VERIFY,
-        |_| true,
-        |_| {
+        ReceiveOptions::new(now, RxMeta::VERIFY).with_realm(now, &mut |_| {
             grants += 1;
             true
-        },
+        }),
+        |_, _| true,
     );
     assert_eq!(grants, 1);
     assert_eq!(server.poll_accept().unwrap().id, id);
@@ -209,13 +226,12 @@ fn realm_half_open_grants_only_valid_new_syns_and_releases_before_transport_tail
     };
     client.receive(now, &out[..tx.len]);
     let n = client.poll_transmit(now, &mut out).unwrap();
-    server.receive_with_realm_admission(
-        now,
-        now,
+    server.receive_reported(
         &out[..n],
-        RxMeta::VERIFY,
-        |_| true,
-        |_| panic!("established input cannot reserve another half-open grant"),
+        ReceiveOptions::new(now, RxMeta::VERIFY).with_realm(now, &mut |_| {
+            panic!("established input cannot reserve another half-open grant")
+        }),
+        |_, _| true,
     );
     assert_eq!(client.tcp_state(client_id), Some(TcpState::Established));
     assert_eq!(server.poll_half_open_released(), Some(id));
@@ -231,8 +247,11 @@ fn realm_release_storage_is_bounded_and_refusal_releases_the_exact_generation() 
     let now = Instant::now();
     let ([mut server, other], budget, _) = shards(now, 1);
     let (_, _, packet) = syn(now);
-    let (_, report) =
-        server.receive_with_realm_admission(now, now, &packet, RxMeta::VERIFY, |_| true, |_| true);
+    let (_, report) = server.receive_reported(
+        &packet,
+        ReceiveOptions::new(now, RxMeta::VERIFY).with_realm(now, &mut |_| true),
+        |_, _| true,
+    );
     let ReceiveOutcome::TcpNew(first) = report.outcome else {
         panic!("new SYN")
     };
@@ -240,20 +259,22 @@ fn realm_release_storage_is_bounded_and_refusal_releases_the_exact_generation() 
     assert_eq!(server.stats().half_open, 0);
     assert_eq!(
         server
-            .receive_with_realm_admission(
-                now,
-                now,
+            .receive_reported(
                 &packet,
-                RxMeta::VERIFY,
-                |_| true,
-                |_| { panic!("full release storage must refuse before aggregate admission") }
+                ReceiveOptions::new(now, RxMeta::VERIFY).with_realm(now, &mut |_| {
+                    panic!("full release storage must refuse before aggregate admission")
+                }),
+                |_, _| true
             )
             .0,
         Rx::Dropped(DropReason::Capacity)
     );
     assert_eq!(server.poll_half_open_released(), Some(first));
-    let (_, report) =
-        server.receive_with_realm_admission(now, now, &packet, RxMeta::VERIFY, |_| true, |_| true);
+    let (_, report) = server.receive_reported(
+        &packet,
+        ReceiveOptions::new(now, RxMeta::VERIFY).with_realm(now, &mut |_| true),
+        |_, _| true,
+    );
     let ReceiveOutcome::TcpNew(second) = report.outcome else {
         panic!("reused tuple")
     };

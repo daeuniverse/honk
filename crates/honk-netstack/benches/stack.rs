@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use honk_netstack::wire::{self, tcp};
 use honk_netstack::{
-    AcceptOpts, Config, Csum, ExcludeSet, FlowId, GsoKind, GsoRx, Mode, Rx, RxMeta, Stack,
-    StreamError, TcpState, TxCaps,
+    AcceptOpts, Config, Csum, ExcludeSet, FlowId, GsoKind, GsoRx, Mode, ReceiveOptions, Rx, RxMeta,
+    Stack, StreamError, TcpState, TxCaps,
 };
 
 /// Config MTU 1420 minus IPv4 and TCP headers; no timestamps are negotiated.
@@ -268,7 +268,12 @@ fn deliver(f: &mut Flow, packets: &[Vec<u8>], read: &mut [u8]) {
         } else {
             RxMeta::VERIFY
         };
-        assert_eq!(f.stack.receive_with(f.now, p, meta), Rx::Consumed);
+        assert_eq!(
+            f.stack
+                .receive_reported(p, ReceiveOptions::new(f.now, meta), |_, _| true)
+                .0,
+            Rx::Consumed
+        );
         black_box(f.stack.tcp_read(f.id, read).unwrap());
         while f.stack.poll_transmit(f.now, &mut f.out).is_some() {}
     }

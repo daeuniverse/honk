@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use honk_netstack::wire;
 use honk_netstack::wire::tcp::{self, ACK, PSH};
-use honk_netstack::{Config, Csum, DropReason, GsoKind, GsoRx, Rx, RxMeta, Stack, StreamError};
+use honk_netstack::{
+    Config, Csum, DropReason, GsoKind, GsoRx, ReceiveOptions, Rx, RxMeta, Stack, StreamError,
+};
 use offload_common::*;
 
 const MSS: usize = 1368;
@@ -69,7 +71,12 @@ fn a_tcp_super_packet_is_one_contiguous_segment_with_intact_data_and_one_ack() {
     let data = pattern(40 * MSS + 17, 7);
     let segs = segments(&mut c, &data, MSS);
     let (pkt, meta) = gro(&segs, MSS as u16);
-    assert_eq!(c.stack.receive_with(c.now, &pkt, meta), Rx::Consumed);
+    assert_eq!(
+        c.stack
+            .receive_reported(&pkt, ReceiveOptions::new(c.now, meta), |_, _| true)
+            .0,
+        Rx::Consumed
+    );
     let out = acks(&mut c);
     assert_eq!(out.len(), 1, "one ACK for the whole run, not one per frame");
     assert_eq!(out[0].h.ack, c.seq, "it acknowledges everything");
@@ -102,19 +109,21 @@ fn metadata_admission_reports_the_exact_new_passive_flow() {
         ),
         16,
     );
-    let (rx, refused) = stack.receive_with_meta_tcp_admission(now, &syn, valid(), |_| false);
+    let (rx, refused) =
+        stack.receive_reported(&syn, ReceiveOptions::new(now, valid()), |_, _| false);
     assert_eq!(rx, Rx::Dropped(DropReason::NotForUs));
     assert!(refused.source.is_some());
     assert_eq!(refused.outcome, honk_netstack::ReceiveOutcome::Unqualified);
     assert!(stack.poll_accept().is_none());
-    let (rx, admitted) = stack.receive_with_meta_tcp_admission(now, &syn, valid(), |_| true);
+    let (rx, admitted) =
+        stack.receive_reported(&syn, ReceiveOptions::new(now, valid()), |_, _| true);
     assert_eq!(rx, Rx::Consumed);
     let new = stack.poll_accept().unwrap();
     assert_eq!(
         admitted.outcome,
         honk_netstack::ReceiveOutcome::TcpNew(new.id)
     );
-    let (_, retry) = stack.receive_with_meta_tcp_admission(now, &syn, valid(), |_| true);
+    let (_, retry) = stack.receive_reported(&syn, ReceiveOptions::new(now, valid()), |_, _| true);
     assert_eq!(retry.outcome, honk_netstack::ReceiveOutcome::Unqualified);
     assert!(stack.poll_accept().is_none());
 }
@@ -127,21 +136,21 @@ fn metadata_reporting_gates_gro_before_mutation_and_keeps_original_flow() {
     let (packet, meta) = gro(&segs, MSS as u16);
     let packet = corrupt_l4(packet, 16);
     let mut callbacks = 0;
-    let (rx, refused) = c
-        .stack
-        .receive_with_meta_tcp_admission(c.now, &packet, meta, |source| {
-            callbacks += 1;
-            assert_eq!((source.src, source.dst), (c.client, c.dst));
-            false
-        });
+    let (rx, refused) =
+        c.stack
+            .receive_reported(&packet, ReceiveOptions::new(c.now, meta), |source, _| {
+                callbacks += 1;
+                assert_eq!((source.src, source.dst), (c.client, c.dst));
+                false
+            });
     assert_eq!(rx, Rx::Dropped(DropReason::NotForUs));
     assert_eq!(callbacks, 1);
     assert!(refused.source.is_some());
     assert_eq!(refused.outcome, honk_netstack::ReceiveOutcome::Unqualified);
     assert!(read_all(&mut c).is_empty());
-    let (rx, accepted) = c
-        .stack
-        .receive_with_meta_tcp_admission(c.now, &packet, meta, |_| true);
+    let (rx, accepted) =
+        c.stack
+            .receive_reported(&packet, ReceiveOptions::new(c.now, meta), |_, _| true);
     assert_eq!(rx, Rx::Consumed);
     assert_eq!(accepted.source, refused.source);
     assert_eq!(
@@ -149,9 +158,11 @@ fn metadata_reporting_gates_gro_before_mutation_and_keeps_original_flow() {
         honk_netstack::ReceiveOutcome::TcpAccepted(c.id)
     );
     assert_eq!(read_all(&mut c), data);
-    let (rx, invalid) = c.stack.receive_with_tcp_admission(c.now, &packet, |_| {
-        panic!("VERIFY reporting must not inherit earlier metadata")
-    });
+    let (rx, invalid) = c.stack.receive_reported(
+        &packet,
+        ReceiveOptions::new(c.now, RxMeta::VERIFY),
+        |_, _| panic!("VERIFY reporting must not inherit earlier metadata"),
+    );
     assert_eq!(rx, Rx::Dropped(DropReason::Checksum));
     assert_eq!(invalid.source, None);
     assert_eq!(invalid.outcome, honk_netstack::ReceiveOutcome::Unqualified);
@@ -174,7 +185,8 @@ fn ack_cadence_counts_full_frames_of_a_super_packet() {
 
     let segs = segments(&mut c, &pattern(MSS, 2), MSS);
     let (pkt, meta) = gro(&segs, MSS as u16);
-    c.stack.receive_with(c.now, &pkt, meta);
+    c.stack
+        .receive_reported(&pkt, ReceiveOptions::new(c.now, meta), |_, _| true);
     assert!(
         acks(&mut c).is_empty(),
         "ceil(len/size) = 1 frame: still delayed"
@@ -186,7 +198,8 @@ fn ack_cadence_counts_full_frames_of_a_super_packet() {
     // Two frames are two full segments: acknowledge now, once, for both.
     let segs = segments(&mut c, &pattern(2 * MSS, 3), MSS);
     let (pkt, meta) = gro(&segs, MSS as u16);
-    c.stack.receive_with(c.now, &pkt, meta);
+    c.stack
+        .receive_reported(&pkt, ReceiveOptions::new(c.now, meta), |_, _| true);
     let out = acks(&mut c);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].h.ack, c.seq);
@@ -194,7 +207,8 @@ fn ack_cadence_counts_full_frames_of_a_super_packet() {
     // A short second frame still counts as a frame: ceil(1378 / 1368) = 2.
     let segs = segments(&mut c, &pattern(MSS + 10, 3), MSS);
     let (pkt, meta) = gro(&segs, MSS as u16);
-    c.stack.receive_with(c.now, &pkt, meta);
+    c.stack
+        .receive_reported(&pkt, ReceiveOptions::new(c.now, meta), |_, _| true);
     assert_eq!(acks(&mut c).len(), 1);
 
     // One frame left waiting, then a super-packet: the ACK covers both.
@@ -202,7 +216,8 @@ fn ack_cadence_counts_full_frames_of_a_super_packet() {
     assert!(acks(&mut c).is_empty());
     let segs = segments(&mut c, &pattern(3 * MSS, 4), MSS);
     let (pkt, meta) = gro(&segs, MSS as u16);
-    c.stack.receive_with(c.now, &pkt, meta);
+    c.stack
+        .receive_reported(&pkt, ReceiveOptions::new(c.now, meta), |_, _| true);
     let out = acks(&mut c);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].h.ack, c.seq);
@@ -231,7 +246,8 @@ fn out_of_order_super_packets_generate_exact_sack_blocks_and_fill_in_order() {
     // Segments 0..10 are lost; 10..20 and 25..30 arrive as two super-packets.
     let (a, ma) = gro(&segs[10..20], MSS as u16);
     let (b, mb) = gro(&segs[25..30], MSS as u16);
-    c.stack.receive_with(c.now, &a, ma);
+    c.stack
+        .receive_reported(&a, ReceiveOptions::new(c.now, ma), |_, _| true);
     let out = acks(&mut c);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].h.ack, first, "a duplicate ACK, nothing advanced");
@@ -240,7 +256,8 @@ fn out_of_order_super_packets_generate_exact_sack_blocks_and_fill_in_order() {
         out[0].h.options.sack.as_slice(),
         &[(lo, lo + (10 * MSS) as u32)]
     );
-    c.stack.receive_with(c.now, &b, mb);
+    c.stack
+        .receive_reported(&b, ReceiveOptions::new(c.now, mb), |_, _| true);
     let out = acks(&mut c);
     assert_eq!(out.len(), 1);
     let blocks = out[0].h.options.sack.as_slice();
@@ -253,7 +270,8 @@ fn out_of_order_super_packets_generate_exact_sack_blocks_and_fill_in_order() {
     );
     // A duplicate super-packet is reported as a DSACK.
     let (a2, ma2) = gro(&segs[10..20], MSS as u16);
-    c.stack.receive_with(c.now, &a2, ma2);
+    c.stack
+        .receive_reported(&a2, ReceiveOptions::new(c.now, ma2), |_, _| true);
     let out = acks(&mut c);
     assert_eq!(
         out[0].h.options.sack.as_slice()[0],
@@ -261,11 +279,13 @@ fn out_of_order_super_packets_generate_exact_sack_blocks_and_fill_in_order() {
     );
     // The hole is filled by one more super-packet: the ACK jumps over everything held.
     let (h, mh) = gro(&segs[0..10], MSS as u16);
-    c.stack.receive_with(c.now, &h, mh);
+    c.stack
+        .receive_reported(&h, ReceiveOptions::new(c.now, mh), |_, _| true);
     let out = acks(&mut c);
     assert_eq!(out.last().unwrap().h.ack, first + (20 * MSS) as u32);
     let (m, mm) = gro(&segs[20..25], MSS as u16);
-    c.stack.receive_with(c.now, &m, mm);
+    c.stack
+        .receive_reported(&m, ReceiveOptions::new(c.now, mm), |_, _| true);
     let out = acks(&mut c);
     assert_eq!(out.last().unwrap().h.ack, first + (30 * MSS) as u32);
     assert!(read_all(&mut c) == data);
@@ -283,11 +303,17 @@ fn paws_and_timestamps_see_a_super_packet_as_one_segment() {
     let stale = (c.ts - 100).to_be_bytes();
     old[ts_off..ts_off + 4].copy_from_slice(&stale);
     // The corrupted option bytes break the IP-independent checksum, which the metadata vouches for.
-    assert_eq!(c.stack.receive_with(c.now, &old, meta), Rx::Consumed);
+    assert_eq!(
+        c.stack
+            .receive_reported(&old, ReceiveOptions::new(c.now, meta), |_, _| true)
+            .0,
+        Rx::Consumed
+    );
     assert!(read_all(&mut c).is_empty(), "PAWS dropped it");
     // A fresh one is accepted and its first timestamp is remembered.
     let (new, meta) = gro(&segs, MSS as u16);
-    c.stack.receive_with(c.now, &new, meta);
+    c.stack
+        .receive_reported(&new, ReceiveOptions::new(c.now, meta), |_, _| true);
     assert_eq!(read_all(&mut c).len(), 8 * MSS);
     let out = acks(&mut c);
     assert_eq!(out.last().unwrap().h.ack, before + (8 * MSS) as u32);
@@ -303,7 +329,8 @@ fn a_super_packet_larger_than_the_window_is_trimmed_like_any_segment() {
     let window = c.stack.tcp_stats(c.id).unwrap().receive_window as usize;
     let segs = segments(&mut c, &pattern(40 * MSS, 5), MSS);
     let (pkt, meta) = gro(&segs, MSS as u16);
-    c.stack.receive_with(c.now, &pkt, meta);
+    c.stack
+        .receive_reported(&pkt, ReceiveOptions::new(c.now, meta), |_, _| true);
     let got = read_all(&mut c);
     assert!(
         got.len() <= window.max(1) && !got.is_empty(),
@@ -365,12 +392,21 @@ fn offload_metadata_is_refused_by_an_endpoint_stack() {
             }),
         },
     ] {
-        assert_eq!(s.receive_with(now, &bad, meta), unsupported);
-        assert_eq!(s.receive_with(now, &good, meta), unsupported);
+        assert_eq!(
+            s.receive_reported(&bad, ReceiveOptions::new(now, meta), |_, _| true)
+                .0,
+            unsupported
+        );
+        assert_eq!(
+            s.receive_reported(&good, ReceiveOptions::new(now, meta), |_, _| true)
+                .0,
+            unsupported
+        );
         for packet in [&bad, &good] {
-            let (rx, report) = s.receive_with_meta_tcp_admission(now, packet, meta, |_| {
-                panic!("Endpoint metadata must be rejected before source reporting")
-            });
+            let (rx, report) =
+                s.receive_reported(packet, ReceiveOptions::new(now, meta), |_, _| {
+                    panic!("Endpoint metadata must be rejected before source reporting")
+                });
             assert_eq!(rx, unsupported);
             assert_eq!(report.source, None);
             assert_eq!(report.outcome, honk_netstack::ReceiveOutcome::Unqualified);
@@ -384,11 +420,20 @@ fn offload_metadata_is_refused_by_an_endpoint_stack() {
     );
     // The plain metadata keeps the always-verify rule: a corrupt checksum is dropped.
     assert_eq!(
-        s.receive_with(now, &bad, RxMeta::VERIFY),
+        s.receive_reported(&bad, ReceiveOptions::new(now, RxMeta::VERIFY), |_, _| true)
+            .0,
         Rx::Dropped(DropReason::Checksum)
     );
     assert_eq!(s.receive(now, &bad), Rx::Dropped(DropReason::Checksum));
-    assert_eq!(s.receive_with(now, &good, RxMeta::default()), Rx::Consumed);
+    assert_eq!(
+        s.receive_reported(
+            &good,
+            ReceiveOptions::new(now, RxMeta::default()),
+            |_, _| true
+        )
+        .0,
+        Rx::Consumed
+    );
     assert_eq!(s.tcp_read(id, &mut out), Ok(100));
     let stats = s.stats();
     assert_eq!(stats.drops[DropReason::Unsupported as usize], 12);
@@ -401,11 +446,20 @@ fn a_transparent_stack_takes_the_drivers_word_for_tcp_and_udp_checksums() {
     let start = wire::parse_ip(&p).unwrap().payload.start;
     let bad = corrupt_l4(p.clone(), 16);
     assert_eq!(
-        c.stack.receive_with(c.now, &bad, RxMeta::VERIFY),
+        c.stack
+            .receive_reported(&bad, ReceiveOptions::new(c.now, RxMeta::VERIFY), |_, _| {
+                true
+            })
+            .0,
         Rx::Dropped(DropReason::Checksum)
     );
     assert!(read_all(&mut c).is_empty());
-    assert_eq!(c.stack.receive_with(c.now, &bad, valid()), Rx::Consumed);
+    assert_eq!(
+        c.stack
+            .receive_reported(&bad, ReceiveOptions::new(c.now, valid()), |_, _| true)
+            .0,
+        Rx::Consumed
+    );
     assert_eq!(read_all(&mut c).len(), 300);
     // CHECKSUM_PARTIAL: the field is only a seed and is not looked at.
     let p2 = c.client_pkt(ACK, &pattern(300, 2), &[]);
@@ -426,14 +480,26 @@ fn a_transparent_stack_takes_the_drivers_word_for_tcp_and_udp_checksums() {
         (0, 0),
     ] {
         assert_eq!(
-            c.stack.receive_with(c.now, &seeded, partial(s, o)),
+            c.stack
+                .receive_reported(
+                    &seeded,
+                    ReceiveOptions::new(c.now, partial(s, o)),
+                    |_, _| true
+                )
+                .0,
             Rx::Dropped(DropReason::Malformed),
             "start {s} offset {o}"
         );
     }
     assert!(read_all(&mut c).is_empty());
     assert_eq!(
-        c.stack.receive_with(c.now, &seeded, partial(start, 16)),
+        c.stack
+            .receive_reported(
+                &seeded,
+                ReceiveOptions::new(c.now, partial(start, 16)),
+                |_, _| true
+            )
+            .0,
         Rx::Consumed
     );
     assert_eq!(read_all(&mut c).len(), 300);
@@ -444,19 +510,39 @@ fn a_transparent_stack_takes_the_drivers_word_for_tcp_and_udp_checksums() {
     let n = wire::udp::emit_packet(&mut b, src, dst, &pattern(200, 3)).unwrap();
     let udp = corrupt_l4(b[..n].to_vec(), 6);
     assert_eq!(
-        c.stack.receive_with(c.now, &udp, RxMeta::VERIFY),
+        c.stack
+            .receive_reported(&udp, ReceiveOptions::new(c.now, RxMeta::VERIFY), |_, _| {
+                true
+            })
+            .0,
         Rx::Dropped(DropReason::Checksum)
     );
-    let Rx::Transparent { payload, .. } = c.stack.receive_with(c.now, &udp, valid()) else {
+    let Rx::Transparent { payload, .. } = c
+        .stack
+        .receive_reported(&udp, ReceiveOptions::new(c.now, valid()), |_, _| true)
+        .0
+    else {
         panic!("a vouched datagram is delivered")
     };
     assert_eq!(payload.len(), 200);
     assert!(matches!(
-        c.stack.receive_with(c.now, &udp, partial(start, 6)),
+        c.stack
+            .receive_reported(
+                &udp,
+                ReceiveOptions::new(c.now, partial(start, 6)),
+                |_, _| true
+            )
+            .0,
         Rx::Transparent { .. }
     ));
     assert_eq!(
-        c.stack.receive_with(c.now, &udp, partial(start, 16)),
+        c.stack
+            .receive_reported(
+                &udp,
+                ReceiveOptions::new(c.now, partial(start, 16)),
+                |_, _| true
+            )
+            .0,
         Rx::Dropped(DropReason::Malformed)
     );
 }
@@ -468,7 +554,9 @@ fn the_ip_header_icmp_and_reassembled_datagrams_are_always_verified() {
     let mut p = c.client_pkt(ACK, &pattern(50, 1), &[]);
     p[10] ^= 1;
     assert_eq!(
-        c.stack.receive_with(c.now, &p, valid()),
+        c.stack
+            .receive_reported(&p, ReceiveOptions::new(c.now, valid()), |_, _| true)
+            .0,
         Rx::Dropped(DropReason::Checksum)
     );
     // ICMP.
@@ -486,7 +574,9 @@ fn the_ip_header_icmp_and_reassembled_datagrams_are_always_verified() {
     let last = icmp.len() - 1;
     icmp[last] ^= 1;
     assert_eq!(
-        c.stack.receive_with(c.now, &icmp, valid()),
+        c.stack
+            .receive_reported(&icmp, ReceiveOptions::new(c.now, valid()), |_, _| true)
+            .0,
         Rx::Dropped(DropReason::Checksum)
     );
     // A UDP datagram reassembled from fragments is verified whatever the fragments claimed.
@@ -496,22 +586,30 @@ fn the_ip_header_icmp_and_reassembled_datagrams_are_always_verified() {
     let whole = corrupt_l4(b[..n].to_vec(), 6);
     let frags = fragment_v4(&whole, 1200);
     assert_eq!(
-        c.stack.receive_with(c.now, &frags[0], valid()),
+        c.stack
+            .receive_reported(&frags[0], ReceiveOptions::new(c.now, valid()), |_, _| true)
+            .0,
         Rx::Consumed
     );
     assert_eq!(
-        c.stack.receive_with(c.now, &frags[1], valid()),
+        c.stack
+            .receive_reported(&frags[1], ReceiveOptions::new(c.now, valid()), |_, _| true)
+            .0,
         Rx::Dropped(DropReason::Checksum)
     );
     // The same fragments with a good checksum are delivered.
     let good = b[..n].to_vec();
     let frags = fragment_v4(&good, 1200);
     assert_eq!(
-        c.stack.receive_with(c.now, &frags[0], valid()),
+        c.stack
+            .receive_reported(&frags[0], ReceiveOptions::new(c.now, valid()), |_, _| true)
+            .0,
         Rx::Consumed
     );
     assert!(matches!(
-        c.stack.receive_with(c.now, &frags[1], valid()),
+        c.stack
+            .receive_reported(&frags[1], ReceiveOptions::new(c.now, valid()), |_, _| true)
+            .0,
         Rx::TransparentOwned { .. }
     ));
 }
@@ -575,7 +673,10 @@ fn a_uso_super_packet_splits_into_datagrams_by_size() {
             dscp,
             payload: range,
             size,
-        } = c.stack.receive_with(c.now, &pkt, meta)
+        } = c
+            .stack
+            .receive_reported(&pkt, ReceiveOptions::new(c.now, meta), |_, _| true)
+            .0
         else {
             panic!("expected a split for {csum:?}")
         };
@@ -596,7 +697,11 @@ fn a_uso_super_packet_splits_into_datagrams_by_size() {
         csum: Csum::Verify,
         gso: Some(uso(1000)),
     };
-    let Rx::Transparent { payload, .. } = c.stack.receive_with(c.now, &one, meta) else {
+    let Rx::Transparent { payload, .. } = c
+        .stack
+        .receive_reported(&one, ReceiveOptions::new(c.now, meta), |_, _| true)
+        .0
+    else {
         panic!("a single datagram")
     };
     assert_eq!(one[payload], p1[..]);
@@ -607,7 +712,9 @@ fn a_uso_super_packet_splits_into_datagrams_by_size() {
         gso: Some(uso(1000)),
     };
     assert_eq!(
-        c.stack.receive_with(c.now, &bad, meta),
+        c.stack
+            .receive_reported(&bad, ReceiveOptions::new(c.now, meta), |_, _| true)
+            .0,
         Rx::Dropped(DropReason::Checksum)
     );
 }
@@ -622,30 +729,61 @@ fn contradictory_gso_metadata_is_malformed() {
         gso: Some(gso),
     };
     // Size 0, the wrong protocol, and more than the kernel's 128 segments.
-    assert_eq!(c.stack.receive_with(c.now, &udp, with(uso(0))), malformed);
+    assert_eq!(
+        c.stack
+            .receive_reported(&udp, ReceiveOptions::new(c.now, with(uso(0))), |_, _| true)
+            .0,
+        malformed
+    );
     let tcp_kind = GsoRx {
         kind: GsoKind::Tcp,
         size: 500,
     };
-    assert_eq!(c.stack.receive_with(c.now, &udp, with(tcp_kind)), malformed);
+    assert_eq!(
+        c.stack
+            .receive_reported(&udp, ReceiveOptions::new(c.now, with(tcp_kind)), |_, _| {
+                true
+            })
+            .0,
+        malformed
+    );
     let (many, _) = udp_super(130, 10, 10);
-    assert_eq!(c.stack.receive_with(c.now, &many, with(uso(10))), malformed);
+    assert_eq!(
+        c.stack
+            .receive_reported(&many, ReceiveOptions::new(c.now, with(uso(10))), |_, _| {
+                true
+            })
+            .0,
+        malformed
+    );
     let (ok, _) = udp_super(128, 10, 10);
     assert!(matches!(
-        c.stack.receive_with(c.now, &ok, with(uso(10))),
+        c.stack
+            .receive_reported(&ok, ReceiveOptions::new(c.now, with(uso(10))), |_, _| true)
+            .0,
         Rx::TransparentSplit { .. }
     ));
     let t = c.client_pkt(ACK, &pattern(100, 1), &[]);
-    assert_eq!(c.stack.receive_with(c.now, &t, with(uso(50))), malformed);
     assert_eq!(
-        c.stack.receive_with(
-            c.now,
-            &t,
-            with(GsoRx {
-                size: 0,
-                ..tcp_kind
-            })
-        ),
+        c.stack
+            .receive_reported(&t, ReceiveOptions::new(c.now, with(uso(50))), |_, _| true)
+            .0,
+        malformed
+    );
+    assert_eq!(
+        c.stack
+            .receive_reported(
+                &t,
+                ReceiveOptions::new(
+                    c.now,
+                    with(GsoRx {
+                        size: 0,
+                        ..tcp_kind
+                    })
+                ),
+                |_, _| true
+            )
+            .0,
         malformed
     );
     // Super-packet metadata on an ICMP message or a fragment has no meaning.
@@ -653,13 +791,25 @@ fn contradictory_gso_metadata_is_malformed() {
     let n = wire::icmp::emit_packet_too_big(&mut icmp, addr(CLIENT).ip(), addr(DST).ip(), 1000, &t)
         .unwrap();
     assert_eq!(
-        c.stack.receive_with(c.now, &icmp[..n], with(tcp_kind)),
+        c.stack
+            .receive_reported(
+                &icmp[..n],
+                ReceiveOptions::new(c.now, with(tcp_kind)),
+                |_, _| true
+            )
+            .0,
         malformed
     );
     let (big, _) = udp_super(3, 800, 800);
     let frags = fragment_v4(&big, 1200);
     assert_eq!(
-        c.stack.receive_with(c.now, &frags[0], with(uso(800))),
+        c.stack
+            .receive_reported(
+                &frags[0],
+                ReceiveOptions::new(c.now, with(uso(800))),
+                |_, _| true
+            )
+            .0,
         malformed
     );
     assert_eq!(c.stack.stats().drops[DropReason::Malformed as usize], 7);

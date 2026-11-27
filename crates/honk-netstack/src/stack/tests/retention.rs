@@ -57,9 +57,11 @@ fn retained_time_wait(now: Instant, source: Option<SourceContext>) -> (Stack, Fl
             let rx = match source {
                 Some(source) => {
                     client
-                        .receive_with_context(now, &packet[..n], RxMeta::VERIFY, source, |_, _| {
-                            true
-                        })
+                        .receive_reported(
+                            &packet[..n],
+                            ReceiveOptions::new(now, RxMeta::VERIFY).with_context(source),
+                            |_, _| true,
+                        )
                         .0
                 }
                 None => client.receive(now, &packet[..n]),
@@ -205,12 +207,20 @@ fn source_survives_retained_and_exhausted_time_wait_until_a_legal_reopen() {
             generation,
             ..original
         };
-        let (rx, _) = stack.receive_with_context(now, &fin, RxMeta::VERIFY, foreign, |_, _| true);
+        let (rx, _) = stack.receive_reported(
+            &fin,
+            ReceiveOptions::new(now, RxMeta::VERIFY).with_context(foreign),
+            |_, _| true,
+        );
         assert_eq!(rx, Rx::Dropped(DropReason::NotForUs));
-        stack.receive_with_context(now, &fin, RxMeta::VERIFY, newer, |_, effective| {
-            assert_eq!(effective, source);
-            true
-        });
+        stack.receive_reported(
+            &fin,
+            ReceiveOptions::new(now, RxMeta::VERIFY).with_context(newer),
+            |_, effective| {
+                assert_eq!(effective, Some(source));
+                true
+            },
+        );
         let mut packet = [0; 2000];
         let retained = stack
             .poll_transmit_with(now, &mut packet, TxCaps::NONE)
@@ -226,14 +236,22 @@ fn source_survives_retained_and_exhausted_time_wait_until_a_legal_reopen() {
         let late = now + Duration::from_secs(30);
         assert_eq!(
             stack
-                .receive_with_context(late, &fin, RxMeta::VERIFY, foreign, |_, _| true)
+                .receive_reported(
+                    &fin,
+                    ReceiveOptions::new(late, RxMeta::VERIFY).with_context(foreign),
+                    |_, _| true
+                )
                 .0,
             Rx::Dropped(DropReason::NotForUs)
         );
-        stack.receive_with_context(late, &fin, RxMeta::VERIFY, newer, |_, effective| {
-            assert_eq!(effective, source);
-            true
-        });
+        stack.receive_reported(
+            &fin,
+            ReceiveOptions::new(late, RxMeta::VERIFY).with_context(newer),
+            |_, effective| {
+                assert_eq!(effective, Some(source));
+                true
+            },
+        );
         let old_output = stack
             .poll_transmit_with(late, &mut packet, TxCaps::NONE)
             .unwrap();
@@ -275,17 +293,24 @@ fn source_survives_retained_and_exhausted_time_wait_until_a_legal_reopen() {
         let stale = syn(sequence.wrapping_sub(1), timestamp);
         assert_eq!(
             stack
-                .receive_with_context(late, &stale, RxMeta::VERIFY, foreign, |_, _| true)
+                .receive_reported(
+                    &stale,
+                    ReceiveOptions::new(late, RxMeta::VERIFY).with_context(foreign),
+                    |_, _| true
+                )
                 .0,
             Rx::Dropped(DropReason::NotForUs)
         );
         assert!(stack.tcp_retained(id));
         let fresh = syn(sequence.wrapping_add(100_000), timestamp.wrapping_add(1));
-        let (rx, report) =
-            stack.receive_with_context(late, &fresh, RxMeta::VERIFY, foreign, |_, effective| {
-                assert_eq!(effective, foreign);
+        let (rx, report) = stack.receive_reported(
+            &fresh,
+            ReceiveOptions::new(late, RxMeta::VERIFY).with_context(foreign),
+            |_, effective| {
+                assert_eq!(effective, Some(foreign));
                 true
-            });
+            },
+        );
         assert_eq!(rx, Rx::Consumed);
         let ReceiveOutcome::TcpNew(new) = report.outcome else {
             panic!("legal SYN did not reopen TIME_WAIT")

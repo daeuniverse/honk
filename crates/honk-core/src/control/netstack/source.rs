@@ -940,11 +940,11 @@ impl PacketScope {
                         .is_some_and(|source| source.lineage == context.lineage)
                 }));
             let sources = &inner.source_work;
-            let (rx, report) = inner
-                .stack
-                .as_mut()
-                .expect("live scope")
-                .receive_with_context(packet_now, packet, meta, context, |source, effective| {
+            let (rx, report) = inner.stack.as_mut().expect("live scope").receive_reported(
+                packet,
+                ReceiveOptions::new(packet_now, meta).with_context(context),
+                |source, effective| {
+                    let effective = effective.expect("contextual input retains its source");
                     expected.is_none_or(|expected| expected == effective)
                         && on_source(
                             source,
@@ -954,7 +954,8 @@ impl PacketScope {
                                 .expect("retained completed Host facts"),
                             pending,
                         )
-                });
+                },
+            );
             inner.register_tcp_new(&report, admission, None);
             let retained = if matches!(&rx, Rx::TransparentOwned { .. }) {
                 Some(SourceWork::retained(

@@ -33,12 +33,11 @@ impl<'a> RealmRxBatch<'a> {
             path,
             can_batch,
             |stack, peer, checked| {
-                let (_, report) = stack.receive_with_realm_admission(
-                    ingress_at,
-                    service_at,
+                let (_, report) = stack.receive_reported(
                     packet,
-                    RxMeta::VERIFY,
-                    |source| {
+                    ReceiveOptions::new(ingress_at, RxMeta::VERIFY)
+                        .with_realm(service_at, &mut |_| false),
+                    |source, _| {
                         peers
                             .confirm_tcp::<false>(
                                 peer,
@@ -50,7 +49,6 @@ impl<'a> RealmRxBatch<'a> {
                             )
                             .unwrap_or(false)
                     },
-                    |_| false,
                 );
                 Ok::<_, std::convert::Infallible>(report)
             },
@@ -563,8 +561,11 @@ impl Inner {
             let Some(stack) = &mut self.stack else {
                 return (Rx::Dropped(DropReason::Stale), Default::default());
             };
-            let (rx, report) =
-                stack.receive_with_meta_tcp_admission(ingress_at, packet, meta, on_source);
+            let (rx, report) = stack.receive_reported(
+                packet,
+                ReceiveOptions::new(ingress_at, meta),
+                |source, _| on_source(source),
+            );
             if let Some(routing) = routing
                 && let honk_netstack::ReceiveOutcome::TcpNew(id) = report.outcome
             {
@@ -585,22 +586,9 @@ impl Inner {
         };
         let (rx, report) = {
             let _unwind = AdmissionUnwind(self.capture_admission.as_deref());
-            stack.receive_with_realm_admission(
-                ingress_at,
-                service_at,
+            stack.receive_reported(
                 packet,
-                meta,
-                |source| {
-                    if track
-                        && source
-                            .tcp_flags
-                            .is_some_and(|flags| flags & honk_netstack::wire::tcp::SYN != 0)
-                    {
-                        tuple.set(Some((source.src, source.dst)));
-                    }
-                    on_source(source)
-                },
-                |address| {
+                ReceiveOptions::new(ingress_at, meta).with_realm(service_at, &mut |address| {
                     let Some(index) = self.half_open.iter().position(Option::is_none) else {
                         return false;
                     };
@@ -622,6 +610,16 @@ impl Inner {
                     }
                     grant = Some((index, hold));
                     true
+                }),
+                |source, _| {
+                    if track
+                        && source
+                            .tcp_flags
+                            .is_some_and(|flags| flags & honk_netstack::wire::tcp::SYN != 0)
+                    {
+                        tuple.set(Some((source.src, source.dst)));
+                    }
+                    on_source(source)
                 },
             )
         };

@@ -1,5 +1,7 @@
 use super::*;
-use honk_netstack::{ReceiveOutcome, RxMeta, SourceContext, TxCaps, ValidatedSource, wire};
+use honk_netstack::{
+    ReceiveOutcome, ReceiveReport, RxMeta, SourceContext, TxCaps, ValidatedSource, wire,
+};
 use std::num::NonZeroU64;
 
 fn fragmented(packet: &[u8], id: u32) -> Vec<Vec<u8>> {
@@ -72,10 +74,14 @@ fn fragmented_current_source_never_comes_from_an_older_pending_syn() {
             let mut reported = Vec::new();
             let mut new_id = None;
             for (index, fragment) in fragments.iter().enumerate() {
-                let (rx, report) = stack.receive_with_tcp_admission(now, fragment, |source| {
-                    reported.push(source);
-                    true
-                });
+                let (rx, report) = stack.receive_reported(
+                    fragment,
+                    ReceiveOptions::new(now, RxMeta::VERIFY),
+                    |source, _| {
+                        reported.push(source);
+                        true
+                    },
+                );
                 let source = report.source;
                 if index + 1 == fragments.len() {
                     assert_eq!(source, Some(expected));
@@ -116,18 +122,20 @@ fn fragmented_current_source_never_comes_from_an_older_pending_syn() {
             *corrupt.last_mut().unwrap() ^= 1;
             let fragments = fragmented(&corrupt, 18);
             for (index, fragment) in fragments.iter().enumerate() {
-                let (rx, source) = stack.receive_with_source(now, fragment, |_| {
-                    panic!("invalid completed transport supplied a receipt")
-                });
+                let (rx, ReceiveReport { source, .. }) = stack.receive_reported(
+                    fragment,
+                    ReceiveOptions::new(now, RxMeta::VERIFY),
+                    |_, _| panic!("invalid completed transport supplied a receipt"),
+                );
                 assert_eq!(source, None);
                 if index + 1 == fragments.len() {
                     assert_eq!(rx, Rx::Dropped(DropReason::Checksum));
                 }
             }
-            let (rx, source) = stack.receive_with_source(
-                now,
+            let (rx, ReceiveReport { source, .. }) = stack.receive_reported(
                 &fragmented(&packet(current, destination, protocol), 19)[0],
-                |_| panic!("incomplete fragment supplied a stale receipt"),
+                ReceiveOptions::new(now, RxMeta::VERIFY),
+                |_, _| panic!("incomplete fragment supplied a stale receipt"),
             );
             assert_eq!(rx, Rx::Consumed);
             assert_eq!(source, None);
@@ -145,9 +153,16 @@ fn checksum_failure_never_reports_and_callback_refusal_precedes_protocol_admissi
         let input = packet(source, destination, protocol);
         let mut corrupt = input.clone();
         *corrupt.last_mut().unwrap() ^= 1;
-        let (rx, receipt) = stack.receive_with_source(now, &corrupt, |_| {
-            panic!("checksum failure reached source callback")
-        });
+        let (
+            rx,
+            ReceiveReport {
+                source: receipt, ..
+            },
+        ) = stack.receive_reported(
+            &corrupt,
+            ReceiveOptions::new(now, RxMeta::VERIFY),
+            |_, _| panic!("checksum failure reached source callback"),
+        );
         assert_eq!((rx, receipt), (Rx::Dropped(DropReason::Checksum), None));
         let expected = ValidatedSource {
             src: source,
@@ -156,11 +171,20 @@ fn checksum_failure_never_reports_and_callback_refusal_precedes_protocol_admissi
             tcp_flags: (protocol == wire::PROTO_TCP).then_some(SYN),
         };
         let mut callbacks = 0;
-        let (rx, receipt) = stack.receive_with_source(now, &input, |receipt| {
-            callbacks += 1;
-            assert_eq!(receipt, expected);
-            false
-        });
+        let (
+            rx,
+            ReceiveReport {
+                source: receipt, ..
+            },
+        ) = stack.receive_reported(
+            &input,
+            ReceiveOptions::new(now, RxMeta::VERIFY),
+            |receipt, _| {
+                callbacks += 1;
+                assert_eq!(receipt, expected);
+                false
+            },
+        );
         assert_eq!(callbacks, 1);
         assert_eq!(
             (rx, receipt),
@@ -202,7 +226,10 @@ fn report_pair(
     now: Instant,
     packet: &[u8],
 ) -> honk_netstack::ReceiveReport {
-    let (rx, report) = reported.receive_with_tcp_admission(now, packet, |_| true);
+    let (rx, report) =
+        reported.receive_reported(packet, ReceiveOptions::new(now, RxMeta::VERIFY), |_, _| {
+            true
+        });
     assert_eq!(rx, ordinary.receive(now, packet));
     matching_output(reported, ordinary, now);
     report
@@ -321,11 +348,17 @@ fn detailed_reports_keep_source_gate_capacity_and_datagram_evidence_separate() {
         cfg.max_flows = 0;
         let mut stack = Stack::new(cfg, now);
         let packet = packet(source, destination, protocol);
-        let (rx, report) = stack.receive_with_tcp_admission(now, &packet, |_| false);
+        let (rx, report) =
+            stack.receive_reported(&packet, ReceiveOptions::new(now, RxMeta::VERIFY), |_, _| {
+                false
+            });
         assert_eq!(rx, Rx::Dropped(DropReason::NotForUs));
         assert!(report.source.is_some());
         assert_eq!(report.outcome, Unqualified);
-        let (_, report) = stack.receive_with_tcp_admission(now, &packet, |_| true);
+        let (_, report) =
+            stack.receive_reported(&packet, ReceiveOptions::new(now, RxMeta::VERIFY), |_, _| {
+                true
+            });
         assert!(report.source.is_some());
         assert_eq!(
             report.outcome,
@@ -411,11 +444,14 @@ fn tcp_keeps_original_snapshot_and_rejects_foreign_lineage_before_mutation() {
         let newer = context(1, 2);
         let foreign = context(2, 3);
         let syn = packet(source, destination, wire::PROTO_TCP);
-        let (_, report) =
-            stack.receive_with_context(now, &syn, RxMeta::VERIFY, original, |_, effective| {
-                assert_eq!(effective, original);
+        let (_, report) = stack.receive_reported(
+            &syn,
+            ReceiveOptions::new(now, RxMeta::VERIFY).with_context(original),
+            |_, effective| {
+                assert_eq!(effective, Some(original));
                 true
-            });
+            },
+        );
         let ReceiveOutcome::TcpNew(id) = report.outcome else {
             panic!("missing contextual passive open")
         };
@@ -423,11 +459,14 @@ fn tcp_keeps_original_snapshot_and_rejects_foreign_lineage_before_mutation() {
         assert!(stack.retains_tcp_with_lineage(source, destination, Some(original.lineage)));
         assert!(!stack.retains_tcp_with_lineage(source, destination, Some(foreign.lineage)));
         assert!(!stack.retains_tcp(source, destination));
-        let (_, report) =
-            stack.receive_with_context(now, &syn, RxMeta::VERIFY, newer, |_, effective| {
-                assert_eq!(effective, original);
+        let (_, report) = stack.receive_reported(
+            &syn,
+            ReceiveOptions::new(now, RxMeta::VERIFY).with_context(newer),
+            |_, effective| {
+                assert_eq!(effective, Some(original));
                 true
-            });
+            },
+        );
         assert_eq!(report.source_context, Some(original));
         assert_eq!(stack.receive(now, &syn), Rx::Dropped(DropReason::NotForUs));
         assert_eq!(stack.poll_accept().unwrap().id, id);
@@ -447,11 +486,14 @@ fn tcp_keeps_original_snapshot_and_rejects_foreign_lineage_before_mutation() {
             Options::default(),
             &[],
         );
-        let (_, report) =
-            stack.receive_with_context(now, &ack, RxMeta::VERIFY, newer, |_, effective| {
-                assert_eq!(effective, original);
+        let (_, report) = stack.receive_reported(
+            &ack,
+            ReceiveOptions::new(now, RxMeta::VERIFY).with_context(newer),
+            |_, effective| {
+                assert_eq!(effective, Some(original));
                 true
-            });
+            },
+        );
         assert_eq!(report.outcome, ReceiveOutcome::TcpAccepted(id));
         for input in [
             syn,
@@ -474,8 +516,11 @@ fn tcp_keeps_original_snapshot_and_rejects_foreign_lineage_before_mutation() {
                 b"foreign",
             ),
         ] {
-            let (rx, report) =
-                stack.receive_with_context(now, &input, RxMeta::VERIFY, foreign, |_, _| true);
+            let (rx, report) = stack.receive_reported(
+                &input,
+                ReceiveOptions::new(now, RxMeta::VERIFY).with_context(foreign),
+                |_, _| true,
+            );
             assert_eq!(rx, Rx::Dropped(DropReason::NotForUs));
             assert_eq!(report.outcome, ReceiveOutcome::Unqualified);
         }
@@ -493,11 +538,14 @@ fn tcp_keeps_original_snapshot_and_rejects_foreign_lineage_before_mutation() {
             Options::default(),
             b"x",
         );
-        let (_, report) =
-            stack.receive_with_context(now, &data, RxMeta::VERIFY, newer, |_, effective| {
-                assert_eq!(effective, original);
+        let (_, report) = stack.receive_reported(
+            &data,
+            ReceiveOptions::new(now, RxMeta::VERIFY).with_context(newer),
+            |_, effective| {
+                assert_eq!(effective, Some(original));
                 true
-            });
+            },
+        );
         assert_eq!(report.source_context, Some(original));
         assert_eq!(stack.tcp_read(id, &mut [0; 1]), Ok(1));
         assert_eq!(stack.tcp_write(id, &[7; 4096]), Ok(4096));
@@ -529,14 +577,12 @@ fn completed_context_is_reported_only_after_full_transport_validation() {
             fragments.reverse();
             for (index, fragment) in fragments.iter().enumerate() {
                 let mut called = false;
-                let (rx, report) = stack.receive_with_context(
-                    now,
+                let (rx, report) = stack.receive_reported(
                     fragment,
-                    RxMeta::VERIFY,
-                    original,
+                    ReceiveOptions::new(now, RxMeta::VERIFY).with_context(original),
                     |_, context| {
                         called = true;
-                        assert_eq!(context, original);
+                        assert_eq!(context, Some(original));
                         true
                     },
                 );
@@ -559,10 +605,18 @@ fn refusal_and_unknown_reset_output_keep_their_original_sources() {
         let source = context(1, 1);
         let successor = context(2, 2);
         let syn = packet(addr(CLIENT), addr(DST), wire::PROTO_TCP);
-        stack.receive_with_context(now, &syn, RxMeta::VERIFY, source, |_, _| true);
+        stack.receive_reported(
+            &syn,
+            ReceiveOptions::new(now, RxMeta::VERIFY).with_context(source),
+            |_, _| true,
+        );
         let old = stack.poll_accept().unwrap().id;
         stack.tcp_refuse(old, how);
-        stack.receive_with_context(now, &syn, RxMeta::VERIFY, successor, |_, _| true);
+        stack.receive_reported(
+            &syn,
+            ReceiveOptions::new(now, RxMeta::VERIFY).with_context(successor),
+            |_, _| true,
+        );
         let new = stack.poll_accept().unwrap().id;
         assert_ne!(old, new);
         let mut output = [0; 1500];
@@ -585,7 +639,11 @@ fn refusal_and_unknown_reset_output_keep_their_original_sources() {
         Options::default(),
         &[],
     );
-    stack.receive_with_context(now, &ack, RxMeta::VERIFY, source, |_, _| true);
+    stack.receive_reported(
+        &ack,
+        ReceiveOptions::new(now, RxMeta::VERIFY).with_context(source),
+        |_, _| true,
+    );
     let mut retained = Vec::new();
     stack.visit_retained_source_contexts(|source| retained.push(source));
     assert_eq!(retained, [source]);
@@ -606,11 +664,16 @@ fn contextual_operations_require_preparation_without_consuming_input_or_output()
     let original = context(1, 1);
     for protocol in [wire::PROTO_TCP, wire::PROTO_UDP] {
         let input = packet(addr(CLIENT), addr(DST), protocol);
-        let (rx, report) =
-            stack.receive_with_context(now, &input, RxMeta::VERIFY, original, |_, _| {
-                panic!("unprepared receive reached source callback")
-            });
+        let before = stack.stats();
+        let (rx, report) = stack.receive_reported(
+            &input,
+            ReceiveOptions::new(now, RxMeta::VERIFY).with_context(original),
+            |_, _| panic!("unprepared receive reached source callback"),
+        );
         assert_eq!(rx, Rx::Dropped(DropReason::Capacity));
+        let mut expected = before;
+        expected.drops[DropReason::Capacity as usize] += 1;
+        assert_eq!(stack.stats(), expected);
         assert_eq!(report.outcome, ReceiveOutcome::Unqualified);
         assert_eq!(report.source_context, None);
     }

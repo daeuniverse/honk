@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::wire::{self, tcp};
 use crate::{
     AcceptOpts, AcceptWhen, Config, Csum, ExcludeSet, FlowId, GsoKind, GsoRx, Keepalive, Mode,
-    Refuse, Rx, RxMeta, SourceContext, Stack, Transmit, TxCaps, TxCsum,
+    ReceiveOptions, Refuse, Rx, RxMeta, SourceContext, Stack, Transmit, TxCaps, TxCsum,
 };
 
 const MAX_OPS: usize = 192;
@@ -294,10 +294,18 @@ impl World {
         match self.source {
             Some(source) => {
                 self.stack
-                    .receive_with_context(self.now, packet, meta, source, |_, _| true)
+                    .receive_reported(
+                        packet,
+                        ReceiveOptions::new(self.now, meta).with_context(source),
+                        |_, _| true,
+                    )
                     .0
             }
-            None => self.stack.receive_with(self.now, packet, meta),
+            None => {
+                self.stack
+                    .receive_reported(packet, ReceiveOptions::new(self.now, meta), |_, _| true)
+                    .0
+            }
         }
     }
 
@@ -499,13 +507,11 @@ fn fragments(w: &mut World, kind: u8, len: u8, how: u8) {
         let ingress_at = original_ingress + Duration::from_secs(if index == 0 { 10 } else { 0 });
         let rx = if delayed {
             w.stack
-                .receive_with_realm_admission(
-                    ingress_at,
-                    w.now,
+                .receive_reported(
                     packet,
-                    RxMeta::VERIFY,
-                    |_| true,
-                    |_| true,
+                    ReceiveOptions::new(ingress_at, RxMeta::VERIFY)
+                        .with_realm(w.now, &mut |_| true),
+                    |_, _| true,
                 )
                 .0
         } else {
@@ -553,13 +559,11 @@ fn fragments(w: &mut World, kind: u8, len: u8, how: u8) {
         w.stack.check();
         if how & 2 != 0 {
             if delayed {
-                w.stack.receive_with_realm_admission(
-                    ingress_at,
-                    w.now,
+                w.stack.receive_reported(
                     packet,
-                    RxMeta::VERIFY,
-                    |_| true,
-                    |_| true,
+                    ReceiveOptions::new(ingress_at, RxMeta::VERIFY)
+                        .with_realm(w.now, &mut |_| true),
+                    |_, _| true,
                 );
             } else {
                 w.receive(packet, meta);
@@ -1005,7 +1009,7 @@ mod tests {
         }
         assert!(
             w.rx_gso_packets >= 3,
-            "GRO and both USO families reached receive_with"
+            "GRO and both USO families reached receive_reported"
         );
         assert!(
             w.tx_gso_packets >= 3,

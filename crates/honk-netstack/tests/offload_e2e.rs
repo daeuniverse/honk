@@ -6,7 +6,9 @@ mod offload_common;
 
 use std::time::{Duration, Instant};
 
-use honk_netstack::{AcceptOpts, FlowId, Rx, Stack, StreamError, TcpState, TxCaps, TxCsum};
+use honk_netstack::{
+    AcceptOpts, FlowId, ReceiveOptions, Rx, Stack, StreamError, TcpState, TxCaps, TxCsum,
+};
 use offload_common::*;
 
 struct Pair {
@@ -118,7 +120,12 @@ impl Pair {
                 }
                 if size != 0 && run.len() > 1 {
                     let (b, meta) = gro(run, size);
-                    assert_eq!(client.receive_with(now, &b, meta), Rx::Consumed);
+                    assert_eq!(
+                        client
+                            .receive_reported(&b, ReceiveOptions::new(now, meta), |_, _| true)
+                            .0,
+                        Rx::Consumed
+                    );
                     stats.0 += 1;
                 } else {
                     for s in run.iter() {

@@ -27,6 +27,7 @@ mod tcp;
 mod transmit_iov;
 mod tx;
 
+pub use rx::ReceiveOptions;
 pub(crate) use rx::SourceReport;
 pub use transmit_iov::IovTransmit;
 
@@ -154,7 +155,7 @@ pub enum Rx {
         packet: OwnedPacket,
         payload: Range<usize>,
     },
-    /// A transparent USO super-packet ([`Stack::receive_with`]): `payload` indexes the input
+    /// A transparent USO super-packet ([`Stack::receive_reported`]): `payload` indexes the input
     /// packet and holds consecutive datagrams of `size` bytes each, the last possibly shorter;
     /// every `size`-byte chunk is one datagram (boundaries preserved, at most 128 of them). Like
     /// [`Rx::Transparent`] it borrows the input packet.

@@ -552,7 +552,7 @@ impl Stack {
 }
 
 /// Receives one UDP datagram for any destination. `meta` is the driver's (transparent mode only,
-/// see `Stack::receive_with`): a trusted checksum skips verification, a USO super-packet becomes
+/// see `Stack::receive_reported`): a trusted checksum skips verification, a USO super-packet becomes
 /// [`Rx::TransparentSplit`].
 pub(crate) fn receive_transparent(
     stack: &mut Stack,

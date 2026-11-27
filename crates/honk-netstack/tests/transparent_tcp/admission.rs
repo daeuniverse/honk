@@ -163,7 +163,9 @@ fn transparent_udp_variants_preserve_wire_dscp_for_both_families() {
                 dscp: got_dscp,
                 payload,
                 size,
-            } = stack.receive_with(now, &packet, meta)
+            } = stack
+                .receive_reported(&packet, ReceiveOptions::new(now, meta), |_, _| true)
+                .0
             else {
                 panic!("USO datagram must retain DSCP alongside its boundaries")
             };

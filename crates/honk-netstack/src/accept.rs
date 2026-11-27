@@ -432,8 +432,11 @@ mod tests {
                 };
                 let mut syn = [0; 64];
                 let n = quote_syn(tuple, 42, &mut syn).unwrap();
-                let (rx, _) =
-                    stack.receive_with_context(now, &syn[..n], RxMeta::VERIFY, source, |_, _| true);
+                let (rx, _) = stack.receive_reported(
+                    &syn[..n],
+                    crate::ReceiveOptions::new(now, RxMeta::VERIFY).with_context(source),
+                    |_, _| true,
+                );
                 assert!(matches!(rx, Rx::Consumed));
                 let id = stack.poll_accept().unwrap().id;
                 stack.tcp_refuse(id, how);
