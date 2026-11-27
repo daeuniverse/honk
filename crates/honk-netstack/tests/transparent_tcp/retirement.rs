@@ -187,7 +187,18 @@ fn refusal_output_retains_its_old_owner_across_slot_and_tuple_reuse() {
         peer.syn(&mut stack, now, 1460);
         let new = info_of(&mut stack).id;
         assert_ne!(old, new);
+        assert_eq!(old.index(), new.index());
         assert!(stack.tcp_retained(new));
+        assert_eq!(
+            stack.retains_pending_source(peer.client.ip()),
+            how != Refuse::Drop
+        );
+        let mut seen = Vec::new();
+        stack.visit_pending_sources(|address| seen.push(address));
+        assert_eq!(
+            seen,
+            vec![peer.client.ip(); usize::from(how != Refuse::Drop)]
+        );
         assert!(
             stack
                 .poll_transmit_with(now, &mut [0; 1], TxCaps::NONE)
@@ -203,6 +214,8 @@ fn refusal_output_retains_its_old_owner_across_slot_and_tuple_reuse() {
         }
         assert!(!stack.tcp_retained(old));
         assert_eq!(stack.take_tcp_retention_change(), how != Refuse::Drop);
+        assert!(stack.retains_source(peer.client.ip()));
+        assert!(!stack.retains_pending_source(peer.client.ip()));
         stack.tcp_close(old);
         assert!(stack.tcp_retained(new));
         stack.tcp_refuse(new, Refuse::Drop);

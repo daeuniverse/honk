@@ -221,6 +221,8 @@ fn source_survives_retained_and_exhausted_time_wait_until_a_legal_reopen() {
         let mut contexts = Vec::new();
         stack.visit_retained_source_contexts(|source| contexts.push(source));
         assert_eq!(contexts, [source]);
+        assert!(!stack.has_pending_sources());
+        stack.visit_pending_sources(|_| panic!("TIME_WAIT is a separate retained owner"));
         let late = now + Duration::from_secs(30);
         assert_eq!(
             stack

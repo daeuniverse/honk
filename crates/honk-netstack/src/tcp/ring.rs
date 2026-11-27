@@ -4,6 +4,7 @@
 //! capacity. Each admitted flow reserves its progress floor before using shared space.
 
 use std::collections::VecDeque;
+use std::io::{self, IoSlice, IoSliceMut};
 use std::sync::Arc;
 
 use crate::budget::MemoryBudget;
@@ -19,6 +20,8 @@ pub const MAX_CHUNK: usize = 64 * 1024;
 /// Payload slices a maximum-size (64 KiB) IP packet can span at the smallest chunk, including an
 /// unaligned first chunk.
 pub const MAX_PARTS: usize = 65536 / MIN_CHUNK + 2;
+/// A 64 KiB application loan can start at the last byte of a 4 KiB chunk.
+pub(crate) const STREAM_PARTS: usize = 65536 / MIN_CHUNK + 1;
 
 /// What admission reserves for one TCP flow: a TX and an RX chunk and the descriptor floor.
 pub const fn floor(chunk: usize) -> usize {
@@ -32,7 +35,7 @@ pub fn clamp_chunk(chunk: usize) -> usize {
 
 /// Free chunks kept for reuse at most, so a bulk flow does not return a chunk to the allocator and
 /// take one back for every 16 KiB. An idle pool keeps one (see `free`).
-const FREE_CACHE: usize = 64;
+const FREE_CACHE: usize = 256;
 /// Chunk-list slots an emptied ring keeps, so a flow draining a few chunks per batch does not
 /// reallocate its list each time; a ring that once held a whole window gives the rest back.
 const KEEP_SLOTS: usize = 4;
@@ -57,7 +60,7 @@ fn fund_indices<T>(pool: &mut Pool, reserved: &mut u32, needed: usize) -> bool {
     }
     let old = (*reserved as usize).max(KEEP_SLOTS);
     let new = index_cells(needed).max(old);
-    if !pool.charge_indices((new - old) * std::mem::size_of::<T>()) {
+    if new != old && !pool.charge_indices((new - old) * std::mem::size_of::<T>()) {
         return false;
     }
     *reserved = new as u32;
@@ -371,22 +374,8 @@ impl SendRing {
         while done < data.len() {
             let end = self.head + self.len as usize;
             let (ci, co) = (end / chunk, end % chunk);
-            if ci == self.chunks.len() {
-                if !self.can_append(pool, 1) {
-                    break;
-                }
-                // The first chunk is the free floor; later ones are shared.
-                if !self.chunks.is_empty() && !pool.reserve(1) {
-                    break;
-                }
-                if !fund_indices::<Chunk>(pool, &mut self.index_reserved, self.chunks.len() + 1) {
-                    if !self.chunks.is_empty() {
-                        pool.release(1);
-                    }
-                    break;
-                }
-                materialize_indices(&mut self.chunks, self.index_reserved, ci + 1);
-                self.chunks.push_back(pool.alloc());
+            if ci == self.chunks.len() && !self.push_chunk(pool) {
+                break;
             }
             let n = (chunk - co).min(data.len() - done);
             self.chunks[ci][co..co + n].copy_from_slice(&data[done..done + n]);
@@ -394,6 +383,68 @@ impl SendRing {
             self.len += n as u32;
         }
         done
+    }
+
+    fn push_chunk(&mut self, pool: &mut Pool) -> bool {
+        if !self.can_append(pool, 1) {
+            return false;
+        }
+        // The first chunk is the progress floor; later ones use shared credit.
+        let shared = !self.chunks.is_empty();
+        if shared && !pool.reserve(1) {
+            return false;
+        }
+        let needed = self.chunks.len() + 1;
+        if !fund_indices::<Chunk>(pool, &mut self.index_reserved, needed) {
+            if shared {
+                pool.release(1);
+            }
+            return false;
+        }
+        materialize_indices(&mut self.chunks, self.index_reserved, needed);
+        self.chunks.push_back(pool.alloc());
+        true
+    }
+
+    pub fn with_spare<const PARTS: usize>(
+        &mut self,
+        pool: &mut Pool,
+        limit: usize,
+        fill: impl FnOnce(&mut [IoSliceMut<'_>]) -> io::Result<usize>,
+    ) -> Option<io::Result<usize>> {
+        let chunk_len = pool.chunk();
+        let end = self.head + self.len();
+        let (first, mut offset) = (end / chunk_len, end % chunk_len);
+        let limit = limit.min(PARTS * chunk_len - offset);
+        let last = first + (offset + limit).div_ceil(chunk_len);
+        let spare = SendSpare {
+            old_capacity: self.chunks.capacity(),
+            ring: self,
+            pool,
+        };
+        while spare.ring.chunks.len() < last && spare.ring.push_chunk(spare.pool) {}
+        let offered = limit.min(spare.ring.chunks.len() * chunk_len - end);
+        if offered == 0 {
+            return None;
+        }
+
+        let count = (offset + offered).div_ceil(chunk_len);
+        let filled = {
+            let mut parts: [IoSliceMut<'_>; PARTS] =
+                std::array::from_fn(|_| IoSliceMut::new(&mut []));
+            let mut left = offered;
+            for (part, chunk) in parts
+                .iter_mut()
+                .zip(spare.ring.chunks.range_mut(first..first + count))
+            {
+                let n = left.min(chunk_len - offset);
+                *part = IoSliceMut::new(&mut chunk[offset..offset + n]);
+                left -= n;
+                offset = 0;
+            }
+            fill(&mut parts[..count])
+        };
+        Some(filled.and_then(|n| spare.commit(n, offered)))
     }
 
     /// A maximum-size IP packet spans at most [`MAX_PARTS`] chunks, including an unaligned first
@@ -459,6 +510,45 @@ impl SendRing {
     #[cfg(test)]
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+}
+
+// Keep provisional capacity inside the loan so an unwinding callback also returns it.
+struct SendSpare<'a> {
+    ring: &'a mut SendRing,
+    pool: &'a mut Pool,
+    old_capacity: usize,
+}
+
+impl SendSpare<'_> {
+    fn commit(self, n: usize, offered: usize) -> io::Result<usize> {
+        if n > offered {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        self.ring.len += n as u32;
+        Ok(n)
+    }
+}
+
+impl Drop for SendSpare<'_> {
+    fn drop(&mut self) {
+        let ring = &mut *self.ring;
+        let keep = (ring.head + ring.len()).div_ceil(self.pool.chunk());
+        if ring.chunks.len() == keep {
+            return;
+        }
+        while ring.chunks.len() > keep {
+            let chunk = ring.chunks.pop_back().unwrap();
+            if !ring.chunks.is_empty() {
+                self.pool.release(1);
+            }
+            self.pool.free(chunk);
+        }
+        let capacity = self.old_capacity.max(index_cells(keep));
+        if ring.chunks.capacity() > capacity {
+            ring.chunks.shrink_to(capacity);
+        }
+        retain_indices::<Chunk>(self.pool, &mut ring.index_reserved, ring.chunks.capacity());
     }
 }
 
@@ -543,16 +633,51 @@ impl RecvRing {
         }
     }
 
+    pub fn peek(&self, mut avail: usize) -> ([IoSlice<'_>; STREAM_PARTS], usize) {
+        let mut parts = [IoSlice::new(&[]); STREAM_PARTS];
+        let mut start = self.head;
+        let mut count = 0;
+        for (part, chunk) in parts.iter_mut().zip(&self.chunks) {
+            if avail == 0 {
+                break;
+            }
+            let Some(chunk) = chunk else {
+                break;
+            };
+            let n = avail.min(chunk.len() - start);
+            *part = IoSlice::new(&chunk[start..start + n]);
+            avail -= n;
+            start = 0;
+            count += 1;
+        }
+        (parts, count)
+    }
+
     /// Copies up to `avail` in-order bytes.
     pub fn read(&mut self, pool: &mut Pool, out: &mut [u8], avail: usize) -> usize {
-        let want = out.len().min(avail);
+        self.consume_with(pool, out.len().min(avail), |done, bytes| {
+            out[done..done + bytes.len()].copy_from_slice(bytes);
+        })
+    }
+
+    pub fn consume(&mut self, pool: &mut Pool, n: usize) {
+        let done = self.consume_with(pool, n, |_, _| {});
+        debug_assert_eq!(done, n, "contiguous receive prefix must be backed");
+    }
+
+    fn consume_with(
+        &mut self,
+        pool: &mut Pool,
+        want: usize,
+        mut copy: impl FnMut(usize, &[u8]),
+    ) -> usize {
         let mut done = 0;
         while done < want {
             let Some(Some(chunk)) = self.chunks.front() else {
                 break;
             };
             let n = (chunk.len() - self.head).min(want - done);
-            out[done..done + n].copy_from_slice(&chunk[self.head..self.head + n]);
+            copy(done, &chunk[self.head..self.head + n]);
             done += n;
             self.head += n;
             if self.head == chunk.len() {
@@ -747,14 +872,14 @@ mod tests {
             CHUNK,
             "drained pool keeps one spare"
         );
-        let mut held: Vec<Chunk> = (0..40).map(|_| pool.alloc()).collect();
+        let mut held: Vec<Chunk> = (0..300).map(|_| pool.alloc()).collect();
         let last = held.pop().unwrap();
         for c in held {
             pool.free(c);
         }
         assert_eq!(
             pool.allocated_bytes(),
-            40 * CHUNK,
+            257 * CHUNK,
             "bursts refill from the cache while a chunk is in use"
         );
         pool.free(last);
@@ -763,6 +888,16 @@ mod tests {
         let c = pool.alloc();
         assert_eq!(pool.allocated_bytes(), CHUNK);
         pool.free(c);
+    }
+
+    #[test]
+    fn accounted_pool_funds_free_cache_storage() {
+        let memory_limit = 8 * 1024 * 1024;
+        let cache_peak = 3 * 256 * std::mem::size_of::<Chunk>();
+        assert_eq!(
+            Pool::overhead_bound(memory_limit),
+            Some(memory_limit + cache_peak)
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Public sans-I/O API and the single-owner scheduler.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{self, IoSlice, IoSliceMut};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU64;
 use std::ops::{BitOr, BitOrAssign, Range};
@@ -87,6 +88,13 @@ impl Config {
 pub struct FlowId {
     pub(crate) idx: u32,
     pub(crate) generation: u32,
+}
+
+impl FlowId {
+    /// Stack-local slot index. Compare the complete handle after indexing a slot.
+    pub fn index(self) -> usize {
+        self.idx as usize
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -281,6 +289,16 @@ pub enum StreamError {
     #[error("stale flow handle")]
     Stale,
 }
+
+/// A receive prefix could not be consumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum TcpConsumeError {
+    #[error("stale flow handle")]
+    Stale,
+    #[error("receive prefix exceeds the contiguous readable bytes")]
+    OutOfRange,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BindError {
     #[error("no local tunnel address")]
@@ -308,7 +326,7 @@ pub enum UdpError {
     Offload,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StackStats {
     /// Indexed by the discriminant of [`DropReason`].
     pub drops: [u64; 16],
@@ -573,14 +591,15 @@ impl Stack {
         self.accepting = accepting;
     }
 
+    /// Budget bytes charged when a new passive TCP flow is admitted.
+    pub fn passive_floor_bytes(&self) -> usize {
+        self.pool.floor()
+    }
+
     /// No live protocol owner or stack-internal output/reassembly obligation remains.
     /// Driver-owned packets and application tasks require their own completion proof.
     pub fn is_quiescent(&self) -> bool {
-        self.table.active == 0
-            && self.table.timewait.is_empty()
-            && self.controls.is_empty()
-            && !self.udp_tx.pending()
-            && self.reasm.is_quiescent()
+        self.table.active == 0 && self.table.timewait.is_empty() && !self.has_pending_sources()
     }
 
     fn overhead_bound(
@@ -1101,6 +1120,21 @@ impl Stack {
         self.drop_packet(DropReason::NoFlow)
     }
 
+    /// Whether a pull could find queued work in the selected output class.
+    /// Stale or currently blocked entries may keep this true. Handle timers separately.
+    pub fn may_have_transmit(&self, control_only: bool) -> bool {
+        let ready = if control_only {
+            self.control_ready.as_ref().unwrap_or(&self.ready)
+        } else {
+            &self.ready
+        };
+        !ready.is_empty()
+            || !self.controls.is_empty()
+            || !self.timewait_ready.is_empty()
+            || self.reasm.pending_icmp()
+            || (!control_only && self.udp_tx.pending())
+    }
+
     pub fn poll_transmit(&mut self, now: Instant, out: &mut [u8]) -> Option<usize> {
         self.poll_transmit_with(now, out, TxCaps::NONE)
             .map(|t| t.len)
@@ -1533,6 +1567,12 @@ impl Stack {
         std::mem::take(&mut self.tx_wakeup)
     }
 
+    /// A shared budget refund can unblock a queued writer without packet or timer activity on
+    /// this Stack. This hint lets an owner schedule a recheck via `handle_timeout` or `poll_event`.
+    pub fn has_pending_writers(&self) -> bool {
+        !self.writers.is_empty()
+    }
+
     pub fn tcp_connect(
         &mut self,
         now: Instant,
@@ -1600,14 +1640,66 @@ impl Stack {
     }
 
     pub fn tcp_write(&mut self, id: FlowId, data: &[u8]) -> Result<usize, StreamError> {
+        self.tcp_write_with(id, |t, pool| t.write(pool, data), |&n| n != 0)
+    }
+
+    /// Lends up to 17 send-ring slices with at most `limit` bytes of spare capacity.
+    ///
+    /// The callback fills a prefix and returns its length to commit it. Zero, an error or
+    /// unwinding leaves the send position intact and releases unused credit. Spare bytes are
+    /// unspecified until written. Committed bytes stay owned through graceful close until
+    /// cumulatively acknowledged.
+    ///
+    /// Connection state and send credit determine the outer result. The inner result carries
+    /// the callback's I/O result, or `InvalidInput` if it reported more bytes than offered.
+    /// A zero limit on an open write half returns `Ok(Ok(0))` without calling the callback.
+    pub fn tcp_reserve_tx(
+        &mut self,
+        id: FlowId,
+        limit: usize,
+        fill: impl FnOnce(&mut [IoSliceMut<'_>]) -> io::Result<usize>,
+    ) -> Result<io::Result<usize>, StreamError> {
+        self.tcp_reserve_tx_parts::<{ ring::STREAM_PARTS }>(id, limit, fill)
+    }
+
+    /// Like [`Self::tcp_reserve_tx`], with the loan ending at the first chunk boundary.
+    /// A partial tail can be borrowed without reserving another chunk.
+    pub fn tcp_reserve_tx_chunk(
+        &mut self,
+        id: FlowId,
+        limit: usize,
+        fill: impl FnOnce(&mut [IoSliceMut<'_>]) -> io::Result<usize>,
+    ) -> Result<io::Result<usize>, StreamError> {
+        self.tcp_reserve_tx_parts::<1>(id, limit, fill)
+    }
+
+    fn tcp_reserve_tx_parts<const PARTS: usize>(
+        &mut self,
+        id: FlowId,
+        limit: usize,
+        fill: impl FnOnce(&mut [IoSliceMut<'_>]) -> io::Result<usize>,
+    ) -> Result<io::Result<usize>, StreamError> {
+        self.tcp_write_with(
+            id,
+            |t, pool| t.with_tx_spare::<PARTS>(pool, limit, fill),
+            |result| result.as_ref().is_ok_and(|&n| n != 0),
+        )
+    }
+
+    fn tcp_write_with<T>(
+        &mut self,
+        id: FlowId,
+        write: impl FnOnce(&mut Tcb, &mut Pool) -> Result<T, StreamError>,
+        published: impl FnOnce(&T) -> bool,
+    ) -> Result<T, StreamError> {
         let Some(Flow::Tcp(t)) = self.table.get_mut(id) else {
             return Err(StreamError::Stale);
         };
-        let result = t.write(&mut self.pool, data);
-        if result == Err(StreamError::WouldBlock) {
+        let result = write(t, &mut self.pool);
+        if matches!(result, Err(StreamError::WouldBlock)) {
             self.sync_without_tx(id.idx, self.now);
         }
-        if result.as_ref().is_ok_and(|&n| n != 0) {
+        if result.as_ref().is_ok_and(published) {
             self.tx_wakeup = true;
             self.sync(id.idx, self.now);
         }
@@ -1619,11 +1711,54 @@ impl Stack {
             return Err(StreamError::Stale);
         };
         let result = t.read(&mut self.pool, out, self.now);
-        if t.ack_due != 0 {
+        let ack_due = t.ack_due != 0;
+        self.sync_tcp_read(id, ack_due);
+        result
+    }
+
+    /// Borrows at most `limit` in-order receive bytes in up to 17 ring slices.
+    ///
+    /// The count is the number of nonempty slices. A drained orderly EOF returns zero slices
+    /// and `true`. Buffered bytes precede EOF and sticky errors. An empty live stream or a
+    /// zero limit with buffered data returns `WouldBlock`.
+    pub fn tcp_peek_rx(
+        &self,
+        id: FlowId,
+        limit: usize,
+    ) -> Result<([IoSlice<'_>; ring::STREAM_PARTS], usize, bool), StreamError> {
+        let Some(Flow::Tcp(t)) = self.table.get(id) else {
+            return Err(StreamError::Stale);
+        };
+        let available = t.read_len()?;
+        if available != 0 && limit == 0 {
+            return Err(StreamError::WouldBlock);
+        }
+        let (parts, count) = t.rx.peek(available.min(limit));
+        Ok((parts, count, available == 0))
+    }
+
+    /// Consumes `n` bytes of the current contiguous receive prefix and updates receive credit.
+    /// A stale handle or an out-of-range count leaves the ring and window unchanged.
+    pub fn tcp_consume_rx(&mut self, id: FlowId, n: usize) -> Result<(), TcpConsumeError> {
+        let Some(Flow::Tcp(t)) = self.table.get_mut(id) else {
+            return Err(TcpConsumeError::Stale);
+        };
+        if n > t.available() {
+            return Err(TcpConsumeError::OutOfRange);
+        }
+        if n != 0 {
+            t.consume_rx(&mut self.pool, n, self.now);
+            let ack_due = t.ack_due != 0;
+            self.sync_tcp_read(id, ack_due);
+        }
+        Ok(())
+    }
+
+    fn sync_tcp_read(&mut self, id: FlowId, ack_due: bool) {
+        if ack_due {
             self.tx_wakeup = true;
         }
         self.sync(id.idx, self.now);
-        result
     }
 
     pub fn tcp_shutdown(&mut self, id: FlowId) -> Result<(), StreamError> {
@@ -1767,15 +1902,49 @@ impl Stack {
             .keys()
             .chain(self.table.timewait.keys())
             .any(|tuple| tuple.remote.ip() == address)
-            || self
-                .controls
-                .iter()
-                .any(|control| control.tuple.remote.ip() == address)
-            || self.udp_tx.retains_destination(address)
-            || self
-                .reasm
-                .obligations()
-                .any(|(source, _, _)| source == address)
+            || self.retains_pending_source(address)
+    }
+
+    /// Whether unpulled control replies, UDP fragments or reassembly retain this peer.
+    pub fn retains_pending_source(&self, address: IpAddr) -> bool {
+        self.pending_sources().any(|source| source == address)
+    }
+
+    /// Constant-time hint for [`Self::visit_pending_sources`]. Fragment tombstones can keep
+    /// this true without yielding addresses.
+    pub fn has_pending_sources(&self) -> bool {
+        !self.controls.is_empty() || self.udp_tx.pending() || !self.reasm.is_quiescent()
+    }
+
+    /// Visits queued control replies, pending UDP datagrams and live reassembly obligations.
+    /// Repeated addresses are allowed. Contextual owners use [`Self::visit_retained_source_contexts`]
+    /// for original source lineages and identity-only tombstones.
+    pub fn visit_pending_sources(&self, visit: impl FnMut(IpAddr)) {
+        self.pending_sources().for_each(visit);
+    }
+
+    /// Upper bound on the number of visits in [`Self::visit_pending_sources`].
+    pub fn pending_source_bound(&self) -> usize {
+        let udp = crate::udp_t::UdpTx::pending_bound(usize::from(self.cfg.mtu));
+        let bound = self.control_limit() + udp;
+        if self.transparent()
+            && self
+                .shard
+                .as_ref()
+                .is_none_or(|shard| shard.reassembly_owner)
+        {
+            bound.saturating_add(self.reasm.obligation_bound())
+        } else {
+            bound
+        }
+    }
+
+    fn pending_sources(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        self.controls
+            .iter()
+            .map(|control| control.tuple.remote.ip())
+            .chain(self.udp_tx.pending_destinations())
+            .chain(self.reasm.obligations().map(|(source, _, _)| source))
     }
 
     /// Reply materialization still pending inside the Stack, before adapter ownership.
@@ -1784,15 +1953,7 @@ impl Stack {
             Some(Flow::Tcp(t)) => t.tuple.remote.ip() == address && (slot.on_tx || slot.on_control),
             Some(Flow::TimeWait(t)) => t.tuple.remote.ip() == address && t.ack_due,
             _ => false,
-        }) || self
-            .controls
-            .iter()
-            .any(|control| control.tuple.remote.ip() == address)
-            || self.udp_tx.retains_destination(address)
-            || self
-                .reasm
-                .obligations()
-                .any(|(source, _, _)| source == address)
+        }) || self.retains_pending_source(address)
     }
 
     /// Pending output for one original source lineage, excluding identity-only tombstones.
@@ -2065,13 +2226,7 @@ impl Stack {
             self.timers.len() <= 2 * self.table.slots.len().max(16) + 1,
             "the timer heap outgrew its rebuild bound"
         );
-        assert!(
-            self.controls.len()
-                <= self
-                    .shard
-                    .as_ref()
-                    .map_or(CONTROL_LIMIT, |s| s.control_limit)
-        );
+        assert!(self.controls.len() <= self.control_limit());
         if let Some(shard) = &self.shard {
             assert!(
                 shard.half_open_released.len() + self.half_open as usize <= shard.release_limit
@@ -2136,13 +2291,14 @@ impl Stack {
         });
     }
 
+    fn control_limit(&self) -> usize {
+        self.shard
+            .as_ref()
+            .map_or(CONTROL_LIMIT, |s| s.control_limit)
+    }
+
     pub(crate) fn queue_control(&mut self, c: Control) {
-        if self.controls.len()
-            == self
-                .shard
-                .as_ref()
-                .map_or(CONTROL_LIMIT, |s| s.control_limit)
-        {
+        if self.controls.len() == self.control_limit() {
             self.counters.control_dropped += 1;
             return;
         }

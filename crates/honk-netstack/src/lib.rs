@@ -55,6 +55,7 @@
 //! [`Stack::retains_source`] also covers stateless controls, UDP fragments and reassembly
 //! replies for peer-path reclamation. [`Stack::retains_source_output`] distinguishes
 //! pending replies from an idle live flow; exported output remains the adapter's duty.
+//! [`Stack::visit_pending_sources`] visits ancillary peer addresses without walking TCP slots.
 //! [`Stack::try_receive_realm_tcp`] can defer a verified complete TCP input at the source
 //! gate so a physical shard can resolve pending output before receiving that input once.
 //!
@@ -63,6 +64,10 @@
 //! the background. Closing with unread data sends RST. TIME_WAIT retains unread data
 //! and an open application handle; once both are gone and the final ACK is sent, its
 //! compact entry holds no chunk reservations and expires after 60 seconds.
+//! [`Stack::tcp_peek_rx`] and [`Stack::tcp_consume_rx`] let an owner borrow in-order bytes and
+//! return credit for the prefix it used. [`Stack::tcp_reserve_tx`] lends writable ring slices
+//! and commits the prefix returned by the callback. [`Stack::tcp_reserve_tx_chunk`] stops at
+//! the first chunk boundary.
 //!
 //! [`Stack::tcp_retained`] checks the original handle through application close, compact
 //! TIME_WAIT and queued refusal output. Drivers retaining delivery state use
@@ -154,7 +159,7 @@
 //! (everything read or acknowledged) returns all its chunks, and descriptor storage is released
 //! when nothing is
 //! in flight: the floor is a guarantee, not resident memory. Allocation statistics include
-//! the pool's cached free chunks (up to 64 while any chunk is in use, one otherwise).
+//! the pool's cached free chunks (up to 256 while any chunk is in use, one otherwise).
 //! [`Config::shared_budget`] lets stacks of one process share an additional limit, charged
 //! for floors and commitments and refunded as flows retire and when a stack is dropped.
 //! Reassembly storage, queued Time Exceeded quotes and pending UDP fragment datagram capacities
@@ -215,7 +220,7 @@ pub use offload::{Csum, GsoKind, GsoRx, GsoTx, RxMeta, SourceContext, Transmit, 
 pub use stack::{
     AccountedTransmit, BindError, Config, ConnectError, ConstructionError, DropReason, FlowId,
     IovTransmit, Ready, ReceiveOutcome, ReceiveReport, Rx, Stack, StackStats, StreamError,
-    UdpError, ValidatedSource,
+    TcpConsumeError, UdpError, ValidatedSource,
 };
 pub use tcp::{TcpState, TcpStats};
 pub use udp_t::UdpRefuse;

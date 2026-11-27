@@ -117,6 +117,9 @@ fn fragment_dispatch_finishes_without_entering_owner_zero_transport() {
     let mut owner_zero =
         Stack::new_accounted_shard(cfg.clone(), now, 4, 0, 2, Arc::clone(&pending)).unwrap();
     let mut owner_one = Stack::new_accounted_shard(cfg, now, 4, 1, 2, pending).unwrap();
+    let udp = (512 * 1024) / (1420 - 40 + 1);
+    assert_eq!(owner_zero.pending_source_bound(), 64 + udp + 64 + 16);
+    assert_eq!(owner_one.pending_source_bound(), 64 + udp);
     let h = wire::tcp::Header {
         src_port: 5000,
         dst_port: 443,
@@ -220,6 +223,12 @@ fn fragment_timeout_output_receipt_keeps_exact_quote_and_resets_on_next_poll() {
             .unwrap()
             .fragment;
         assert_ne!(old.incarnation, fresh.incarnation);
+        let address = old.identity.src;
+        let mut seen = Vec::new();
+        owner.visit_pending_sources(|addr| seen.push(addr));
+        assert_eq!(seen, [address; 2], "live reassembly and its previous quote");
+        assert!(owner.has_pending_sources());
+        assert!(owner.may_have_transmit(true));
         let mut out = [0; 1280];
         let mut icmp = crate::IcmpState::default();
         let charge = budget
@@ -242,6 +251,10 @@ fn fragment_timeout_output_receipt_keeps_exact_quote_and_resets_on_next_poll() {
         assert!(!owner.retains_fragment(suppressed));
         assert!(!owner.retains_fragment(old));
         assert!(owner.retains_fragment(fresh));
+        seen.clear();
+        owner.visit_pending_sources(|addr| seen.push(addr));
+        assert_eq!(seen, [address]);
+        assert!(!owner.may_have_transmit(true));
         let service = service + Duration::from_secs(30);
         owner.handle_timeout(service);
         assert!(matches!(
@@ -267,6 +280,8 @@ fn fragment_timeout_output_receipt_keeps_exact_quote_and_resets_on_next_poll() {
             AccountedTransmit::Idle
         ));
         assert_eq!(owner.take_fragment_output(), None);
+        owner.visit_pending_sources(|_| panic!("all reassembly obligations drained"));
+        assert!(!owner.has_pending_sources());
         drop((owner, icmp, charge));
         assert_eq!(budget.used(), 0);
     }

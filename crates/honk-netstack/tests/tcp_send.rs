@@ -12,6 +12,8 @@ use honk_netstack::{
 mod accounted;
 #[path = "tcp_send/control.rs"]
 mod control;
+#[path = "tcp_send/vectored.rs"]
+mod vectored;
 
 const CHUNK: usize = 16 * 1024;
 const MSS: u16 = 1000;

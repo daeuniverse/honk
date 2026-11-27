@@ -74,6 +74,7 @@ fn full_local_buffers_on_zero_window_flows_do_not_scan_pool_waiters() {
         assert_eq!(s.tcp_write(id, &[8]), Err(StreamError::WouldBlock));
     }
     assert!(s.writers.is_empty());
+    assert!(!s.has_pending_writers());
     assert!(s.poll_event().is_none());
     assert_eq!(s.writer_visits, 0);
 }
@@ -127,6 +128,61 @@ fn ack_promotes_a_pool_waiter_until_another_stack_refunds() {
     s.handle_timeout(now);
     assert_eq!(s.poll_event(), Some((id, Ready::WRITABLE)));
     assert_eq!(s.tcp_write(id, &[1; CHUNK]), Ok(CHUNK));
+}
+
+#[test]
+fn returned_tx_loan_credit_wakes_a_borrowed_writer_on_another_stack() {
+    let now = Instant::now();
+    let budget = MemoryBudget::new(1 << 20);
+    let mut donor = stack(Some(budget.clone()), 128 << 10, now);
+    let mut waiter = stack(Some(budget.clone()), 128 << 10, now);
+    let donor_id = open(&mut donor, 443, u16::MAX);
+    let waiter_id = open(&mut waiter, 8443, u16::MAX);
+    assert_eq!(
+        waiter
+            .tcp_reserve_tx_chunk(waiter_id, CHUNK, |parts| {
+                parts[0].fill(1);
+                Ok(CHUNK)
+            })
+            .unwrap()
+            .unwrap(),
+        CHUNK
+    );
+    let _held = budget.reserve(budget.available() - CHUNK).unwrap();
+    let epoch = budget.release_epoch();
+    assert_eq!(
+        donor
+            .tcp_reserve_tx(donor_id, 2 * CHUNK, |parts| {
+                assert_eq!(parts.len(), 2);
+                assert_eq!(budget.available(), 0);
+                assert!(matches!(
+                    waiter.tcp_reserve_tx_chunk(waiter_id, CHUNK, |_| panic!("unfunded loan")),
+                    Err(StreamError::WouldBlock)
+                ));
+                assert!(waiter.has_pending_writers());
+                assert!(waiter.poll_event().is_none());
+                Ok(0)
+            })
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert_eq!(budget.available(), CHUNK);
+    assert_ne!(budget.release_epoch(), epoch);
+    assert_eq!(waiter.poll_event(), Some((waiter_id, Ready::WRITABLE)));
+    assert!(!waiter.has_pending_writers());
+    assert!(waiter.poll_event().is_none());
+    assert_eq!(
+        waiter
+            .tcp_reserve_tx_chunk(waiter_id, CHUNK, |parts| {
+                parts[0].fill(2);
+                Ok(CHUNK)
+            })
+            .unwrap()
+            .unwrap(),
+        CHUNK
+    );
+    assert_eq!(budget.available(), 0);
 }
 
 #[test]

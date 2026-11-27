@@ -804,6 +804,10 @@ impl Reassembler {
         self.entries.is_empty() && self.expired.is_empty()
     }
 
+    pub(crate) fn obligation_bound(&self) -> usize {
+        self.limits.max_entries.saturating_add(MAX_PENDING_ICMP)
+    }
+
     pub(crate) fn obligations(&self) -> impl Iterator<Item = (IpAddr, IpAddr, u8)> + Clone + '_ {
         self.entries
             .iter()

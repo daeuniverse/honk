@@ -16,6 +16,7 @@ pub(crate) mod sack;
 pub(crate) mod sent;
 pub(crate) mod seq;
 
+use std::io::{self, IoSliceMut};
 use std::time::{Duration, Instant};
 
 use crate::flow::FourTuple;
@@ -371,29 +372,48 @@ impl Tcb {
     }
 
     pub fn write(&mut self, pool: &mut Pool, data: &[u8]) -> Result<usize, StreamError> {
+        let limit = self.write_room(pool, data.len())?;
+        let n = self.tx.write(pool, &data[..limit]);
+        if n == 0 && limit != 0 {
+            self.write_blocked = true;
+            return Err(StreamError::WouldBlock);
+        }
+        Ok(n)
+    }
+
+    pub fn with_tx_spare<const PARTS: usize>(
+        &mut self,
+        pool: &mut Pool,
+        limit: usize,
+        fill: impl FnOnce(&mut [IoSliceMut<'_>]) -> io::Result<usize>,
+    ) -> Result<io::Result<usize>, StreamError> {
+        let room = self.write_room(pool, limit)?;
+        if room == 0 {
+            return Ok(Ok(0));
+        }
+        let Some(result) = self.tx.with_spare::<PARTS>(pool, room, fill) else {
+            self.write_blocked = true;
+            return Err(StreamError::WouldBlock);
+        };
+        Ok(result)
+    }
+
+    fn write_room(&mut self, pool: &Pool, requested: usize) -> Result<usize, StreamError> {
         if let Some(error) = self.error {
             return Err(error);
         }
         if self.fin_requested || matches!(self.state, TcpState::TimeWait | TcpState::Closed) {
             return Err(StreamError::Closed);
         }
-        if data.is_empty() {
+        if requested == 0 {
             return Ok(0);
         }
-        if !matches!(self.state, TcpState::Established | TcpState::CloseWait) {
+        let room = self.send_limit(pool.chunk()).saturating_sub(self.tx.len());
+        if room == 0 || !matches!(self.state, TcpState::Established | TcpState::CloseWait) {
             self.write_blocked = true;
             return Err(StreamError::WouldBlock);
         }
-        let limit = self.send_limit(pool.chunk());
-        let n = self.tx.write(
-            pool,
-            &data[..data.len().min(limit.saturating_sub(self.tx.len()))],
-        );
-        if n == 0 {
-            self.write_blocked = true;
-            return Err(StreamError::WouldBlock);
-        }
-        Ok(n)
+        Ok(requested.min(room))
     }
 
     fn send_limit(&self, chunk: usize) -> usize {
@@ -419,42 +439,29 @@ impl Tcb {
         out: &mut [u8],
         now: Instant,
     ) -> Result<usize, StreamError> {
+        let avail = self.read_len()?;
+        if avail == 0 {
+            return Ok(0);
+        }
+        if out.is_empty() {
+            return Err(StreamError::WouldBlock);
+        }
+        let old_window = self.wire_window(false);
+        let n = self.rx.read(pool, out, avail);
+        self.read_progress(pool, n, now, old_window);
+        Ok(n)
+    }
+
+    pub fn consume_rx(&mut self, pool: &mut Pool, n: usize, now: Instant) {
+        let old_window = self.wire_window(false);
+        self.rx.consume(pool, n);
+        self.read_progress(pool, n, now, old_window);
+    }
+
+    pub fn read_len(&self) -> Result<usize, StreamError> {
         let avail = self.available();
         if avail != 0 {
-            if out.is_empty() {
-                return Err(StreamError::WouldBlock);
-            }
-            let old_window = self.wire_window(false);
-            let n = self.rx.read(pool, out, avail);
-            self.drs_copied = self.drs_copied.saturating_add(n);
-            if now.saturating_duration_since(self.drs_time) >= self.rcv_rtt {
-                self.rcv_target = self
-                    .rcv_target
-                    .max(
-                        self.drs_copied
-                            .saturating_mul(2)
-                            .saturating_add(16 * usize::from(self.local_mss)),
-                    )
-                    .min(self.rcv_max);
-                self.drs_copied = 0;
-                self.drs_time = now;
-            }
-            if self.available() == 0 && self.ooo.is_empty() {
-                self.rx.compact(pool, self.committed_right);
-            } else {
-                self.rx.shrink(pool, self.committed_right);
-            }
-            if !self.peer_fin_seen {
-                self.grow_window(pool);
-                let right = self.wire_right(false);
-                if (old_window == 0 && self.wire_window(false) != 0)
-                    || (seq::gt(right, self.last_adv_right)
-                        && right.wrapping_sub(self.last_adv_right) >= 2 * u32::from(self.local_mss))
-                {
-                    self.ack_due |= WINDOW_UPDATE;
-                }
-            }
-            return Ok(n);
+            return Ok(avail);
         }
         if let Some(error) = self.error {
             return Err(error);
@@ -463,6 +470,37 @@ impl Tcb {
             return Ok(0);
         }
         Err(StreamError::WouldBlock)
+    }
+
+    fn read_progress(&mut self, pool: &mut Pool, n: usize, now: Instant, old_window: u16) {
+        self.drs_copied = self.drs_copied.saturating_add(n);
+        if now.saturating_duration_since(self.drs_time) >= self.rcv_rtt {
+            self.rcv_target = self
+                .rcv_target
+                .max(
+                    self.drs_copied
+                        .saturating_mul(2)
+                        .saturating_add(16 * usize::from(self.local_mss)),
+                )
+                .min(self.rcv_max);
+            self.drs_copied = 0;
+            self.drs_time = now;
+        }
+        if self.available() == 0 && self.ooo.is_empty() {
+            self.rx.compact(pool, self.committed_right);
+        } else {
+            self.rx.shrink(pool, self.committed_right);
+        }
+        if !self.peer_fin_seen {
+            self.grow_window(pool);
+            let right = self.wire_right(false);
+            if (old_window == 0 && self.wire_window(false) != 0)
+                || (seq::gt(right, self.last_adv_right)
+                    && right.wrapping_sub(self.last_adv_right) >= 2 * u32::from(self.local_mss))
+            {
+                self.ack_due |= WINDOW_UPDATE;
+            }
+        }
     }
 
     pub fn shutdown(&mut self) -> Result<(), StreamError> {

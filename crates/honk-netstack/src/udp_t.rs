@@ -121,9 +121,13 @@ impl Drop for UdpTx {
 
 impl UdpTx {
     pub(crate) fn overhead_bound(mtu: usize) -> Option<usize> {
+        crate::budget::collection_peak::<Pending>(Self::pending_bound(mtu))
+    }
+
+    pub(crate) fn pending_bound(mtu: usize) -> usize {
         // IPv6's larger header gives the smallest UDP datagram that needs queueing.
-        let min_datagram = mtu.checked_sub(wire::ip_header_len(true))?.checked_add(1)?;
-        crate::budget::collection_peak::<Pending>(MAX_PENDING_BYTES / min_datagram)
+        let min_datagram = mtu.saturating_sub(wire::ip_header_len(true)) + 1;
+        MAX_PENDING_BYTES / min_datagram
     }
 
     pub(crate) fn new(secret: &[u8; 32], budget: Option<Arc<MemoryBudget>>) -> UdpTx {
@@ -151,8 +155,8 @@ impl UdpTx {
         !self.queue.is_empty()
     }
 
-    pub(crate) fn retains_destination(&self, address: IpAddr) -> bool {
-        self.queue.iter().any(|pending| pending.dst == address)
+    pub(crate) fn pending_destinations(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        self.queue.iter().map(|pending| pending.dst)
     }
 
     pub(crate) fn retains_tuple(&self, source: SocketAddr, destination: SocketAddr) -> bool {
@@ -1148,6 +1152,13 @@ mod tests {
                 let mut retained = Vec::new();
                 stack.visit_retained_source_contexts(|source| retained.push(source));
                 assert_eq!(retained, if len > 1280 { vec![source] } else { vec![] });
+                let mut pending = Vec::new();
+                stack.visit_pending_sources(|address| pending.push(address));
+                assert_eq!(pending, if len > 1280 { vec![dst.ip()] } else { vec![] });
+                assert!(pending.len() <= stack.pending_source_bound());
+                assert_eq!(stack.has_pending_sources(), !pending.is_empty());
+                assert_eq!(stack.may_have_transmit(false), !pending.is_empty());
+                assert!(!stack.may_have_transmit(true));
                 assert!(
                     stack
                         .poll_transmit_with(Instant::now(), &mut [0; 1], TxCaps::NONE)
@@ -1162,6 +1173,9 @@ mod tests {
                 stack.visit_retained_source_contexts(|_| {
                     panic!("final UDP fragment still pins source")
                 });
+                stack.visit_pending_sources(|_| panic!("final fragment released pending source"));
+                assert!(!stack.has_pending_sources());
+                assert!(!stack.may_have_transmit(false));
                 let packet = if packets.len() == 1 {
                     packets.pop().unwrap()
                 } else {
