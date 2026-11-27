@@ -16,7 +16,7 @@ pub(super) enum TcpInput {
 }
 
 // Bound what each shared connection future carries, including non-Host connections.
-#[cfg(all(test, target_os = "linux", target_pointer_width = "64"))]
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 const _: () = assert!(size_of::<TcpFlow>() <= 448);
 
 pub(super) enum TcpFlow {
@@ -63,6 +63,13 @@ impl DirectRelayOwner {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl FlowIo {
+    pub(in crate::control) fn worker_completion_credit(&self) -> Option<MemoryReservation> {
+        self.try_reserve_memory(size_of::<PacketCompletion>())
+    }
+}
+
 impl PacketFlow {
     fn install_completion(
         &mut self,
@@ -75,12 +82,70 @@ impl PacketFlow {
                 .stream
                 .set_retirement_callback(move || finish_packet_ack(ack));
         }
+        #[cfg(target_os = "linux")]
+        let on_failure = id
+            .and(self.stream.local())
+            .and(ack.close.as_ref())
+            .map(|close| Arc::clone(&close.0));
+        #[cfg(not(target_os = "linux"))]
+        let on_failure = None;
         let completion = PacketCompletion {
             tracked: id.map(|id| (Arc::clone(&self.tracker), id)),
             ack,
         };
         self.stream
-            .set_retirement_callback_with_credit(credit, None, move || completion.finish())
+            .set_retirement_callback_with_credit(credit, on_failure, move || completion.finish())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) struct WorkerRemote<'a> {
+    pub(super) accounting: &'a mut Option<RemoteAccounting>,
+    pub(super) copy_credit: MemoryReservation,
+    pub(super) score: Option<&'a crate::group::ScoreReporter>,
+    pub(super) direct_fallback: Option<DirectFallback<'a>>,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) struct DirectFallback<'a> {
+    stats: &'a crate::stats::StatsManager,
+    bound: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> DirectFallback<'a> {
+    pub(super) fn new(stats: &'a crate::stats::StatsManager) -> Self {
+        Self {
+            stats,
+            bound: false,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DirectFallback<'_> {
+    fn drop(&mut self) {
+        self.stats.record_direct_attach_fallback(self.bound);
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) struct RemoteAccounting {
+    progress: crate::control::netstack::RemoteProgress,
+    score: Option<crate::group::ScoreReporter>,
+    accepted: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl RemoteAccounting {
+    pub(super) fn publish(&mut self) {
+        let Some(score) = &self.score else { return };
+        let (accepted, _, last_at) = self.progress.snapshot();
+        let bytes = accepted - self.accepted;
+        if bytes != 0 {
+            score.transfer_at(0, bytes, last_at.expect("accepted download time"));
+            self.accepted = accepted;
+        }
     }
 }
 
@@ -114,8 +179,28 @@ impl TcpFlow {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn local(&self) -> Option<&crate::control::netstack::local::LocalFlow> {
+        match self {
+            Self::Kernel(_) => None,
+            Self::Packet(flow) => flow.stream.local(),
+        }
+    }
+
+    pub(super) async fn sniff(&mut self) -> std::io::Result<sniffing::SniffResult> {
+        #[cfg(target_os = "linux")]
+        if let Some(local) = self.local() {
+            return local.sniff().await;
+        }
+        Ok(sniffing::sniff_tcp(self).await)
+    }
+
     pub(super) fn mark_packet_rx_admitted(&self) {
         if let Self::Packet(flow) = self {
+            #[cfg(target_os = "linux")]
+            if flow.stream.local().is_some() {
+                return;
+            }
             flow.stream.mark_rx_admitted();
         }
     }
@@ -133,6 +218,10 @@ impl TcpFlow {
                     .await
             }
             Self::Packet(flow) => {
+                #[cfg(target_os = "linux")]
+                if flow.stream.local().is_some() {
+                    flow.stream.attach_remote().await?;
+                }
                 let scope = flow.stream.scope();
                 controller
                     .handle_packet_tcp_dns(&mut flow.stream, client, destination, scope)
@@ -188,8 +277,28 @@ impl TcpFlow {
         progress: relay::RelayProgress,
         prefix: SniffPrefix,
         close: Option<&Arc<CloseSignal>>,
+        #[cfg(target_os = "linux")] worker: Option<WorkerRemote<'_>>,
         #[cfg(feature = "native-api")] observer: Option<&FlowObserver>,
     ) -> Option<(Self, RelayCompletion)> {
+        #[cfg(target_os = "linux")]
+        if let Some(worker) = worker {
+            debug_assert!(
+                prefix.bytes.is_empty(),
+                "local sniff leaves its prefix in Stack"
+            );
+            let operation = self.relay_worker_remote(
+                proxy.stream,
+                (client, destination),
+                progress,
+                close,
+                worker,
+            );
+            #[cfg(feature = "native-api")]
+            let operation = observe_relay(observer, operation);
+            let result = operation.await;
+            return Some((self, result));
+        }
+
         let on_owner = move |mut flow: PacketFlow, proxy: ProxyStream, progress, prefix| {
             let stream = proxy.stream;
             let close = close.cloned();
@@ -258,6 +367,94 @@ impl TcpFlow {
         Some((self, result))
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) async fn relay_worker_remote(
+        &mut self,
+        proxy: Box<dyn honk_outbound::proxy::AsyncReadWrite>,
+        endpoints: (SocketAddr, SocketAddr),
+        progress: relay::RelayProgress,
+        close: Option<&Arc<CloseSignal>>,
+        remote: WorkerRemote<'_>,
+    ) -> RelayCompletion {
+        let Self::Packet(packet) = self else {
+            unreachable!("only the worker flow can bind a remote stream");
+        };
+        let credit = remote.copy_credit;
+        let counters = crate::control::netstack::RemoteCounters {
+            download: Arc::clone(&progress.download),
+            outbound: progress.outbound.clone(),
+            observe_live: remote.score.is_some(),
+        };
+        let attached = tokio::select! {
+            biased;
+            () = wait_for_close(close) => {
+                packet.stream.abort();
+                return RelayCompletion::Closed;
+            }
+            result = packet.stream.attach_remote_with(Some(counters)) => result,
+        };
+        if let Some(mut fallback) = remote.direct_fallback {
+            fallback.bound = attached.is_ok();
+        }
+        if let Err(error) = attached {
+            if error.kind() == std::io::ErrorKind::ConnectionAborted {
+                return RelayCompletion::Closed;
+            }
+            return RelayCompletion::LocalError(error);
+        }
+        packet.stream.mark_rx_admitted();
+        let accounting = remote.accounting.insert(RemoteAccounting {
+            progress: packet
+                .stream
+                .remote_progress()
+                .expect("bound remote stream"),
+            score: remote.score.cloned(),
+            accepted: 0,
+        });
+        let mut result = {
+            let accepted_download = accounting.progress.clone();
+            let operation = relay_until_close(
+                close,
+                relay::relay_remote_tcp(&mut packet.stream, proxy, endpoints, &progress, || {
+                    accepted_download.accepted()
+                }),
+            );
+            if accounting.score.is_some() {
+                tokio::pin!(operation);
+                loop {
+                    accounting.publish();
+                    tokio::select! {
+                        result = &mut operation => break result,
+                        () = std::future::poll_fn(|cx| {
+                            accounting.progress.poll_changed(cx, accounting.accepted)
+                        }), if !accounting.progress.finished() => {}
+                    }
+                }
+            } else {
+                operation.await
+            }
+        };
+        drop(credit);
+        if matches!(&result, RelayCompletion::Relayed(Err(error)) if error.is::<relay::DrainExpired>())
+        {
+            result = RelayCompletion::Closed;
+        }
+        accounting.publish();
+        if let RelayCompletion::Relayed(Ok(stats)) = &result {
+            let upload = progress.upload.load(std::sync::atomic::Ordering::Relaxed);
+            if stats.client_to_proxy == upload
+                && stats.proxy_to_client == accounting.progress.accepted()
+            {
+                return result;
+            }
+            result = RelayCompletion::Closed;
+        }
+        packet.stream.abort();
+        std::future::poll_fn(|cx| accounting.progress.poll_finished(cx)).await;
+        accounting.publish();
+        result
+    }
+
     async fn relay(
         &mut self,
         proxy: ProxyStream,
@@ -314,7 +511,7 @@ async fn relay_until_close(
 }
 
 #[cfg(feature = "native-api")]
-async fn observe_relay<T>(
+pub(super) async fn observe_relay<T>(
     observer: Option<&FlowObserver>,
     operation: impl Future<Output = T>,
 ) -> T {

@@ -160,19 +160,192 @@ async fn reply_payload(
     destination: SocketAddr,
 ) -> Vec<u8> {
     let output = scope.next_output().await.unwrap();
-    let ip = wire::parse_ip(output.packet()).unwrap();
-    assert_eq!((ip.src, ip.dst), (destination.ip(), source.ip()));
-    let udp = &output.packet()[ip.payload];
-    assert!(wire::udp::verify_checksum(ip.src, ip.dst, udp));
-    let (from, to, payload) = wire::udp::parse(udp).unwrap();
-    assert_eq!((from, to), (destination.port(), source.port()));
-    let payload = udp[payload].to_vec();
+    let payload = wire_reply_payload(output.packet(), source, destination).to_vec();
     output.release();
     payload
 }
 
+fn wire_reply_payload(packet: &[u8], source: SocketAddr, destination: SocketAddr) -> &[u8] {
+    let ip = wire::parse_ip(packet).unwrap();
+    assert_eq!((ip.src, ip.dst), (destination.ip(), source.ip()));
+    let udp = &packet[ip.payload];
+    assert!(wire::udp::verify_checksum(ip.src, ip.dst, udp));
+    let (from, to, payload) = wire::udp::parse(udp).unwrap();
+    assert_eq!((from, to), (destination.port(), source.port()));
+    &udp[payload]
+}
+
 async fn reply(scope: &PacketScope, source: SocketAddr, destination: SocketAddr, expected: &[u8]) {
     assert_eq!(reply_payload(scope, source, destination).await, expected);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn local_packet_udp_and_dns_replies_return_driver_credit_on_close() {
+    use crate::control::netstack::{CAPTURE_MEMORY, capture_realm};
+    use crate::xdp::{ReturnPath, worker::PeerAuthority};
+    use honk_datapath::buffer::TxClass;
+    use std::future::poll_fn;
+    use std::task::Poll;
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (plane, _health) = local_plane_with(|config| {
+            config.dns.upstream = vec![honk_config::dns::DnsUpstream {
+                name: "loopback".into(),
+                address: dns.local_addr().unwrap().to_string(),
+                protocol: honk_config::types::DnsProtocol::Udp,
+                tls_server_name: None,
+                outbound: None,
+            }];
+            config.dns.routing.fallback = "loopback".into();
+        })
+        .await;
+        let budget = MemoryBudget::new(CAPTURE_MEMORY);
+        let (realm, owners) = capture_realm(1280, 1, 1, 1, 1, &budget).unwrap();
+        let gate = Arc::new(AtomicBool::new(false));
+        realm.install_admission_fence(Arc::clone(&gate)).unwrap();
+        let peers = PeerAuthority::new(Arc::clone(&gate), &budget).unwrap();
+        let (endpoints, mut owner, mut drivers) =
+            PacketEndpoints::start_driven(plane, vec![(realm, owners)], 2, None, ScopeId::HOST)
+                .await
+                .unwrap();
+        let mut driver = drivers.pop().unwrap();
+        driver.make_local(1).unwrap();
+        let scope = driver.owner_scope().clone();
+        poll_fn(|cx| {
+            driver.service(cx, Instant::now());
+            owner.poll_ready(cx)
+        })
+        .await
+        .unwrap();
+        gate.store(true, Ordering::Release);
+        endpoints.capture_ready().unwrap();
+
+        let receive = |driver: &mut PacketDriver, source, destination, path, payload: &[u8]| {
+            let now = Instant::now();
+            let packet = packet(source, destination, 0, payload);
+            let (selected, claim) = endpoints
+                .execution_owner(scope.scope(), wire::PacketView::from_slice(&packet))
+                .unwrap();
+            assert!(claim.is_none() && selected.same_owner(driver.owner_scope()));
+            let report = endpoints
+                .receive_local_on_timed(
+                    driver,
+                    &packet,
+                    now,
+                    now,
+                    None,
+                    false,
+                    |source, pending| peers.retain(scope.scope(), source, path, now, pending),
+                )
+                .unwrap();
+            assert!(report.taken_over);
+            report.qualified_rx
+        };
+        let take_reply = async |driver: &mut PacketDriver| {
+            poll_fn(|cx| {
+                driver.service(cx, Instant::now());
+                let mut output = [None];
+                match driver.poll_outputs_class(cx, TxClass::Bulk, &mut output) {
+                    Poll::Ready(Some(1)) => Poll::Ready(output[0].take().unwrap()),
+                    Poll::Pending => Poll::Pending,
+                    _ => panic!("expected one local UDP reply"),
+                }
+            })
+            .await
+        };
+
+        let client: SocketAddr = "192.0.2.10:41000".parse().unwrap();
+        let target = upstream.local_addr().unwrap();
+        let path = ReturnPath {
+            realm: 1,
+            device: 0,
+            mac: [2, 0, 0, 0, 0, 1],
+            vlan_tci: [0; 2],
+            vlan_proto: [0; 2],
+            vlan_count: 0,
+        };
+        let payload = b"driver UDP echo\0\xff";
+        assert!(!receive(&mut driver, client, target, path, payload));
+        let mut bytes = [0; 1024];
+        let (length, sender) = upstream.recv_from(&mut bytes).await.unwrap();
+        assert_eq!(&bytes[..length], payload);
+        upstream.send_to(&bytes[..length], sender).await.unwrap();
+        let udp_reply = take_reply(&mut driver).await;
+        assert_eq!(udp_reply.peer_hold().unwrap().original_path(), path);
+        assert_eq!(
+            wire_reply_payload(udp_reply.packet(), client, target),
+            payload
+        );
+        assert!(receive(&mut driver, client, target, path, payload));
+        let (length, _) = upstream.recv_from(&mut bytes).await.unwrap();
+        assert_eq!(&bytes[..length], payload);
+
+        let dns_client: SocketAddr = "192.0.2.11:41001".parse().unwrap();
+        let dns_target = "198.51.100.53:53".parse().unwrap();
+        let dns_path = ReturnPath {
+            mac: [2, 0, 0, 0, 0, 2],
+            ..path
+        };
+        let query = dns_query_payload();
+        assert!(!receive(
+            &mut driver,
+            dns_client,
+            dns_target,
+            dns_path,
+            &query
+        ));
+        let (length, sender) = dns.recv_from(&mut bytes).await.unwrap();
+        let question = crate::dns::forwarder::parse_dns_question(&query);
+        assert_eq!(
+            crate::dns::forwarder::parse_dns_question(&bytes[..length]),
+            question
+        );
+        let mut response = bytes[..length].to_vec();
+        response[2..4].copy_from_slice(&[0x81, 0x80]);
+        response[6..8].copy_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 99]);
+        dns.send_to(&response, sender).await.unwrap();
+
+        // The DNS reply cannot use the sole bulk frame until the UDP consumer releases it.
+        udp_reply.release();
+        let dns_reply = take_reply(&mut driver).await;
+        assert_eq!(dns_reply.peer_hold().unwrap().original_path(), dns_path);
+        let received = wire_reply_payload(dns_reply.packet(), dns_client, dns_target);
+        assert_eq!(&received[..2], &query[..2]);
+        assert_ne!(received[2] & 0x80, 0);
+        assert_eq!(received[3] & 0x0f, 0);
+        assert_eq!(
+            crate::dns::forwarder::parse_dns_question(received),
+            question
+        );
+        assert_eq!(
+            crate::dns::forwarder::extract_answer_ips(received),
+            vec!["203.0.113.99".parse::<std::net::IpAddr>().unwrap()]
+        );
+        endpoints.close();
+        {
+            let mut shutdown = std::pin::pin!(endpoints.shutdown());
+            assert!(scope.retains_source(dns_client.ip()));
+            assert!(futures::poll!(&mut shutdown).is_pending());
+            dns_reply.release();
+            poll_fn(|cx| {
+                driver.service_closing(cx, Instant::now());
+                shutdown.as_mut().poll(cx)
+            })
+            .await
+            .unwrap();
+        }
+        owner.run().await.unwrap();
+        assert!(!scope.retains_source(dns_client.ip()));
+        assert!(!scope.retains_source(client.ip()));
+        drop((driver, scope, peers, endpoints));
+        assert_eq!(budget.used(), 0);
+    })
+    .await
+    .expect("local UDP and DNS owners must retire with their reply credit");
 }
 
 #[tokio::test]

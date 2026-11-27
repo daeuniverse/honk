@@ -24,6 +24,8 @@ mod direct_relay;
 mod input;
 mod score;
 mod terminal;
+#[cfg(target_os = "linux")]
+mod worker;
 
 use direct_relay::{DirectRelay, RelayPublication};
 use input::{TcpFlow, TcpInput};
@@ -48,6 +50,45 @@ enum RelayCompletion {
     PrefixFailed(std::io::Error),
     LocalError(std::io::Error),
     Relayed(anyhow::Result<relay::RelayStats>),
+}
+
+#[cfg(feature = "native-api")]
+impl RelayCompletion {
+    fn terminal(&self) -> TcpTerminal {
+        match self {
+            Self::Closed => TcpTerminal::IntentionalRetirement,
+            Self::PrefixFailed(_) => TcpTerminal::PrefixWriteFailed,
+            Self::LocalError(_) => TcpTerminal::ConnectionFailed,
+            Self::Relayed(Ok(_)) => TcpTerminal::RelayClosed,
+            Self::Relayed(Err(_)) => TcpTerminal::RelayFailed,
+        }
+    }
+}
+
+fn accepted_transfer(
+    reporter: Option<&crate::group::ScoreReporter>,
+    observation: &ConnectionObservation,
+) -> Option<Arc<dyn Fn(u64, u64) + Send + Sync>> {
+    let reporter = reporter.cloned();
+    let flow = observation.flow().cloned();
+    if reporter.is_none() && flow.is_none() {
+        return None;
+    }
+    Some(Arc::new(move |upload, download| {
+        if let Some(reporter) = &reporter {
+            if upload != 0 {
+                reporter.tx(upload);
+            }
+            if download != 0 {
+                reporter.rx(download);
+            }
+        }
+        if upload != 0
+            && let Some(flow) = &flow
+        {
+            flow.accepted_send();
+        }
+    }))
 }
 
 async fn write_prefix(
@@ -213,6 +254,8 @@ impl ControlPlaneHandle {
             original_dst,
             None,
             None,
+            #[cfg(target_os = "linux")]
+            None,
         )
         .await
     }
@@ -223,8 +266,16 @@ impl ControlPlaneHandle {
     ) -> anyhow::Result<()> {
         let client = stream.peer_addr();
         let destination = stream.local_addr();
-        self.serve_tcp_input(TcpInput::Packet(stream), client, destination, None, None)
-            .await
+        self.serve_tcp_input(
+            TcpInput::Packet(stream),
+            client,
+            destination,
+            None,
+            None,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+        .await
     }
 
     pub(in crate::control) async fn serve_auxiliary_packet_connection(
@@ -244,6 +295,8 @@ impl ControlPlaneHandle {
             destination,
             None,
             Some((binding, cancel)),
+            #[cfg(target_os = "linux")]
+            None,
         )
         .await
     }
@@ -267,6 +320,8 @@ impl ControlPlaneHandle {
                 client,
                 destination,
                 Some((&mut relay, credit)),
+                None,
+                #[cfg(target_os = "linux")]
                 None,
             ));
             let mut stop = std::pin::pin!(Abortable::new(std::future::pending::<()>(), cancel));
@@ -306,8 +361,15 @@ impl ControlPlaneHandle {
         original_dst: SocketAddr,
         direct: Option<(&mut DirectRelay<'_>, honk_netstack::MemoryReservation)>,
         auxiliary: Option<(&AuxiliaryWork, AbortRegistration)>,
+        #[cfg(target_os = "linux")] mut worker: Option<&mut worker::WorkerTcp<'_>>,
     ) -> anyhow::Result<()> {
         let (direct, credit) = direct.unzip();
+        #[cfg(target_os = "linux")]
+        let credit = credit.or_else(|| {
+            worker
+                .as_deref_mut()
+                .and_then(|worker| worker.completion_credit.take())
+        });
         let (auxiliary, task_cancel) = auxiliary.unzip();
         let (admitted_route, packet_scope, packet_dscp, gateway_process) = match &mut input {
             TcpInput::Packet(stream) => (
@@ -366,6 +428,10 @@ impl ControlPlaneHandle {
                         None,
                     ),
                 };
+                #[cfg(target_os = "linux")]
+                if let Some(local) = flow.local() {
+                    local.wait_established().await?;
+                }
                 let packet_input = gateway_process.map(|process| (process, None)).or_else(|| {
                     flow.packet_source()
                         .and_then(|source| source.packet_input())
@@ -438,6 +504,10 @@ impl ControlPlaneHandle {
                         .as_ref()
                         .is_some_and(|handoff| handoff.outbound == OutboundIndex::Block as u8)
                 {
+                    #[cfg(target_os = "linux")]
+                    if let Some(worker) = worker.as_deref_mut() {
+                        worker.release_copy_credit();
+                    }
                     flow.serve_dns(&self.dns_controller, client_addr, original_dst)
                         .await?;
                     #[cfg(feature = "native-api")]
@@ -520,7 +590,7 @@ impl ControlPlaneHandle {
                 let sniff_result = if skip_sniff {
                     sniffing::SniffResult::unknown()
                 } else {
-                    sniffing::sniff_tcp(&mut flow).await
+                    flow.sniff().await?
                 };
                 if auxiliary.is_some_and(|binding| !binding.is_active()) {
                     return Ok(());
@@ -947,6 +1017,8 @@ impl ControlPlaneHandle {
                     }
                 };
                 let proxy_stream = winner.stream;
+                #[cfg(target_os = "linux")]
+                let mut proxy_stream = proxy_stream;
                 let target = winner.target;
                 let node = &target.node;
                 let score_reporter = winner.reporter;
@@ -1063,6 +1135,85 @@ impl ControlPlaneHandle {
                     "TCP connection: {} <-> {}", client_addr, original_dst,
                 );
 
+                let has_direct_owner = direct.is_some();
+                #[cfg(target_os = "linux")]
+                let has_direct_owner = has_direct_owner || worker.is_some();
+                let handoff_direct = has_direct_owner
+                    && self
+                        .proxy_registry
+                        .can_handoff_packet_direct(&runtime_generation, &target);
+                let mut conn_progress = relay::RelayProgress {
+                    upload: conn_upload,
+                    download: conn_download,
+                    outbound: Some(outbound),
+                    first_response: None,
+                    on_transfer: None,
+                };
+                #[cfg(target_os = "linux")]
+                let mut direct_fallback = None;
+                #[cfg(target_os = "linux")]
+                if let Some(worker) = worker.as_deref_mut().filter(|_| {
+                    handoff_direct && proxy_stream.stream.as_ref().as_any().is::<TcpStream>()
+                }) {
+                    let local = flow.local().expect("worker Direct requires a local flow");
+                    match worker::start_direct(
+                        local,
+                        proxy_stream,
+                        &conn_progress,
+                        score_reporter.is_some() || observation.flow().is_some(),
+                        close_signal.as_ref(),
+                    ) {
+                        Ok(worker::DirectStart::Submitted(observer, credit)) => {
+                            let job = worker::WorkerDirect {
+                                flow,
+                                observer,
+                                close: close_signal.clone(),
+                                score: score_reporter,
+                                observation: std::mem::take(&mut observation),
+                                #[cfg(feature = "native-api")]
+                                relay_observer: winner_observer,
+                                stats: Arc::clone(&self.stats),
+                                outbound: (outbound_name, outbound_kind),
+                                endpoints: (client_addr, original_dst),
+                            };
+                            return worker.complete_on_worker(job, credit);
+                        }
+                        Ok(worker::DirectStart::Remote(proxy)) => {
+                            proxy_stream = proxy;
+                            direct_fallback = Some(input::DirectFallback::new(&self.stats));
+                        }
+                        Ok(worker::DirectStart::Closed) => {
+                            if let Some(score) = &score_reporter {
+                                score.finish(crate::group::ScoreOutcome::Cancelled);
+                            }
+                            anyhow::ensure!(
+                                flow.retire(
+                                    RetireAck {
+                                        close: None,
+                                        outbound: None
+                                    },
+                                    None
+                                )
+                                .await,
+                                "TCP retirement failed"
+                            );
+                            #[cfg(feature = "native-api")]
+                            {
+                                terminal = Some(TcpTerminal::IntentionalRetirement);
+                            }
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            if let Some(score) = &score_reporter {
+                                score.finish(crate::group::ScoreOutcome::Rejected);
+                            }
+                            return Err(
+                                anyhow::Error::new(error).context("attaching packet Direct socket")
+                            );
+                        }
+                    }
+                }
+
                 let has_prefix = !sniff_result.buffered.is_empty();
                 let prefix = SniffPrefix {
                     bytes: sniff_result.buffered,
@@ -1099,44 +1250,13 @@ impl ControlPlaneHandle {
                         Arc::new(move || reporter.first_response()) as Arc<dyn Fn() + Send + Sync>
                     })
                 };
-                let first_response = observation.first_response(first_response);
-                let on_transfer = score_reporter.as_ref().map(|reporter| {
-                    let reporter = reporter.clone();
-                    std::sync::Arc::new(move |upload, download| {
-                        if upload != 0 {
-                            reporter.tx(upload);
-                        }
-                        if download != 0 {
-                            reporter.rx(download);
-                        }
-                    }) as std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>
-                });
-                let on_transfer = match observation.flow() {
-                    Some(flow) => {
-                        let flow = Arc::clone(flow);
-                        Some(Arc::new(move |upload, download| {
-                            if let Some(callback) = &on_transfer {
-                                callback(upload, download);
-                            }
-                            if upload != 0 {
-                                flow.accepted_send();
-                            }
-                        })
-                            as Arc<dyn Fn(u64, u64) + Send + Sync>)
-                    }
-                    None => on_transfer,
-                };
-                let conn_progress = relay::RelayProgress {
-                    upload: conn_upload.clone(),
-                    download: conn_download.clone(),
-                    outbound: Some(outbound),
-                    first_response,
-                    on_transfer,
-                };
-                let direct = direct.filter(|_| {
-                    self.proxy_registry
-                        .can_handoff_packet_direct(&runtime_generation, &target)
-                });
+                conn_progress.first_response = observation.first_response(first_response);
+                conn_progress.on_transfer =
+                    accepted_transfer(score_reporter.as_ref(), &observation);
+                let direct = direct.filter(|_| handoff_direct);
+                #[cfg(target_os = "linux")]
+                let remote =
+                    worker.map(|worker| worker.remote(score_reporter.as_ref(), direct_fallback));
                 let Some((flow, relay_result)) = flow
                     .relay_owned(
                         direct,
@@ -1146,6 +1266,8 @@ impl ControlPlaneHandle {
                         conn_progress,
                         prefix,
                         close_signal.as_ref(),
+                        #[cfg(target_os = "linux")]
+                        remote,
                         #[cfg(feature = "native-api")]
                         winner_observer.as_ref(),
                     )
@@ -1159,13 +1281,7 @@ impl ControlPlaneHandle {
                 }
                 #[cfg(feature = "native-api")]
                 {
-                    terminal = Some(match &relay_result {
-                        RelayCompletion::Closed => TcpTerminal::IntentionalRetirement,
-                        RelayCompletion::PrefixFailed(_) => TcpTerminal::PrefixWriteFailed,
-                        RelayCompletion::LocalError(_) => TcpTerminal::ConnectionFailed,
-                        RelayCompletion::Relayed(Ok(_)) => TcpTerminal::RelayClosed,
-                        RelayCompletion::Relayed(Err(_)) => TcpTerminal::RelayFailed,
-                    });
+                    terminal = Some(relay_result.terminal());
                 }
                 let relay_succeeded = matches!(&relay_result, RelayCompletion::Relayed(Ok(_)));
                 match relay_result {

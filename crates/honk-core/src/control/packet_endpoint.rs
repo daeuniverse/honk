@@ -46,6 +46,34 @@ fn report_tcp_completion(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(super) type DirectCompletion = futures::future::BoxFuture<'static, ()>;
+
+#[cfg(target_os = "linux")]
+async fn run_direct_completions(mut receiver: mpsc::UnboundedReceiver<DirectCompletion>) {
+    use futures::{StreamExt, stream::FuturesUnordered};
+
+    let mut active = FuturesUnordered::new();
+    loop {
+        tokio::select! {
+            job = receiver.recv() => match job {
+                Some(job) => active.push(std::panic::AssertUnwindSafe(job).catch_unwind()),
+                None => break,
+            },
+            Some(result) = active.next() => {
+                if result.is_err() {
+                    tracing::error!("packet Direct completion panicked");
+                }
+            }
+        }
+    }
+    while let Some(result) = active.next().await {
+        if result.is_err() {
+            tracing::error!("packet Direct completion panicked");
+        }
+    }
+}
+
 pub(super) async fn run_until_auxiliary_pause<F: Future>(
     auxiliary: Option<&AuxiliaryWork>,
     operation: F,
@@ -350,6 +378,9 @@ struct EndpointRuntime {
     standalone_dns_scope: ScopeId,
     scope_tasks: TaskRegistry,
     tcp_tasks: TaskRegistry,
+    #[cfg(target_os = "linux")]
+    // Each queued or active completion holds its funded TCP admission.
+    direct_completions: mpsc::UnboundedSender<DirectCompletion>,
     startup: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -411,6 +442,12 @@ impl PacketEndpoints {
             return false;
         };
         match protocol {
+            6 if realm.tracks_tcp() => {
+                packet_lineage.is_none()
+                    && realm
+                        .tcp_directory_owner(source, destination, true)
+                        .is_some()
+            }
             6 => realm.owners().iter().any(|owned| match packet_lineage {
                 None => owned.retains_tcp(source, destination),
                 Some(_) => owned.retains_tcp_with_lineage(source, destination, packet_lineage),
@@ -449,11 +486,13 @@ impl PacketEndpoints {
     /// Includes protocol, initializer/retirement, queued work and actual output owners.
     /// Call outside the receive callback, which already holds the scope mutex.
     pub(crate) fn retains_source(&self, scope: ScopeId, address: std::net::IpAddr) -> bool {
-        self.shared
-            .scopes
-            .iter()
-            .any(|owned| owned.scope() == scope && owned.retains_source(address))
-            || self.shared.udp_pool.retains_source(scope, address)
+        self.realm(scope).is_some_and(|realm| {
+            realm.tcp_directory_retains_source(address)
+                || realm
+                    .owners()
+                    .iter()
+                    .any(|owner| owner.retains_source(address))
+        }) || self.shared.udp_pool.retains_source(scope, address)
     }
 
     pub(crate) fn prepare_dns_bind(
@@ -666,6 +705,8 @@ impl PacketEndpoints {
             })
             .and_then(|n| n.checked_add(size_of::<Shared>() + maintenance::COMMAND_MEMORY))
             .ok_or_else(|| anyhow::anyhow!("packet ingress capacity overflows"))?;
+        #[cfg(target_os = "linux")]
+        let bytes = bytes + INGRESS_CAPACITY * size_of::<DirectCompletion>();
         let memory = budget
             .reserve(bytes)
             .ok_or_else(|| anyhow::anyhow!("packet ingress memory capacity"))?;
@@ -715,6 +756,8 @@ impl PacketEndpoints {
         });
         let (sender, receiver) = mpsc::channel(INGRESS_CAPACITY);
         let (initializers, initializer_rx) = mpsc::channel(INGRESS_CAPACITY);
+        #[cfg(target_os = "linux")]
+        let (direct_completions, direct_rx) = mpsc::unbounded_channel();
         let (started, ready) = tokio::sync::oneshot::channel();
         let mut drivers = Vec::new();
         let mut runtime = EndpointRuntime {
@@ -728,6 +771,8 @@ impl PacketEndpoints {
             standalone_dns_scope,
             scope_tasks,
             tcp_tasks,
+            #[cfg(target_os = "linux")]
+            direct_completions,
             startup: Some(started),
         };
         // As with scope-task factories, fund the concrete future before taking any owner.
@@ -762,6 +807,10 @@ impl PacketEndpoints {
                 let _completion =
                     crate::connection_tracker::CloseCompletion(Arc::clone(&completed));
                 let _commands = crate::connection_tracker::CloseCompletion(commands_closed);
+                #[cfg(target_os = "linux")]
+                let ((plane, result), ()) =
+                    tokio::join!(runtime.run(), run_direct_completions(direct_rx));
+                #[cfg(not(target_os = "linux"))]
                 let (plane, result) = runtime.run().await;
                 completed.finish(result.is_ok());
                 (plane, result)
@@ -1270,6 +1319,10 @@ impl PacketEndpoints {
     }
 
     fn accept_ready(&self, scope: &PacketScope, auxiliary: Option<&AuxiliaryWork>) {
+        #[cfg(target_os = "linux")]
+        if scope.is_local() {
+            return;
+        }
         if self.shared.is_closing()
             || auxiliary.is_some_and(|binding| !binding.is_active())
             || !scope.has_pending_accept()
@@ -1734,10 +1787,15 @@ impl EndpointRuntime {
                             report_tcp_completion(result);
                         }
                         self.plane.udp_pool.reap_tasks();
+                        #[cfg(target_os = "linux")]
+                        if flow.local().is_some() {
+                            self.dispatch_worker_connection(&handle, flow, permit);
+                            continue;
+                        }
                         let guard = ConnectionGuard::new(Arc::clone(&self.plane.drain_tracker));
                         let mut auxiliary = auxiliary;
                         let owner = flow.direct_relay_runtime()
-                            .filter(|_| auxiliary.is_none() && !flow.is_local_worker())
+                            .filter(|_| auxiliary.is_none())
                             .and_then(|owner| owner.with_completion_credit(&self.shared.budget));
                         let mut connection = Some((handle.clone(), permit, guard, flow));
                         let buffers = crate::relay::COPY_BUFFER_MEMORY + crate::sniffing::SNIFF_MEMORY;
@@ -1789,13 +1847,6 @@ impl EndpointRuntime {
                                             let (handle, permit, guard, flow) = connection.take().unwrap();
                                             async move {
                                                 let (_permit, _guard) = (permit, guard);
-                                                #[cfg(target_os = "linux")]
-                                                let mut flow = flow;
-                                                #[cfg(target_os = "linux")]
-                                                if flow.local().is_some() && let Err(error) = flow.attach_remote().await {
-                                                    tracing::debug!(%error, "packet TCP attachment refused");
-                                                    return;
-                                                }
                                                 if let Err(error) = handle.serve_packet_connection(flow).await {
                                                     tracing::debug!(%error, "packet TCP endpoint ended");
                                                 }
@@ -1903,6 +1954,51 @@ impl EndpointRuntime {
         let result = maintenance::shutdown(&mut self.plane, failure, Some(shutdown)).await;
         drop(panics);
         (self.plane, result)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dispatch_worker_connection(
+        &mut self,
+        handle: &ControlPlaneHandle,
+        flow: FlowIo,
+        permit: OwnedSemaphorePermit,
+    ) {
+        let mut flow = Some(flow);
+        let result = (|| {
+            let stream = flow.as_ref().unwrap();
+            let completion = stream.worker_completion_credit().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::OutOfMemory, "packet TCP completion capacity")
+            })?;
+            // A refused Direct transfer can still use the original socket over SPSC.
+            let copy = stream.reserve_memory(crate::relay::COPY_BUFFER_MEMORY)?;
+            self.tcp_tasks.spawn_scoped_with(
+                |registration| {
+                    let flow = flow.take().unwrap();
+                    let completions = self.direct_completions.clone();
+                    let guard = ConnectionGuard::new(Arc::clone(&self.plane.drain_tracker));
+                    let handle = handle.clone();
+                    async move {
+                        if let Err(error) = handle
+                            .serve_worker_packet_connection(
+                                flow,
+                                (completion, copy),
+                                registration,
+                                completions,
+                                (permit, guard),
+                            )
+                            .await
+                        {
+                            tracing::debug!(%error, "physical packet TCP endpoint ended");
+                        }
+                    }
+                },
+                0,
+            )
+        })();
+        if let Err(error) = result {
+            flow.as_mut().unwrap().abort();
+            tracing::debug!(%error, "physical packet TCP task admission refused");
+        }
     }
 
     async fn dispatch_datagram(&self, handle: &ControlPlaneHandle, datagram: Datagram) {

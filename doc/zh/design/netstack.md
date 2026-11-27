@@ -175,7 +175,11 @@ AF_XDP TX 仍逐包立即发布。具体的同步设备轮次只把逐包 NEED_W
 
 `control::packet_endpoint::PacketEndpoints` 消费未启动的控制面及共享同一预算的显式 scopes。supervisor 会 join scope、TCP、UDP 和退休工作；取消 shutdown 等待者不会取消已接纳清理。TCP 复用既有路由/dial/Score 路径，采用 copy relay，不伪造内核接纳或 splice。UDP 复用同一个 endpoint/source pool 和捕获的 packet reply sender，不占 reply FD。endpoint/source/foreign-reply/sniffer 键均包含 scope；packet 退休不能修改碰巧相同的内核状态。DNS 仍先执行流量策略，must/Block 保持终端性。
 
-当 realm 只有一个已核验的 Intel `i40e` PCI 物理功能，且每个配置的 worker 都有独立 Stack owner（一个或两个）时，XDP Endpoint 可在流所属 worker 的事件循环转发已连接的 Direct TCP。路由、拨号和连接跟踪仍在共享 runtime。内建 Direct 处理器胜出后，父任务将已连接的普通 socket 和 packet flow 一次性交给确切 owner；owner 注册 socket，先写出已嗅探的前缀，再双向转发。其他传输、其他设备或可选预算不足时，仍走共享 relay。
+物理 XDP 的 `direct: endpoint` 在单设备且每个 worker 恰有一个队列（一或两个 worker）时，由各队列 owner 驱动自己的 Stack。路由、拨号、Score 和记账继续使用共享 runtime。只有选中的内建 Direct 连接器没有代理路由时，才能把已连接的普通 socket 交给该 owner。reactor 只发送一次嗅探前缀。读 socket 仅将实收字节提交给 Stack 的发送环，写 socket 仅消费对端已接受的接收前缀。代理链仍逐跳执行。
+
+Remote TCP 每个方向各有一个单生产者、单消费者环，最多容纳 32 个块。每个分片的所有流共享一个缓存，只接纳已足额扣账的 16 KiB 块。每个分片最多保留 64 个块，所有分片共同分配捕获根预算的十六分之一用于缓存载荷。4 KiB 小块消费完即归还额度。预留失败时，owner 先归还缓存，再重试一次。分片关闭时清空缓存，晚到的归还也释放额度。
+
+worker 的 epoll 同时等待队列、socket 和唤醒描述符。Direct 软件句柄同时核验槽位和代际。旧代仍有输出在途时，同一 TCP 槽位可以接纳新流。旧流的退役回调须等应用关闭、协议退出（包括 TIME_WAIT）及原代际最后一份输出归还后才执行。
 
 协调线程在开放捕获准入前持有两个 worker 的 relay fence。故障时两端都停止接纳 relay，并保持 runtime 运行到实际任务 join 完成。这不释放网卡尚未归还的描述符，也不把被保留的 worker 线程视为已经退出。
 

@@ -847,15 +847,15 @@ impl ConnectionObservation {
             if let Some(callback) = &previous {
                 callback();
             }
-            if flow.first_reply() {
-                flow.transition(
-                    ConnectionState::Active,
-                    "response_received",
-                    ConnectionMilestone::FirstReply,
-                    Some(true),
-                );
-            }
+            tcp_first_response(&flow);
         }))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn tcp_first_response(&self) {
+        if let Some(flow) = self.flow() {
+            tcp_first_response(flow);
+        }
     }
 
     pub(super) fn udp_preparing(&self) {
@@ -867,6 +867,17 @@ impl ConnectionObservation {
                 Some(false),
             );
         }
+    }
+}
+
+fn tcp_first_response(flow: &FlowGuard) {
+    if flow.first_reply() {
+        flow.transition(
+            ConnectionState::Active,
+            "response_received",
+            ConnectionMilestone::FirstReply,
+            Some(true),
+        );
     }
 }
 

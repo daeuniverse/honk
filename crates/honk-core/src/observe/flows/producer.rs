@@ -284,6 +284,26 @@ impl FlowGuard {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn udp_queue_drop_at(
+        &self,
+        reason: &'static str,
+        at: (std::time::Instant, std::time::SystemTime),
+    ) {
+        if let Some(store) = self.store.upgrade() {
+            store.record_step_at(
+                &self.key,
+                StepData::Datapath {
+                    plane: crate::observe::vocab::Plane::Userspace,
+                    action: "drop",
+                    reason,
+                    error: None,
+                },
+                at,
+            );
+        }
+    }
+
     pub(crate) fn mark_gap(&self, reason: GapReason) {
         if let Some(store) = self.store.upgrade() {
             store.mark_gap(&self.key, reason);

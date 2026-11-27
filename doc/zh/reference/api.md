@@ -1375,7 +1375,9 @@ Global 绑定的是稳定身份：目标消失后，新流量按 fail-closed 处
 
 XDP 另以 `x-honk.xdp` 返回 capture owner 最新观测。默认 summary 包含 `state`、`state_changed_at_unix_ms` 和 `queue_count`；`detail=full` 增加 `queues` 与 `truncated`。Clash `GET /stats` 的 `xdp` 使用同一完整投影。尚未安装 XDP owner（包括 TC/TUN）时为 null；生产者不依赖任一 HTTP feature。每个 XDP 投影至多 64 KiB；`truncated: true` 表示只容纳了按准入设备/队列顺序排列的前若干项，`queue_count` 仍为全部已准入队列数。
 
-摘要和完整视图均包含 `cross_worker_handoffs`：本次捕获中，另一 worker 的队列成功接收的包封装数，以十进制字符串表示，到上限后不再增长。入队失败或本地处理不计数；成功入队不等于包已送达。仅可比较同一次捕获的读数。
+`cross_worker_handoffs` 统计另一 worker 实际接收入队的封装，不代表送达。`handoffs[目标][种类]` 按目标 worker（0 或 1，来源为另一 worker）和种类（0：需继续分类的入向包；1：Endpoint）拆分。`packets`、`l3_bytes` 是入队成功的包数与 L3 字节；`refused`、`refused_l3_bytes` 是共享 cell 用尽或目标队列未接纳的包数与 L3 字节。均不含 L2、设备元数据或本地处理的包；统计的是交接次数，不是 TCP 应用字节或去重包数。只在同一次捕获内比较差值。
+
+`ownership_dir_full`、`udp_reply_queue_full`、`remote_backpressure` 分别反映 TCP 归属登记、UDP 回包准入和远端 TCP 缓冲的压力，不能当成丢包数。`direct_attach_fallback` 统计 Direct 未接入后尝试改用 Remote 的次数，其中未能绑定 Remote 的计入 `direct_attach_fallback_failed`。摘要与完整视图均使用十进制字符串；交接和 Direct 回退计数到上限后不再增长。
 
 `dns_projection_state` 区分 `disabled_by_config`、`inactive_no_domain_rules`、`staged_closed`、`active_tcp_udp`、`degraded_fallback`（原因见 `dns_projection_reason`）和 `closed`。`would_pass_dns` 统计影子判定，不是原生流量。`dns_projection_counters` 描述采样的 bank；完整视图还可包含 `dns_realm_revocations`（数字 realm ID 与撤销次数）。不导出域名或 IP。
 
@@ -1625,7 +1627,7 @@ URLTest、LoadBalance、Fallback 和 Score 都拒绝手动选择。
 ```text
 {
   outbounds: [{ name, totalConns, activeConns, upload, download, errors }],
-  xdp: null | { state, state_changed_at_unix_ms, queue_count, cross_worker_handoffs, dns_projection_state, dns_projection_reason, would_pass_dns, dns_decisions, dns_projection_counters, dns_realm_revocations?, truncated, queues },
+  xdp: null | { state, state_changed_at_unix_ms, queue_count, cross_worker_handoffs, handoffs, ownership_dir_full, udp_reply_queue_full, remote_backpressure, direct_attach_fallback, direct_attach_fallback_failed, dns_projection_state, dns_projection_reason, would_pass_dns, dns_decisions, dns_projection_counters, dns_realm_revocations?, truncated, queues },
   pool: { readyHits, readyMisses, entries },
   dns: {
     socketAdmission: { refused, timeouts },

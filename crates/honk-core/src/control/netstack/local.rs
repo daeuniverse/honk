@@ -2469,8 +2469,20 @@ mod tests {
                 Poll::Ready(Ok(()))
             ));
         }
+        let progress = RelayProgress {
+            upload: Arc::new(AtomicU64::new(0)),
+            download: Arc::new(AtomicU64::new(0)),
+            outbound: None,
+            first_response: None,
+            on_transfer: None,
+        };
         {
-            let mut attach = std::pin::pin!(flow.attach_remote());
+            let counters = remote::RemoteCounters {
+                download: Arc::clone(&progress.download),
+                outbound: None,
+                observe_live: false,
+            };
+            let mut attach = std::pin::pin!(flow.attach_remote_with(Some(counters)));
             assert!(futures::poll!(&mut attach).is_pending());
             driver.service(&mut cx, now);
             attach.await.unwrap();
@@ -2541,16 +2553,21 @@ mod tests {
         let before = budget.used();
         let (proxy, mut upstream) = tokio::io::duplex(256 << 10);
         upstream.write_all(&vec![7; 256 << 10]).await.unwrap();
-        let progress = RelayProgress {
-            upload: Arc::new(AtomicU64::new(0)),
-            download: Arc::new(AtomicU64::new(0)),
-            outbound: None,
-            first_response: None,
-            on_transfer: None,
-        };
         let committed = {
-            let mut relay = std::pin::pin!(relay::relay_remote_tcp(
+            let enqueued = Arc::new(AtomicU64::new(0));
+            let enqueued_writes = Arc::clone(&enqueued);
+            let client = relay::RelayIo::wrap(
                 &mut flow,
+                Arc::default(),
+                None,
+                None,
+                Some(Arc::new(move |_, bytes| {
+                    enqueued_writes.fetch_add(bytes, Ordering::Relaxed);
+                })),
+                false,
+            );
+            let mut relay = std::pin::pin!(relay::relay_remote_tcp(
+                client,
                 proxy,
                 (syn.client, syn.original_dst),
                 &progress,
@@ -2584,7 +2601,8 @@ mod tests {
                     .unwrap()
                     .tx_pending()
             );
-            assert!(progress.download.load(Ordering::Relaxed) > committed);
+            assert!(enqueued.load(Ordering::Relaxed) > committed);
+            assert_eq!(progress.download.load(Ordering::Relaxed), committed);
             let ledger = &mut driver.local.as_mut().unwrap().inner.ledger;
             let spare = ledger
                 .reserve_tx(TxClass::Bulk)

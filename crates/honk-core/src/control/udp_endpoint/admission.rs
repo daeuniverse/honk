@@ -492,7 +492,16 @@ impl UdpInitLease {
         flow: Option<Arc<crate::observe::flows::FlowGuard>>,
     ) -> Option<observation::SharedTerminal> {
         let flow = flow?;
-        let terminal = self.initializer.native_terminal.get_or_init(&flow);
+        #[cfg(target_os = "linux")]
+        let packet_budget = self.pool.memory_budget.as_ref().filter(|_| {
+            self.packet_source()
+                .is_some_and(|source| source.owner().is_local())
+        });
+        let terminal = self.initializer.native_terminal.get_or_init(
+            &flow,
+            #[cfg(target_os = "linux")]
+            packet_budget,
+        );
         if !packet_binding_active(self.packet_source()) {
             terminal.outcome(UdpTerminal::IntentionalRetirement);
         }

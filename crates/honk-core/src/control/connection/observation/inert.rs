@@ -166,6 +166,10 @@ impl ConnectionObservation {
         previous
     }
 
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(super) fn tcp_first_response(&self) {}
+
     #[inline]
     pub(super) fn udp_preparing(&self) {}
 }

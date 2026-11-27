@@ -1496,7 +1496,9 @@ Map capacity may be known while occupancy remains null. Attached hooks alone do 
 
 XDP additionally publishes `x-honk.xdp` from the capture owner's latest observations. The default summary contains `state`, `state_changed_at_unix_ms` and `queue_count`; `detail=full` adds `queues` and `truncated`. Clash `GET /stats` exposes the same full projection as `xdp`. It is null before an XDP owner is installed, including TC/TUN deployments. The producer remains available independently of either HTTP feature. Each XDP projection is bounded to 64 KiB; `truncated: true` means only the first queues in admitted device/queue order fit, while `queue_count` retains the complete admitted count.
 
-The summary and full view also include `cross_worker_handoffs`: a saturating decimal-string count of packet envelopes accepted by the other worker's queue in this capture. Failed enqueues and locally processed packets do not count. A handoff is not proof that the packet was delivered. Compare readings from the same capture only.
+`cross_worker_handoffs` counts packet envelopes accepted by the other worker, not deliveries. `handoffs[destination][kind]` splits packets and L3 bytes by destination worker (0 or 1; source is the other worker) and kind (0: ingress requiring classification, 1: Endpoint). `packets` and `l3_bytes` count successful enqueues; `refused` and `refused_l3_bytes` count a full shared cell pool or a destination queue that did not accept the envelope. No L2, driver metadata, or local traffic is counted. These are handoff operations, not TCP application bytes or unique packets. Compare deltas only within the same capture.
+
+`ownership_dir_full`, `udp_reply_queue_full` and `remote_backpressure` report saturated TCP ownership admission, UDP reply admission and remote TCP buffer pressure respectively; a pressure event is not evidence of packet loss. `direct_attach_fallback` counts attempts to use Remote after a Direct attachment could not be made; `direct_attach_fallback_failed` is the subset that did not bind Remote. Both views use decimal strings. Handoff and Direct fallback counters saturate.
 
 `dns_projection_state` distinguishes `disabled_by_config`, `inactive_no_domain_rules`, `staged_closed`, `active_tcp_udp`, `degraded_fallback` (with `dns_projection_reason`), and `closed`. `would_pass_dns` counts shadow decisions, not native traffic. `dns_projection_counters` describes the sampled bank; the full view can also include `dns_realm_revocations` as numeric realm ID/count pairs. No domain or IP is exposed.
 
@@ -1736,7 +1738,7 @@ Download or extraction failures are logged and do not stop the engine.
 ```text
 {
   outbounds: [{ name, totalConns, activeConns, upload, download, errors }],
-  xdp: null | { state, state_changed_at_unix_ms, queue_count, cross_worker_handoffs, dns_projection_state, dns_projection_reason, would_pass_dns, dns_decisions, dns_projection_counters, dns_realm_revocations?, truncated, queues },
+  xdp: null | { state, state_changed_at_unix_ms, queue_count, cross_worker_handoffs, handoffs, ownership_dir_full, udp_reply_queue_full, remote_backpressure, direct_attach_fallback, direct_attach_fallback_failed, dns_projection_state, dns_projection_reason, would_pass_dns, dns_decisions, dns_projection_counters, dns_realm_revocations?, truncated, queues },
   pool: { readyHits, readyMisses, entries },
   dns: {
     socketAdmission: { refused, timeouts },

@@ -10,6 +10,10 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
+#[cfg(target_os = "linux")]
+#[path = "tcp_packet_tests/worker.rs"]
+mod worker;
+
 struct Wire {
     scope: PacketScope,
     owner: Option<PacketOwner>,

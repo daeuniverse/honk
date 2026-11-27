@@ -370,10 +370,25 @@ impl FlowStore {
         self.record_with(id, generation, |_| Some(data))
     }
 
+    #[cfg(target_os = "linux")]
+    fn record_step_at(&self, id: &Uuid, data: StepData, at: (Instant, SystemTime)) -> bool {
+        self.record_with_at(id, None, Some(at), |_| Some(data))
+    }
+
     fn record_with(
         &self,
         id: &Uuid,
         generation: Option<u64>,
+        build: impl FnOnce(&Record) -> Option<StepData>,
+    ) -> bool {
+        self.record_with_at(id, generation, None, build)
+    }
+
+    fn record_with_at(
+        &self,
+        id: &Uuid,
+        generation: Option<u64>,
+        at: Option<(Instant, SystemTime)>,
         build: impl FnOnce(&Record) -> Option<StepData>,
     ) -> bool {
         let mut accepted = false;
@@ -400,9 +415,10 @@ impl FlowStore {
             record.redacted |= redacted;
             record.overflow |= overflow;
             let previous_count = record.steps.len();
-            let pushed = record.push_step(
+            let pushed = record.push_step_at(
                 generation.map(|generation| format!("{}:{generation}", self.instance_id)),
                 data,
+                at,
             );
             accepted = record.steps.len() != previous_count;
             pushed || changed
@@ -668,7 +684,16 @@ impl Record {
             .and_then(|step| step.generation_id.clone())
     }
 
-    fn push_step(&mut self, generation_id: Option<String>, mut data: StepData) -> bool {
+    fn push_step(&mut self, generation_id: Option<String>, data: StepData) -> bool {
+        self.push_step_at(generation_id, data, None)
+    }
+
+    fn push_step_at(
+        &mut self,
+        generation_id: Option<String>,
+        mut data: StepData,
+        at: Option<(Instant, SystemTime)>,
+    ) -> bool {
         if self.steps.len() == MAX_STEPS {
             return !std::mem::replace(&mut self.overflow, true);
         }
@@ -709,10 +734,13 @@ impl Record {
             };
             self.mode_recorded = false;
         }
-        let elapsed = self.started.elapsed().as_micros();
+        let (monotonic, observed_at) = at.unwrap_or_else(|| (Instant::now(), SystemTime::now()));
+        let elapsed = monotonic
+            .saturating_duration_since(self.started)
+            .as_micros();
         let step = Step {
             seq: self.steps.len() + 1,
-            observed_at: SystemTime::now(),
+            observed_at,
             elapsed_us: (elapsed <= u128::from(MAX_SAFE_UINT)).then_some(elapsed as u64),
             generation_id,
             evidence: "observed",

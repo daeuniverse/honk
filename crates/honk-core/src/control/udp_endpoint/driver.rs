@@ -504,7 +504,7 @@ impl UdpEndpointPool {
                         Ok(initial) => initial,
                         Err(_) => return,
                     };
-                    let driver_result = run_endpoint_driver(
+                    let operation = run_endpoint_driver(
                         UdpDriverContext {
                             endpoint: Arc::clone(&endpoint),
                             queue_rx,
@@ -522,8 +522,15 @@ impl UdpEndpointPool {
                             let ack = first_ack.take().expect("one first-send acknowledgement");
                             let _ = ack.send(result);
                         },
-                    )
-                    .await;
+                    );
+                    #[cfg(all(target_os = "linux", feature = "native-api"))]
+                    let operation = std::pin::pin!(operation);
+                    #[cfg(all(target_os = "linux", feature = "native-api"))]
+                    let operation = super::observation::observe_packet_drops(
+                        endpoint.native.terminal(),
+                        operation,
+                    );
+                    let driver_result = operation.await;
                     let UdpDriverResult { result, outcome } = driver_result;
                     cleanup.set_outcome(outcome);
                     if let Err(error) = result {
