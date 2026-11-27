@@ -575,6 +575,49 @@ fn gateway_completes_positive_and_negative_ports_before_looking_up_facts() {
 }
 
 #[test]
+fn nine_thousand_singleton_ports_preserve_source_destination_and_negation() {
+    let router = router("dport(443) -> direct(must)\ndefault: proxy");
+    let mut plan = RoutingPushPlan::compile(&router, &ids(), DialMode::Ip).unwrap();
+    for source in [false, true] {
+        for not in [false, true] {
+            let ranges = (0..8999)
+                .chain([u16::MAX])
+                .map(|port| crate::routing::PortRange {
+                    start: port,
+                    end: port,
+                })
+                .collect();
+            plan.rules[0].conditions = vec![KernelCondition {
+                not,
+                predicate: if source {
+                    KernelPredicate::SourcePort(ranges)
+                } else {
+                    KernelPredicate::DestinationPort(ranges)
+                },
+            }];
+            let gateway = emit_gateway_routing_program(&plan, FDS, false, false).unwrap();
+            for (port, member) in [
+                (0, true),
+                (8998, true),
+                (8999, false),
+                (65534, false),
+                (65535, true),
+            ] {
+                let mut packet = input(&sample(), true);
+                if source {
+                    packet.src_port = port;
+                } else {
+                    packet.dst_port = port;
+                }
+                let (verdict, decision, _) = execute(&gateway.insns, &plan, &packet, None, true);
+                assert_eq!(verdict, i64::from(member != not));
+                assert_eq!(decision.rule_id, if member != not { 0 } else { u32::MAX });
+            }
+        }
+    }
+}
+
+#[test]
 fn gateway_generated_jump_overflow_is_an_io_error() {
     let router = router("dport(443) -> direct\ndefault: proxy");
     let mut plan = RoutingPushPlan::compile(&router, &ids(), DialMode::Ip).unwrap();
@@ -583,8 +626,8 @@ fn gateway_generated_jump_overflow_is_an_io_error() {
         predicate: KernelPredicate::DestinationPort(
             (0..9000)
                 .map(|port| crate::routing::PortRange {
-                    start: port,
-                    end: port,
+                    start: port * 3,
+                    end: port * 3 + 1,
                 })
                 .collect(),
         ),

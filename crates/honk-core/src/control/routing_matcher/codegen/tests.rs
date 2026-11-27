@@ -285,9 +285,28 @@ fn complete_positive_and_negative_ports_precede_ip_facts() {
             fields(&insns[start]),
             (BPF_LDX | BPF_W | BPF_MEM, R0, R6, offset, 0)
         );
-        let next = start + 2 + 4 * ranges.len();
-        for (index, &(low, high)) in ranges.iter().enumerate() {
-            let range = start + 1 + 4 * index;
+        let width: usize = ranges
+            .iter()
+            .map(|(low, high)| if low == high { 1 } else { 4 })
+            .sum();
+        let next = start + 2 + width;
+        let matched = if negated { fail } else { next };
+        let mut range = start + 1;
+        for &(low, high) in ranges {
+            if low == high {
+                assert_eq!(
+                    fields(&insns[range]),
+                    (
+                        BPF_JMP | BPF_JEQ | BPF_K,
+                        R0,
+                        0,
+                        i16::try_from(matched - range - 1).unwrap(),
+                        low
+                    )
+                );
+                range += 1;
+                continue;
+            }
             assert_eq!(
                 fields(&insns[range]),
                 (BPF_JMP | BPF_JGE | BPF_K, R0, 0, 1, low)
@@ -298,10 +317,8 @@ fn complete_positive_and_negative_ports_precede_ip_facts() {
                 (BPF_JMP | BPF_JGT | BPF_K, R0, 0, 1, high)
             );
             assert_eq!(insns[range + 3].code as u32, BPF_JMP | BPF_JA);
-            assert_eq!(
-                jump_target(insns, range + 3),
-                if negated { fail } else { next }
-            );
+            assert_eq!(jump_target(insns, range + 3), matched);
+            range += 4;
         }
         assert_eq!(insns[next - 1].code as u32, BPF_JMP | BPF_JA);
         assert_eq!(

@@ -932,6 +932,10 @@ fn emit_port_ranges(
 ) -> anyhow::Result<()> {
     asm.ldx_w(R0, R6, offset)?;
     for range in ranges {
+        if range.start == range.end {
+            asm.jump(BPF_JEQ, R0, range.start as i32, on_true)?;
+            continue;
+        }
         let next = asm.label();
         let inside = asm.label();
         asm.jump(BPF_JGE, R0, range.start as i32, inside)?;
