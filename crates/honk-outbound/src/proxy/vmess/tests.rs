@@ -269,11 +269,11 @@ async fn upload_batches_a_queued_burst_and_flushes_when_input_goes_idle() {
         vmess_relay(
             Box::new(transport),
             &mut relay_client,
-            header.to_vec(),
-            fixed_session(),
+            (header.to_vec(), fixed_session()),
             &super::super::transport::relay_upload::pipe().1,
             &mut None,
             &mut Vec::new(),
+            None,
         )
         .await
     });
@@ -790,11 +790,22 @@ async fn read_request_header(wire: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
 }
 
 async fn read_first_chunk(wire: &mut (impl AsyncRead + Unpin), header: &[u8]) -> Vec<u8> {
-    let mut upload = BodyChunks::new(
+    let mut upload = upload_chunks(header);
+    read_upload_chunk(wire, &mut upload).await
+}
+
+fn upload_chunks(header: &[u8]) -> BodyChunks {
+    BodyChunks::new(
         header[17..33].try_into().unwrap(),
         header[1..17].try_into().unwrap(),
     )
-    .unwrap();
+    .unwrap()
+}
+
+async fn read_upload_chunk(
+    wire: &mut (impl AsyncRead + Unpin),
+    upload: &mut BodyChunks,
+) -> Vec<u8> {
     let mut len = [0u8; 2];
     wire.read_exact(&mut len).await.unwrap();
     let mut chunk = vec![0u8; upload.decode_len(len) as usize];
@@ -802,6 +813,30 @@ async fn read_first_chunk(wire: &mut (impl AsyncRead + Unpin), header: &[u8]) ->
     let size = upload.open_chunk(&mut chunk).unwrap();
     chunk.truncate(size);
     chunk
+}
+
+fn response_wire(header: &[u8], payload: &[u8]) -> Vec<u8> {
+    let resp_key: [u8; 16] = Sha256::digest(&header[17..33])[..16].try_into().unwrap();
+    let resp_iv: [u8; 16] = Sha256::digest(&header[1..17])[..16].try_into().unwrap();
+    let response = [header[33], 0, 0, 0];
+    let mut reply = VmessHandler::seal_aad(
+        &kdf16(&resp_key, KDF_SALT_RESP_LEN_KEY, &[]),
+        &kdf12(&resp_iv, KDF_SALT_RESP_LEN_IV, &[]),
+        &(response.len() as u16).to_be_bytes(),
+        &[],
+    );
+    reply.extend(VmessHandler::seal_aad(
+        &kdf16(&resp_key, KDF_SALT_RESP_KEY, &[]),
+        &kdf12(&resp_iv, KDF_SALT_RESP_IV, &[]),
+        &response,
+        &[],
+    ));
+    reply.extend(
+        BodyChunks::new(&resp_key, &resp_iv)
+            .unwrap()
+            .seal_chunk(payload),
+    );
+    reply
 }
 
 /// A minimal AEAD server on the far end of a tunneled carrier: it opens the
@@ -816,32 +851,12 @@ async fn dial_over_relays_through_the_carrier() {
             &header[37..45],
             &[CMD_TCP, 0x00, 0x50, addr::ATYP_VMESS.ipv4, 93, 184, 216, 34]
         );
-        let req_iv: [u8; 16] = header[1..17].try_into().unwrap();
-        let req_key: [u8; 16] = header[17..33].try_into().unwrap();
-        let resp_key: [u8; 16] = Sha256::digest(req_key)[..16].try_into().unwrap();
-        let resp_iv: [u8; 16] = Sha256::digest(req_iv)[..16].try_into().unwrap();
-
         assert_eq!(read_first_chunk(&mut server, &header).await, *b"ping");
 
-        let response = [header[33], 0, 0, 0];
-        let mut reply = VmessHandler::seal_aad(
-            &kdf16(&resp_key, KDF_SALT_RESP_LEN_KEY, &[]),
-            &kdf12(&resp_iv, KDF_SALT_RESP_LEN_IV, &[]),
-            &(response.len() as u16).to_be_bytes(),
-            &[],
-        );
-        reply.extend(VmessHandler::seal_aad(
-            &kdf16(&resp_key, KDF_SALT_RESP_KEY, &[]),
-            &kdf12(&resp_iv, KDF_SALT_RESP_IV, &[]),
-            &response,
-            &[],
-        ));
-        reply.extend(
-            BodyChunks::new(&resp_key, &resp_iv)
-                .unwrap()
-                .seal_chunk(b"pong"),
-        );
-        server.write_all(&reply).await.unwrap();
+        server
+            .write_all(&response_wire(&header, b"pong"))
+            .await
+            .unwrap();
         let mut rest = Vec::new();
         server.read_to_end(&mut rest).await.ok();
     });
@@ -1080,4 +1095,5 @@ async fn three_hop_vmess_attributes_a_bad_header_but_not_a_socks_carrier_reset()
     }
 }
 
+mod vmess_uot;
 mod websocket;

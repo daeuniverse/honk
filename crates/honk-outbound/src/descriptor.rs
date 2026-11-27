@@ -118,7 +118,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
     ProtocolDescriptor {
         protocol: NodeProtocol::VMess,
-        supports_udp: never,
+        supports_udp: |node| node.vmess().unwrap().udp_enabled(),
         pool_ready_streams: never,
         pool_bare_tcp: stream_pool_bare_tcp,
         supports_warm: stream_supports_warm,

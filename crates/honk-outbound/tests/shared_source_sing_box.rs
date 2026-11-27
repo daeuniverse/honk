@@ -195,6 +195,24 @@ fn protos(cert: &str, key: &str) -> Vec<Proto> {
     #[cfg(feature = "rprx")]
     {
         use honk_config::node::{VlessMultiplex, VlessUdpEncoding};
+        let port = free_port();
+        out.push(Proto {
+            name: "vmess-uot-v2",
+            inbound: listen(
+                "vmess",
+                port,
+                &format!(r#""users": [{{ "uuid": "{UUID}" }}]"#),
+            ),
+            node: node(
+                "vmess-uot-v2",
+                port,
+                OutboundConfig::Vmess(honk_config::node::VmessConfig {
+                    uuid: Some(UUID.into()),
+                    udp_over_tcp: true,
+                    ..Default::default()
+                }),
+            ),
+        });
         for (name, encoding, multiplex, mux) in [
             (
                 "vless-uot-v2",
@@ -481,7 +499,6 @@ async fn sing_box_shared_source_eim_eif_and_domain_matrix() {
         .iter()
         .map(|proto| (proto.name, vec![proto.node.clone()]))
         .collect();
-    // sing-box's SOCKS5 inbound fronts its own Trojan inbound.
     let hop = |name: &str| {
         protos
             .iter()
@@ -493,6 +510,12 @@ async fn sing_box_shared_source_eim_eif_and_domain_matrix() {
     let (front, exit) = (hop("socks5"), hop("trojan"));
     let via = Node::chain_from_nodes("via", &[&front, &exit]).expect("bind UDP chain");
     cases.push(("trojan via socks5 chain", vec![via, front, exit]));
+    #[cfg(feature = "rprx")]
+    {
+        let (front, exit) = (hop("socks5"), hop("vmess-uot-v2"));
+        let via = Node::chain_from_nodes("via", &[&front, &exit]).unwrap();
+        cases.push(("vmess-uot-v2 via socks5 chain", vec![via, front, exit]));
+    }
 
     let mut matrix = Vec::new();
     for (name, nodes) in &cases {

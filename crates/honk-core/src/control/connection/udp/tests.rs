@@ -40,7 +40,7 @@ fn source_path_selects_shared_exactly_for_the_registered_slots() {
     for (protocol, shared) in [
         (NodeProtocol::SS, true),
         (NodeProtocol::Trojan, true),
-        (NodeProtocol::VMess, false),
+        (NodeProtocol::VMess, cfg!(feature = "rprx")),
         (NodeProtocol::Socks5, true),
         (NodeProtocol::Juicity, true),
         (NodeProtocol::AnyTLS, true),
@@ -52,6 +52,25 @@ fn source_path_selects_shared_exactly_for_the_registered_slots() {
             shared.then_some(SourcePath::Shared),
             "{protocol:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn vmess_uot_requires_an_enabled_node_even_with_a_shared_slot() {
+    let vmess = node(NodeProtocol::VMess);
+    let result = production()
+        .dial_udp_transport(
+            &vmess,
+            "127.0.0.1:53".parse().unwrap(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+    let error = result.unwrap_err();
+    if cfg!(feature = "rprx") {
+        assert!(error.to_string().contains("UDP not supported"));
+    } else {
+        assert!(error.is::<honk_outbound::proxy::MissingProtocolHandler>());
     }
 }
 

@@ -74,6 +74,38 @@ async fn assert_no_vless_backend(node: Node) {
 }
 
 #[tokio::test]
+async fn vmess_uot_opt_in_without_rprx_has_no_executable_handler() {
+    let mut node = Node {
+        name: "vmess".into(),
+        host: "127.0.0.1".into(),
+        port: 9,
+        outbound: OutboundConfig::Vmess(VmessConfig {
+            uuid: Some("00000000-0000-4000-8000-000000000001".into()),
+            udp_over_tcp: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    assert!(node.supports_tunneled_udp());
+    assert!(!registry.has_shared_source(node.protocol()));
+    let error = registry
+        .dial_udp_transport(
+            &node,
+            "127.0.0.1:53".parse().unwrap(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<MissingProtocolHandler>().unwrap().0,
+        node.protocol()
+    );
+}
+
+#[tokio::test]
 async fn missing_tcp_backend_is_retryable_without_connecting_the_prefix() {
     const UUID: &str = "00000000-0000-4000-8000-000000000001";
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

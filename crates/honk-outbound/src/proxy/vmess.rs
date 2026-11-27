@@ -14,15 +14,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::sync::oneshot;
 
 use super::addr::{self, SocksAddr};
+use super::uot::{self, StreamUotTransport};
 use super::{
-    AsyncReadWrite, ProbeableOutbound, ProxyStream, TcpOutbound, TunnelDialOptions,
+    AsyncReadWrite, MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport,
+    ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound, TunnelDialOptions,
     WarmRequirement, WarmableOutbound,
 };
+use crate::runtime::NodeRuntime;
 
 /// VMess protocol version byte.
 const VMESS_VERSION: u8 = 0x01;
@@ -189,12 +193,74 @@ impl Session {
 /// The terminal relay failure, surfaced after any buffered application data.
 type RelayFailure = std::sync::Arc<std::sync::OnceLock<(std::io::ErrorKind, crate::SharedError)>>;
 
+#[derive(Default)]
+struct FlushFence {
+    flushed: u64,
+    closed: bool,
+    waiter: Option<(u64, oneshot::Sender<()>)>,
+}
+
+/// The relay owns closure even when its runtime aborts it before the first poll.
+struct RelayFence(Arc<parking_lot::Mutex<FlushFence>>);
+
+impl RelayFence {
+    fn advance(&self, through: u64) {
+        let mut fence = self.0.lock();
+        fence.flushed = through;
+        if fence
+            .waiter
+            .as_ref()
+            .is_some_and(|(end, _)| *end <= through)
+            && let Some((_, wake)) = fence.waiter.take()
+        {
+            let _ = wake.send(());
+        }
+    }
+}
+
+impl Drop for RelayFence {
+    fn drop(&mut self) {
+        let mut fence = self.0.lock();
+        fence.closed = true;
+        fence.waiter.take();
+    }
+}
+
+#[derive(Default)]
+struct UotFlush {
+    fence: Arc<parking_lot::Mutex<FlushFence>>,
+    accepted: u64,
+    pending: Option<oneshot::Receiver<()>>,
+}
+
+impl UotFlush {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            if let Some(rx) = &mut self.pending {
+                std::task::ready!(Pin::new(rx).poll(cx)).map_err(|_| io::ErrorKind::BrokenPipe)?;
+                self.pending = None;
+            }
+            let mut fence = self.fence.lock();
+            if self.accepted <= fence.flushed {
+                return Poll::Ready(Ok(()));
+            }
+            if fence.closed {
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
+            let (tx, rx) = oneshot::channel();
+            fence.waiter = Some((self.accepted, tx));
+            self.pending = Some(rx);
+        }
+    }
+}
+
 struct VmessStream {
     _relay: super::transport::RelayTask,
     inner: tokio::io::DuplexStream,
     failure: RelayFailure,
     pipe: super::transport::relay_upload::Writer,
     upload_done: super::transport::UploadEnd,
+    uot_flush: Option<Box<UotFlush>>,
 }
 
 impl VmessStream {
@@ -203,29 +269,57 @@ impl VmessStream {
         header_wire: Vec<u8>,
         session: Session,
     ) -> anyhow::Result<Self> {
+        Self::spawn(stream, (header_wire, session), None, None)
+    }
+
+    fn start_uot(
+        stream: Box<dyn AsyncReadWrite>,
+        request: (Vec<u8>, Session),
+        gate: Option<oneshot::Receiver<()>>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn(stream, request, Some(Box::default()), gate)
+    }
+
+    fn spawn(
+        stream: Box<dyn AsyncReadWrite>,
+        request: (Vec<u8>, Session),
+        uot_flush: Option<Box<UotFlush>>,
+        gate: Option<oneshot::Receiver<()>>,
+    ) -> anyhow::Result<Self> {
         let (inner, server) = tokio::io::duplex(65536);
         let failure = RelayFailure::default();
         let (pipe, reader) = super::transport::relay_upload::pipe();
         let (uploaded, upload_done) = super::transport::UploadEnd::channel();
+        let observer = match &uot_flush {
+            Some(_) => None,
+            None => crate::runtime::flow_observation::current(),
+        };
         let relay = vmess_relay_recorded(
             stream,
             server,
-            header_wire,
-            session,
+            request,
             failure.clone(),
             reader,
             uploaded,
+            uot_flush
+                .as_ref()
+                .map(|flush| RelayFence(Arc::clone(&flush.fence))),
         );
-        let relay = crate::runtime::flow_observation::scope(
-            crate::runtime::flow_observation::current(),
-            relay,
-        );
+        let relay = crate::runtime::flow_observation::scope(observer, async move {
+            if let Some(gate) = gate
+                && gate.await.is_err()
+            {
+                return;
+            }
+            relay.await;
+        });
         Ok(Self {
             _relay: super::transport::RelayTask::spawn(relay)?,
             inner,
             failure,
             pipe,
             upload_done,
+            uot_flush,
         })
     }
 
@@ -241,22 +335,22 @@ impl VmessStream {
 async fn vmess_relay_recorded(
     server: Box<dyn AsyncReadWrite>,
     mut client: tokio::io::DuplexStream,
-    header_wire: Vec<u8>,
-    session: Session,
+    request: (Vec<u8>, Session),
     failure: RelayFailure,
     pipe: super::transport::relay_upload::Reader,
     uploaded: tokio::sync::oneshot::Sender<std::io::Result<()>>,
+    fence: Option<RelayFence>,
 ) {
     let mut uploaded = Some(uploaded);
     let mut tail = Vec::new();
     if let Err(error) = vmess_relay(
         server,
         &mut client,
-        header_wire,
-        session,
+        request,
         &pipe,
         &mut uploaded,
         &mut tail,
+        fence.as_ref(),
     )
     .await
     {
@@ -270,6 +364,7 @@ async fn vmess_relay_recorded(
             crate::SharedError::new(error.context("VMess relay failed")),
         ));
     }
+    drop(fence);
     if let Some(uploaded) = uploaded {
         let result = match failure.get() {
             Some((kind, cause)) => Err(std::io::Error::new(*kind, cause.clone())),
@@ -320,12 +415,23 @@ impl AsyncWrite for VmessStream {
             .pipe
             .poll_write(cx, |cx| Pin::new(inner).poll_write(cx, buf))
         {
+            Poll::Ready(Ok(n)) => {
+                if let Some(flush) = &mut this.uot_flush {
+                    flush.accepted += n as u64;
+                }
+                Poll::Ready(Ok(n))
+            }
             Poll::Ready(Err(error)) => Poll::Ready(Err(this.relay_error().unwrap_or(error))),
             other => other,
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if let Some(flush) = &mut self.uot_flush {
+            return flush
+                .poll(cx)
+                .map_err(|error| self.relay_error().unwrap_or(error));
+        }
         if std::task::ready!(self.pipe.poll_flush(cx)).is_err() {
             std::task::ready!(self.upload_done.poll(cx))
                 .map_err(|error| self.relay_error().unwrap_or(error))?;
@@ -487,15 +593,12 @@ impl VmessHandler {
         )
     }
 
-    /// Build the request header and return a proxy stream backed by a
-    /// duplex pipe + background relay task.
-    fn perform_handshake(
+    fn request_header(
         uuid_bytes: &[u8],
-        stream: Box<dyn AsyncReadWrite>,
         target: SocketAddr,
         target_domain: Option<&str>,
         ambiguous_header_io: bool,
-    ) -> anyhow::Result<ProxyStream> {
+    ) -> anyhow::Result<(Vec<u8>, Session)> {
         let cmd_key = Self::derive_cmd_key(uuid_bytes);
         let session = Session::new(ambiguous_header_io);
 
@@ -514,12 +617,107 @@ impl VmessHandler {
         let plain =
             Self::build_header_plain(&session, padding_len, &padding, target, target_domain)?;
         let header_wire = Self::seal_request_header(&cmd_key, &auth_id, &conn_nonce, &plain);
+        Ok((header_wire, session))
+    }
+
+    fn perform_handshake(
+        uuid_bytes: &[u8],
+        stream: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        ambiguous_header_io: bool,
+    ) -> anyhow::Result<ProxyStream> {
+        let (header_wire, session) =
+            Self::request_header(uuid_bytes, target, target_domain, ambiguous_header_io)?;
 
         Ok(ProxyStream {
             stream: Box::new(VmessStream::start(stream, header_wire, session)?),
             target_addr: target,
             target_domain: target_domain.map(|s| s.to_string()),
         })
+    }
+
+    fn uot_header(node: &Node, ambiguous_header_io: bool) -> anyhow::Result<(Vec<u8>, Session)> {
+        Self::request_header(
+            uuid(node)?.as_bytes(),
+            SocketAddr::from(([0; 4], 0)),
+            Some(uot::MAGIC_ADDRESS),
+            ambiguous_header_io,
+        )
+    }
+
+    async fn prepare_transport(
+        node: &Node,
+        runtime: Option<&Arc<NodeRuntime>>,
+        timeout: Duration,
+    ) -> anyhow::Result<(
+        Box<dyn AsyncReadWrite>,
+        super::transport::TransportPreparation,
+    )> {
+        match runtime {
+            Some(runtime) => {
+                super::transport::prepare_transport_runtime(runtime, None, timeout).await
+            }
+            None => Ok((
+                super::transport::wrap_transport(node, None, timeout).await?,
+                super::transport::TransportPreparation::none(),
+            )),
+        }
+    }
+
+    async fn prepare_uot_stream<T: ?Sized + Send + Sync + 'static>(
+        node: &Node,
+        runtime: Option<&Arc<NodeRuntime>>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        timeout: Duration,
+        project: fn(Arc<StreamUotTransport>) -> Arc<T>,
+    ) -> anyhow::Result<PreparedUdpTransport<T>> {
+        anyhow::ensure!(
+            node.vmess().unwrap().udp_enabled(),
+            "UDP not supported for this VMess node"
+        );
+        let header = Self::uot_header(node, false)?;
+        let request = uot::request(false, target, domain)?;
+        let (carrier, preparation) = Self::prepare_transport(node, runtime, timeout).await?;
+        let handoff = super::chain::native_udp_writer_handoff(node);
+        let domain = domain.map(Box::<str>::from);
+        Ok(PreparedUdpTransport::new(async move {
+            // Admit the task before publishing XHTTP, and release its header only after publication.
+            let (start, gate) = oneshot::channel();
+            let stream = VmessStream::start_uot(carrier, header, Some(gate))?;
+            preparation.commit()?;
+            let _ = start.send(());
+            Ok(project(Arc::new(StreamUotTransport::new(
+                Box::new(stream),
+                target,
+                domain.as_deref(),
+                request,
+                handoff,
+                None,
+            ))))
+        }))
+    }
+
+    async fn open_uot_over(
+        node: &Node,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<Arc<StreamUotTransport>> {
+        if !node.supports_tunneled_udp() {
+            return Err(super::TunnelUnsupported("vmess udp").into());
+        }
+        let header = Self::uot_header(node, true)?;
+        let request = uot::request(false, target, domain)?;
+        let carrier = super::transport::wrap_tunnel(node, carrier, options).await?;
+        let exit = super::chain::UDP_EXIT_HOP.try_with(|exit| *exit).ok();
+        let stream = VmessStream::start_uot(carrier, header, None)?;
+        let stream = super::chain::locate_udp_exit_stream(Box::new(stream));
+        Ok(Arc::new(StreamUotTransport::new(
+            stream, target, domain, request, None, exit,
+        )))
     }
 }
 
@@ -589,6 +787,99 @@ impl TcpOutbound for VmessHandler {
             target_domain,
             ambiguous_header_io,
         )
+    }
+}
+
+#[async_trait]
+impl PacketOutbound for VmessHandler {
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        target: SocketAddr,
+        domain: Option<&str>,
+        timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        Self::prepare_uot_stream(node, None, target, domain, timeout, |t| {
+            t as Arc<dyn PacketTransport>
+        })
+        .await?
+        .commit()
+        .await
+    }
+
+    async fn dial_udp_transport_runtime(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_udp_transport_speculative_runtime(runtime, target, domain, timeout)
+            .await?
+            .commit()
+            .await
+    }
+
+    async fn dial_udp_transport_speculative_runtime(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        timeout: Duration,
+    ) -> anyhow::Result<PreparedUdpTransport> {
+        Self::prepare_uot_stream(
+            &runtime.node,
+            Some(&runtime),
+            target,
+            domain,
+            timeout,
+            |t| t as Arc<dyn PacketTransport>,
+        )
+        .await
+    }
+
+    async fn dial_udp_over(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        Ok(Self::open_uot_over(&runtime.node, carrier, target, domain, options).await?)
+    }
+}
+
+#[async_trait]
+impl SharedSourceOutbound for VmessHandler {
+    async fn prepare_shared_source(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        timeout: Duration,
+        _speculative: bool,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        Self::prepare_uot_stream(
+            &runtime.node,
+            Some(&runtime),
+            target,
+            domain,
+            timeout,
+            |t| t as Arc<dyn MultiTargetTransport>,
+        )
+        .await
+    }
+
+    async fn prepare_shared_source_over(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<Arc<dyn MultiTargetTransport>> {
+        Ok(Self::open_uot_over(&runtime.node, carrier, target, domain, options).await?)
     }
 }
 
@@ -714,11 +1005,11 @@ impl BodyChunks {
 async fn vmess_relay(
     server: Box<dyn AsyncReadWrite>,
     client: &mut tokio::io::DuplexStream,
-    header_wire: Vec<u8>,
-    session: Session,
+    (header_wire, session): (Vec<u8>, Session),
     pipe: &super::transport::relay_upload::Reader,
     uploaded: &mut Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
     tail: &mut Vec<u8>,
+    fence: Option<&RelayFence>,
 ) -> anyhow::Result<()> {
     let peer_end = super::transport::WsPeerEnd::for_stream(server.as_ref());
     let omitted = AtomicBool::new(false);
@@ -726,7 +1017,12 @@ async fn vmess_relay(
     let (mut client_read, mut client_write) = tokio::io::split(client);
 
     let upload = async {
-        super::transport::write_request(&mut server_write, &header_wire).await?;
+        if fence.is_some() {
+            server_write.write_all(&header_wire).await?;
+            server_write.flush().await?;
+        } else {
+            super::transport::write_request(&mut server_write, &header_wire).await?;
+        }
 
         let mut body = BodyChunks::new(&session.req_key, &session.req_iv)?;
         let mut buf = vec![0u8; CHUNK_MAX_LEN];
@@ -736,6 +1032,9 @@ async fn vmess_relay(
                 Some(read) => read?,
                 None => {
                     server_write.flush().await?;
+                    if let Some(fence) = fence {
+                        fence.advance(relayed);
+                    }
                     client_read.read(&mut buf).await?
                 }
             };
@@ -750,6 +1049,9 @@ async fn vmess_relay(
                 writer.write_all(bytes).await?;
                 if flush {
                     writer.flush().await?;
+                    if let Some(fence) = fence {
+                        fence.advance(relayed);
+                    }
                 }
                 Ok::<_, std::io::Error>(())
             })
@@ -770,6 +1072,9 @@ async fn vmess_relay(
                 return Ok(true);
             }
             return Err(error.into());
+        }
+        if let Some(fence) = fence {
+            fence.advance(relayed);
         }
         if let Some(uploaded) = uploaded.take() {
             let _ = uploaded.send(Ok(()));
