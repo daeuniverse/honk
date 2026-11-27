@@ -134,13 +134,13 @@ const _: () = {
 
 // SAFETY: All fields admit arbitrary bits; the sums above rule out implicit
 // padding, including inside In6Addr and RoutingResult.
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for TuplesKey {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for RoutingHandoffEntry {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for DomainRouting {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for SocketIdentity {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for TcpSocketBinding {}

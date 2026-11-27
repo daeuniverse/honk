@@ -262,23 +262,23 @@ const _: () = {
 };
 
 // SAFETY: The layout assertions exclude implicit padding; every leaf is an integer.
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for CaptureRealmKey {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for GatewayKey {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for GatewayHold {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for HostFlowMeta {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for HostFlowOwner {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for HostBindingKey {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for LocalAddressKey {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for FragmentKey {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for FragmentVerdict {}
 
 #[cfg(test)]

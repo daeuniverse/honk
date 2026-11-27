@@ -273,7 +273,7 @@ impl Default for DaeParam {
 
 // Pod impls are only needed on the userspace side (honk-core).
 // The BPF side (honk-ebpf) uses aya-ebpf which doesn't have a Pod trait.
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for DaeParam {}
 
 /// Outbound indices written into eBPF `match_set.outbound`.
@@ -561,7 +561,7 @@ pub struct LpmKey {
     pub data: [u32; 4],
 }
 
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for LpmKey {}
 
 /// One per-CPU `OUTBOUND_STATS` value for an outbound. Keeping the four
@@ -576,7 +576,7 @@ pub struct OutboundStatsCounters {
     pub rx_bytes: u64,
 }
 
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for OutboundStatsCounters {}
 
 impl OutboundStatsCounters {
@@ -652,9 +652,9 @@ const _: () = {
 
 // SAFETY: Integer leaves admit every bit pattern; the recursive field-size
 // checks exclude implicit padding in both these structs and their unions.
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for RedirectTuple {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for RedirectEntry {}
 
 #[cfg(test)]

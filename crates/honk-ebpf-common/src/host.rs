@@ -30,9 +30,9 @@ pub struct HostSkDecision {
 }
 
 // repr(C), fixed-width integers, explicit padding and no invalid bit patterns.
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for HostSkIdentity {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for HostSkDecision {}
 const _: () = assert!(size_of::<HostSkIdentity>() == 56);
 const _: () = assert!(size_of::<HostSkDecision>() == 80);
@@ -123,15 +123,15 @@ pub struct HostSocketLock {
 pub type HostSequence = FlowMapValue<u64>;
 
 // Every shared payload has explicit fields covering its complete C layout.
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for HostSourceFacts {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for HostSocketEntry {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for HostSocketPayload {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for HostSocketLock {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for HostSequence {}
 
 const _: () = assert!(core::mem::size_of::<HostSourceFacts>() == 80);

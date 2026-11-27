@@ -40,3 +40,4 @@ Added
 - Add per-family checksum completion for single TCP packets emitted by transparent netstack devices.
 - Standalone TUN writes borrowed packet slices directly and commits transmission after the device accepts a complete record.
 - Narrow DNS projection and control-plane backend capabilities while retaining generation-fenced publication and TC ownership.
+- Build the mock daemon and `honk-tool` without Aya's userspace loader. Real eBPF builds enable the shared ABI's `aya-pod` feature.

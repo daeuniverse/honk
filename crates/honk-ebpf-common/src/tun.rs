@@ -169,11 +169,11 @@ const _: () = {
     assert!(core::mem::offset_of!(TunOwnerV1, close_enter) == 88);
 };
 
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for TunPacketRecordV1 {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for TunReadWindowV1 {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for TunOwnerV1 {}
 
 #[cfg(test)]
