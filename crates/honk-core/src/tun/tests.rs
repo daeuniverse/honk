@@ -836,6 +836,27 @@ fn runtime_refuses_unavailable_tun_authority_without_restricting_dial_modes() {
         config.global.dial_mode = mode.into();
         validate_runtime(&config, false).unwrap();
     }
+    for queues in [2, 3, 8] {
+        let mut config = base.clone();
+        config
+            .datapath
+            .as_mut()
+            .unwrap()
+            .tun
+            .as_mut()
+            .unwrap()
+            .queues = queues;
+        validate_config(&config).unwrap();
+        config
+            .datapath
+            .as_mut()
+            .unwrap()
+            .tun
+            .as_mut()
+            .unwrap()
+            .host_facts = true;
+        assert!(validate_config(&config).is_err());
+    }
     assert!(validate_runtime(&base, true).is_err());
     let mut config = base.clone();
     config.global.nfqueue_enable = true;

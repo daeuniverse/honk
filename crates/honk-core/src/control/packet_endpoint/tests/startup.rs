@@ -28,6 +28,7 @@ async fn packet_plane_with(
             tun: Some(honk_config::datapath::TunConfig {
                 name: "honk0".into(),
                 mtu: 1500,
+                queues: 1,
                 address4: Some("198.18.0.1".parse().unwrap()),
                 address6: Some("fd00:686f:6e6b:100::1".parse().unwrap()),
                 table: 202,

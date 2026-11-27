@@ -45,12 +45,12 @@ mod realm_receive;
 pub(in crate::control) mod remote;
 #[cfg(target_os = "linux")]
 pub(in crate::control) use fragment_peer::{FragmentPeer, fragment_offset_zero};
-#[cfg(target_os = "linux")]
-pub(crate) use realm::capture_realm_for_workers;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use realm::capture_realm;
 use realm::{HalfOpenHold, RealmResources};
 pub(crate) use realm::{PacketRealm, PacketRealmPlan, TcpClaim};
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) use realm::{capture_realm, capture_tun_realm};
+#[cfg(target_os = "linux")]
+pub(crate) use realm::{capture_realm_for_workers, capture_tun_realm};
 #[cfg(target_os = "linux")]
 pub(crate) use realm_receive::RealmRxBatch;
 #[cfg(target_os = "linux")]

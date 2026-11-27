@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, bail, ensure};
-use honk_config::Config;
+use honk_config::{Config, datapath::MAX_TUN_QUEUES};
 use honk_xsk::topology::{
     Topology, TunReadback, TunRoute, TunRouteKind, TunRule, TunRuleAction, TunRuleSelector,
     TunSpec, TunStage, tun_readback,
@@ -29,7 +29,6 @@ use crate::state;
 
 const SOURCE_SHA: &str = env!("HONK_SOURCE_SHA");
 const RECEIPT_FORMAT: u32 = 1;
-const MAX_TUN_QUEUES: u8 = 8;
 const TUN_FLAGS: libc::c_int = libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_VNET_HDR;
 const OFFLOADS: libc::c_ulong =
     (libc::TUN_F_CSUM | libc::TUN_F_TSO4 | libc::TUN_F_TSO6) as libc::c_ulong;

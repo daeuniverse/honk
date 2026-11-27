@@ -59,6 +59,7 @@ datapath { backend: tun
     direct: endpoint
     tun { name: honk0
         mtu: 1500
+        queues: 1
         host_facts: true
         address4: 198.18.0.1/32
         address6: fd00:686f:6e6b:100::1/128
@@ -78,6 +79,7 @@ routing { fallback: direct }
     let tun = datapath.tun.as_ref().unwrap();
     assert_eq!(tun.name, "honk0");
     assert_eq!(tun.mtu, 1500);
+    assert_eq!(tun.queues, 1);
     assert!(tun.host_facts);
     assert_eq!(tun.address4, Some("198.18.0.1".parse().unwrap()));
     assert_eq!(tun.address6, Some("fd00:686f:6e6b:100::1".parse().unwrap()));
@@ -159,10 +161,59 @@ fn tun_host_facts_strict_boolean_and_round_trip() {
 }
 
 #[test]
+fn tun_queues_defaults_and_all_counts_round_trip_in_both_adapters() {
+    for queues in std::iter::once(None).chain((1..=8).map(Some)) {
+        let mut value = tun_parameters();
+        if let Some(queues) = queues {
+            value["queues"] = queues.into();
+        }
+        let dae = honk_config::parser::parse_dae_config(&tun_source(&value)).unwrap();
+        let structured = Config::from_json_str(&tun_json(&value).to_string()).unwrap();
+        structured.validate().unwrap();
+        assert_eq!(dae.datapath, structured.datapath);
+        let encoded = serde_json::to_value(&dae).unwrap();
+        assert_eq!(encoded["datapath"]["tun"]["queues"], queues.unwrap_or(1));
+        let decoded: Config = serde_json::from_value(encoded).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded.datapath, dae.datapath);
+    }
+}
+
+#[test]
+fn tun_queues_reject_invalid_counts_and_require_single_queue_for_host_facts() {
+    for invalid in [
+        serde_json::json!(0),
+        serde_json::json!(9),
+        serde_json::json!(256),
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!(true),
+        serde_json::Value::Null,
+    ] {
+        let mut value = tun_parameters();
+        value["queues"] = invalid;
+        assert_tun_admission(&value, false);
+    }
+    let mut value = tun_parameters();
+    value["queues"] = serde_json::json!("1");
+    assert!(Config::from_json_str(&tun_json(&value).to_string()).is_err());
+    for invalid in ["+1", "0x1"] {
+        value["queues"] = invalid.into();
+        assert_tun_admission(&value, false);
+    }
+    value["host_facts"] = true.into();
+    value["queues"] = 1.into();
+    assert_tun_admission(&value, true);
+    value["queues"] = 2.into();
+    assert_tun_admission(&value, false);
+}
+
+#[test]
 fn tun_required_fields_unknown_settings_and_duplicate_claims_reject() {
     let mut valid = tun_parameters();
     valid["mtu"] = 1500.into();
     valid["host_facts"] = false.into();
+    valid["queues"] = 1.into();
     for key in ["name", "table", "rule_priority", "capture"] {
         let mut missing = valid.clone();
         missing.as_object_mut().unwrap().remove(key);
@@ -486,6 +537,9 @@ fn tun_merged_sections_and_includes_reject_duplicate_claims() {
     let duplicate = enabled_block.replacen("tun {\n", "tun {\nhost_facts: false\n", 1);
     std::fs::write(&child, format!("datapath {{\n{duplicate}\n}}")).unwrap();
     assert!(Config::from_file(entry.to_str().unwrap()).is_err());
+    let duplicate = block.replacen("tun {\n", "tun {\nqueues: 1\nqueues: 2\n", 1);
+    std::fs::write(&child, format!("datapath {{\n{duplicate}\n}}")).unwrap();
+    assert!(Config::from_file(entry.to_str().unwrap()).is_err());
     for extra in [
         "backend: tun".to_owned(),
         "direct: endpoint".to_owned(),
@@ -517,6 +571,7 @@ fn tun_device_restart_identity_compares_every_setting() {
         .unwrap();
     let mut explicit = value.clone();
     explicit["mtu"] = 1500.into();
+    explicit["queues"] = 1.into();
     explicit["capture"] = serde_json::json!(["::/0", "0.0.0.0/0", "::/0"]);
     explicit["host_facts"] = false.into();
     let equivalent = honk_config::parser::parse_dae_config(&tun_source(&explicit))
@@ -526,6 +581,7 @@ fn tun_device_restart_identity_compares_every_setting() {
     assert_eq!(original, equivalent);
     assert!(original.same_device_setup(&equivalent));
     for (key, changed) in [
+        ("queues", serde_json::json!(3)),
         ("name", serde_json::json!("honk1")),
         ("mtu", serde_json::json!(9000)),
         ("address4", serde_json::json!("198.18.0.2/32")),
@@ -555,7 +611,7 @@ fn tun_device_restart_identity_compares_every_setting() {
 #[test]
 fn tun_direct_models_use_shared_canonical_admission() {
     let original = honk_config::parser::parse_dae_config(&tun_source(&tun_parameters())).unwrap();
-    for case in 0..13 {
+    for case in 0..16 {
         let mut config = original.clone();
         let tun = config.datapath.as_mut().unwrap().tun.as_mut().unwrap();
         match case {
@@ -580,6 +636,12 @@ fn tun_direct_models_use_shared_canonical_admission() {
             10 => tun.address6 = None,
             11 => tun.capture = vec!["10.0.0.1/32".parse().unwrap(); 65],
             12 => tun.capture.clear(),
+            13 => tun.queues = 0,
+            14 => tun.queues = 9,
+            15 => {
+                tun.queues = 2;
+                tun.host_facts = true;
+            }
             _ => unreachable!(),
         }
         assert!(tun.validate().is_err(), "case {case}");

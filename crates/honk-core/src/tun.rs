@@ -1,5 +1,6 @@
 //! Daemon-owned Linux TUN capture into the existing scoped packet Endpoint executor.
 
+mod multiqueue;
 mod setup;
 #[cfg(feature = "packet-ebpf")]
 mod source;
@@ -61,6 +62,13 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
     else {
         return Ok(());
     };
+    ensure!(
+        !datapath
+            .tun
+            .as_ref()
+            .is_some_and(|tun| tun.host_facts && tun.queues > 1),
+        "TUN host_facts requires a single queue"
+    );
     datapath.validate()?;
     ensure!(
         !config.global.nfqueue_enable,
@@ -994,19 +1002,9 @@ async fn run_owned(
         let dns = PacketEndpoints::prepare_dns_bind(&config)?;
         let capacity = plane.packet_udp_capacity();
         ensure!(capacity != 0, "TUN requires a funded UDP endpoint capacity");
-        let memory = budget
-            .reserve(
-                size_of::<Runtime>()
-                    + RX_BYTES
-                    + 4 * size_of::<(
-                        crate::control::netstack::PacketScope,
-                        crate::control::netstack::PacketOwner,
-                    )>(),
-            )
-            .context("TUN receive and runtime metadata capacity")?;
-        Ok((dns, capacity, memory))
+        Ok((dns, capacity))
     })();
-    let (dns, capacity, memory) = match prepared {
+    let (dns, capacity) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return (Some(plane), Err(error)),
     };
@@ -1015,6 +1013,22 @@ async fn run_owned(
         .as_ref()
         .and_then(|value| value.tun.as_ref())
         .unwrap();
+    if tun.queues > 1 {
+        return multiqueue::run(plane, &config, budget, admission, dns, capacity).await;
+    }
+    let Some(memory) = budget.reserve(
+        size_of::<Runtime>()
+            + RX_BYTES
+            + 4 * size_of::<(
+                crate::control::netstack::PacketScope,
+                crate::control::netstack::PacketOwner,
+            )>(),
+    ) else {
+        return (
+            Some(plane),
+            Err(anyhow::anyhow!("TUN receive and runtime metadata capacity")),
+        );
+    };
     #[cfg(feature = "packet-ebpf")]
     let mut source = if tun.host_facts {
         match source::Source::prepare(&config, &budget, _pin_root) {

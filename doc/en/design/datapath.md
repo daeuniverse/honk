@@ -11,14 +11,15 @@ consumer of the existing scoped Stack, canonical Router, DNS projector and
 outbound flow initializers. It creates no TC hooks, NFQUEUE, `dae0` or `daens`.
 Only `host_facts: true` requires the `ebpf` feature. It rejects `--mock-ebpf`.
 
-A single `TunDevice` owns `/dev/net/tun`, opened `O_RDWR|O_NONBLOCK|O_CLOEXEC`.
-`TUNSETIFF` requests `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR|IFF_TUN_EXCL`;
-`TUNGETIFF` verifies TUN/NO_PI/VNET_HDR and rejects multi-queue, persistence,
-NAPI and unexpected flags. The creation-only EXCL bit is not required in readback.
-Setup sets and reads back a 10-byte little-endian vnet header, then enables only
-`TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`; unsupported setup refuses explicitly.
-There is one reader/writer, no duplicate/inherited FD, persistent device,
-external-FD input or pre-existing-link adoption. UFO, USO and TSO ECN are not enabled.
+Each queue owns one nonpersistent `TunDevice` FD opened `O_RDWR|O_NONBLOCK|O_CLOEXEC`.
+Single-queue creation requests `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR|IFF_TUN_EXCL`.
+With 2–8 queues, the first FD adds `IFF_MULTI_QUEUE` and subsequent FDs
+attach to the same link with that bit but without `IFF_TUN_EXCL`. All FDs
+must match the namespace, name, ifindex, attachment flags and 10-byte
+little-endian vnet framing. Netlink must show the requested number of queues
+and zero disabled queues. Setup enables only `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`.
+HostFacts and private auxiliary TUNs remain single-queue. honk refuses unsupported
+setup and accepts only its own newly created device and FDs.
 
 ### Setup and readiness
 
@@ -47,6 +48,8 @@ external-FD input or pre-existing-link adoption. UFO, USO and TSO ECN are not en
    Service every driver during readiness and failed-startup cleanup. DNS bind,
    software flags and subscription authorizations must be ready. Bind the true-mode
    source owner to the actual FD and attachment before capture becomes active.
+   Multi-queue startup waits for every queue worker and the final FD and queue
+   readback before publishing capture routes.
 5. Read back link/address/rules, install and read back metric-1024 capture
    routes, then establish the final `Topology::admit_tun` subscription and full
    snapshot while retaining the old watch. Only after successful final admission
@@ -57,6 +60,8 @@ The receipt at `<data_dir>/state/tun-<netns_cookie>-<instance_nonce>.json` is
 create-new, mode 0600 and nonsymlink. It journals full source SHA, PID/starttime,
 actual namespace/link/attachment identity and exact address/route/rule keys with
 Intent/Acknowledged/Removed states, persisting and fsyncing each transition.
+Multi-queue receipts distinguish exclusive creation from queue attachment and
+record the expected and observed queue counts.
 Only confirmed instance-owned objects can be removed. Ambiguity retains the
 receipt and object; a receipt never authorizes adoption or automatic recovery.
 
@@ -87,7 +92,7 @@ canonical initializer/Router, real outbound and generated output lease on the sa
 FD. Direct makes a new dial; neither scope/tuple/mark nor generated replies grant
 original-operation or pre-NAT/TTL equivalence.
 
-RX uses one funded 65,586-byte buffer (10 vnet + 65,575 ordinary IPv6 + 1 sentinel)
+Each queue uses one funded 65,586-byte RX buffer (10 vnet + 65,575 ordinary IPv6 + 1 sentinel)
 and one ingress timestamp per turn. A full-buffer read is rejected as possibly
 truncated; exact IP extent and vnet flags/type/family/header/checksum bounds must
 validate before the combined metadata/source/admission path. TCPv4/TCPv6 GSO enters
@@ -96,6 +101,14 @@ ICMP and completed reassembly still verify checksums; Endpoint/WireGuard trust r
 are unchanged. Borrowed UDP is accepted/copied through funded ingress before the
 next read. The source callback checks the live reverse consumer for this scope and
 attachment; it never writes the FD, blocks or re-enters the scope mutex.
+
+In multi-queue mode one coordinator manages one Tokio task and one PacketDriver per queue.
+A non-fragment packet on its canonical owner is processed directly from the RX buffer.
+Other queues hand off owned records through bounded FIFO inboxes funded before startup.
+Queue 0 owns IP reassembly and forwards completed packets to their canonical owners with
+`RxMeta::VERIFY` and the completion ingress timestamp. Ordinary packets preserve their RX
+metadata and ingress time. A full inbox counts a capacity drop. Each owner writes replies
+on its own FD, allowing Linux to steer established traffic toward that queue.
 
 TX funds 65,535-byte CPU frames separately from logical MTU; MSS/PMTU and ordinary
 UDP MTU behavior do not increase. Every output includes a 10-byte vnet header,
@@ -106,6 +119,7 @@ The owner services every driver before and after bounded RX. RX is limited to 32
 syscall attempts/packets, 1 MiB or 1 ms per turn. TX rotates scope/class groups,
 retaining pending leases and sharing one bounded syscall/byte/time output turn.
 EINTR counts; limits are scheduler bounds, not preemptible syscall deadlines.
+In multi-queue mode each worker services its own driver within bounded turns.
 
 | TUN write result | Ownership |
 | --- | --- |
@@ -131,22 +145,26 @@ outside locks while driver service and `owner.poll_join_plane` continue until
 TCP/UDP initializers, sources/receivers, retirement, DNS and original scope owners
 actually join. `shutdown_wait_connections` supplies no natural-completion grace.
 
-After the supervisor returns its real `(ControlPlane, result)`, close the only FD,
-drain the source owner while its required resources remain live, confirm owned-link
-disappearance, and remove only receipt-backed objects still
+After the supervisor returns, join all queue workers and close all queue FDs.
+Drain the single-reader source owner while its required resources remain live,
+if enabled. Confirm owned-link disappearance and remove only receipt-backed objects still
 proven to belong to this instance. Once business cleanup succeeds, remove P+4
 first, then guards/table and bypass/return rules, and finally the receipt. This
 explicit stop restores ordinary main routing. Software policy cleanup and the
 existing API/subscription shutdown follow.
 
-Runtime failure, crash or unconfirmed cleanup retains blackholes/rules and the
-receipt and returns an error. Stop sources and inspect exact ownership before
-operator cleanup; do not restart by deleting a name/table blindly. Drop only
+A fatal worker or FD error closes admission for the entire device. Runtime failure,
+crash or unconfirmed cleanup retains blackholes, rules and the receipt and returns an error.
+Stop sources and verify ownership before operator cleanup. Drop only
 closes local admission/endpoints, disposes local leases, returns driving rights
 and closes the FD; it performs no rtnetlink cleanup or successful-cleanup ack.
 The original supervisor retains joined cleanup on its original Tokio runtime,
 which an embedder must keep alive. There is no automatic FD reopen, resource
 adoption or TC/XDP fallback.
+
+Stage 1 native tests cover ownership, startup and rollback. Validation of actual
+Linux multiqueue behavior and scaling at 1/2/4/8 queues requires the separate
+Stage 2 floor/recent disposable VM gate.
 
 ## Full-XDP startup
 

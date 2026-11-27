@@ -172,12 +172,16 @@ pub struct XdpInterface {
     pub role: InterfaceRole,
 }
 
+pub const MAX_TUN_QUEUES: u8 = 8;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TunConfig {
     pub name: String,
     #[serde(default = "default_tun_mtu")]
     pub mtu: u16,
+    #[serde(default = "default_tun_queues")]
+    pub queues: u8,
     #[serde(default)]
     pub host_facts: bool,
     #[serde(
@@ -200,6 +204,10 @@ pub struct TunConfig {
 
 pub(crate) fn default_tun_mtu() -> u16 {
     1500
+}
+
+pub(crate) fn default_tun_queues() -> u8 {
+    1
 }
 
 fn invalid_tun(message: &str) -> crate::ConfigError {
@@ -288,6 +296,14 @@ impl TunConfig {
         }
         if self.mtu < 1280 {
             return Err(invalid_tun("mtu must be between 1280 and 65535"));
+        }
+        if !(1..=MAX_TUN_QUEUES).contains(&self.queues) {
+            return Err(invalid_tun(&format!(
+                "queues must be between 1 and {MAX_TUN_QUEUES}"
+            )));
+        }
+        if self.host_facts && self.queues != 1 {
+            return Err(invalid_tun("host_facts requires queues: 1"));
         }
         if self.address4.is_none() && self.address6.is_none() {
             return Err(invalid_tun("at least one local address is required"));

@@ -285,7 +285,7 @@ pub(crate) fn capture_realm_for_workers(
     ))
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn capture_tun_realm(
     mtu: u32,
     queues: usize,

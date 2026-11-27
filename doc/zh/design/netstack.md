@@ -192,7 +192,7 @@ Capture 退役以 `PacketEndpoints::retains` 为准，包括控制器 DNS 查询
 
 正常关闭先关闭准入并发布同一个控制面 shutdown signal，再启动协议 abort，随后等待正在执行的 selector 精确退休。应用关闭以及已导出/CQ 持有输出的实际释放仍必须完成；命令完成或空 scope owner 退出都不能伪造这些释放。
 
-TUN 向 driven supervisor 传入保留的 DNS bind 候选和明确的 plain 独立 DNS scope。false 使用一个 scope，true 增加独立 Host scope；XDP 和普通嵌入保留 HOST 独立 DNS。两个后端共用 supervisor 和 Router。
+TUN 向 driven supervisor 传入保留的 DNS bind 候选和明确的 plain 独立 DNS scope。TUN 分片共用 plain DNS scope。单队列 HostFacts 增加独立 Host scope。XDP 和普通嵌入保留 HOST 独立 DNS。两个后端共用 supervisor 和 Router。
 
 `control::netstack::capture_scope(mtu, realms, bulk_frames, &budget)` 与 `CAPTURE_MEMORY` 让 XDP 或 TUN 的 scope 和设备/runtime 存储共用一个 384 MiB capture 预算。准入 `R` 个 realm 时，每个 Stack 的 limit 为 `192 MiB / R`，flow/slot 上限为 `min(4096 / R, 1024)`；每个 scope 保留 32 个 control frame 和 256 个 waiter。bulk 容量由调用方选择。默认 CPU backing 在分配前按每 scope `(32 + bulk_frames) * mtu.max(1280)` 字节计费：bulk 128 对应 160 个 frame，bulk 256 对应 288 个 frame。内部 `capture_scope_with_output` 可以选择单独计费的输出容量和能力，不改变逻辑 MTU。metadata 和 Stack 存储仍在同一共享预算内计费。两个 helper 都选择 `Mode::Transparent { exclude: Default::default() }`；Direct 的 **Endpoint 执行 profile** 不等于 WireGuard 的 `Mode::Endpoint`。原手工嵌入及 WireGuard 默认值不变，进展 floor 也不是 accepted-flow 总承诺。
 
@@ -212,9 +212,9 @@ XDP 在启动时为每个物理 Port 选择容量。`physical_mtu + 22` 不溢�
 
 每个已配置的 `l3_lan` 从同一 384 MiB 预算独立预留 4 MiB，等待设备时也保留。其 Stack 有 16 个 TCP 槽（包括保留的 TIME_WAIT）、512 KiB TCP 池、2 个 control 和 6 个 bulk CPU 帧，以及 32 个等待者。完整 TUN 接收记录与待写输出数组也在该份额内。设备 map、link 与程序各代另计入共享根预算。这些是容量界限，不是吞吐或内核 RSS 的实测值。
 
-TUN 选择 bulk 128 和配置的逻辑 MTU（默认 1500）；false 使用一个 realm，true 使用两个。每个 scope 的 160 个 CPU frame 各计费 65,535 字节（总计 10,485,600 字节）；共用 384 MiB 预算和一个 UDP pool，不改变 MSS/PMTU 或普通 UDP MTU。
+单队列 TUN 选择 bulk 128 与配置的逻辑 MTU（默认 1500），使用一个 plain realm。启用 HostFacts 时另设独立 Host realm。每个 scope 的 160 个 CPU frame 各计费 65,535 字节（共 10,485,600 字节）。2–8 个队列使用一个非物理 realm，在各归属者之间划分 Stack 与输出容量，realm 内共享半开 TCP、待处理 UDP 和 ICMP 限额。每个任务的 RX buffer 与有界 FIFO 均向同一个 384 MiB 捕获预算预先计费。FIFO 槽按最大 IP 记录加元数据计费。MSS/PMTU 和普通 UDP MTU 保持原值。
 
-[TUN owner](./datapath.md#fd-报文管线) 在每个类别内先写出已排队的 CPU 帧，再借用协议栈的头和载荷切片执行一次 `writev`。setup 要求独占、单队列、非 persistent 的 `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR`，设置并回读 10 字节小端 vnet 头，仅启用 `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`；内核不支持时明确拒绝。RX 预留 65,586 字节：10 字节 vnet 头、普通 IPv6 最大 65,575 字节以及一个截断 sentinel。读满 buffer、不完整/带填充 IP record、未知 flag、不支持的 GSO 类型/地址族及非法首部/校验和范围，均在组合 metadata/source/admission 路径之前拒绝。GSO `hdr_len` 是 Linux 线性头部范围提示，可包含载荷，必须覆盖解析后的 TCP 头且不超过 IP record。普通 UDP `CHECKSUM_PARTIAL` 无需 USO 也能接收。在回收唯一 RX buffer 前接纳/复制借用 UDP。
+[TUN owner](./datapath.md#fd-报文管线) 在每个类别内先写出已排队的 CPU 帧，再借用协议栈的头和载荷切片执行一次 `writev`。setup 在每个队列 FD 上回读 10 字节小端 vnet 头，仅启用 `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`；内核不支持时明确拒绝。每个队列为 RX 预留 65,586 字节：10 字节 vnet 头、普通 IPv6 最大 65,575 字节以及一个截断 sentinel。读满 buffer、不完整/带填充 IP record、未知 flag、不支持的 GSO 类型/地址族及非法首部/校验和范围，均在组合 metadata/source/admission 路径之前拒绝。GSO `hdr_len` 是 Linux 线性头部范围提示，可包含载荷，必须覆盖解析后的 TCP 头且不超过 IP record。普通 UDP `CHECKSUM_PARTIAL` 无需 USO 也能接收。在回收唯一 RX buffer 前接纳/复制借用 UDP。
 
 每个 scope/class 每轮最多处理 32 次发送或维护。完整记录写成功才提交协议状态。EAGAIN 保留待发报文并重新注册可写唤醒，EINTR 在本轮预算内重试。短写或零写立即终止该设备。就绪和 joined close 期间服务所有 driver。独立 DNS 在 plain scope 学习，透明 DNS 使用各 packet 的 scope，均不借用 HOST 事实。Socket HostFacts 保留原始来源有效期与所有权；plain 不提供进程权威。Direct 新建 dial，不保留原 socket operation 或 pre-NAT/TTL 行为。
 
@@ -601,7 +601,7 @@ driver 位于 `honk-outbound/src/proxy/wireguard/`；规范在[出站设计](./o
 | 接收 | 每流最多 32 个乱序区间；ACK 拉伸受 64 包接收批次限制。 |
 | 规模 | 空闲的已建立流约占 1.4 KiB 堆（无 chunk）；每条隧道 4096 个流，每条被接纳的流从进程预算预留约 33 KiB 的 floor；预算即份额（默认 256 MiB，honk 取内存的 1/8，限制在 64 MiB..4 GiB），所有隧道的栈共同使用，64 MiB / 256 MiB / 1 GiB 下仅 floor 约可容纳 2,000 / 8,000 / 32,000 条流；活动隧道数由其固定开销限制，`share / 4 MiB`，夹在 1..128；`max_flows` 统计 UDP 关联；每条隧道一把锁、一个 owner 任务，因此单条隧道受限于一个核。 |
 | WireGuard | 每条隧道恰好一个 peer；无入站连接；IPv4 与 IPv6 各自需要配置隧道地址；endpoint 域名只在握手尝试超时之后的下一次获取时重新解析，已有会话时端点集合不变；每个 control plane 每个（密钥对，端点）只有一条隧道（不带 runtime 的拨号共用一个单独的进程级 registry），每个 registry 的活动隧道最多 `share / 4 MiB` 条（1..128，见规模）；共享密钥对与端点的节点必须所有隧道设置一致，否则互相替换，主机名与 IP 字面量写法的同一端点是不同的隧道；内层 MTU 至多 65472，使外层数据报装得进一个 UDP 载荷。 |
-| 透明 | core packet 嵌入与 Linux XDP/TUN Endpoint 后端；无 netmap/Windows、Android/VpnService。TUN 可选接纳 socket HostFacts；Direct 新建 dial，不具备原 operation 或 pre-NAT/TTL 等价性。独占单队列使用 checksum/TCP offload，无外部/persistent FD、UFO、USO 或 TSO ECN。设备集成需要真实内核验证，不宣称实验室性能收益。 |
+| 透明 | core packet 嵌入与 Linux XDP/TUN Endpoint 后端。暂不支持 netmap、Windows 或 Android/VpnService。TUN 支持 1–8 个队列及 checksum/TCP offload，socket HostFacts 只支持单队列。仅使用守护进程自建的非持久化 FD。Direct 新建出站 socket，使用新的操作与路由语义。第二阶段需要一次性 VM 验证 Linux 设备行为及 1/2/4/8 队列扩展性。 |
 | 验证 | 没有对非 Linux TCP 实现的互通测试，没有 ARM 实测，也没有跑 `test-routing`/`test-netns` 虚拟机门槛。设计阈值在一台 x86-64 4-vCPU 虚拟机上以内核 WireGuard + 内核 TCP 为对照实测（不是设计里的同一外层引擎 + TUN 对照臂，且 honk 一侧多一跳本地中继）：G1–G4 通过，G5 下行公平性按中位数通过，G5 空闲内存（含驱动与中继状态约每流 4 KiB）未达到 1 KiB 目标；证据在 `bench` 分支的 `bench/netstack/results/` 下。 |
 
 ## 设计验证（P1）

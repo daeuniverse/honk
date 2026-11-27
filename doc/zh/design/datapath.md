@@ -10,13 +10,12 @@ Linux capture 向共享用户态策略和出站路径交付流量。用户态路
 Router、DNS projector 与出站流初始化器，不创建 TC hook、NFQUEUE、`dae0` 或
 `daens`。仅 `host_facts: true` 要求 `ebpf` feature；拒绝 `--mock-ebpf`。
 
-唯一 `TunDevice` 以 `O_RDWR|O_NONBLOCK|O_CLOEXEC` 打开 `/dev/net/tun`。
-`TUNSETIFF` 使用 `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR|IFF_TUN_EXCL`；
-`TUNGETIFF` 核对 TUN/NO_PI/VNET_HDR，拒绝 multi-queue、persistent、NAPI 与未知
-flag，不要求回读仅创建时有意义的 EXCL 位。setup 设置并回读 10 字节小端 vnet
-头，再仅启用 `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`；内核不支持则明确拒绝。
-只有一个 reader/writer，不 dup/继承 FD，不支持 persistent、外部 FD 或接管已有
-链路，不启用 UFO、USO 或 TSO ECN。
+每个队列独占一个非持久化 `TunDevice` FD，以 `O_RDWR|O_NONBLOCK|O_CLOEXEC` 打开。
+单队列用 `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR|IFF_TUN_EXCL` 创建。配置 2–8 个队列时，
+首个 FD 增加 `IFF_MULTI_QUEUE`，其余 FD 保留该位、去掉 `IFF_TUN_EXCL` 并附加到同一链路。
+所有 FD 都须核对网络命名空间、名称、ifindex、附加标志及 10 字节小端 vnet 格式。
+Netlink 必须回读到配置的队列数且禁用队列为零。仅启用 `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`。
+HostFacts 与辅助私有 TUN 保持单队列。honk 拒绝不支持的设置，只使用自己新建的设备和 FD。
 
 ### Setup 与就绪
 
@@ -40,6 +39,7 @@ flag，不要求回读仅创建时有意义的 EXCL 位。setup 设置并回读 
    bind 候选和明确的 plain 独立 DNS scope。就绪和失败清理期间服务所有 driver；
    DNS、软件 flags 与订阅 authorization 均须 ready。true 模式在捕获激活前将
    source owner 绑定到真实 FD 与 attachment。
+   多队列模式等待全部队列工作任务就绪，并完成最终 FD 和队列回读，才发布捕获路由。
 5. 回读 link/address/rule，安装并回读 metric-1024 capture route；保留旧
    watch 的同时建立最终 `Topology::admit_tun` 订阅及完整 snapshot。全部准入成功
    后才开共享 gate，调用 `capture_ready()`，报告 `TUN datapath ready`、lifecycle
@@ -48,8 +48,9 @@ flag，不要求回读仅创建时有意义的 EXCL 位。setup 设置并回读 
 Receipt 位于 `<data_dir>/state/tun-<netns_cookie>-<instance_nonce>.json`，
 create-new、mode 0600、拒绝 symlink。它记录完整源码 SHA、PID/starttime、实际
 netns/link/attachment identity，以及精确 address/route/rule key 的
-Intent/Acknowledged/Removed 状态，每次转换都持久化并 fsync。仅删除已确认仍属
-本实例的对象；归属不明时保留对象和 receipt，不用 receipt 自动重放或接管。
+Intent/Acknowledged/Removed 状态，每次转换都持久化并 fsync。多队列收据区分独占创建
+和后续附加，并记录预期与回读队列数。仅删除已确认仍属本实例的对象。归属不明时保留
+对象和收据。收据不授予自动重放或接管的权限。
 
 两个地址族的 active capture route 使用 metric 1024，static blackhole guard
 仍为 32760。Linux 会规范化 IPv6 metric 0，IPv4 route delete 的 metric 0
@@ -73,7 +74,7 @@ FD read 接收 kernel egress；FD write 注入**新的 interface ingress 包**�
 outbound 和同一 FD 的生成 output lease。Direct 新建 dial；scope/tuple/mark 或
 生成回复不提供原 operation 或 pre-NAT/TTL 等价。
 
-RX 复用一个已计费的 65,586 字节 buffer（10 字节 vnet + 65,575 字节普通 IPv6
+每个队列复用一个已计费的 65,586 字节 buffer（10 字节 vnet + 65,575 字节普通 IPv6
 以及一个字节 sentinel），一轮共用同一个入口时间戳。读满 buffer 可能截断，直接拒绝；
 在组合 metadata/source/admission 路径之前，必须验证精确 IP 长度以及 vnet
 flag/type/family/header/checksum 范围。TCPv4/TCPv6 GSO 以一个连续 run 接收；
@@ -82,6 +83,12 @@ Endpoint/WireGuard 信任规则不变。借用 UDP 在下一次 read 前经 fund
 接纳/复制。source callback 仅检查该 scope/attachment 的真实 reverse consumer
 存活，不写 FD、不阻塞、不重入 scope mutex。
 
+多队列模式下，一个协调任务管理每队列各一个 Tokio 工作任务和 PacketDriver。
+非分片报文若已在规范归属队列上，就直接从 RX buffer 处理。其他队列通过启动前已计费的
+有界 FIFO 传递自有报文。队列 0 负责 IP 重组，以 `RxMeta::VERIFY` 和重组完成入站时间
+将完整报文交给规范归属者。普通报文保留原 RX 元数据和入站时间。FIFO 满时计数并丢包。
+每个归属者用自己的 FD 写回，Linux 据此可将已建立的流导向该队列。
+
 TX 为 CPU frame 单独计费 65,535 字节容量，不放大逻辑 MTU、MSS/PMTU 或普通
 UDP MTU。所有输出均带 10 字节 vnet 头，包括普通 ACK/UDP/control；一次 writev
 提交该头与不可变 lease 字节，由内核分段 TSO 并完成 partial checksum。
@@ -89,6 +96,7 @@ UDP MTU。所有输出均带 10 字节 vnet 头，包括普通 ACK/UDP/control�
 Owner 在有界 RX 前后服务所有 driver。RX 每轮最多 32 次 syscall 尝试/包、1 MiB
 或 1 ms。TX 轮转 scope/class 组并保留 pending lease，共用有界 syscall/byte/time
 输出预算。EINTR 计数；这些是调度限额，不是可抢占 syscall 的硬期限。
+多队列模式下，各工作任务在有界轮次内服务自己的 driver。
 
 | TUN write 结果 | 所有权 |
 | --- | --- |
@@ -112,17 +120,19 @@ guard，再停止 FD RX，同时保留 setup/watcher/FD/driver。`endpoints.clos
 initializer、source/receiver、retirement、DNS 与原 scope owner 真正 join。
 `shutdown_wait_connections` 不提供自然结束宽限。
 
-Supervisor 返回真实 `(ControlPlane, result)` 后关闭唯一 FD，在必需资源仍存活时
-排空 source owner，确认自有 link 消失，仅删除 receipt 记录且仍证明属于本实例的对象。
+Supervisor 返回后，等待全部队列工作任务退出并关闭所有队列 FD。启用来源捕获时，在必需资源
+仍存活时排空单读者 source owner。确认自有链路消失后，只删除收据记录且仍可证明归属的对象。
 全部业务清理成功后先删除 P+4，
 再清 guard/table、bypass/return rule，最后删除 receipt。这个显式 stop 恢复普通
 main 路由；之后进行软件 policy cleanup 和已有 API/订阅 shutdown。
 
-Runtime failure、crash 或未确认清理时保留 blackhole/rule 与 receipt，返回错误。
+任一工作任务或 FD 遭遇致命故障时，整个设备关闭准入。运行失败、崩溃或清理未经确认时，保留 blackhole、规则和收据，并返回错误。
 先停源并核对精确归属再由操作者清理，不按名称/表盲删后重启。Drop 只同步关闭
 本地 admission/endpoint、处置本地 lease、归还驱动权并关闭 FD，不做 rtnetlink
 清理或成功 ack。原 supervisor 在原 Tokio runtime 上继续持有 joined cleanup，
 嵌入方必须保持该 runtime 存活。不自动重开 FD、接管资源或回退 TC/XDP。
+
+第一阶段的原生测试覆盖归属、启动与回滚。Linux 真实多队列行为及 1/2/4/8 队列扩展性须通过第二阶段的最低和近期内核一次性 VM 验证。
 
 ## Full-XDP 启动
 

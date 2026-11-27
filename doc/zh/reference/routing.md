@@ -94,7 +94,7 @@ routing {
 
 运行时没有 BTF 偏移，或没有 verifier 允许的内核 argv 访问方式时，cgroup hook 同步改用调用线程的 `comm`。只匹配 honk 所在主机上的进程，不匹配 LAN 客户端上的应用。
 
-TUN 使用 `pname` 要求 `tun.host_facts: true`。进程事实仅在经认证的应用 socket Host 记录确有该信息时可用；plain 或单条记录缺失时不匹配正向谓词，但匹配其否定。plain 不代表已证明 Transit。
+TUN 中使用 `pname` 或其否定形式，要求同时配置 `host_facts: true` 与 `queues: 1`。进程事实来自确有该信息的已认证应用 socket Host 记录。plain 或单条记录缺失时只匹配否定谓词。plain 可以包含两种流量，即本机发起和转发流量。参见 [Linux TUN Endpoint](./global.md#linux-tun-endpoint)。
 
 ```dae
 routing {

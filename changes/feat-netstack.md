@@ -46,3 +46,4 @@ Added
 - Drive eligible physical XDP Endpoint flows on their queue owner, share bounded Remote TCP buffers per shard, and retain outstanding output across TCP slot reuse.
 - Borrow worker Remote TCP upload chunks directly and halve the per-flow copy buffer reservation.
 - Consolidate reported packet input in `Stack::receive_reported` and expose TCP retention through the lineage-aware query.
+- Add restart-only `datapath.tun.queues` for standalone Linux TUN Endpoint capture, from 1 to 8 queues with a default of 1. Multi-queue capture uses a shared packet realm, bounded handoff, and device-wide readiness and failure handling. HostFacts requires one queue. Real-device and scaling measurements are separate from the native tests.

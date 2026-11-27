@@ -368,14 +368,14 @@ honk starts UDP DNS target initialization at startup, within the health-check ti
 
 ## Traffic entry and interception
 
-honk receives traffic through eBPF TC hooks on the configured interfaces, not through a proxy port that clients connect to.
+TC is the default interception backend. Opt in to [Linux TUN Endpoint](#linux-tun-endpoint) through datapath configuration.
 
 - `lan_interface` hooks intercept traffic that LAN clients send through the host, for example clients that use it as their gateway.
 - `wan_interface` hooks intercept TCP and UDP that the host itself originates.
 - The datapath sends flows that need userspace handling through `dae0` into the `daens` namespace. There, `sk_lookup` assigns them to the transparent TCP or UDP listener on `tproxy_port`. NFQUEUE staging (`nfqueue_enable`) holds ambiguous LAN-forwarded UDP instead.
-- Interception requires the real eBPF backend; the mock backend intercepts nothing.
+- The mock backend intercepts nothing.
 
-honk has no TUN inbound, no `mixed-port`, no `redir-port`, and no HTTP or SOCKS inbound. The Clash API's `GET /configs` reports `port`, `socks-port` and `mixed-port` as `0` and `tun.enable` as `false`. Besides the transparent listeners, honk listens only on the optional [`dns.bind`](./dns.md#standalone-listener-bind) address and on the API listeners configured in [`experimental`](./experimental.md). The [packet walk](../design/overview.md#packet-walk) follows a flow through the hooks.
+honk provides no `mixed-port`, `redir-port`, HTTP or SOCKS proxy listeners. The Clash API's `GET /configs` reports `port`, `socks-port` and `mixed-port` as `0`. Its `tun` object reports the accepted TUN configuration, including `enable`. Readiness is reported separately. Besides transparent listeners, honk listens only on the optional [DNS listener](./dns.md#standalone-listener-bind) and the API listeners configured in [experimental](./experimental.md). See the [TC packet walk](../design/overview.md#packet-walk).
 
 ## Interface semantics
 
@@ -576,8 +576,7 @@ Packets already proved Direct continue on the original socket. Endpoint traffic 
 ### Linux TUN Endpoint
 
 Select TUN explicitly with `backend: tun` and `direct: endpoint`. honk creates and
-owns a new, nonpersistent, single-queue Linux TUN; the values below are resources
-chosen by the operator, not reserved defaults:
+owns a new, nonpersistent Linux TUN. The resources below are chosen by the operator.
 
 ```dae
 global {
@@ -591,6 +590,7 @@ datapath {
     tun {
         name: honk0
         mtu: 1500
+        queues: 1
         host_facts: true
         address4: 198.18.0.1/32
         address6: fd00:686f:6e6b:100::1/128
@@ -611,10 +611,11 @@ routing {
 | --- | --- |
 | `name` | Required; 1–15 ASCII bytes from `[A-Za-z0-9_.-]`. `lo` and `auto` are rejected. The name must be unused in this network namespace; existing links are never adopted or replaced. |
 | `mtu` | Optional, default `1500`; integer `1280..=65535`. |
+| `queues` | Optional integer from 1 through 8, including non-powers of two. Defaults to 1. Counts above 1 require `host_facts: false`. Changes require restart. |
 | `address4` / `address6` | At least one required; exact host prefixes `/32` and `/128`. Unspecified, multicast, broadcast, mapped IPv6, link-local and duplicate local addresses are rejected. |
 | `table` | Required; `1..=0xfffffffe`, excluding `253..=255`. No existing route or rule may use this dedicated table. |
 | `rule_priority` | Required first priority P; `P >= 1` and checked `P+4 < 32766`. All five priorities `[P,P+4]` must be unused. |
-| `host_facts` | Optional strict boolean, default `false`. `true` requires an `ebpf` build and real source capture; changes require restart. |
+| `host_facts` | Optional strict boolean, default `false`. `true` requires `queues: 1`, an `ebpf` build and real source capture. Changes require restart. |
 | `capture { ... }` | Required, 1–64 canonical CIDR networks in configured address families. Host bits and mutually containing redundant prefixes are rejected; entries are sorted and deduplicated. Only bare prefixes are accepted, without keyed entries or nested blocks. |
 
 TUN requires exactly one `tun` block; TC/XDP reject that block. TUN rejects
@@ -628,7 +629,7 @@ Run on Linux with `/dev/net/tun`, permission to create/configure TUN and apply
 `SO_MARK`, and no `--mock-ebpf`. Explicitly disable NFQUEUE and leave
 `global.lan_interface`/`wan_interface` empty. Nonzero traffic-rule/default marks
 and MAC predicates (including negations) are unsupported. Process-name predicates
-are rejected unless `host_facts: true`. All four dial modes remain available.
+require single-queue HostFacts. All four dial modes remain available. See [pname](./routing.md#pname).
 
 For every enabled address family honk validates the standard priority-0 local
 rule and installs exactly five owned RPDB rules, where M is the effective
@@ -687,7 +688,7 @@ operator cleanup, never authority to replay setup, adopt resources or delete an
 ambiguous object. See [TUN setup and teardown](../design/datapath.md#linux-tun-endpoint).
 
 Direct TCP/UDP is an explicit Endpoint relay: real TUN FD read → scoped Stack →
-canonical Router → new direct/proxy outbound → generated reply → the same FD.
+canonical Router → new direct/proxy outbound → generated reply → the owning shard's FD.
 With `host_facts: true`, authenticated application-socket records carry their
 original source facts into a separate Host scope; witnessed unattributed records
 remain plain, not proven Transit. Process names are available only for authenticated
@@ -699,10 +700,10 @@ it does not fall back to plain on source errors. The original source expiry is n
 refreshed by read delay. Generated replies provide no original operation or
 pre-NAT/TTL equivalence.
 
-The entire canonical TUN setup, including `host_facts`, backend and Direct profile
-are restart-only; omitted MTU and explicit 1500 compare equal, as do omitted and
-explicit false `host_facts`. Policy/group/DNS/subscription/mode updates retain the
-FD and scopes. Semantic `dns.bind` changes still require restart. Normal joined stop
+The entire canonical TUN setup, including `queues` and `host_facts`, the backend and the
+Direct profile require a restart when changed. Omission is equivalent to MTU 1500,
+`queues: 1` and `host_facts: false`. Policy/group/DNS/subscription/mode updates retain
+the FDs and scopes. Semantic `dns.bind` changes still require restart. Normal joined stop
 removes capture first, drains actual owners, then removes owned rules/guards and
 the receipt to restore main routing. Failure or unconfirmed cleanup retains
 blackholes, rules and receipt for stop-source inspection and exact cleanup;

@@ -94,7 +94,7 @@ routing {
 
 Without runtime BTF offsets or verifier-safe kernel argv access, the cgroup hook uses the calling thread's `comm` synchronously. Matches processes on the honk host only, not applications on LAN clients.
 
-For TUN, `pname` requires `tun.host_facts: true`. Process facts exist only for authenticated application-socket Host records when present; plain or individually missing facts do not match a positive predicate and do match its negation. This does not prove plain input is Transit.
+For TUN, `pname` and its negation require `host_facts: true` with `queues: 1`. Process facts come from authenticated application-socket Host records when present. Plain input and records with missing facts match only the negated predicate. Plain input may include both Host and Transit traffic. See [Linux TUN Endpoint](./global.md#linux-tun-endpoint).
 
 ```dae
 routing {

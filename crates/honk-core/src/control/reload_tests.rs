@@ -140,8 +140,10 @@ fn tun_restart_identity_covers_every_owned_device_value() {
     let current = tun_endpoint_config();
     let tun = current.datapath.as_ref().unwrap().tun.as_ref().unwrap();
     assert_eq!(tun.mtu, 1500);
+    assert_eq!(tun.queues, 1);
     let mut explicit = serde_json::to_value(&current).unwrap();
     explicit["datapath"]["tun"]["mtu"] = serde_json::json!(1500);
+    explicit["datapath"]["tun"]["queues"] = serde_json::json!(1);
     explicit["datapath"]["tun"]["host_facts"] = serde_json::json!(false);
     let explicit: Config = serde_json::from_value(explicit).unwrap();
     assert!(restart_required_changes(&current, &explicit).is_empty());
@@ -149,6 +151,7 @@ fn tun_restart_identity_covers_every_owned_device_value() {
     policy.routing.default_outbound = "block".into();
     assert!(restart_required_changes(&current, &policy).is_empty());
     for field in [
+        "queues",
         "name",
         "mtu",
         "address4",
@@ -163,6 +166,7 @@ fn tun_restart_identity_covers_every_owned_device_value() {
         match field {
             "name" => tun.name = "honk1".into(),
             "mtu" => tun.mtu = 1280,
+            "queues" => tun.queues = 3,
             "address4" => tun.address4 = Some("198.18.0.2".parse().unwrap()),
             "address6" => tun.address6 = Some("fd00:686f:6e6b:100::2".parse().unwrap()),
             "table" => tun.table = 203,

@@ -367,14 +367,14 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 
 ## 流量入口与拦截
 
-honk 通过所配置网卡上的 eBPF TC hook 接收流量，不提供供客户端连接的代理端口。
+默认由 TC 拦截流量。可通过 datapath 配置显式选择 [Linux TUN Endpoint](#linux-tun-endpoint)。
 
 - `lan_interface` 上的 hook 拦截 LAN 客户端经本机转发的流量，例如把本机设为网关的客户端。
 - `wan_interface` 上的 hook 拦截本机发起的 TCP/UDP。
 - 需要用户态处理的流量由数据路径经 `dae0` 送进 `daens` 命名空间，再由 `sk_lookup` 交给 `tproxy_port` 上的透明代理 TCP 或 UDP listener。有歧义的 LAN 转发 UDP 则由 NFQUEUE 暂存（`nfqueue_enable`）。
-- 拦截需要真实 eBPF 后端；mock 后端不拦截任何流量。
+- mock 后端不拦截任何流量。
 
-honk 没有 TUN 入站，也没有 `mixed-port`、`redir-port` 或 HTTP/SOCKS 入站。Clash API 的 `GET /configs` 把 `port`、`socks-port` 和 `mixed-port` 报告为 `0`，把 `tun.enable` 报告为 `false`。除透明代理 listener 外，honk 只监听可选的 [`dns.bind`](./dns.md#独立-listenerbind) 地址，以及 [`experimental`](./experimental.md) 中配置的 API listener。流量经过各个 hook 的过程见[报文路径](../design/overview.md#报文路径)。
+honk 不提供 `mixed-port`、`redir-port`、HTTP 或 SOCKS 代理监听。Clash API 的 `GET /configs` 将 `port`、`socks-port` 和 `mixed-port` 报告为 `0`。`tun` 对象报告已接受的 TUN 配置（包括 `enable`）。就绪状态单独报告。除透明代理监听外，honk 只监听可选的 [DNS 地址](./dns.md#独立-listenerbind)和 [experimental](./experimental.md) 中配置的 API 地址。参见 [TC 报文路径](../design/overview.md#报文路径)。
 
 ## 网卡语义
 
@@ -564,7 +564,7 @@ datapath {
 ### Linux TUN Endpoint
 
 通过 `backend: tun` 和 `direct: endpoint` 显式选择 TUN。honk 新建并独占一个
-非 persistent、单队列 Linux TUN；下列值由操作者选择，不是全局保留的默认资源：
+非持久化 Linux TUN。下列资源由操作者选择。
 
 ```dae
 global {
@@ -578,6 +578,7 @@ datapath {
     tun {
         name: honk0
         mtu: 1500
+        queues: 1
         host_facts: true
         address4: 198.18.0.1/32
         address6: fd00:686f:6e6b:100::1/128
@@ -598,10 +599,11 @@ routing {
 | --- | --- |
 | `name` | 必填；1–15 个 ASCII 字节，仅限 `[A-Za-z0-9_.-]`，拒绝 `lo` 和 `auto`。该 netns 内必须尚无同名链路，绝不接管或替换已有链路。 |
 | `mtu` | 可省略，默认 `1500`；整数 `1280..=65535`。 |
+| `queues` | 可省略，默认 `1`。接受 1 到 8 的整数，包括非 2 的幂。大于 1 时要求 `host_facts: false`。变更需重启。 |
 | `address4` / `address6` | 至少配置一个，严格使用 `/32`、`/128` 主机前缀。拒绝 unspecified、multicast、broadcast、mapped IPv6、link-local 及重复的本地地址。 |
 | `table` | 必填；`1..=0xfffffffe`，排除 `253..=255`。任何现存 route/rule 都不得使用此专用表。 |
 | `rule_priority` | 必填，首优先级 P；`P >= 1` 且 checked `P+4 < 32766`。五个优先级 `[P,P+4]` 必须全部空闲。 |
-| `host_facts` | 可选严格布尔值，默认 `false`。`true` 要求 `ebpf` 构建和真实来源捕获；变更需重启。 |
+| `host_facts` | 可选严格布尔值，默认 `false`。`true` 要求 `queues: 1`、`ebpf` 构建与真实来源捕获。变更需重启。 |
 | `capture { ... }` | 必填，1–64 条已配置地址族内的规范 CIDR 网络。拒绝 host bits 及互相包含的冗余前缀；排序并去重。仅接受裸前缀，不接受键值条目或嵌套块。 |
 
 TUN 必须恰有一个 `tun` 块；TC/XDP 拒绝该块。TUN 拒绝 `interface`、
@@ -613,7 +615,7 @@ TUN 必须恰有一个 `tun` 块；TC/XDP 拒绝该块。TUN 拒绝 `interface`�
 要求 Linux、`/dev/net/tun`、创建/配置 TUN 和应用 `SO_MARK` 的权限，不能传
 `--mock-ebpf`。必须显式关闭 NFQUEUE，并保持 `global.lan_interface`/
 `wan_interface` 为空。拒绝非零 traffic rule/default mark、MAC 谓词及其否定；
-只有 `host_facts: true` 才允许进程名谓词。既有四种 dial mode 均可使用。
+进程名谓词要求单队列 HostFacts。既有四种 dial mode 均可使用。参见 [pname](./routing.md#pname)。
 
 对每个已启用地址族，honk 验证系统 priority-0 local rule，并安装恰好五条自有
 RPDB rule；M 为有效 `global.so_mark_from_dae`，T 为 `tun.table`，P 为
@@ -665,7 +667,7 @@ rule key。每次外部变更前先持久化 Intent；ACK 与 Removed 状态均�
 详见 [TUN setup 与拆卸](../design/datapath.md#linux-tun-endpoint)。
 
 Direct TCP/UDP 明确使用 Endpoint relay：真实 TUN FD read → scoped Stack →
-canonical Router → 新建 direct/proxy outbound → 生成回复 → 同一 FD。启用
+canonical Router → 新建 direct/proxy outbound → 生成回复 → 所属分片的 FD。启用
 `host_facts: true` 时，经认证的应用 socket 记录携带原始来源事实进入独立 Host
 scope；见证过但无归属的记录仍走 plain，不代表已证明 Transit。进程名仅在经认证
 Host 来源且存在时可用；Missing 不匹配正向谓词，但匹配其否定。两个 scope 共用
@@ -673,9 +675,9 @@ Host 来源且存在时可用；Missing 不匹配正向谓词，但匹配其否�
 scope；均不借用 HOST DNS 事实。来源准入要求真实支持，来源错误不能回退 plain；
 读取延迟不刷新原始来源有效期。生成回复不提供原 operation 或 pre-NAT/TTL 等价。
 
-整个规范 TUN setup（含 `host_facts`）、backend 与 Direct profile 都需重启；
-省略 MTU 与显式 1500 等价，省略 `host_facts` 与显式 false 也等价。
-policy/group/DNS/订阅/mode 更新沿用既有 FD 与 scope；`dns.bind` 语义变化仍需重启。正常 joined stop 先撤销 capture，等待真实 owner
+整个规范 TUN setup（含 `queues` 与 `host_facts`）、backend 与 Direct profile 变更均需重启。
+省略时分别等同于 MTU 1500、`queues: 1` 与 `host_facts: false`。
+policy/group/DNS/订阅/mode 更新沿用既有 FD 与 scope。`dns.bind` 语义变化仍需重启。正常 joined stop 先撤销 capture，等待真实 owner
 退出，再移除自有 rule/guard 与 receipt，恢复 main 路由。失败或未确认清理时保留
 blackhole、rule 与 receipt，供停源后核对并精确清理；不自动重开、接管或回退后端。
 

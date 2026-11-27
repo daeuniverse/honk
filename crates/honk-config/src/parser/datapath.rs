@@ -3,7 +3,8 @@ use crate::datapath::{
     Backend, BusyPollConfig, CalibrationStatus, DatapathConfig, DirectProfile, HostConfig,
     InterfaceRole, PollCalibration, PollMode, REMOVED_HOST_XSK_MODE_CODE,
     REMOVED_HOST_XSK_MODE_MESSAGE, TunConfig, XdpInterface, XskMode, canonical_tun_capture,
-    default_tun_mtu, parse_tun_address4, parse_tun_address6, removed_host_xsk_mode_setting,
+    default_tun_mtu, default_tun_queues, parse_tun_address4, parse_tun_address6,
+    removed_host_xsk_mode_setting,
 };
 use crate::diagnostic::{SettingPath, Severity};
 use crate::error::{DetailedConfigError, ErrorCategory};
@@ -251,8 +252,9 @@ fn parse_tun(section: &Segment<'_, '_>) -> Result<TunConfig, ParseFailure> {
         "table",
         "rule_priority",
         "host_facts",
+        "queues",
     ];
-    let mut values = [None; 7];
+    let mut values = [None; 8];
     let mut capture = None;
     for child in section
         .body()
@@ -303,6 +305,15 @@ fn parse_tun(section: &Segment<'_, '_>) -> Result<TunConfig, ParseFailure> {
             .map(|value| value.parse().map_err(|_| invalid("invalid tun MTU")))
             .transpose()?
             .unwrap_or_else(default_tun_mtu),
+        queues: values[7]
+            .map(|value| {
+                if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(invalid("tun.queues must be an unsigned decimal integer"));
+                }
+                value.parse().map_err(|_| invalid("invalid tun.queues"))
+            })
+            .transpose()?
+            .unwrap_or_else(default_tun_queues),
         host_facts: values[6]
             .map(|value| {
                 value

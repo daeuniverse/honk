@@ -80,6 +80,8 @@ The `l3-lan` selection in the XDP daemon smoke needs guest `wireguard-tools` and
 
 TUN S-a real-FD validation belongs to `.github/ci/tun-daemon-smoke.sh`, restricted to the same disposable floor/recent guest and its private namespaces with a matching daemon. The fixture owns operator forwarding/firewall/main-route prerequisites; the daemon must own TUN/address/table/five-rule/receipt setup. The complete gate must retain TC/XDP selections and exercise all twelve A Host/Transit × IPv4/IPv6 × TCP/connected/unconnected UDP rows, actual proxy and Endpoint Direct exchanges, FD/read-write/mark/DNS/reload/failure/representation subrows and confirmed stop versus crash guards. Socketpair/unit tests are not TUN evidence; record missing rows as NOT_RUN, never HostFacts/Native or E6.4 acceptance. This location/required matrix is not a claim that the gate has run.
 
+Wave 3C Stage 1 uses unprivileged config, realm, queue lifecycle and fault-injection tests. Stage 2 uses the disposable Linux 6.12.0 and 7.2.5 guests to validate actual `IFF_MULTI_QUEUE` attachment, traffic, shutdown and 1/2/4/8-queue scaling. Record each stage separately. HostFacts uses a separate single-reader lane. Auxiliary TCX TUN admission rejects multiqueue.
+
 Use skill `honk-real-ebpf-tests` for the prerequisite sequence from CI: an
 x86_64 Ubuntu 24.04 host, repository-pinned Rust toolchains, build/VM packages,
 checksum-pinned virtme-ng and bpf-linker, geo assets, both BTF-bearing objects,

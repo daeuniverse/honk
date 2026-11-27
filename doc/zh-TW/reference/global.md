@@ -360,14 +360,62 @@ UDP DNS 目標在啟動時按健康檢查逾時嘗試初始化。本機拒絕或
 
 ## 流量入口與攔截
 
-honk 透過所設定網卡上的 eBPF TC hook 接收流量，不提供供用戶端連線的代理連接埠。
+預設由 TC 攔截流量。可透過 datapath 設定明確選用 [Linux TUN Endpoint](#linux-tun-endpoint)。
 
 - `lan_interface` 上的 hook 會攔截 LAN 用戶端經本機轉發的流量，例如把本機設為閘道器的用戶端。
 - `wan_interface` 上的 hook 會攔截本機發起的 TCP/UDP。
 - 需要使用者空間處理的流量由資料路徑經 `dae0` 送進 `daens` 命名空間，再由 `sk_lookup` 交給 `tproxy_port` 上的透明代理 TCP 或 UDP listener。有歧義的 LAN 轉發 UDP 則由 NFQUEUE 暫存（`nfqueue_enable`）。
-- 攔截需要真實 eBPF 後端；mock 後端不攔截任何流量。
+- mock 後端不攔截流量。
 
-honk 沒有 TUN 入站，也沒有 `mixed-port`、`redir-port` 或 HTTP/SOCKS 入站。Clash API 的 `GET /configs` 會把 `port`、`socks-port` 和 `mixed-port` 報告為 `0`，並把 `tun.enable` 報告為 `false`。除了透明代理 listener，honk 只會監聽選用的 [`dns.bind`](./dns.md#獨立-listenerbind) 位址，以及 [`experimental`](./experimental.md) 中設定的 API listener。流量經過各個 hook 的過程見[封包路徑](../design/overview.md#封包路徑)。
+honk 不提供 `mixed-port`、`redir-port`、HTTP 或 SOCKS 代理監聽。Clash API 的 `GET /configs` 將 `port`、`socks-port` 和 `mixed-port` 回報為 `0`。`tun` 物件會回報已接受的 TUN 設定（包括 `enable`）。就緒狀態另行回報。除透明代理監聽外，honk 只監聽選用的 [DNS 位址](./dns.md#獨立-listenerbind)與 [experimental](./experimental.md) 設定的 API 位址。請參閱 [TC 封包路徑](../design/overview.md#封包路徑)。
+
+## Linux TUN Endpoint
+
+以 `backend: tun` 和 `direct: endpoint` 選用 honk 建立的非持久化 Linux TUN。以下資源由操作者選擇。
+
+```dae
+global {
+    nfqueue_enable: false
+    so_mark_from_dae: 0x100
+    dial_mode: ip
+}
+datapath {
+    backend: tun
+    direct: endpoint
+    tun {
+        name: honk0
+        mtu: 1500
+        queues: 1
+        host_facts: true
+        address4: 198.18.0.1/32
+        address6: fd00:686f:6e6b:100::1/128
+        table: 202
+        rule_priority: 10000
+        capture {
+            0.0.0.0/0
+            ::/0
+        }
+    }
+}
+routing {
+    fallback: direct
+}
+```
+
+| `tun` 欄位 | 設定 |
+| --- | --- |
+| `name` | 必填。1–15 個 ASCII 位元組，僅限 `[A-Za-z0-9_.-]`。拒絕 `lo`、`auto` 及同名介面。 |
+| `mtu` | 選填，預設 `1500`。接受 `1280..=65535` 的整數。 |
+| `queues` | 選填，預設 `1`。接受 1 到 8 的整數，包括非 2 的冪。大於 1 時須設定 `host_facts: false`。變更須重新啟動。 |
+| `host_facts` | 選填的嚴格布林值，預設 `false`。`true` 須搭配 `queues: 1`、包含 `ebpf` 的建置及實際來源擷取。參閱 [pname](./routing.md#pname)。 |
+| `address4` / `address6` | 至少一個。使用 `/32` 或 `/128` 的單播主機位址。 |
+| `table` | 必填。須為未使用的專用路由表，範圍 `1..=0xfffffffe`，排除 `253..=255`。 |
+| `rule_priority` | 必填。五個連續優先順序均須空閒，第一個大於等於 1，最後一個小於 32766。 |
+| `capture { ... }` | 必填。1–64 筆已設定的位址家族 CIDR 網路前綴。拒絕含主機位元及互相包含的前綴。 |
+
+TUN 須有一個 `tun` 區塊，TC/XDP 拒絕該區塊。合併區段和 include 後仍會拒絕重複欄位及區塊。變更裝置設定須重新啟動。省略 MTU、`queues` 或 `host_facts` 分別等同於設定 `1500`、`1` 或 `false`。策略重新載入沿用現有 FD 與分片。
+
+執行時須能存取 `/dev/net/tun`、設定 TUN 和路由，並設定 `SO_MARK`。關閉 NFQUEUE，清空 `global.lan_interface` 和 `global.wan_interface`，並使用實際後端。Direct 會建立新的對外連線。請參閱 [TUN 設計](../design/datapath.md#linux-tun-endpoint)與[完整 Linux TUN 資源規則](../../en/reference/global.md#linux-tun-endpoint)。
 
 ## 網卡語義
 

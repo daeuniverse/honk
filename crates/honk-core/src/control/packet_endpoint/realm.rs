@@ -91,7 +91,7 @@ impl PacketEndpoints {
     }
 
     /// Receives an L3 TUN packet on the owner already selected by the device worker.
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn receive_tun_on(
         &self,
         owner: &PacketScope,
