@@ -1053,6 +1053,94 @@ async fn xdp_sharded_startup_funds_required_owners_before_optional_output() {
     .expect("two original scope owners and their funded supervisor must join");
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tun_driven_startup_enforces_configured_multiqueue_plain_realm() {
+    use crate::control::netstack::{CAPTURE_MEMORY, capture_tun_realm};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Layout {
+        Plain,
+        TwoPlainRealms,
+        HostFacts,
+        UnexpectedHost,
+        WrongDns,
+    }
+    for (queues, owners, layout, accepts) in [
+        (2, 2, Layout::Plain, true),
+        (4, 4, Layout::Plain, true),
+        (8, 8, Layout::Plain, true),
+        (4, 1, Layout::Plain, false),
+        (2, 1, Layout::TwoPlainRealms, false),
+        (2, 1, Layout::HostFacts, false),
+        (2, 2, Layout::HostFacts, false),
+        (4, 4, Layout::UnexpectedHost, false),
+        (4, 4, Layout::WrongDns, false),
+    ] {
+        let budget = MemoryBudget::new(CAPTURE_MEMORY);
+        let (realm, realm_owners) =
+            capture_tun_realm(1500, owners, honk_netstack::TxCaps::NONE, &budget).unwrap();
+        let dns_scope = if matches!(layout, Layout::WrongDns) {
+            ScopeId::HOST
+        } else {
+            realm.scope()
+        };
+        let mut plans = vec![PacketRealmPlan::from((realm, realm_owners))];
+        match layout {
+            Layout::TwoPlainRealms => plans.push(scope(&budget).into()),
+            Layout::HostFacts | Layout::UnexpectedHost => {
+                let host = scope(&budget);
+                host.0.prepare_host().unwrap();
+                plans.push(host.into());
+            }
+            Layout::Plain | Layout::WrongDns => {}
+        }
+        let (plane, _health) = packet_plane(Backend::Tun, "Rule", "block").await;
+        {
+            let mut config = plane.config.write().await;
+            let tun = Arc::make_mut(&mut *config)
+                .datapath
+                .as_mut()
+                .unwrap()
+                .tun
+                .as_mut()
+                .unwrap();
+            tun.queues = queues;
+            tun.host_facts = matches!(layout, Layout::HostFacts);
+        }
+        let (endpoints, mut supervisor, mut drivers) =
+            PacketEndpoints::start_driven(plane, plans, 1, None, dns_scope)
+                .await
+                .unwrap();
+        let ready = std::future::poll_fn(|cx| {
+            for driver in &mut drivers {
+                driver.service(cx, Instant::now());
+            }
+            supervisor.poll_ready(cx)
+        })
+        .await;
+        if accepts {
+            ready.unwrap_or_else(|error| {
+                panic!("{queues} configured queues, {owners} owners, {layout:?}: {error:#}")
+            });
+            join_packet(endpoints, supervisor, drivers).await;
+        } else {
+            let error = ready.expect_err("mismatched configured TUN realm reached readiness");
+            assert!(
+                format!("{error:#}")
+                    .contains("TUN requires its plain scope and configured Host scope"),
+                "{queues}/{owners} {layout:?}: {error:#}"
+            );
+            drop((endpoints, supervisor, drivers));
+        }
+        assert_eq!(
+            budget.used(),
+            0,
+            "{queues}/{owners} {layout:?} leaked a reservation"
+        );
+    }
+}
+
 #[tokio::test]
 async fn tun_driven_startup_requires_configured_host_and_plain_dns_identity() {
     tokio::time::timeout(Duration::from_secs(10), async {

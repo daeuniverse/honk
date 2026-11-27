@@ -1602,67 +1602,71 @@ impl EndpointRuntime {
             }
         }
         let fallback_fatal = (!self.owners.is_empty()).then(|| fatal.clone());
-        let (configured_packet, egress_mark, mut authorizations, endpoint) =
-            if failure.is_none() && !self.shared.is_closing() {
-                let config = self.plane.config.read().await;
-                let backend = config.datapath.as_ref().map(|datapath| datapath.backend);
-                let configured_packet = matches!(
-                    backend,
-                    Some(honk_config::datapath::Backend::Xdp | honk_config::datapath::Backend::Tun)
-                );
-                let tun = backend == Some(honk_config::datapath::Backend::Tun);
-                if tun {
-                    let host_facts = config
-                        .datapath
-                        .as_ref()
-                        .and_then(|value| value.tun.as_ref())
-                        .is_some_and(|tun| tun.host_facts);
-                    let plain = self
-                        .shared
-                        .scopes
-                        .iter()
-                        .filter(|scope| !scope.is_host())
-                        .count();
-                    let host = self
-                        .shared
-                        .scopes
-                        .iter()
-                        .filter(|scope| scope.is_host())
-                        .count();
-                    if plain != 1
-                        || host != usize::from(host_facts)
-                        || !self.shared.scopes.iter().any(|scope| {
-                            scope.scope() == self.standalone_dns_scope && !scope.is_host()
-                        })
-                    {
-                        failure = Some(anyhow::anyhow!(
-                            "TUN requires its plain scope and configured Host scope"
-                        ));
+        let (configured_packet, egress_mark, mut authorizations, endpoint) = if failure.is_none()
+            && !self.shared.is_closing()
+        {
+            let config = self.plane.config.read().await;
+            let backend = config.datapath.as_ref().map(|datapath| datapath.backend);
+            let configured_packet = matches!(
+                backend,
+                Some(honk_config::datapath::Backend::Xdp | honk_config::datapath::Backend::Tun)
+            );
+            let tun = backend == Some(honk_config::datapath::Backend::Tun);
+            if tun {
+                let tun_config = config
+                    .datapath
+                    .as_ref()
+                    .and_then(|value| value.tun.as_ref());
+                let host_facts = tun_config.is_some_and(|tun| tun.host_facts);
+                let expected_queues = tun_config.map_or(0, |tun| usize::from(tun.queues));
+                let realms = &self.shared.realms;
+                let scopes = &self.shared.scopes;
+                let host_realms = realms
+                    .iter()
+                    .filter(|realm| realm.owners()[0].is_host())
+                    .count();
+                let host_owners = scopes.iter().filter(|owner| owner.is_host()).count();
+                let plain_realms = realms.len() - host_realms;
+                let plain_owners = scopes.len() - host_owners;
+                let dns_realm_valid = realms.iter().any(|realm| {
+                    realm.scope() == self.standalone_dns_scope
+                        && realm.owners().len() == expected_queues
+                        && realm.owners().iter().all(|owner| !owner.is_host())
+                });
+                if expected_queues == 0
+                    || (host_facts && expected_queues != 1)
+                    || plain_realms != 1
+                    || plain_owners != expected_queues
+                    || host_realms != usize::from(host_facts)
+                    || host_owners != usize::from(host_facts)
+                    || !dns_realm_valid
+                {
+                    failure = Some(anyhow::anyhow!(
+                        "TUN requires its plain scope and configured Host scope"
+                    ));
+                }
+            }
+            let egress_mark = config.required_socket_mark();
+            let authorizations = if configured_packet {
+                match crate::subscription::SubscriptionAuthorizations::new(&config.subscriptions) {
+                    Ok(authorizations) => Some(authorizations),
+                    Err(error) => {
+                        failure = Some(error);
+                        None
                     }
                 }
-                let egress_mark = config.required_socket_mark();
-                let authorizations = if configured_packet {
-                    match crate::subscription::SubscriptionAuthorizations::new(
-                        &config.subscriptions,
-                    ) {
-                        Ok(authorizations) => Some(authorizations),
-                        Err(error) => {
-                            failure = Some(error);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                let endpoint = if configured_packet {
-                    config.dns.bind_endpoint().map_err(anyhow::Error::from)
-                } else {
-                    Ok(None)
-                };
-                (configured_packet, egress_mark, authorizations, endpoint)
             } else {
-                (false, None, None, Ok(None))
+                None
             };
+            let endpoint = if configured_packet {
+                config.dns.bind_endpoint().map_err(anyhow::Error::from)
+            } else {
+                Ok(None)
+            };
+            (configured_packet, egress_mark, authorizations, endpoint)
+        } else {
+            (false, None, None, Ok(None))
+        };
         let fact_scope = self.standalone_dns_scope;
         if configured_packet
             && failure.is_none()
