@@ -97,6 +97,7 @@ pub(super) fn parse_query(
                     | "encryption"
                     | "security"
                     | "tls"
+                    | "udp"
             )
             && query.get(&key).is_some_and(|previous| previous != &value)
         {

@@ -736,7 +736,7 @@ The last row preserves TCP/UDP availability. A skipped UDP/443 target uses the p
 
 Old `vless_mode` URI syntax is rejected. The parser also rejects ambiguous third-party URI spellings such as `smux`, `multiplex`, `udp-over-tcp`, `packet-encoding`, `packet_encoding`, `packet-addr`, `xudp`, `only-tcp`, Brutal controls, and H2 stream-count tuning; only the exact canonical parameters in the table above configure these choices.
 
-Non-VLESS links accept `packetEncoding=none` as an inert compatibility value. Any other `packetEncoding` value or a `vless_mode` key rejects them.
+Encoded-authority VMess links also accept `packetEncoding=uot-v2`. Other non-VLESS links accept only `packetEncoding=none` as an inert compatibility value. Any other `packetEncoding` value or a `vless_mode` key rejects them.
 
 #### Target selection and composition
 

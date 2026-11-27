@@ -1992,8 +1992,10 @@ fn shadowrocket_vmess_uot_requires_explicit_encoding() {
         ("packetEncoding=none", false, false),
         ("packetEncoding=uot-v2", true, true),
         ("packetEncoding=uot-v2&udp=1&udp=1", true, true),
+        ("packetEncoding=uot-v2&udp=1&udp=true", true, true),
         ("packetEncoding=uot-v2&udp=true", true, true),
         ("packetEncoding=uot-v2&udp=0", true, false),
+        ("packetEncoding=uot-v2&udp=0&udp=false", true, false),
     ] {
         let node = parse(query).unwrap();
         let config = node.vmess().unwrap();

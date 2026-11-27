@@ -290,6 +290,84 @@ async fn ws_tls_dial_offers_the_host_header_as_sni() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn ws_and_endpoint_ipv6_verify_ip_san_certificate() {
+    use std::time::Duration;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut params = rcgen::CertificateParams::new(vec!["2001:db8::1".to_string()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let cert_pem = cert.pem();
+        let key_pem = key.serialize_pem();
+
+        let mut store = X509StoreBuilder::new().unwrap();
+        store
+            .add_cert(X509::from_pem(cert_pem.as_bytes()).unwrap())
+            .unwrap();
+        let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_2))
+            .unwrap();
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        builder.set_cert_store(store.build());
+        builder.set_verify(SslVerifyMode::PEER);
+        let connector = TlsConnector {
+            connector: builder.build(),
+            chrome: false,
+            alps: false,
+            ech_config_list: None,
+            ech_discovery: false,
+        };
+
+        for (endpoint, ws_host, expect_ok) in [
+            ("[2001:db8::1]", None, true),
+            ("edge.example", Some("[2001:db8::1]:8443"), true),
+            ("edge.example", Some("2001:db8::2"), false),
+        ] {
+            let (port, server) = spawn_sni_server(&cert_pem, &key_pem);
+            let mut node = test_node();
+            node.host = endpoint.into();
+            node.port = port;
+            let tls = node.tls_mut().unwrap();
+            tls.enabled = true;
+            tls.skip_cert_verify = false;
+            let transport = node.transport_mut().unwrap();
+            transport.transport = "ws".into();
+            transport.ws_host = ws_host.map(str::to_owned);
+            let server_name = node.tls_server_name();
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let result = connector.connect(&server_name, tcp).await;
+            if expect_ok {
+                let stream = result.unwrap_or_else(|e| panic!("{endpoint}, {ws_host:?}: {e:?}"));
+                assert_eq!(server.join().unwrap(), None, "{endpoint}, {ws_host:?}");
+                drop(stream);
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{endpoint}, {ws_host:?} must fail IP-SAN verification"
+                );
+                let _ = server.join().unwrap();
+            }
+        }
+
+        // Bracketed IPv6 fails BoringSSL IP-SAN verification, proving unbracketing matters.
+        let (port, server) = spawn_sni_server(&cert_pem, &key_pem);
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        assert!(connector.connect("[2001:db8::1]", tcp).await.is_err());
+        let _ = server.join().unwrap();
+    })
+    .await
+    .unwrap();
+}
+
 /// Spawn a server holding real ECH keys (boring test fixtures:
 /// public_name ech.com, DHKEM-P256-SHA256).
 fn spawn_ech_server(cert_pem: &str, key_pem: &str) -> (u16, thread::JoinHandle<Vec<u8>>) {

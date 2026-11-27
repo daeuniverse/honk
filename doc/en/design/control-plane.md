@@ -148,7 +148,7 @@ endpoint keeps its own decision token, generation, terminal transition, and
 five-tuple retirement fence.
 
 Common source admission and joined shutdown remain enabled without `rprx`;
-only the VLESS alternatives are feature-gated. Hy2/TUIC preserve the real reply
+only the VLESS and VMess alternatives are feature-gated. Hy2/TUIC preserve the real reply
 peer through bounded reassembly. Their QUIC send guard starts after source-gate
 admission and stays with the driver until the final I/O outcome is classified.
 

@@ -722,7 +722,7 @@ node {
 
 舊版 `vless_mode` URI 語法會被拒絕。解析器也拒絕 `smux`、`multiplex`、`udp-over-tcp`、`packet-encoding`、`packet_encoding`、`packet-addr`、`xudp`、`only-tcp`、Brutal 控制項與 H2 流數量調校等意義不明確的第三方 URI 拼寫；只有上表中的精確標準參數會設定這些選擇。
 
-非 VLESS 連結把 `packetEncoding=none` 當作不生效的相容值接受。其他 `packetEncoding` 值或 `vless_mode` key 會使連結被拒絕。
+編碼位址形式的 VMess 連結也接受 `packetEncoding=uot-v2`。其他非 VLESS 連結只把 `packetEncoding=none` 當作不生效的相容值接受。其他 `packetEncoding` 值或 `vless_mode` key 會使連結被拒絕。
 
 #### 目標選擇與組合
 

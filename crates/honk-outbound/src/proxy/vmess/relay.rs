@@ -103,10 +103,7 @@ pub(super) async fn run(
             // size == AEAD overhead is the server's termination chunk
             // (AuthenticationReader.readInternal).
             if chunk_len == GCM_TAG_LEN {
-                break peer_end
-                    .as_ref()
-                    .map(|_| body.into_terminator())
-                    .transpose()?;
+                break peer_end.is_some().then_some(body);
             }
             if !(chunk_len > GCM_TAG_LEN && chunk_len <= CHUNK_MAX_LEN + GCM_TAG_LEN) {
                 return Err(crate::proxy::NodeFailure(
@@ -169,9 +166,10 @@ pub(super) async fn run(
             ))
             .into());
         }
-        if let Some((nonce, cipher)) = marker {
+        if let Some(body) = marker {
             // Ordinary VMess readers accept the length alone as EOF. Only the
             // peer-close exception needs proof of the entire empty record.
+            let (nonce, cipher) = body.into_terminator()?;
             let mut tag = [0u8; GCM_TAG_LEN];
             server_read.read_exact(&mut tag).await?;
             cipher

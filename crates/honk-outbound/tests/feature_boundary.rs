@@ -15,15 +15,22 @@ use tokio::net::TcpListener;
 // Integration tests link the normal library: cfg(test) must not enable its backend.
 #[tokio::test]
 async fn parsed_vless_has_no_backend_without_rprx() {
+    use base64::Engine as _;
+    let vmess_xhttp = format!(
+        "vmess://{}?security=none&type=xhttp&packetEncoding=uot-v2",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode("auto:00000000-0000-4000-8000-000000000001@127.0.0.1:9")
+    );
     for link in [
         "vless://00000000-0000-4000-8000-000000000001@127.0.0.1:9?security=none&mux=h2mux&udp=1",
         "vless://00000000-0000-4000-8000-000000000001@127.0.0.1:9?security=none&type=xhttp",
+        vmess_xhttp.as_str(),
     ] {
-        assert_no_vless_backend(Node::from_share_link(link).unwrap()).await;
+        assert_no_rprx_backend(Node::from_share_link(link).unwrap()).await;
     }
 }
 
-async fn assert_no_vless_backend(node: Node) {
+async fn assert_no_rprx_backend(node: Node) {
     let generation = Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap());
     let fork = generation.fork_for_dns().unwrap();
     let mut ephemeral = NodeRuntime::try_ephemeral_guarded(&node).unwrap();
