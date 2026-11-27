@@ -17,7 +17,7 @@ pub(super) fn bpf<T>(command: u32, attr: &mut T) -> std::io::Result<i32> {
         );
     }
     let result =
-        unsafe { crate::ebpf::real::syscall::bpf_syscall(command as libc::c_long, &mut storage) };
+        unsafe { crate::ebpf::common::syscall::bpf_syscall(command as libc::c_long, &mut storage) };
     unsafe {
         std::ptr::copy_nonoverlapping(
             (&storage as *const aya_obj::generated::bpf_attr).cast::<u8>(),

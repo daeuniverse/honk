@@ -1,5 +1,6 @@
 use super::*;
 use crate::ebpf::DomainRouteWriteError;
+use crate::ebpf::common::btf;
 #[cfg(test)]
 use crate::ebpf::interface::TcProgram;
 use crate::ebpf::maps::DOMAIN_MAP_CAPACITY;
@@ -732,7 +733,7 @@ impl RealEbpfBackend {
             bindings,
             cgroup_sock_links: Vec::new(),
             cgroup_sock_addr_links: Vec::new(),
-            pname_mode: process_name::PnameCaptureMode::Argv0,
+            pname_mode: PnameCaptureMode::Argv0,
             dae0_ingress_link: None,
             dae0peer_ingress_link: None,
             sk_lookup_link: None,

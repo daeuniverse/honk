@@ -6,7 +6,7 @@ use std::io::Read as _;
 use std::ops::Range;
 use std::sync::Arc;
 
-pub(super) const BTF_HEADER_LEN: usize = 24;
+pub(in crate::ebpf) const BTF_HEADER_LEN: usize = 24;
 
 // Only raw BTF parses here; an ELF debug vmlinux needs HONK_VMLINUX_BTF pointed at its extracted `.BTF`.
 const VMLINUX_BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
@@ -258,7 +258,7 @@ impl<'a> Btf<'a> {
         None
     }
 
-    pub(super) fn unsigned_integer_width(&self, type_id: u32, width: u32) -> bool {
+    pub(in crate::ebpf) fn unsigned_integer_width(&self, type_id: u32, width: u32) -> bool {
         let Some(cursor) = self.resolve_modifiers(type_id) else {
             return false;
         };
@@ -267,7 +267,7 @@ impl<'a> Btf<'a> {
             && self.u32_at(cursor + 12) == width.checked_mul(8)
     }
 
-    pub(super) fn member_offset(&self, type_name: &str, member_name: &str) -> Option<u32> {
+    pub(in crate::ebpf) fn member_offset(&self, type_name: &str, member_name: &str) -> Option<u32> {
         self.composite_member_offset(self.find_type(4, type_name)?, member_name, 0, None)
     }
 

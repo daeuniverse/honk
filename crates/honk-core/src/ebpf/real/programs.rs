@@ -7,6 +7,7 @@ use aya::maps::{Map, MapData};
 use parking_lot::Mutex;
 
 use super::bindings::PreparedTcProgram;
+use crate::ebpf::common::{btf, syscall::map_data};
 use crate::ebpf::interface::TcProgram;
 
 pub(super) type KernelMaps = HashMap<String, Map>;
@@ -80,7 +81,7 @@ impl ProgramLoader {
         let backend_maps = maps
             .iter()
             .map(|(name, map)| {
-                let data = super::syscall::map_data(map);
+                let data = map_data(map);
                 let duplicate = MapData::from_fd(data.fd().as_fd().try_clone_to_owned()?)?;
                 Ok((name.clone(), Map::from_map_data(duplicate)?))
             })
@@ -142,7 +143,7 @@ impl ProgramLoader {
                 );
                 None
             } else {
-                let result = super::btf::load_kernel().and_then(|(_, btf)| {
+                let result = btf::load_kernel().and_then(|(_, btf)| {
                     super::receive_trace::ReceiveTrace::attach(
                         &mut object,
                         &btf,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::ebpf::real::{btf::Btf, syscall::bpf_syscall};
+use crate::ebpf::common::{btf::Btf, syscall::bpf_syscall};
 use aya_obj::generated::{bpf_attr, bpf_cmd::BPF_PROG_TEST_RUN};
 use honk_ebpf_common::xdp_gateway::{
     GatewayKey, GatewayReason, HOLD_MANAGED, HOLD_SEQUENCE_MAX, NATIVE_PENDING_CAP,

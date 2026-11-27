@@ -1,7 +1,7 @@
 //! Socket-owned Host identity, independent of TUN HostFacts and ordinary TC.
 use crate::ebpf::{
     PnameSupport,
-    real::{btf, syscall},
+    common::{btf, syscall},
 };
 use anyhow::{Context as _, ensure};
 use aya::{

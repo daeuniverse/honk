@@ -3,6 +3,7 @@
 //! will use, map info proves the instantiated maps actually carry them.
 
 use super::*;
+use crate::ebpf::common::{btf, syscall::validate_map_layout};
 use honk_ebpf_common::event::DaeEvent;
 
 pub(super) fn validate_object(obj: &[u8]) -> anyhow::Result<()> {
@@ -237,13 +238,13 @@ pub(super) fn validate_loaded_maps(bpf: &Ebpf) -> anyhow::Result<()> {
         ("AUX_OCCUPANCY", BPF_MAP_TYPE_PERCPU_ARRAY, 4, 8, 2, 0),
         ("ADMISSION_PRESSURE", BPF_MAP_TYPE_ARRAY, 4, 4, 1, 0),
     ] {
-        syscall::validate_map_layout(bpf, name, type_, key, value, count, flags)?;
+        validate_map_layout(bpf, name, type_, key, value, count, flags)?;
     }
     Ok(())
 }
 
 pub(super) fn validate_socket_identity(bpf: &Ebpf) -> anyhow::Result<()> {
-    syscall::validate_map_layout(
+    validate_map_layout(
         bpf,
         "SOCKET_IDENTITY",
         aya_obj::generated::bpf_map_type::BPF_MAP_TYPE_SK_STORAGE,

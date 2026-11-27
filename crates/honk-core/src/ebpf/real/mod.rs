@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 
 #[cfg(test)]
 use super::TcpSocketOwnership;
+use super::common::PnameCaptureMode;
 use super::retirement::AuxDeleteTally;
 use super::{
     DomainProjectionSink, EbpfBackend, FlowExpiryHint, PolicyBackend, RETIRE_BATCH_CAPACITY,
@@ -63,7 +64,7 @@ pub struct RealEbpfBackend {
     cgroup_sock_links: Vec<aya::programs::cgroup_sock::CgroupSockLink>,
     /// cgroup connect4/6 + sendmsg4/6 links; same lifetime rule as above.
     cgroup_sock_addr_links: Vec<aya::programs::cgroup_sock_addr::CgroupSockAddrLink>,
-    pname_mode: process_name::PnameCaptureMode,
+    pname_mode: PnameCaptureMode,
     dae0_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
     dae0peer_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
     sk_lookup_link: Option<aya::programs::sk_lookup::SkLookupLink>,
@@ -189,14 +190,13 @@ impl RealEbpfBackend {
 
 mod attach;
 mod bindings;
-pub(crate) mod btf;
 mod events;
 mod iface_watch;
 mod interface_startup;
 mod interface_state;
 mod layout;
 mod observation;
-pub(crate) mod process_name;
+mod process_name;
 pub(crate) mod programs;
 #[cfg(feature = "native-api")]
 pub(crate) mod receive_trace;
@@ -667,7 +667,7 @@ impl PolicyBackend for RealEbpfBackend {
     fn pname_support(&self) -> super::PnameSupport {
         if self.cgroup_sock_links.is_empty() {
             super::PnameSupport::Unavailable
-        } else if self.pname_mode == process_name::PnameCaptureMode::Comm {
+        } else if self.pname_mode == PnameCaptureMode::Comm {
             super::PnameSupport::ThreadName
         } else {
             super::PnameSupport::Full

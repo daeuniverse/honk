@@ -1,12 +1,8 @@
 use super::{kernel::KernelLayout, receipt::Receipt, sys};
 use crate::ebpf::{
     PnameSupport,
+    common::{PnameCaptureMode, btf::Btf, load_pair, syscall},
     host_bank::{self, HostSocketBank},
-    real::{
-        btf::Btf,
-        process_name::{self, PnameCaptureMode},
-        syscall,
-    },
 };
 use anyhow::{Context as _, ensure};
 use aya::{
@@ -135,7 +131,7 @@ impl Object {
         for index in 0..TUN_PACKET_CELLS {
             free.push(&index, 0)?;
         }
-        let mode = if process_name::load_pair(
+        let mode = if load_pair(
             &mut bpf,
             "tproxy_wan_cg_sock_create",
             "tproxy_wan_cg_connect4",

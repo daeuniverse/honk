@@ -1,6 +1,8 @@
 //! eBPF backend abstraction.
 
 #[cfg(feature = "ebpf")]
+pub(crate) mod common;
+#[cfg(feature = "ebpf")]
 pub(crate) mod host_bank;
 #[cfg(feature = "ebpf")]
 pub(crate) mod interface;

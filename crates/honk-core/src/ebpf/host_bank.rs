@@ -1,5 +1,5 @@
 //! The one read-only socket-bank mapping shared by concrete capture owners.
-use super::real::btf::Btf;
+use super::common::btf::Btf;
 use anyhow::{Context as _, ensure};
 use aya_obj::generated::{BPF_F_MMAPABLE, bpf_attr, bpf_cmd::BPF_OBJ_GET_INFO_BY_FD, bpf_map_info};
 use honk_ebpf_common::host::{HOST_SOCKET_BUCKETS, HostSocketPayload};

@@ -1,6 +1,6 @@
 //! Admit the running vmlinux/module BTF before emitting any TUN program.
 use super::sys;
-use crate::ebpf::real::btf::{self, Btf, Leaf, field};
+use crate::ebpf::common::btf::{self, Btf, Leaf, field};
 use anyhow::{Context as _, ensure};
 use honk_netstack::{MemoryBudget, MemoryReservation};
 use honk_xsk::{TunKernelOffsets, TunTraceTarget};
