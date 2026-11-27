@@ -24,10 +24,9 @@ flowchart LR
 | 调用 | 约定 |
 | --- | --- |
 | `receive(now, packet) -> Rx` | 借用一个完整 IP 包并验证校验和（`RxMeta::VERIFY`）。需要保留的 TCP 字节会复制进栈自有的环。UDP 返回 `Rx::Datagram`（Endpoint）或 `Rx::Transparent`（透明模式）：**返回的范围只在调用方复用或回收输入 buffer 之前有效**。`Rx::TransparentOwned` 自带重组后的包。`Rx::Dropped(reason)` 会被计数。 |
-| `receive_with(now, packet, RxMeta) -> Rx` | 在透明模式下附带可信的 TCP/UDP 校验和来源和/或 GRO/USO 元数据。Endpoint 模式将 `RxMeta::VERIFY` 之外的元数据以 `Unsupported` 丢弃；WireGuard 不能跳过验证。见[校验和信任](#校验和信任)和[分段卸载](#分段卸载)。 |
-| `receive_with_source(now, packet, callback) -> (Rx, Option<ValidatedSource>)` | 复用同一 parser/reassembler/checksum 路径，仅当前完成验证的 TCP/UDP 包返回 `{src, dst, protocol, tcp_flags}`；TCP flags 是已校验的首部事实，不是准入证明。callback 先于协议状态变更/UDP 分发执行；false 以 `NotForUs` 丢弃。即使被拒绝，receipt 仍只是有效性事实，**不是**握手、交付或内核 accepted-child 证明。未完成/无效分片、坏校验和均无 receipt。 |
-| `receive_with_tcp_admission(now, packet, callback) -> (Rx, ReceiveReport)` | 同一验证路径分别报告 `source` 和 `outcome`：`Unqualified`、`TcpAccepted(original_id)`、`TcpNew(exact_new_id)` 或 `DatagramValidated`。仅来源 API 从该报告投影 receipt。gated 输入、非法握手 ACK、PAWS/序列号/ACK 拒绝、触发 challenge 的 RST/SYN 及容量丢弃，不会因 `Rx::Consumed` 而成为已接受输入。合法 TIME_WAIT FIN/旧数据处理在压缩后仍保留原始句柄。 |
-| `receive_with_meta_tcp_admission(now, packet, meta, callback) -> (Rx, ReceiveReport)` | 将本地设备元数据与同一个 source gate、精确新 TCP 身份及 qualification 报告组合。Endpoint 拒绝非 VERIFY 元数据；IPv4 头、ICMP 和重组完成报文仍验证校验和。 |
+| `receive_reported(packet, options, on_source) -> (Rx, ReceiveReport)` | `ReceiveOptions::new(ingress_at, meta)` 提供入站时间和设备元数据。校验通过后、协议状态变更前调用来源回调。报告区分已验证来源和协议接收结果，并给出新被动 TCP 流的确切 `FlowId`。`with_context` 要求预先准备来源存储。`with_realm` 还提供半开连接的准入回调，并在接收后恢复服务时钟。 |
+| `try_receive_realm_tcp(ingress_at, service_at, packet, on_source)` | 未配置来源存储时，来源回调可推迟处理已验证的完整 TCP 包。返回 `Err` 时保留原时钟、收包计数和丢包计数。 |
+| `reassemble_for_dispatch(ingress_at, service_at, packet)` | 由 0 号所有者先重组分片，再选择传输层所有者。完整报文继续占用原有内存预算。 |
 | `poll_transmit(now, out) -> Option<usize>` | 把一个完整 IP 包写入 `out[..n]`。`out` 过小时返回 `None` 且不丢包。`None` 也表示 cwnd、rwnd 或 pacing 当前不允许发送。 |
 | `poll_transmit_with(now, out, TxCaps) -> Option<Transmit>` | 同一调度器，在透明模式下可选用 TCP 分段卸载；返回 `len`、`gso`、`csum` 和已知 TCP 输出的原始 `flow` 句柄，无状态或未知流输出的 `flow` 为 `None`。Endpoint 模式忽略卸载能力。`poll_transmit` 是使用 `TxCaps::NONE` 的普通包封装，会丢弃这些元数据。 |
 | `poll_control_transmit(now, out)` | 复用 TCP emitter，但不发送 TCP/UDP 载荷；保留普通 readiness、DRR 和载荷 TLP 义务，允许符合协议条件的 ACK/RST/SYN/FIN/探测、TIME_WAIT ACK 和 ICMP。调用前须取得控制 frame/descriptor credit。 |
@@ -66,7 +65,7 @@ RACK 记账扩容无法获得预算时，只延后该流：保留待重传义务
 - 普通出站 IPv4 包设置 DF、TTL/hop limit 为 64，不带选项；透明模式的 `udp_send_from`/`udp_send_gso_from` 不设置 DF，IPv6 UDP 分片会添加 Fragment 头。
 - Endpoint 模式下，目的地址不是本族已配置本地地址的包为 `NotForUs`。没有本地地址的地址族完全不可用（`NoLocalAddress`）。透明模式改为接受任意单播目的地址（见[范围与寻址](#范围与寻址)）。
 - `StackStats` 按原因计数丢包：`Malformed`、`Checksum`、`Fragment`、`NotForUs`、`NoFlow`、`Unsupported`，透明模式下还有 `HalfOpen` 和 `Capacity`。（`Stale` 已定义但从未产生。）
-- **普通接收在两种模式下都验证校验和**（IPv4 头、TCP、UDP、ICMP），且发生在流状态变化之前。IPv4 UDP 校验和为 0 表示没有；IPv6 UDP 为 0 在验证路径上无效。只有透明模式的 `receive_with` 才能信任 driver 的 TCP/UDP `Csum::Valid`/`Partial`；IPv4 头、ICMP 和重组后的数据报仍然验证。Endpoint 模式拒绝此类元数据，所以 WireGuard 总会验证内层包：它认证的是隧道对端，而不是发送方的 inner 校验和。完整发送输出先复制载荷，再使用本机字节序的并行累加道计算校验和；卸载输出改为携带部分校验和（见[校验和信任](#校验和信任)）。
+- **普通接收在两种模式下都验证校验和**（IPv4 头、TCP、UDP、ICMP），且发生在流状态变化之前。IPv4 UDP 校验和为 0 表示没有；IPv6 UDP 为 0 在验证路径上无效。只有透明模式的 `receive_reported` 才能信任 driver 的 TCP/UDP `Csum::Valid`/`Partial`；IPv4 头、ICMP 和重组后的数据报仍然验证。Endpoint 模式拒绝此类元数据，所以 WireGuard 总会验证内层包：它认证的是隧道对端，而不是发送方的 inner 校验和。完整发送输出先复制载荷，再使用本机字节序的并行累加道计算校验和；卸载输出改为携带部分校验和（见[校验和信任](#校验和信任)）。
 - UDP 按其声明长度校验，该长度可以小于 IP payload；尾随的 IP 字节不属于 UDP 数据或校验和，但 Core 转发仍保留这些 IP 字节。连续与 scatter/gather 输入使用同一边界。
 - **ICMP 在两种模式下都会被消费，只有透明模式才发送。** packet-too-big（RFC 1191/8201）或 destination-unreachable 仅在报文地址族与流一致、且被引用的 TCP 序号落在未确认窗口内时才生效：PTB 降低该流的路径 MTU（只减不增），并让所有变得过大的段重新可发，包括已按旧尺寸重传过的段；`SYN_SENT` 流收到 unreachable 时 connect 以 `Unreachable` 失败。不带 MTU 的旧式 PTB 使用 RFC 1191 plateau 表。ICMP echo 和其他 ICMP 一律忽略。Endpoint 模式下栈从不生成 ICMP；生成见 [ICMP 生成](#icmp-生成)。
 - **Endpoint 模式的 UDP** 没有接收队列，也没有发送队列。发往未绑定端口的数据报为 `NoFlow`（不发 ICMP 错误）。`udp_send` 直接把一个 IP 包序列化进调用方的 buffer；超过 MTU 的数据报返回 `TooLarge`。透明 UDP 是无状态的，见[透明 UDP](#透明-udp)。
@@ -312,7 +311,7 @@ security/address authority；路由或 mode 变化不会把已准入的 transit 
 `Decision::Endpoint` 携带计费的 `EndpointAdmission`，保存实际路由 action、config、
 group/runtime handle 和生效 mode 判决。capture consumer 将其传给
 `PacketEndpoints::receive_admitted_with_source`。UDP 随 datagram 排队同一个 authority；
-TCP 在 scope 互斥锁内将其绑定到 `Stack::receive_with_tcp_admission` 返回的当前
+TCP 在 scope 互斥锁内将其绑定到 `Stack::receive_reported` 返回的当前
 新建 `FlowId`，先绑定再唤醒输出。重传保留原 authority，`poll_accept` 只移交已经
 绑定的精确 incarnation。延迟 dispatch 不按新 config 重路由，也不重新应用新 mode。
 pending snapshot 的预算计费保留到消费或精确流处置，没有跨调用的“上一个包”快照。
@@ -484,7 +483,7 @@ TUN smoke 通过原始客户端 socket 成功 `SHUT_WR`、完整保留尾部的�
 
 - `receive` 对数据报返回 `Rx::Transparent { src, dst, payload }`：没有流、没有 bind，两端地址都在其中。`payload` 是输入包中的范围。
 - `Rx::TransparentOwned { src, dst, packet, payload }` 对应由分片重组出的数据报：返回值拥有 `packet`，`payload` 索引它。
-- `receive_with` 对包含多个数据报的 UDP super-packet 返回 `Rx::TransparentSplit { src, dst, payload, size }`。遍历 `packet[payload].chunks(usize::from(size))`：每个 chunk 是一个数据报，最后一个可较短，必须保留这些边界。最多接受 128 个数据报（`MAX_USO_RX`），超出为 `Malformed`。至多包含一个数据报的 run 改为返回 `Rx::Transparent`。
+- `receive_reported` 对包含多个数据报的 UDP super-packet 返回 `Rx::TransparentSplit { src, dst, payload, size }`。遍历 `packet[payload].chunks(usize::from(size))`：每个 chunk 是一个数据报，最后一个可较短，必须保留这些边界。最多接受 128 个数据报（`MAX_USO_RX`），超出为 `Malformed`。至多包含一个数据报的 run 改为返回 `Rx::Transparent`。
 - **借用载荷寿命。** `Rx::Datagram`、`Rx::Transparent`、`Rx::TransparentSplit` 范围仅在输入回收/复用前有效。TUN read buffer 与 AF_XDP UMEM frame 中每份载荷都须在下一次 read 或归还 FILL 前消费/复制；`TransparentOwned` 自带字节所有权。
 - `udp_send_from(src, dst, payload, out)` 无状态，可使用任意源地址（回复以数据报的原始目的地址为源）。不超过 MTU 的数据报作为一个包写入 `out`（无 DF，设置 identification）。更大的数据报，UDP 长度至多 65535 字节（IPv4 总长度同理，超出返回 `TooLarge`），会被分片：第一个分片写入 `out`，其余是栈内状态（已算好校验和的数据报，只复制一次），通过 `poll_transmit` 每次调用输出一个分片，按 FIFO；存在待发分片时 `take_tx_wakeup()` 置位。待发数据报容量上限 512 KiB，并计入 `Config::shared_budget`，第一个排队的数据报也不例外。发送若会超出任一上限，在写出首分片之前返回 `Busy`。输出 buffer 过小时费用继续保留，直到最后一个分片输出或栈被丢弃；初次调用的 `out` 过小则返回 `BufferTooSmall`，不产生费用。地址族不一致为 `FamilyMismatch`。
 - `udp_send_gso_from((src, dst), payload, size, caps, out)` 以 UDP 分段卸载发送一组数据报，而不是做 IP 分片。它返回 `Transmit`；上限和 driver 约定见[分段卸载](#分段卸载)。
@@ -525,7 +524,7 @@ TUN smoke 通过原始客户端 socket 成功 `SHUT_WR`、完整保留尾部的�
 
 ### 校验和信任
 
-`receive(now, packet)` 在所有模式下都是仅验证的入口，等同于 `receive_with(now, packet, RxMeta::VERIFY)`。`receive_with` 只在 `Mode::Transparent` 下接受拥有本地设备的 driver 提供的 `RxMeta { csum, gso }`。在 `Mode::Endpoint` 下，`RxMeta::VERIFY` 以外的元数据在处理报文之前就以 `Unsupported` 丢弃：WireGuard 无法选择受信任的校验和或 super-packet，因为它的内层包来自网络。
+`receive(now, packet)` 在所有模式下都是仅验证的入口。`receive_reported` 只在 `Mode::Transparent` 下接受拥有本地设备的 driver 提供的 `RxMeta { csum, gso }`。在 `Mode::Endpoint` 下，`RxMeta::VERIFY` 以外的元数据在处理报文之前就以 `Unsupported` 丢弃：WireGuard 无法选择受信任的校验和或 super-packet，因为它的内层包来自网络。
 
 - `Csum::Verify` 正常验证 TCP/UDP 校验和。`Csum::Valid` 信任设备已经验证过它。`Csum::Partial { start, offset }` 接受本地 `CHECKSUM_PARTIAL` 报文，其字段只有伪首部和，没有可供验证的最终校验和；`start` 必须是 L4 头偏移，`offset` 必须指向其中的校验和字段（TCP 16，UDP 6），否则报文为 `Malformed`。
 - IPv4 头校验和和每个 ICMP 校验和总会被验证。分片元数据不为重组后的数据报担保：完成后以 `RxMeta::VERIFY` 重新进入接收路径。分片或 ICMP 包上的 GSO 元数据为 `Malformed`。
@@ -533,7 +532,7 @@ TUN smoke 通过原始客户端 socket 成功 `SHUT_WR`、完整保留尾部的�
 
 ### 分段卸载
 
-- **TCP RX（GRO）。** `receive_with` 把 TCP super-packet 作为一个连续段接收。延迟 ACK 和 quickack 节奏按 `ceil(被接受的载荷长度 / size)` 个帧计数，不会把头部当成多个 TCP 输入重放。该 run 只产生一个受正常 ACK 时序约束的累计 ACK 义务，而不是一串可能触发伪丢包恢复的重复 ACK。UDP RX 改为通过 `Rx::TransparentSplit` 暴露数据报边界（[透明 UDP](#透明-udp)）。
+- **TCP RX（GRO）。** `receive_reported` 把 TCP super-packet 作为一个连续段接收。延迟 ACK 和 quickack 节奏按 `ceil(被接受的载荷长度 / size)` 个帧计数，不会把头部当成多个 TCP 输入重放。该 run 只产生一个受正常 ACK 时序约束的累计 ACK 义务，而不是一串可能触发伪丢包恢复的重复 ACK。UDP RX 改为通过 `Rx::TransparentSplit` 暴露数据报边界（[透明 UDP](#透明-udp)）。
 - **TCP TX（TSO）。** `poll_transmit_with(now, out, caps)` 只在透明模式下使用按地址族的 `tso4`/`tso6` 能力。TCP 数据可作为 `GsoKind::Tcp` super-packet 输出，分段大小按 MSS/PMTU，最后一段可较短。当前 emitter 把含头部的聚合包限制在 65535 字节和 `out.len()` 内；拥塞与接收窗口、描述符空间、pacing 令牌和约 1 ms pacing 速率的自动定长进一步限制它。pacing 突发仍不超过 2 ms 流量（至少一个段）。每个被代表的段保留自己的发送描述符；连续丢失的段可以作为一个 TSO 包重传。输出 buffer 较小时退化为普通包；SYN、纯 ACK、控制回复、TIME_WAIT 回复、ICMP 和排队的 UDP IP 分片仍是普通包。Endpoint 模式忽略所有 `TxCaps`；`TxCaps::NONE`（也是默认值）与 `poll_transmit` 输出相同。
 - **UDP TX（USO）。** `udp_send_gso_from((src, dst), payload, size, caps, out)` 把 `payload` 当作连续数据报，在透明模式下使用该地址族的 `uso4`/`uso6` 能力。每个 super-packet 至多 64 个数据报（`MAX_USO_TX`）；每个 `size` 字节数据报加 IP/UDP 头必须装进 MTU，聚合 UDP 长度（IPv4 总长度同理）必须装进 65535。大小为零或超出大小/数量上限为 `TooLarge`；地址族不一致为 `FamilyMismatch`；多数据报 run 缺少透明模式或对应能力时为 `Offload`。载荷至多 `size` 字节时，即使无对应能力也使用普通 `udp_send_from`，包括其分片与唤醒行为。整个 super-packet 直接写入 `out`，不排队；buffer 过小为 `BufferTooSmall`，所有错误都不消耗任何东西。
 - **TX 描述符与 driver 合同。** `Transmit { len, gso, csum, flow }` 描述 `out[..len]`，`flow` 具有上文 Stack 局部寿命。单包的 `gso` 为 `None`。TCP 默认使用 `TxCsum::Full`。透明驱动可以独立启用 `csum4` 或 `csum6`，接收对应地址族的 TCP 部分校验和。卸载包带 `GsoTx { kind, size, hdr_len }` 与 `TxCsum::Partial { start, offset }`，字段保存聚合 L4 长度的未取反伪首部和。Linux TUN 接收 TCPv4/TCPv6 GSO，并通过保留的描述符输出 TSO；内核负责分段并完成首部/校验和。TUN 不宣告 UFO、USO 或 `TUN_F_TSO_ECN`；栈的 UDP offload API 仍供明确具备能力的嵌入使用。AF_XDP 生成普通输出，不执行软件 GRO。aggregate 不能当普通 wire packet 发送。

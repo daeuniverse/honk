@@ -458,7 +458,7 @@ fn tcp_keeps_original_snapshot_and_rejects_foreign_lineage_before_mutation() {
         assert_eq!(report.source_context, Some(original));
         assert!(stack.retains_tcp_with_lineage(source, destination, Some(original.lineage)));
         assert!(!stack.retains_tcp_with_lineage(source, destination, Some(foreign.lineage)));
-        assert!(!stack.retains_tcp(source, destination));
+        assert!(!stack.retains_tcp_with_lineage(source, destination, None));
         let (_, report) = stack.receive_reported(
             &syn,
             ReceiveOptions::new(now, RxMeta::VERIFY).with_context(newer),

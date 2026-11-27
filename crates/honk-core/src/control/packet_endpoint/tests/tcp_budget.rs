@@ -282,6 +282,7 @@ async fn physical_worker_dispatch_copy_budget_boundary() {
             let (realm, owners) = capture_realm(1280, 1, 2, 1, 1, &budget).unwrap();
             let (plane, _health) = local_plane_with(|config| config.groups.clear()).await;
             let draining = Arc::clone(&plane.drain_tracker);
+            let permit_target = Arc::clone(&plane.tcp_admission_target);
             let (endpoints, mut supervisor, mut drivers) =
                 PacketEndpoints::start_driven(plane, vec![(realm, owners)], 1, None, ScopeId::HOST)
                     .await
@@ -296,7 +297,6 @@ async fn physical_worker_dispatch_copy_budget_boundary() {
             let flow = accept_local_syn(&mut driver, "203.0.113.9:443".parse().unwrap());
             let completion = flow.worker_completion_credit().unwrap().bytes();
             let slots = &endpoints.shared.tcp_slots;
-            let available = slots.available_permits();
             let slot = Arc::clone(slots).try_acquire_owned().unwrap();
             let baseline = budget.used();
             // Completion is reserved before copy. The probe releases the competing charge
@@ -311,7 +311,11 @@ async fn physical_worker_dispatch_copy_budget_boundary() {
             let grant = pressure.granted();
             assert_eq!(grant, admit.then_some(COPY_BYTES), "headroom {headroom}");
             assert_eq!(draining.active_count(), usize::from(admit));
-            assert_eq!(slots.available_permits(), available - usize::from(admit));
+            // The scaler can resize admission while the supervisor handles the flow.
+            assert_eq!(
+                slots.available_permits() + usize::from(admit),
+                permit_target.load(Ordering::Acquire)
+            );
             drop(pressure);
             let task = if admit {
                 let bytes = budget
@@ -334,7 +338,7 @@ async fn physical_worker_dispatch_copy_budget_boundary() {
             .unwrap();
             result.unwrap();
             assert_eq!(draining.active_count(), 0);
-            assert_eq!(slots.available_permits(), available);
+            assert_eq!(slots.available_permits(), permit_target.load(Ordering::Acquire));
             drop((plane, supervisor, endpoints, driver));
             assert_eq!(budget.used(), 0);
             eprintln!(

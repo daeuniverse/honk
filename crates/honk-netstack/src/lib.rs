@@ -43,7 +43,7 @@
 //! ordinary stacks keep the compact flow slots and allocate no context array. An ordinary
 //! embedding that opts in binds its slab-slot ceiling to [`Config::max_flows`]; accounted
 //! stacks keep their supplied ceiling. Unprepared contextual input/output consumes nothing.
-//! [`Stack::retains_tcp`] classifies existing scoped transport ownership through pending
+//! [`Stack::retains_tcp_with_lineage`] classifies existing scoped transport ownership through pending
 //! opens, TIME_WAIT and flow-owned controls; adapters must additionally retain their own
 //! queued/exported output leases. It neither validates input nor mutates protocol state.
 //! [`Stack::retains_source`] also covers stateless controls, UDP fragments and reassembly

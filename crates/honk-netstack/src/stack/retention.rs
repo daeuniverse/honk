@@ -54,12 +54,6 @@ impl Stack {
         self.reasm.visit_retained_source_contexts(visit);
     }
 
-    /// Read-only execution ownership through pending TCP, TIME_WAIT and flow-owned
-    /// control output. This is not packet validation or admission authority.
-    pub fn retains_tcp(&self, source: SocketAddr, destination: SocketAddr) -> bool {
-        self.retains_tcp_with_lineage(source, destination, None)
-    }
-
     /// Selects only the requested source lineage; `None` selects non-contextual owners.
     pub fn retains_tcp_with_lineage(
         &self,
@@ -115,7 +109,7 @@ impl Stack {
     }
 
     /// Whether unpulled control replies, UDP fragments or reassembly retain this peer.
-    pub fn retains_pending_source(&self, address: IpAddr) -> bool {
+    fn retains_pending_source(&self, address: IpAddr) -> bool {
         self.pending_sources().any(|source| source == address)
     }
 

@@ -48,22 +48,32 @@ fn application_close_and_compaction_do_not_retire_the_protocol_owner() {
     c.stack.handle_timeout(idle);
     assert_eq!(c.stack.tcp_state(c.id), Some(TcpState::Established));
     assert!(c.stack.tcp_retained(c.id));
-    assert!(c.stack.retains_tcp(c.peer.client, c.peer.dst));
+    assert!(
+        c.stack
+            .retains_tcp_with_lineage(c.peer.client, c.peer.dst, None)
+    );
     assert!(c.stack.retains_source(c.peer.client.ip()));
-    assert!(!c.stack.retains_tcp(c.peer.dst, c.peer.client));
+    assert!(
+        !c.stack
+            .retains_tcp_with_lineage(c.peer.dst, c.peer.client, None)
+    );
     c.t0 = idle;
     let (closed, _, _) = enter_time_wait(&mut c);
     c.stack
         .handle_timeout(closed + Duration::from_secs(60) - Duration::from_nanos(1));
     assert!(c.stack.tcp_retained(c.id));
     assert!(
-        c.stack.retains_tcp(c.peer.client, c.peer.dst),
+        c.stack
+            .retains_tcp_with_lineage(c.peer.client, c.peer.dst, None),
         "compact TIME_WAIT retains Endpoint execution"
     );
     assert!(c.stack.retains_source(c.peer.client.ip()));
     c.stack.handle_timeout(closed + Duration::from_secs(60));
     assert!(!c.stack.tcp_retained(c.id));
-    assert!(!c.stack.retains_tcp(c.peer.client, c.peer.dst));
+    assert!(
+        !c.stack
+            .retains_tcp_with_lineage(c.peer.client, c.peer.dst, None)
+    );
     assert!(!c.stack.retains_source(c.peer.client.ip()));
 }
 
@@ -169,7 +179,7 @@ fn refusal_output_retains_its_old_owner_across_slot_and_tuple_reuse() {
         let mut peer = Peer::new(CLIENT, DST, 1000);
         peer.syn(&mut stack, now, 1460);
         assert!(
-            stack.retains_tcp(peer.client, peer.dst),
+            stack.retains_tcp_with_lineage(peer.client, peer.dst, None),
             "queued SYN owns execution before poll_accept"
         );
         assert!(stack.retains_source(peer.client.ip()));
@@ -179,7 +189,7 @@ fn refusal_output_retains_its_old_owner_across_slot_and_tuple_reuse() {
         assert!(stack.take_tcp_retention_change());
         assert_eq!(stack.tcp_retained(old), how != Refuse::Drop);
         assert_eq!(
-            stack.retains_tcp(peer.client, peer.dst),
+            stack.retains_tcp_with_lineage(peer.client, peer.dst, None),
             how != Refuse::Drop
         );
         assert_eq!(stack.retains_source(peer.client.ip()), how != Refuse::Drop);
@@ -189,10 +199,6 @@ fn refusal_output_retains_its_old_owner_across_slot_and_tuple_reuse() {
         assert_ne!(old, new);
         assert_eq!(old.index(), new.index());
         assert!(stack.tcp_retained(new));
-        assert_eq!(
-            stack.retains_pending_source(peer.client.ip()),
-            how != Refuse::Drop
-        );
         let mut seen = Vec::new();
         stack.visit_pending_sources(|address| seen.push(address));
         assert_eq!(
@@ -215,12 +221,12 @@ fn refusal_output_retains_its_old_owner_across_slot_and_tuple_reuse() {
         assert!(!stack.tcp_retained(old));
         assert_eq!(stack.take_tcp_retention_change(), how != Refuse::Drop);
         assert!(stack.retains_source(peer.client.ip()));
-        assert!(!stack.retains_pending_source(peer.client.ip()));
+        stack.visit_pending_sources(|address| assert_ne!(address, peer.client.ip()));
         stack.tcp_close(old);
         assert!(stack.tcp_retained(new));
         stack.tcp_refuse(new, Refuse::Drop);
         assert!(!stack.tcp_retained(new));
-        assert!(!stack.retains_tcp(peer.client, peer.dst));
+        assert!(!stack.retains_tcp_with_lineage(peer.client, peer.dst, None));
         assert!(!stack.retains_source(peer.client.ip()));
     }
 }
