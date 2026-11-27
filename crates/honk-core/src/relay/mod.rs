@@ -22,11 +22,23 @@ mod vision;
 
 #[cfg(test)]
 mod progress_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod remote_memory_tests;
 
 use self::drain::{CopyProgress, drain_idle};
 use futures::FutureExt;
+#[cfg(target_os = "linux")]
+use parking_lot::Mutex;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll, ready},
+};
+#[cfg(target_os = "linux")]
+use tokio::io::{AsyncBufRead, ReadBuf};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
@@ -101,13 +113,13 @@ pub fn is_ignorable_connection_error(err: &std::io::Error) -> bool {
 pub(crate) struct ClientIoError;
 
 #[derive(Debug)]
-struct RelayError {
+pub(crate) struct RelayError {
     error: std::io::Error,
     client: bool,
 }
 
 impl RelayError {
-    fn new(error: std::io::Error, client_side: bool) -> Self {
+    pub(crate) fn new(error: std::io::Error, client_side: bool) -> Self {
         let client = client_side
             && matches!(
                 error.kind(),
@@ -123,7 +135,7 @@ impl RelayError {
         Self { error, client }
     }
 
-    fn into_anyhow(self) -> anyhow::Error {
+    pub(crate) fn into_anyhow(self) -> anyhow::Error {
         let error = anyhow::Error::new(self.error);
         if self.client {
             error.context(ClientIoError)
@@ -151,8 +163,7 @@ pub struct RelayStats {
 pub struct RelayProgress {
     pub upload: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub download: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub outbound_upload: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
-    pub outbound_download: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    pub outbound: Option<std::sync::Arc<crate::stats::OutboundTracker>>,
     /// First nonempty upstream read, independent of client write backpressure.
     pub first_response: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// Accepted destination writes as `(upload_bytes, download_bytes)`.
@@ -165,7 +176,7 @@ pub type OptionalRelayProgress = Option<RelayProgress>;
 pub(crate) struct RelayIo<S> {
     inner: S,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    aggregate: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    aggregate: Option<std::sync::Arc<crate::stats::OutboundTracker>>,
     on_progress: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     on_transfer: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
     write_is_upload: bool,
@@ -175,7 +186,7 @@ impl<S> RelayIo<S> {
     pub(crate) fn wrap(
         inner: S,
         counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        aggregate: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+        aggregate: Option<std::sync::Arc<crate::stats::OutboundTracker>>,
         on_progress: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
         on_transfer: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
         write_is_upload: bool,
@@ -214,7 +225,7 @@ fn relay_io_pair<S1, S2>(
         RelayIo::wrap(
             client,
             progress.upload.clone(),
-            progress.outbound_upload.clone(),
+            progress.outbound.clone(),
             None,
             progress.on_transfer.clone(),
             false,
@@ -222,7 +233,7 @@ fn relay_io_pair<S1, S2>(
         RelayIo::wrap(
             proxy,
             progress.download.clone(),
-            progress.outbound_download.clone(),
+            progress.outbound.clone(),
             progress.first_response.clone(),
             progress.on_transfer.clone(),
             true,
@@ -244,7 +255,12 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for RelayIo<S> {
                 self.counter
                     .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 if let Some(aggregate) = &self.aggregate {
-                    aggregate.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                    let bytes = if self.write_is_upload {
+                        &aggregate.rx_bytes
+                    } else {
+                        &aggregate.tx_bytes
+                    };
+                    bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 if let Some(callback) = self.on_progress.take() {
                     callback();
@@ -301,9 +317,24 @@ const RELAY_BUF_SIZE: usize = u16::MAX as usize;
 // Idle and chatty flows keep this small buffer; one saturated read marks a
 // bulk flow, which uses the full frame size until an idle check window passes.
 const RELAY_BUF_MIN: usize = 8 * 1024;
+pub(crate) const COPY_BUFFER_MEMORY: usize = 2 * (RELAY_BUF_SIZE + RELAY_BUF_MIN);
+pub(crate) const REMOTE_COPY_BUFFER_MEMORY: usize = RELAY_BUF_SIZE + RELAY_BUF_MIN;
+const _: () = assert!(REMOTE_COPY_BUFFER_MEMORY * 2 == COPY_BUFFER_MEMORY);
+// Both directions are polled by one task. Only one can hold an old and new buffer
+// during replacement, leaving the other small-buffer allowance for both boxed timers.
+const _: () = assert!(2 * size_of::<tokio::time::Sleep>() <= RELAY_BUF_MIN);
+const _: () = assert!(size_of::<tokio::time::Sleep>() <= RELAY_BUF_MIN);
+
 // Idle check window before shrinking back to RELAY_BUF_MIN (60-120 s without
 // reads, avoiding churn across 30 s keepalives).
 const RELAY_BUF_IDLE_SHRINK: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn allocate_copy_buffer(size: usize) -> Vec<u8> {
+    let buffer = vec![0; size];
+    #[cfg(all(test, target_os = "linux"))]
+    remote_memory_tests::observe_buffer_allocation();
+    buffer
+}
 
 struct IdleShrink {
     sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
@@ -339,8 +370,9 @@ fn poll_idle_shrink(
             .reset(tokio::time::Instant::now() + RELAY_BUF_IDLE_SHRINK);
     }
     if should_shrink {
-        *buffer = vec![0; RELAY_BUF_MIN];
+        // The expanded buffer and its replacement use the entire remote allowance.
         *idle_shrink = None;
+        *buffer = allocate_copy_buffer(RELAY_BUF_MIN);
     }
 }
 
@@ -393,6 +425,7 @@ async fn copy_way<R, W>(
     eof: &tokio::sync::Notify,
     upload: bool,
     park: Option<&Park<'_>>,
+    (mut on_read, mut on_write): (impl FnMut(), impl FnMut(u64)),
 ) -> Result<(), RelayError>
 where
     R: AsyncRead + Unpin,
@@ -404,7 +437,7 @@ where
     // relay starts, independently of bytes read by this copy loop.
     wr.flush().await.map_err(write_error)?;
     {
-        let mut buffer = vec![0; RELAY_BUF_MIN];
+        let mut buffer = allocate_copy_buffer(RELAY_BUF_MIN);
         let mut idle_shrink: Option<IdleShrink> = None;
         let mut n = 0;
         loop {
@@ -440,6 +473,7 @@ where
                 eof.notify_one();
                 break;
             }
+            on_read();
             progress.read.store(n + read as u64, Ordering::Relaxed);
             let mut rest = &buffer[..read];
             while !rest.is_empty() {
@@ -449,13 +483,77 @@ where
                 }
                 rest = &rest[written..];
                 n += written as u64;
+                on_write(written as u64);
                 progress.written.store(n, Ordering::Relaxed);
             }
             if read == buffer.len() && read < RELAY_BUF_SIZE {
-                buffer = vec![0; RELAY_BUF_SIZE];
+                buffer = allocate_copy_buffer(RELAY_BUF_SIZE);
             }
         }
     }
+    wr.flush().await.map_err(write_error)?;
+    wr.shutdown().await.map_err(write_error)
+}
+
+/// Copies directly from the source's retained slice and advances it only for
+/// bytes accepted by the writer.
+#[cfg(target_os = "linux")]
+async fn copy_buf_way<R, W>(
+    rd: &mut R,
+    wr: &mut W,
+    progress: &CopyProgress,
+    eof: &tokio::sync::Notify,
+    mut on_upload: impl FnMut(u64),
+) -> Result<(), RelayError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let read_error = |error| RelayError::new(error, true);
+    let write_error = |error| RelayError::new(error, false);
+    wr.flush().await.map_err(write_error)?;
+
+    let mut written_total = 0;
+    let mut seen_read = 0;
+    loop {
+        let written = std::future::poll_fn(|cx| {
+            let buf = match Pin::new(&mut *rd).poll_fill_buf(cx) {
+                Poll::Pending => {
+                    ready!(Pin::new(&mut *wr).poll_flush(cx)).map_err(write_error)?;
+                    return Poll::Pending;
+                }
+                Poll::Ready(result) => result.map_err(read_error)?,
+            };
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+
+            // A pending or short write can leave this same slice at the front.
+            let observed = written_total + buf.len() as u64;
+            if observed > seen_read {
+                seen_read = observed;
+                progress.read.store(observed, Ordering::Relaxed);
+            }
+            let n = ready!(Pin::new(&mut *wr).poll_write(cx, buf)).map_err(write_error)?;
+            if n == 0 {
+                return Poll::Ready(Err(write_error(io::ErrorKind::WriteZero.into())));
+            }
+            Pin::new(&mut *rd).consume(n);
+            Poll::Ready(Ok(n))
+        })
+        .await?;
+        if written == 0 {
+            eof.notify_one();
+            break;
+        }
+        let written = written as u64;
+        written_total += written;
+        on_upload(written);
+        progress.written.store(written_total, Ordering::Relaxed);
+        // Some codecs accept writes without touching a Tokio I/O budget.
+        tokio::task::consume_budget().await;
+    }
+
     wr.flush().await.map_err(write_error)?;
     wr.shutdown().await.map_err(write_error)
 }
@@ -489,6 +587,103 @@ where
     relay_outcome(result, start, client_addr, target_addr)
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, thiserror::Error)]
+#[error("packet relay drain stalled")]
+pub(crate) struct DrainExpired;
+
+// The same task polls both halves. Each guard covers just one I/O poll.
+#[cfg(target_os = "linux")]
+struct ProxyRead<'a, S>(&'a Mutex<S>);
+
+#[cfg(target_os = "linux")]
+impl<S: AsyncRead + Unpin> AsyncRead for ProxyRead<'_, S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.0.lock()).poll_read(cx, buf)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ProxyWrite<'a, S>(&'a Mutex<S>);
+
+#[cfg(target_os = "linux")]
+impl<S: AsyncWrite + Unpin> AsyncWrite for ProxyWrite<'_, S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.0.lock()).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.0.lock()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.0.lock()).poll_shutdown(cx)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn relay_remote_tcp<R, W, S>(
+    (mut client_rd, mut client_wr): (R, W),
+    proxy: S,
+    (client_addr, target_addr): (SocketAddr, SocketAddr),
+    progress: &RelayProgress,
+    accepted_download: impl Fn() -> u64 + Send,
+) -> anyhow::Result<RelayStats>
+where
+    R: AsyncBufRead + Send + Unpin,
+    W: AsyncWrite + Send + Unpin,
+    S: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    let start = tokio::time::Instant::now();
+    let mut first_response = progress.first_response.as_ref();
+    let on_reply = move || {
+        if let Some(callback) = first_response.take() {
+            callback();
+        }
+    };
+    let on_upload = |bytes| {
+        progress.upload.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(outbound) = &progress.outbound {
+            outbound.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+        if let Some(callback) = &progress.on_transfer {
+            callback(bytes, 0);
+        }
+    };
+    let proxy = Mutex::new(proxy);
+    let mut proxy_rd = ProxyRead(&proxy);
+    let mut proxy_wr = ProxyWrite(&proxy);
+    let upload = CopyProgress::default();
+    let download = CopyProgress::default();
+    let eof = tokio::sync::Notify::new();
+    let c2p = copy_buf_way(&mut client_rd, &mut proxy_wr, &upload, &eof, on_upload);
+    let p2c = copy_way(
+        &mut proxy_rd,
+        &mut client_wr,
+        &download,
+        &eof,
+        false,
+        None,
+        (on_reply, |_| {}),
+    );
+    let result = join_copy(c2p, p2c, &upload, &download, &eof, None, accepted_download).await;
+    let _ = client_wr.shutdown().now_or_never();
+    let _ = proxy.into_inner().shutdown().now_or_never();
+    let result = match result {
+        Ok((_, true)) => return Err(DrainExpired.into()),
+        result => result.map(|(bytes, _)| bytes),
+    };
+    relay_outcome(result, start, client_addr, target_addr)
+}
+
 /// Copies both directions until they finish or, with an armed `park`, until
 /// one direction takes it. A parked phase shuts nothing down.
 async fn copy_phase<S1, S2>(
@@ -505,8 +700,30 @@ where
     let upload = CopyProgress::default();
     let download = CopyProgress::default();
     let eof = tokio::sync::Notify::new();
-    let c2p = copy_way(&mut cr, &mut pw, &upload, &eof, true, park);
-    let p2c = copy_way(&mut pr, &mut cw, &download, &eof, false, park);
+    let c2p = copy_way(&mut cr, &mut pw, &upload, &eof, true, park, (|| {}, |_| {}));
+    let p2c = copy_way(
+        &mut pr,
+        &mut cw,
+        &download,
+        &eof,
+        false,
+        park,
+        (|| {}, |_| {}),
+    );
+    join_copy(c2p, p2c, &upload, &download, &eof, park, || 0)
+        .await
+        .map(|(bytes, _)| bytes)
+}
+
+async fn join_copy(
+    c2p: impl Future<Output = Result<(), RelayError>>,
+    p2c: impl Future<Output = Result<(), RelayError>>,
+    upload: &CopyProgress,
+    download: &CopyProgress,
+    eof: &tokio::sync::Notify,
+    park: Option<&Park<'_>>,
+    accepted_download: impl Fn() -> u64,
+) -> Result<((u64, u64), bool), RelayError> {
     tokio::pin!(c2p, p2c);
     let parked = || park.is_some_and(Park::taken);
     let copy = async {
@@ -523,20 +740,21 @@ where
         Ok::<(), RelayError>(())
     };
     let cutoff = async {
-        // Reset the idle budget only for byte movement at the copy boundary.
+        // SPSC writes finish when queued, so also count the owner's later TCP writes.
         eof.notified().await;
-        drain::drain_copy_idle(&upload, &download).await;
+        drain::drain_copy_idle(upload, download, accepted_download).await;
     };
     // A pending codec can exhaust the copy task's budget before the timer is polled.
-    tokio::select! {
+    let expired = tokio::select! {
         biased;
-        result = copy => result?,
-        () = tokio::task::unconstrained(cutoff) => (),
-    }
-    Ok((
+        result = copy => { result?; false },
+        () = tokio::task::unconstrained(cutoff) => true,
+    };
+    let bytes = (
         upload.written.load(Ordering::Relaxed),
         download.written.load(Ordering::Relaxed),
-    ))
+    );
+    Ok((bytes, expired))
 }
 
 fn relay_outcome(
@@ -638,6 +856,7 @@ mod tests {
                 &tokio::sync::Notify::new(),
                 true,
                 None,
+                (|| {}, |_| {}),
             )
             .await
             .unwrap();
@@ -694,6 +913,7 @@ mod tests {
             &tokio::sync::Notify::new(),
             true,
             None,
+            (|| {}, |_| {}),
         )
         .await
         .unwrap();
@@ -786,6 +1006,7 @@ mod tests {
             &tokio::sync::Notify::new(),
             true,
             None,
+            (|| {}, |_| {}),
         )
         .await
         .unwrap();
@@ -1049,8 +1270,7 @@ mod tests {
                         Some(RelayProgress {
                             upload: upload.clone(),
                             download: download.clone(),
-                            outbound_upload: None,
-                            outbound_download: None,
+                            outbound: None,
                             first_response: Some(Arc::new(move || {
                                 first_response.fetch_add(1, Ordering::Relaxed);
                             })),
@@ -1206,12 +1426,12 @@ mod tests {
             let (mut client, relayed_client) = tokio::io::duplex(64);
             let (upstream, mut peer) = tokio::io::duplex(64);
             let upload = Arc::new(AtomicU64::new(0));
-            let aggregate = Arc::new(AtomicU64::new(17));
+            let aggregate = Arc::new(crate::stats::OutboundTracker::new());
+            aggregate.tx_bytes.store(17, Ordering::Relaxed);
             let progress = RelayProgress {
                 upload: upload.clone(),
                 download: Arc::new(AtomicU64::new(0)),
-                outbound_upload: Some(aggregate.clone()),
-                outbound_download: None,
+                outbound: Some(aggregate.clone()),
                 first_response: None,
                 on_transfer: None,
             };
@@ -1239,7 +1459,7 @@ mod tests {
                 assert!(task.await.unwrap().is_err());
             }
             assert_eq!(upload.load(Ordering::Relaxed), 6);
-            assert_eq!(aggregate.load(Ordering::Relaxed), 23);
+            assert_eq!(aggregate.tx_bytes.load(Ordering::Relaxed), 23);
         }
     }
 }

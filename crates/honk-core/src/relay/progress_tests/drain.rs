@@ -208,8 +208,7 @@ impl CopyCounters {
         let progress = RelayProgress {
             upload: Arc::new(AtomicU64::new(upload)),
             download: Arc::new(AtomicU64::new(download)),
-            outbound_upload: None,
-            outbound_download: None,
+            outbound: None,
             first_response: None,
             on_transfer: Some(Arc::new({
                 let accepted = accepted.clone();

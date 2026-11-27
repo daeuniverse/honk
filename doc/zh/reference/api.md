@@ -152,6 +152,8 @@ TCP 在 copy 读取成功或 splice 写入目标 socket 成功时立即计数，
 
 就 `pname_routing` 而言，缺少 hook 时 `pname()` 条件拿不到进程名：肯定条件永远不匹配，否定条件总是匹配。原因 `comm_fallback` 表示该条件用的是线程名，不是 argv。
 
+已准入的 packet Host 来源仅提供 Host 范围进程支持，并非全局能力；代码 `pname_routing_host_only` 的原因为 `host_only`，仅线程名可用时为 `host_only_comm_fallback`。plain 记录及缺少可用名称的 Host 记录仍遵循相同 Missing/否定语义。
+
 进入 `iface_watch` 降级后，接口协调改为每 60 秒执行一次，不再接收事件通知。错误码是 `interface_watcher_disabled`，原因是 `subscribe_failed` 或 `poll_setup_failed`。
 
 `interface_binding` 的错误码为 `interface_binding_incomplete`，消息为 `A configured network interface is not fully bound; traffic interception may be incomplete.`
@@ -685,6 +687,10 @@ weak 标签语法合法，但永远不匹配；`*` 匹配已存在的资源。�
 
 reload 会拒绝那些修改了需重启设置的候选配置，但已经写入的文件不会回滚。于是磁盘上的 hash 和已接受的 hash 不再一致，后续写入都会返回 412。所以协调器在写入之前就拒绝这类修改。组 PATCH、节点与 provider 编辑、数据库模式的 import 和修订激活同样如此；`full` 校验会以 warning 报出这些诊断。需重启的设置请在配置文件里改，然后重启 honk。
 
+完整准入同样在文件或数据库耐久修改前检查所选 XDP 执行策略。后端、Direct profile、
+接口身份及有效 XSK 模式变化要求重启；省略与显式 ZeroCopy 等价。防火墙/NAT 策略仍可
+热重载。这里验证策略，不冒充物理设备能力检查。
+
 协调器在产生副作用之前先预留操作，把 API 新写入和 SIGHUP 串行处理。SIGHUP 也要先入队，再去读盘。
 
 单源覆盖通过完整校验后，写入使用目录文件描述符，依次执行：
@@ -1035,6 +1041,8 @@ action 是 `upstream` 或 `requery` 时，`upstream` 是引擎实际使用的小
 
 每条流最多 16 个客户端，每个客户端最多排队 64 个事件，每 15 秒发一次心跳注释。16 个名额用满后，新连接返回 `503 temporarily_unavailable`，带 `Retry-After`。游标过期、属于别的流或实例、或过滤器不同时，在 HTTP 200 之前返回 `409 event_cursor_expired`；队列已满或重放记录丢失时直接断流。
 
+与 Clash `/logs` 相同，捕获始终排除 `quinn::endpoint` 与 `boringtun` 目标：前者的端点驱动任务 ERROR 与 honk 自行报告、带有上下文的 carrier 故障重复；boringtun 的握手重试和会话过期日志不带节点名（同样的事件由 WireGuard driver 只报告一次）。
+
 缩容会让被淘汰记录的游标失效。
 
 和 Clash `/logs` 一样，捕获始终排除 `quinn::endpoint` 目标：它由 endpoint 驱动任务报出的 ERROR，会和 honk 自己报告、带上下文的 carrier 故障重复。
@@ -1365,6 +1373,25 @@ Global 绑定的是稳定身份：目标消失后，新流量按 fail-closed 处
 
 正常的 no-op 接受也会触发重置，provider 与网络更新则不触发。
 
+XDP 另以 `x-honk.xdp` 返回 capture owner 最新观测。默认 summary 包含 `state`、`state_changed_at_unix_ms` 和 `queue_count`；`detail=full` 增加 `queues` 与 `truncated`。Clash `GET /stats` 的 `xdp` 使用同一完整投影。尚未安装 XDP owner（包括 TC/TUN）时为 null；生产者不依赖任一 HTTP feature。每个 XDP 投影至多 64 KiB；`truncated: true` 表示只容纳了按准入设备/队列顺序排列的前若干项，`queue_count` 仍为全部已准入队列数。
+
+`cross_worker_handoffs` 统计另一 worker 实际接收入队的封装，不代表送达。`handoffs[目标][种类]` 按目标 worker（0 或 1，来源为另一 worker）和种类（0：需继续分类的入向包；1：Endpoint）拆分。`packets`、`l3_bytes` 是入队成功的包数与 L3 字节；`refused`、`refused_l3_bytes` 是共享 cell 用尽或目标队列未接纳的包数与 L3 字节。均不含 L2、设备元数据或本地处理的包；统计的是交接次数，不是 TCP 应用字节或去重包数。只在同一次捕获内比较差值。
+
+`ownership_dir_full`、`udp_reply_queue_full`、`remote_backpressure` 分别反映 TCP 归属登记、UDP 回包准入和远端 TCP 缓冲的压力，不能当成丢包数。`direct_attach_fallback` 统计 Direct 未接入后尝试改用 Remote 的次数，其中未能绑定 Remote 的计入 `direct_attach_fallback_failed`。摘要与完整视图均使用十进制字符串；交接和 Direct 回退计数到上限后不再增长。
+
+`dns_projection_state` 区分 `disabled_by_config`、`inactive_no_domain_rules`、`staged_closed`、`active_tcp_udp`、`degraded_fallback`（原因见 `dns_projection_reason`）和 `closed`。`would_pass_dns` 统计影子判定，不是原生流量。`dns_projection_counters` 描述采样的 bank；完整视图还可包含 `dns_realm_revocations`（数字 realm ID 与撤销次数）。不导出域名或 IP。
+
+`dns_decisions` 是本次捕获累计计数的低频采样。`pass_dns_d1` 计首次原生授权；`pass_dns_d1_pending_retry` 计命中 conntrack 前仍获授权的包。两者都不含 CT 命中，也不证明已送达。`drop_native_pending_conflict` 计已有 pending 但无法重新授权而丢弃的包；`dns_native_pending_capped` 是原生名额已满，不等于丢包。`drop_hold_contention`、`drop_hold_unavailable`、`hold_guard_release_failed` 分别表示同键竞争未决、归属保护资源不可用、已持有的 guard 释放失败。计数以十进制字符串表示，null 表示未取得读数，不是零。
+`hold_retire_failed` 独立记录 pending 清理或计费失败；已确认的 CT 放行不是原生名额已归还的证据。
+
+对 XDP Host，`host_meta_insert_failed` 计 Endpoint 元数据发布被拒的次数。`host_direct_unrecorded` 计当前策略已明确判为 Direct、但因表满不能记录新 UDP 归属的包，不是建连成功数。`host_late_packet` 计私有 TUN 因准入时间戳缺失、无效、来自未来或已超过 30 秒而拒绝的输入，不表示 TCP 空闲超时或网卡丢包。
+
+每队列保留真实 `namespace_cookie`、`attachment_generation`、`ifindex`、`queue_id`、实际 `mode`（`copy` 或 `zerocopy`）、`ring_capacity` 以及 RX/control/bulk frame 容量。一个物理队列可服务多个逻辑 realm。`sequence`、`attempted_at_unix_ms` 和 `last_success_at_unix_ms` 分别标识采样次数、最近尝试与最近成功的 socket 读取；时间为十进制 Unix 毫秒字符串，所有完整宽度整数均为十进制字符串，序列和错误计数饱和。`socket` 保存六项原始累计 XDP_STATISTICS：`rx_dropped`、`rx_invalid_descs`、`tx_invalid_descs`、`rx_ring_full`、`rx_fill_ring_empty_descs`、`tx_ring_empty_descs`。`rings` 保存 `rx`、`tx`、`fill`、`cq` 的原始 u32 `producer`/`consumer` 索引；索引会回绕，单位为 descriptor，不是包数。
+
+采样不受 DEBUG 过滤影响，只在既有 owner turn 中至多每秒执行一次，正常 socket 关闭前另取最终样本。不增加空闲 timer，安静队列可能保留较旧样本。Socket、ring、各队列均顺序读取，不是跨计数器/ring/队列的原子快照。`socket_available: false` 且 `socket: null` 表示尚未观测或不可用，不代表零丢包；尝试失败后 `socket_error` 为 `statistics_unavailable`，`socket_errno` 有值时保留数字 errno，即使错误无 errno 也增加 `socket_read_errors`。失败可保留旧 `last_success_at_unix_ms`，但不会将旧成功计数冒充本次数据。统计读取失败不终止 capture。`rx_fill_ring_empty_descs` 是内核空 FILL 事件，不是丢包率；当前 FILL 有内容不能否定历史饥饿。不会相加为总丢包，也不推导速率或增量。
+
+生命周期从真实激活前的 `starting` 进入 `active`；关闭 capture admission 后为 `closing`，完成 socket 拆除后为 `closed`，失败且保留 capture 所有权/UMEM 时为终态 `failed_retained`。终态不再改变生命周期；策略重载保留同一 attachment 身份和计数。HTTP 只读保留值，不读取 socket、不推进序列、不重置计数，也不改变 polling/admission。诊断读者在持有观测期间保留其内存计费，不持有 Port、FD 或包 lease。
+
 `GET /datapath` 和运行时里的数据面摘要都使用后端的程序、挂接、路由和 admission 观测，不按配置的接口去猜。Mock 报告 `disabled` 和 `none`。真实观测是 `partial`，没有验证过的事实保留未知值或 `null`，路由 generation 的身份独立于运行时 generation。已知映射容量不代表知道占用量。hook 只是挂上了，不代表 admission 已经开启，也不声明 `full_transparency`。
 
 `GET /datapath` 返回 `{observed_at,kind,state,visibility,ebpf,errors}`。`kind` 不是 `ebpf` 时 `ebpf` 为 `null`。`detail=full` 增加 `ebpf.attachments` 与 `ebpf.maps`，默认的 `summary` 省略二者。
@@ -1600,6 +1627,7 @@ URLTest、LoadBalance、Fallback 和 Score 都拒绝手动选择。
 ```text
 {
   outbounds: [{ name, totalConns, activeConns, upload, download, errors }],
+  xdp: null | { state, state_changed_at_unix_ms, queue_count, cross_worker_handoffs, handoffs, ownership_dir_full, udp_reply_queue_full, remote_backpressure, direct_attach_fallback, direct_attach_fallback_failed, dns_projection_state, dns_projection_reason, would_pass_dns, dns_decisions, dns_projection_counters, dns_realm_revocations?, truncated, queues },
   pool: { readyHits, readyMisses, entries },
   dns: {
     socketAdmission: { refused, timeouts },

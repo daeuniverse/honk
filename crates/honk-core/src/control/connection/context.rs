@@ -17,6 +17,16 @@ impl Drop for ConnectionGuard {
     }
 }
 
+impl ControlPlaneHandle {
+    pub(in crate::control) async fn udp_admission(
+        &self,
+    ) -> anyhow::Result<tc_kernel::UdpAdmission<'_>> {
+        TcKernelController::require(&self.tc_kernel)?
+            .udp_admission()
+            .await
+    }
+}
+
 /// Shared context passed to every connection handler. Each field is its own
 /// shared handle, so cloning the bundle bumps one reference count per field.
 #[derive(Clone)]
@@ -30,10 +40,11 @@ pub(in crate::control) struct ControlPlaneHandle {
     pub(in crate::control) dns_resolver: Arc<DnsResolver>,
     pub(in crate::control) group_manager: SharedGroupManager,
     pub(in crate::control) stats: Arc<StatsManager>,
-    pub(in crate::control) ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    pub(in crate::control) ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
+    pub(in crate::control) tc_kernel: Option<Arc<TcKernelController>>,
     pub(in crate::control) active_routing_plan: routing_matcher::SharedRoutingPlan,
     pub(in crate::control) udp_pool: Arc<UdpEndpointPool>,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub(in crate::control) pending_udp_verdicts:
         Option<Arc<crate::control::nfqueue::PendingUdpVerdicts>>,
     pub(in crate::control) tcp_sniff_neg_cache: Arc<crate::control::tcp_sniff::TcpSniffNegCache>,

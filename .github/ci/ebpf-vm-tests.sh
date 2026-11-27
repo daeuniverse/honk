@@ -7,9 +7,13 @@ test -x "$HONK_CORE_TEST_BIN"
 test -x "$HONK_DATAPATH_TEST_BIN"
 test -x "$HONK_NFQUEUE_TEST_BIN"
 test -x "$HONK_OUTBOUND_TEST_BIN"
+test -x "$HONK_XSK_TEST_BIN"
+test -x "$HONK_XDP_DAEMON"
 
 cd "$repo"
 test "$(id -u)" -eq 0
+read -r cmdline </proc/cmdline
+[[ " $cmdline " == *' virtme.'* ]]
 kernel=$(uname -r)
 printf 'Guest uname -r: %s\n' "$kernel" >> "${GITHUB_STEP_SUMMARY:?}"
 test "$kernel" = "${HONK_CI_EXPECTED_KERNEL:?}"
@@ -37,6 +41,18 @@ watchdog=$!
 # vng waits for the console to close, so the watchdog and its sleep must not
 # hold it or outlive the gate.
 trap 'pkill -P "$watchdog" 2>/dev/null || true; kill "$watchdog" 2>/dev/null || true' EXIT
+
+host_smoke() {
+  HONK_XDP_DAEMON="$HONK_XDP_DAEMON" \
+  bash "$repo/.github/ci/host-daemon-smoke.sh" \
+    "${HONK_CI_HOST_INPUTS:?}" "${HONK_CI_HOST_INPUTS_SHA256:?}" \
+    2>&1 | tee "$log_dir/honk-host-daemon.log"
+}
+case ${HONK_CI_HOST_SELECTION:?} in
+  all) ;;
+  host-ct-reply|host-pname) host_smoke; exit ;;
+  *) exit 2 ;;
+esac
 
 "$HONK_CORE_TEST_BIN" ebpf::real::tests --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-core-real.log"
@@ -123,3 +139,26 @@ mark_test=proxy::packet::socket_mark_tests::socket_marks_preserve_global_and_dir
 test "$("$HONK_OUTBOUND_TEST_BIN" "$mark_test" --exact --ignored --list --format terse)" = "$mark_test: test"
 "$HONK_OUTBOUND_TEST_BIN" "$mark_test" --exact --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-outbound-socket-marks.log"
+mkdir -p "$log_dir/complete"
+HONK_XDP_CORE_TEST_BIN="$HONK_CORE_TEST_BIN" HONK_XDP_XSK_TEST_BIN="$HONK_XSK_TEST_BIN" HONK_XDP_ARTIFACT_ROOT="$log_dir/complete" \
+  bash "$repo/.github/ci/xdp-daemon-smoke.sh" "$HONK_XDP_DAEMON" all \
+  2>&1 | tee "$log_dir/honk-xdp-daemon.log"
+# TUN uses the same fresh executable, independently of the eBPF Cargo feature.
+for tun_test in \
+  tun::setup::tests::kernel_tun_exclusive_fd_and_containment_are_owned \
+  control::packet_endpoint::tests::startup::tun_dns_bind_starts_with_prepared_addresses_and_marks_both_transports \
+  control::dns_listener::tests::tun_prepared_listener_marks_tcp_udp_and_accepted_sockets \
+  clash_api::sampler_tests::netns_tun_listener_marks_accepted_sockets \
+  native_api::startup::tests::netns_tun_listener_marks_accepted_sockets; do
+  test "$("$HONK_CORE_TEST_BIN" "$tun_test" --exact --ignored --list --format terse)" = "$tun_test: test"
+  "$HONK_CORE_TEST_BIN" "$tun_test" --exact --ignored --test-threads=1 \
+    2>&1 | tee -a "$log_dir/honk-tun-consumers.log"
+done
+tun_readiness_test=tun::tests::writable_readiness_retries_the_same_lease_without_new_input
+test "$("$HONK_CORE_TEST_BIN" "$tun_readiness_test" --exact --list --format terse)" = "$tun_readiness_test: test"
+"$HONK_CORE_TEST_BIN" "$tun_readiness_test" --exact --test-threads=1 \
+  2>&1 | tee "$log_dir/honk-tun-readiness.log"
+HONK_TUN_ARTIFACT_ROOT="$log_dir" \
+  bash "$repo/.github/ci/tun-daemon-smoke.sh" "$HONK_XDP_DAEMON" \
+  2>&1 | tee "$log_dir/honk-tun-daemon.log"
+host_smoke

@@ -8,10 +8,13 @@ license.workspace = true
 # It contains types, constants, and map definitions used by both sides.
 # Both sides must agree on struct layouts and map keys.
 
+[features]
+aya-pod = ["dep:aya"]
+
 [dependencies]
 aya-ebpf-bindings.workspace = true
 network-types.workspace = true
 
 # aya is userspace-only; exclude it from BPF target builds.
 [target.'cfg(not(target_arch = "bpf"))'.dependencies]
-aya.workspace = true
+aya = { workspace = true, optional = true }

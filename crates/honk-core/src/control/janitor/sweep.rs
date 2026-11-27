@@ -4,7 +4,7 @@ use super::{
     AuxScanResult, BpfJanitor, JANITOR_DELETE_CHUNK, JANITOR_SCAN_CHUNK, OccupancyGauge, ScanTuning,
 };
 use crate::ebpf::{
-    EbpfBackend, RetireCounts, RetireError, RetireKind, RetireOutcome, RetireRequest, conn_expired,
+    RetireCounts, RetireError, RetireKind, RetireOutcome, RetireRequest, conn_expired,
     conn_state_timeout_ns,
 };
 use honk_ebpf_common::TuplesKey;
@@ -34,31 +34,36 @@ fn redirect_timeout_ns(
 }
 
 impl BpfJanitor {
-    pub(super) async fn run_blocking_read<T, F>(&self, label: &'static str, work: F) -> Option<T>
+    pub(super) async fn run_blocking_read<T, F>(
+        &self,
+        label: &'static str,
+        work: F,
+    ) -> anyhow::Result<Option<T>>
     where
         T: Send + 'static,
-        F: FnOnce(&dyn EbpfBackend) -> T + Send + 'static,
+        F: FnOnce(&crate::control::tc_kernel::MapScan<'_>) -> T + Send + 'static,
     {
-        let ebpf = Arc::clone(&self.ebpf);
+        let tc = Arc::clone(&self.tc);
         #[cfg(test)]
         let blocking_read_hook = self.blocking_read_hook.clone();
         match tokio::task::spawn_blocking(move || {
-            let ebpf = ebpf.blocking_read();
-            #[cfg(test)]
-            if let Some(hook) = blocking_read_hook {
-                hook();
-            }
-            work(ebpf.as_ref())
+            tc.blocking_scan(|scan| {
+                #[cfg(test)]
+                if let Some(hook) = blocking_read_hook {
+                    hook();
+                }
+                work(scan)
+            })
         })
         .await
         {
-            Ok(result) => Some(result),
+            Ok(result) => result.map(Some),
             Err(error) => {
                 error!(%error, map = label, "BPF janitor blocking read task failed");
                 if error.is_panic() {
                     std::panic::resume_unwind(error.into_panic());
                 }
-                None
+                Ok(None)
             }
         }
     }
@@ -72,7 +77,7 @@ impl BpfJanitor {
         T: Send + 'static,
         F: for<'a> FnMut(&'a T) -> RetireRequest<'a> + Send + 'static,
     {
-        let ebpf = Arc::clone(&self.ebpf);
+        let tc = Arc::clone(&self.tc);
         let pins = Arc::clone(&self.tcp_flow_pins);
         let udp_pool = self.udp_pool.clone();
         #[cfg(test)]
@@ -87,19 +92,12 @@ impl BpfJanitor {
             }
             // Release between batches so queued per-flow readers can proceed.
             for chunk in entries.chunks(JANITOR_DELETE_CHUNK) {
-                let mut ebpf = ebpf.blocking_write();
-                requests.clear();
-                requests.extend(
-                    chunk
-                        .iter()
-                        .map(&mut request)
-                        .filter(|request| !pins.contains(&request.key)),
+                let batch = tc.blocking_retire_unpinned(
+                    &pins,
+                    chunk.iter().map(&mut request),
+                    &mut requests,
+                    &mut outcomes,
                 );
-                if requests.is_empty() {
-                    continue;
-                }
-                let batch = ebpf.retire_batch(&requests, &mut outcomes[..requests.len()]);
-                drop(ebpf);
                 // Deletes before a failure are real, so their endpoints retire too.
                 if let Some(pool) = &udp_pool {
                     for (request, outcome) in requests.iter().zip(&outcomes) {
@@ -139,7 +137,7 @@ impl BpfJanitor {
         (label, cursor_index): (&'static str, usize),
         tuning: ScanTuning,
         for_each: impl FnOnce(
-            &dyn EbpfBackend,
+            &crate::control::tc_kernel::MapScan<'_>,
             &mut crate::ebpf::FlowScanCursor,
             &mut dyn FnMut(&[(K, V)]) -> bool,
         ) -> anyhow::Result<()>
@@ -184,6 +182,10 @@ impl BpfJanitor {
                 anyhow::Ok((expired, total, complete && from_start && cursor.is_start()))
             })
             .await;
+        let scanned = match scanned {
+            Ok(scanned) => scanned,
+            Err(error) => return (AuxScanResult::default(), Err(error)),
+        };
         let (expired, total, complete) = match scanned {
             Some(Ok(scanned)) => scanned,
             Some(Err(error)) => {
@@ -218,9 +220,7 @@ impl BpfJanitor {
             .sweep(
                 ("conn-state", 0),
                 tuning,
-                |ebpf, cursor, visit| {
-                    ebpf.conn_state_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit)
-                },
+                |ebpf, cursor, visit| ebpf.conn_state(JANITOR_SCAN_CHUNK, cursor, visit),
                 move |key, state| conn_expired(key.l4proto, state, now_ns),
                 move |(key, expected)| RetireRequest {
                     key: *key,
@@ -256,9 +256,7 @@ impl BpfJanitor {
             .sweep(
                 ("redirect-track", 1),
                 tuning,
-                |ebpf, cursor, visit| {
-                    ebpf.redirect_track_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit)
-                },
+                |ebpf, cursor, visit| ebpf.redirect_track(JANITOR_SCAN_CHUNK, cursor, visit),
                 move |key, entry| {
                     now_ns.saturating_sub(entry.last_seen_ns) > redirect_timeout_ns(key, entry)
                 },
@@ -299,9 +297,7 @@ impl BpfJanitor {
             .sweep(
                 ("routing-handoff", 2),
                 tuning,
-                |ebpf, cursor, visit| {
-                    ebpf.routing_handoff_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit)
-                },
+                |ebpf, cursor, visit| ebpf.routing_handoff(JANITOR_SCAN_CHUNK, cursor, visit),
                 move |_, entry| {
                     now_ns.saturating_sub(entry.last_seen_ns) > ROUTING_HANDOFF_TIMEOUT_NS
                 },

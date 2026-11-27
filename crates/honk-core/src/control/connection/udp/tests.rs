@@ -44,6 +44,7 @@ fn source_path_selects_shared_exactly_for_the_registered_slots() {
         (NodeProtocol::Socks5, true),
         (NodeProtocol::Juicity, true),
         (NodeProtocol::AnyTLS, true),
+        (NodeProtocol::WireGuard, true),
         (NodeProtocol::Direct, false),
         (NodeProtocol::Block, false),
     ] {
@@ -267,6 +268,7 @@ async fn one_client_shares_one_chain_association_across_destinations() {
     for target in ["192.0.2.1:53", "192.0.2.2:53"] {
         let preparation = pool
             .prepare_source(
+                honk_datapath::ScopeId::HOST,
                 &registry,
                 Arc::clone(&generation),
                 generation.get(&via.id).unwrap(),
@@ -280,6 +282,7 @@ async fn one_client_shares_one_chain_association_across_destinations() {
                 Arc::clone(&stats),
                 IpVersion::V4,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -311,6 +314,8 @@ async fn prepare_plan(
 > {
     handle
         .prepare_udp_candidates(
+            honk_datapath::ScopeId::HOST,
+            None,
             plan,
             None,
             "127.0.0.1:40000".parse().unwrap(),
@@ -381,7 +386,7 @@ async fn ordinary_udp_handoff_and_staged_mapping_use_the_committed_group_owner()
                 handle.staged_udp_outbound(&owned, &manager, "south", OutboundConstraint::Group)?,
                 base + 1
             );
-            handle.resolve_udp_handoff_group(backend.as_ref(), base, generation)?
+            handle.resolve_udp_handoff_group(backend.tc().unwrap(), base, generation)?
         };
         assert_eq!(name, "north");
         let info = build_connection_info(
@@ -553,7 +558,7 @@ async fn assert_udp_handoff_generations(
 ) {
     let backend = handle.ebpf.read().await;
     for &generation in accepted {
-        let result = handle.resolve_udp_handoff_group(backend.as_ref(), slot, generation);
+        let result = handle.resolve_udp_handoff_group(backend.tc().unwrap(), slot, generation);
         assert_eq!(
             result.as_deref().ok(),
             Some(group),
@@ -561,7 +566,7 @@ async fn assert_udp_handoff_generations(
         );
     }
     for &generation in rejected {
-        let result = handle.resolve_udp_handoff_group(backend.as_ref(), slot, generation);
+        let result = handle.resolve_udp_handoff_group(backend.tc().unwrap(), slot, generation);
         assert!(
             result.is_err(),
             "slot {slot}, generation {generation}: {result:?}"
@@ -882,6 +887,8 @@ async fn udp_handoff_missing_auxiliary_cannot_skip_the_cached_group_cutoff() -> 
                 UdpFlowOwner::new(0, incarnation).unwrap(),
                 #[cfg(feature = "native-api")]
                 &observation,
+                #[cfg(feature = "native-api")]
+                None,
             )
             .await
     };
@@ -919,7 +926,7 @@ async fn udp_handoff_revalidates_the_original_group_after_a_mode_replacement() -
     let handle = cp.spawn_handle();
     let capture = async |generation| {
         let backend = handle.ebpf.read().await;
-        handle.capture_udp_group(backend.as_ref(), OWNER_SLOT, generation)
+        handle.capture_udp_group(OWNER_SLOT, generation, backend.routing_policy_generation())
     };
     let revalidate = |proof| handle.revalidate_udp_group(&handle.group_manager.read(), proof);
     let choose = async |proof: &UdpGroupProof| {
@@ -929,8 +936,7 @@ async fn udp_handoff_revalidates_the_original_group_after_a_mode_replacement() -
             mark: None,
             matched_rule: None,
             reroute_by_sniffed_domain: false,
-            #[cfg(feature = "native-api")]
-            native_route: None,
+            native_route: Default::default(),
         };
         handle
             .apply_mode_override(&mut route, OutboundConstraint::Group)
@@ -1275,15 +1281,19 @@ async fn selected_block_after_ready_prevents_the_first_trojan_datagram() {
     let permit = Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()
         .unwrap();
-    let EndpointReservation::Initializing(mut lease) =
-        handle
-            .udp_pool
-            .reserve_or_enqueue(client, dst, b"no replay", permit, &handle.stats)
-    else {
+    let EndpointReservation::Initializing(mut lease) = handle.udp_pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"no replay",
+        permit,
+        &handle.stats,
+    ) else {
         panic!("fresh lease");
     };
     assert!(lease.bind_selected(fixture.nodes[1].id, prepared.evidence));
     let mut driver = handle.udp_pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         lease.generation(),

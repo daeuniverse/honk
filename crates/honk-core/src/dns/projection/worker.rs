@@ -6,14 +6,14 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::time::Instant;
 
 use super::{ProjectionCounters, RoutingProjection};
-use crate::ebpf::{EbpfBackend, maps};
+use crate::ebpf::{DomainProjectionSink, maps};
 
 const WARN_INTERVAL: Duration = Duration::from_secs(5);
 
-pub(super) async fn run(
+pub(super) async fn run<S: DomainProjectionSink + ?Sized>(
     projection: std::sync::Weak<RoutingProjection>,
     mut receiver: mpsc::Receiver<()>,
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: Arc<RwLock<Box<S>>>,
     counters: Arc<ProjectionCounters>,
 ) {
     let mut last_warning = None;
@@ -52,29 +52,44 @@ pub(super) async fn run(
     }
 }
 
-async fn flush(
+async fn flush<S: DomainProjectionSink + ?Sized>(
     projection: &RoutingProjection,
-    ebpf: &RwLock<Box<dyn EbpfBackend>>,
+    ebpf: &RwLock<Box<S>>,
     counters: &ProjectionCounters,
     last_warning: &mut Option<Instant>,
 ) {
     flush_after_snapshot(projection, ebpf, counters, last_warning, || {}).await;
 }
 
-async fn flush_after_snapshot(
+async fn flush_after_snapshot<S: DomainProjectionSink + ?Sized>(
     projection: &RoutingProjection,
-    ebpf: &RwLock<Box<dyn EbpfBackend>>,
+    ebpf: &RwLock<Box<S>>,
     counters: &ProjectionCounters,
     last_warning: &mut Option<Instant>,
     after_snapshot: impl FnOnce(),
 ) {
     let now = Instant::now();
+    #[cfg(target_os = "linux")]
+    let gateway;
     let batch = {
         let mut state = projection.state.lock();
         state.expire(now);
+        #[cfg(target_os = "linux")]
+        {
+            gateway = state.gateway_bank().cloned();
+        }
         state.batch(now)
     };
     after_snapshot();
+    #[cfg(target_os = "linux")]
+    if let Some(bank) = gateway {
+        if let Some(fill) = bank.take_fill() {
+            projection.write_gateway_dns(&bank, fill);
+        }
+        if bank.reclaim_due(now) {
+            bank.reclaim();
+        }
+    }
     if batch.sets.is_empty() && batch.removes.is_empty() {
         return;
     }
@@ -144,18 +159,18 @@ async fn flush_after_snapshot(
 }
 
 #[cfg(test)]
-pub(super) async fn flush_for_test(
+pub(super) async fn flush_for_test<S: DomainProjectionSink + ?Sized>(
     projection: &RoutingProjection,
-    ebpf: &RwLock<Box<dyn EbpfBackend>>,
+    ebpf: &RwLock<Box<S>>,
 ) {
     let mut last_warning = None;
     flush(projection, ebpf, &projection.counters, &mut last_warning).await;
 }
 
 #[cfg(test)]
-pub(super) async fn flush_for_test_after_snapshot(
+pub(super) async fn flush_for_test_after_snapshot<S: DomainProjectionSink + ?Sized>(
     projection: &RoutingProjection,
-    ebpf: &RwLock<Box<dyn EbpfBackend>>,
+    ebpf: &RwLock<Box<S>>,
     after_snapshot: impl FnOnce(),
 ) {
     let mut last_warning = None;

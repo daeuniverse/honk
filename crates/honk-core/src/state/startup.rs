@@ -202,6 +202,14 @@ mod state_claim_tests {
         }
     }
 
+    fn test_datapath() -> &'static str {
+        if crate::PACKET_ONLY {
+            "datapath {\n backend: tun\n direct: endpoint\n tun {\n name: honk0\n address4: 198.18.0.1/32\n table: 202\n rule_priority: 10000\n capture { 0.0.0.0/0 }\n }\n}\n"
+        } else {
+            ""
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_successor_without_the_instance_lock_leaves_the_state_alone() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -241,18 +249,14 @@ mod state_claim_tests {
             std::fs::write(
                 &config,
                 format!(
-                    "global {{\n data_dir: '{}'\n store_subscribe: true\n}}\nsubscription {{\n '{}'\n}}\n",
+                    "global {{\n data_dir: '{}'\n nfqueue_enable: false\n store_subscribe: true\n}}\nsubscription {{\n '{}'\n}}\n{}",
                     data_dir.display(),
-                    sub.url
+                    sub.url, test_datapath()
                 ),
             )
             .unwrap();
-            let cli = crate::Cli::parse_from([
-                "honk-core",
-                "--mock-ebpf",
-                "-c",
-                config.to_str().unwrap(),
-            ]);
+            let mut cli = crate::Cli::parse_from(["honk-core", "-c", config.to_str().unwrap()]);
+            cli.mock_ebpf = !crate::PACKET_ONLY;
             let error = crate::run(cli).await.unwrap_err();
             assert!(error.to_string().contains("refusing to start"), "{error:#}");
         }
@@ -333,14 +337,14 @@ mod state_claim_tests {
         std::fs::write(
             &config,
             format!(
-                "global {{\n data_dir: '{}'\n}}\nexperimental {{\n native_api {{\n  enabled: true\n  listen: '{}'\n  allow_anonymous_loopback: true\n }}\n}}\n",
+                "global {{\n data_dir: '{}'\n nfqueue_enable: false\n}}\nexperimental {{\n native_api {{\n  enabled: true\n  listen: '{}'\n  allow_anonymous_loopback: true\n }}\n}}\n{}",
                 data_dir.display(),
-                occupied.local_addr().unwrap()
+                occupied.local_addr().unwrap(), test_datapath()
             ),
         )
         .unwrap();
-        let cli =
-            crate::Cli::parse_from(["honk-core", "--mock-ebpf", "-c", config.to_str().unwrap()]);
+        let mut cli = crate::Cli::parse_from(["honk-core", "-c", config.to_str().unwrap()]);
+        cli.mock_ebpf = !crate::PACKET_ONLY;
 
         let error = crate::run(cli)
             .await

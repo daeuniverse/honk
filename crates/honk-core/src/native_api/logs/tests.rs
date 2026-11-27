@@ -548,8 +548,8 @@ async fn only_a_request_line_with_a_known_refusal_reason_is_admitted() {
 }
 
 #[tokio::test]
-async fn quinn_endpoint_errors_are_not_captured() {
-    if run_isolated("native_api::logs::tests::quinn_endpoint_errors_are_not_captured") {
+async fn quiet_targets_are_not_captured() {
+    if run_isolated("native_api::logs::tests::quiet_targets_are_not_captured") {
         return;
     }
     let owner = super::super::observation::NativeObservation::new(&honk_config::Config::default());
@@ -563,6 +563,7 @@ async fn quinn_endpoint_errors_are_not_captured() {
     drop(stream);
     tracing::dispatcher::with_default(&dispatch, || {
         tracing::error!(target: "quinn::endpoint", "I/O error: broken pipe");
+        tracing::warn!(target: "boringtun::noise::timers", "HANDSHAKE(REKEY_TIMEOUT)");
         tracing::error!(target: "honk_core::control::runtime", "after the quinn error");
     });
     let mut resumed = response(&store, "", Some(cursor(&baseline)))

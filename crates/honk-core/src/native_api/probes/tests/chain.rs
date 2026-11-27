@@ -323,7 +323,9 @@ async fn captured_chain_probes_use_and_close_private_physical_entry_sessions() {
         ));
         let (cancel, receiver) = watch::channel(false);
         let deadline = Instant::now() + TIMEOUT;
-        let origin_exchange = async {
+        // Keep probe execution and the peer's reload out of the timeout's inline state.
+        let probe = Box::pin(execute(&state, &mut plan, deadline, receiver));
+        let origin_exchange = Box::pin(async {
             let (socket, _) = origin.accept().await.unwrap();
             let mut socket = BufReader::new(socket);
             let methods: &[&str] = if warmth == "warm" {
@@ -366,15 +368,13 @@ async fn captured_chain_probes_use_and_close_private_physical_entry_sessions() {
                 socket.get_mut().write_all(response).await.unwrap();
             }
             assert_eq!(socket.read(&mut [0]).await.unwrap(), 0);
-        };
-        let (result, ()) = tokio::time::timeout(TIMEOUT * 2, async {
-            tokio::join!(
-                execute(&state, &mut plan, deadline, receiver),
-                origin_exchange
-            )
-        })
-        .await
-        .expect("the probe must reach the pinned origin through the private entry and close it");
+        });
+        let (result, ()) =
+            tokio::time::timeout(TIMEOUT * 2, async { tokio::join!(probe, origin_exchange) })
+                .await
+                .expect(
+                    "the probe must reach the pinned origin through the private entry and close it",
+                );
         result.unwrap();
         let (status, error) = match completion {
             Completion::Success | Completion::Obsolete => ("healthy", None),

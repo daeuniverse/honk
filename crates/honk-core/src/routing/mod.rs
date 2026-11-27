@@ -2,15 +2,15 @@
 
 use honk_config::routing::{RoutingConfig, RoutingRule};
 use honk_ebpf_common::{DomainRouting, ROUTING_FACT_CAPACITY};
-use honk_outbound::proxy::DirectMark;
 use regex::Regex;
 use std::{net::IpAddr, sync::Arc};
 
 mod domain;
 mod fingerprint;
+pub(crate) mod firewall;
 mod geo;
 mod ir;
-#[cfg(any(feature = "ebpf", test))]
+#[cfg(any(feature = "legacy-tc", test))]
 mod lan_protection;
 mod lpm;
 
@@ -43,13 +43,13 @@ fn normalize_process_matcher(name: &str) -> String {
 pub struct RouteAction {
     pub outbound: String,
     pub must: bool,
-    pub mark: Option<DirectMark>,
+    pub mark: Option<u32>,
     pub direct_mark_index: Option<u8>,
 }
 
 impl RouteAction {
     pub fn is_terminal_direct_mark(&self) -> bool {
-        self.must && self.outbound == "direct" && self.mark.is_some()
+        self.must && self.outbound == "direct" && self.mark.is_some_and(|mark| mark != 0)
     }
 }
 
@@ -69,15 +69,6 @@ pub struct CompiledRoute {
     /// Source-spelled conditions in compiled order; never expanded GeoIP networks.
     #[cfg(feature = "native-api")]
     pub condition_expressions: Vec<String>,
-}
-
-impl CompiledRoute {
-    /// Whether the rule references any domain-class matcher, positive or negated.
-    pub fn has_domain_conditions(&self) -> bool {
-        self.conditions
-            .iter()
-            .any(|condition| matches!(condition.predicate, CompiledPredicate::Domain(_)))
-    }
 }
 
 // The untimed production specialization has no clock reads or per-alternative budget branch.
@@ -101,7 +92,7 @@ pub struct ConnectionInfo {
     pub src_port: u16,
     pub protocol: &'static str,
     pub process_name: Option<String>,
-    pub mac: Option<String>,
+    pub mac: Option<[u8; 6]>,
     pub dscp: Option<u8>,
 }
 
@@ -114,7 +105,7 @@ pub(crate) struct PredicateInput<'a> {
     pub(crate) src_port: Option<u16>,
     pub(crate) protocol: &'a str,
     pub(crate) process_name: Option<&'a str>,
-    pub(crate) mac: Option<&'a str>,
+    pub(crate) mac: Option<[u8; 6]>,
     pub(crate) dscp: Option<u8>,
 }
 
@@ -194,9 +185,76 @@ pub struct Router {
     domain_matchers: Arc<[DomainMatcher]>,
     direct_marks: Arc<[u32]>,
     policy_fingerprint: [u8; 32],
+    firewall: Option<Arc<firewall::FirewallPolicy>>,
+    security_epoch: u64,
 }
 
 impl Router {
+    /// Prepare under the existing configuration transaction, before this Router is
+    /// pinned/published. Traffic route changes do not revoke unchanged security state.
+    pub(crate) fn bind_firewall(
+        &mut self,
+        config: &honk_config::Config,
+        previous: Option<&Router>,
+        sources: &GeoSourceSet,
+        shared: &mut SharedMatchers,
+    ) -> anyhow::Result<()> {
+        if let Some(datapath) = &config.datapath {
+            datapath.validate()?;
+        }
+        let configured = config.datapath.as_ref().and_then(|datapath| {
+            datapath
+                .firewall
+                .as_ref()
+                .map(|firewall| (firewall, &datapath.nat))
+        });
+        let old = previous.and_then(|router| router.firewall.as_ref());
+        let unchanged = previous.map_or(configured.is_none(), |router| {
+            router.firewall_matches(config, sources)
+        });
+        let epoch = previous.map_or(0, |router| router.security_epoch);
+        if unchanged {
+            self.firewall = old.cloned();
+            self.security_epoch = epoch;
+            return Ok(());
+        }
+        let epoch = epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("firewall security epoch exhausted"))?;
+        let candidate = configured
+            .map(|(firewall, nat)| {
+                firewall::FirewallPolicy::compile(firewall, nat, sources, shared).map(Arc::new)
+            })
+            .transpose()?;
+        self.firewall = candidate;
+        self.security_epoch = epoch;
+        Ok(())
+    }
+
+    pub(crate) fn firewall_policy(&self) -> Option<&Arc<firewall::FirewallPolicy>> {
+        self.firewall.as_ref()
+    }
+    pub(crate) fn security_epoch(&self) -> u64 {
+        self.security_epoch
+    }
+    pub(crate) fn firewall_matches(
+        &self,
+        config: &honk_config::Config,
+        sources: &GeoSourceSet,
+    ) -> bool {
+        let configured = config.datapath.as_ref().and_then(|datapath| {
+            datapath
+                .firewall
+                .as_ref()
+                .map(|firewall| (firewall, &datapath.nat))
+        });
+        match (configured, &self.firewall) {
+            (None, None) => true,
+            (Some((firewall, nat)), Some(policy)) => policy.matches(firewall, nat, sources),
+            _ => false,
+        }
+    }
+
     /// Ad-hoc rule set; its fallback carries no configured `must` or mark.
     pub fn new(rules: &[RoutingRule], plain_fallback: &str) -> anyhow::Result<Self> {
         let sources = GeoSourceSet::load(&GeoRequirements::for_traffic(rules));
@@ -234,7 +292,7 @@ impl Router {
         let fallback = RouteAction {
             outbound: routing.default_outbound.clone(),
             must: routing.default_must,
-            mark: DirectMark::new(routing.default_mark),
+            mark: routing.default_mark,
             direct_mark_index: None,
         };
         Self::build(&routing.rules, fallback, geo_sources, shared)
@@ -255,7 +313,14 @@ impl Router {
         for (source_index, rule) in rules.iter().enumerate() {
             let mut conditions = Vec::new();
             for not in [false, true] {
-                append_conditions(&mut conditions, not, rule, &assets, &mut registry, shared)?;
+                append_conditions(
+                    &mut conditions,
+                    not,
+                    &rule.condition,
+                    &assets,
+                    &mut registry,
+                    shared,
+                )?;
             }
 
             let outbound = rule.outbound.as_str().to_owned();
@@ -274,7 +339,7 @@ impl Router {
                 action: RouteAction {
                     outbound,
                     must: rule.must,
-                    mark: DirectMark::new(rule.mark),
+                    mark: rule.mark,
                     direct_mark_index: None,
                 },
                 expression: String::new(),
@@ -307,7 +372,7 @@ impl Router {
             .map(|route| &route.action)
             .chain(std::iter::once(&fallback))
             .filter(|action| action.is_terminal_direct_mark())
-            .filter_map(|action| action.mark.map(DirectMark::get))
+            .filter_map(|action| action.mark)
             .collect();
         direct_marks.sort_unstable();
         direct_marks.dedup();
@@ -318,11 +383,8 @@ impl Router {
         );
         let index_for = |action: &mut RouteAction| {
             if action.is_terminal_direct_mark() {
-                action.direct_mark_index = Some(
-                    direct_marks
-                        .binary_search(&action.mark.unwrap().get())
-                        .unwrap() as u8,
-                );
+                action.direct_mark_index =
+                    Some(direct_marks.binary_search(&action.mark.unwrap()).unwrap() as u8);
             }
         };
         for route in &mut compiled {
@@ -344,6 +406,8 @@ impl Router {
             domain_matchers: registry.matchers.into(),
             direct_marks: direct_marks.into(),
             policy_fingerprint,
+            firewall: None,
+            security_epoch: 0,
         })
     }
 
@@ -357,11 +421,10 @@ impl Router {
     }
 
     pub fn has_direct_marks(&self) -> bool {
-        self.fallback.outbound == "direct" && self.fallback.mark.is_some()
-            || self
-                .routes
-                .iter()
-                .any(|route| route.action.outbound == "direct" && route.action.mark.is_some())
+        self.fallback.outbound == "direct" && self.fallback.mark.is_some_and(|mark| mark != 0)
+            || self.routes.iter().any(|route| {
+                route.action.outbound == "direct" && route.action.mark.is_some_and(|mark| mark != 0)
+            })
     }
 
     /// Whether any rule has a `pname()` condition, positive or negated.
@@ -458,8 +521,19 @@ impl Router {
         domain_bitmap: Option<&DomainRouting>,
         mut observe: impl FnMut(usize, Option<usize>, bool),
     ) -> Option<RouteMatch<'a>> {
+        let input = PredicateInput {
+            domain: conn.domain.as_deref(),
+            dst_ip: Some(conn.dst_ip),
+            dst_port: Some(conn.dst_port),
+            src_ip: Some(conn.src_ip),
+            src_port: Some(conn.src_port),
+            protocol: conn.protocol,
+            process_name: conn.process_name.as_deref(),
+            mac: conn.mac,
+            dscp: conn.dscp,
+        };
         self.routes.iter().enumerate().find_map(|(index, route)| {
-            let matched = self.matches_route(route, conn, domain_bitmap, |condition, matched| {
+            let matched = self.matches_input(route, input, domain_bitmap, |condition, matched| {
                 observe(index, Some(condition), matched);
             });
             observe(index, None, matched);
@@ -472,7 +546,7 @@ impl Router {
                 route.name,
                 route.action.outbound,
                 route.action.must,
-                route.action.mark.map_or(0, DirectMark::get)
+                route.action.mark.unwrap_or(0)
             );
             Some(RouteMatch {
                 rule_id: route.id,
@@ -484,24 +558,24 @@ impl Router {
         })
     }
 
-    fn matches_route(
+    pub(crate) fn route_input(
+        &self,
+        input: PredicateInput<'_>,
+        domain_bitmap: Option<&DomainRouting>,
+    ) -> &RouteAction {
+        self.routes
+            .iter()
+            .find(|route| self.matches_input(route, input, domain_bitmap, |_, _| {}))
+            .map_or_else(|| self.fallback(), |route| &route.action)
+    }
+
+    fn matches_input(
         &self,
         route: &CompiledRoute,
-        conn: &ConnectionInfo,
+        input: PredicateInput<'_>,
         domain_bitmap: Option<&DomainRouting>,
         mut observe: impl FnMut(usize, bool),
     ) -> bool {
-        let input = PredicateInput {
-            domain: conn.domain.as_deref(),
-            dst_ip: Some(conn.dst_ip),
-            dst_port: Some(conn.dst_port),
-            src_ip: Some(conn.src_ip),
-            src_port: Some(conn.src_port),
-            protocol: conn.protocol,
-            process_name: conn.process_name.as_deref(),
-            mac: conn.mac.as_deref(),
-            dscp: conn.dscp,
-        };
         !route.conditions.is_empty()
             && route
                 .conditions
@@ -566,11 +640,9 @@ impl Router {
             CompiledPredicate::ProcessName(patterns) => input.process_name.map(|name| {
                 bounded_any::<BOUNDED, _>(patterns, deadline, |pattern| name.contains(pattern))
             }),
-            CompiledPredicate::Mac(macs) => input.mac.map(|mac| {
-                normalize_mac_bytes(mac).is_some_and(|mac| {
-                    bounded_any::<BOUNDED, _>(macs, deadline, |value| *value == mac)
-                })
-            }),
+            CompiledPredicate::Mac(macs) => input
+                .mac
+                .map(|mac| bounded_any::<BOUNDED, _>(macs, deadline, |value| *value == mac)),
         }
     }
 
@@ -606,7 +678,7 @@ pub struct RouteMatch<'a> {
 fn append_conditions(
     conditions: &mut Vec<CompiledCondition>,
     not: bool,
-    rule: &RoutingRule,
+    condition: &honk_config::routing::RoutingCondition,
     assets: &GeoAssets,
     registry: &mut DomainRegistry,
     shared: &mut SharedMatchers,
@@ -614,9 +686,9 @@ fn append_conditions(
     macro_rules! field {
         ($name:ident) => {
             if not {
-                &rule.condition.not.$name
+                &condition.not.$name
             } else {
-                &rule.condition.$name
+                &condition.$name
             }
         };
     }
@@ -641,20 +713,28 @@ fn append_conditions(
         || !domain_regex.is_empty()
         || !geosites.is_empty()
     {
-        let (mut geosite_domains, mut matchers) = (Vec::new(), Vec::new());
-        for code in geosites {
-            let selected = assets.geosite_domains(std::slice::from_ref(code));
-            matchers.push(shared.geosite(code, &selected));
-            geosite_domains.extend(selected);
-        }
-        let id = registry.intern(DomainMatcher::new(
-            domains,
-            domain_suffixes,
-            domain_keywords,
-            domain_regex,
-            &geosite_domains,
-            matchers,
-        )?)?;
+        let single = if domains.is_empty()
+            && domain_suffixes.is_empty()
+            && domain_keywords.is_empty()
+            && domain_regex.is_empty()
+        {
+            shared.single_geosite(geosites, assets)
+        } else {
+            None
+        };
+        let id = if let Some((digest, matcher)) = single {
+            registry.intern_single(digest, matcher)?
+        } else {
+            registry.intern(DomainMatcher::from_selectors(
+                domains,
+                domain_suffixes,
+                domain_keywords,
+                domain_regex,
+                geosites,
+                assets,
+                shared,
+            )?)?
+        };
         conditions.push(CompiledCondition {
             not,
             predicate: CompiledPredicate::Domain(id),
@@ -773,36 +853,36 @@ fn protocol_value(protocol: &str) -> u8 {
     }
 }
 
-/// Normalize MAC to canonical `aa:bb:cc:dd:ee:ff` form.
-/// Accepts `aa:bb:cc:dd:ee:ff`, `aa-bb-cc-dd-ee-ff`, `aabb.ccdd.eeff`, `aabbccddeeff`.
-fn normalize_mac(s: &str) -> Option<String> {
-    let stripped: String = s
-        .chars()
-        .filter(|&c| c != ':' && c != '-' && c != '.')
-        .collect();
-    if stripped.len() != 12 {
-        return None;
+#[cfg(any(feature = "native-api", test))]
+pub(crate) fn mac_string(mac: [u8; 6]) -> String {
+    let mut text = String::with_capacity(17);
+    for byte in mac_text(mac) {
+        text.push(char::from(byte));
     }
-    let bytes: Vec<u8> = (0..12)
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&stripped[i..i + 2], 16).ok())
-        .collect::<Option<Vec<_>>>()?;
-    Some(
-        bytes
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<Vec<_>>()
-            .join(":"),
-    )
+    text
 }
 
-fn normalize_mac_bytes(s: &str) -> Option<[u8; 6]> {
-    let canonical = normalize_mac(s)?;
-    let mut bytes = [0_u8; 6];
-    for (index, value) in canonical.split(':').enumerate() {
-        bytes[index] = u8::from_str_radix(value, 16).ok()?;
+#[cfg(any(feature = "native-api", test))]
+fn mac_text(mac: [u8; 6]) -> [u8; 17] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = [b':'; 17];
+    for (index, byte) in mac.into_iter().enumerate() {
+        bytes[index * 3] = HEX[(byte >> 4) as usize];
+        bytes[index * 3 + 1] = HEX[(byte & 15) as usize];
     }
-    Some(bytes)
+    bytes
+}
+
+/// Accept the separators used by colon, hyphen, dotted and bare hexadecimal forms.
+fn normalize_mac_bytes(text: &str) -> Option<[u8; 6]> {
+    let mut hex = text.bytes().filter(|b| !matches!(b, b':' | b'-' | b'.'));
+    let mut mac = [0; 6];
+    for byte in &mut mac {
+        let high = char::from(hex.next()?).to_digit(16)?;
+        let low = char::from(hex.next()?).to_digit(16)?;
+        *byte = ((high << 4) | low) as u8;
+    }
+    hex.next().is_none().then_some(mac)
 }
 
 fn parse_ip_version(s: &str) -> Option<u8> {

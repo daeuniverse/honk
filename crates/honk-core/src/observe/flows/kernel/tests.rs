@@ -1,5 +1,5 @@
 use super::*;
-use crate::ebpf::{EbpfBackend, RoutingPushPhase, mock::MockEbpfBackend};
+use crate::ebpf::{EbpfBackend, PolicyBackend, RoutingPushPhase, mock::MockEbpfBackend};
 use honk_config::types::DialMode;
 use std::collections::HashMap;
 
@@ -122,6 +122,58 @@ fn old_witness_keeps_accepted_generation_across_fences_and_failed_publication() 
             .unwrap_err(),
         "kernel_trace_identity_mismatch"
     );
+}
+
+#[test]
+fn witness_preserves_mark_operation_and_rejects_invalid_encodings() {
+    use crate::observe::flows::record::{EvaluationInput, StepData};
+
+    let (mut backend, _, _, _) = fixture();
+    let (key, id, generation) = captured(&mut backend, 0);
+    for (kind, mark) in [
+        (ROUTING_MARK_KEEP, 0),
+        (ROUTING_MARK_SET, 0),
+        (ROUTING_MARK_SET, u32::MAX),
+        (ROUTING_MARK_KEEP, 1),
+        (2, 0),
+    ] {
+        let output = &mut backend.route_witnesses.get_mut(&id).unwrap().output;
+        output.mark_kind = kind;
+        output.decision.mark = mark;
+        let result = backend.capture_kernel_route(
+            &key,
+            KernelRouteReference {
+                trace_id: id,
+                decision_token: 0,
+                routing_generation: generation,
+                effective_outbound: 0,
+                mark: Some(mark),
+                must: Some(0),
+            },
+        );
+        if kind > ROUTING_MARK_SET || (kind == ROUTING_MARK_KEEP && mark != 0) {
+            assert_eq!(result.unwrap_err(), "kernel_trace_input_mismatch");
+        } else {
+            let capture = result.unwrap();
+            assert_eq!((capture.mark_kind, capture.mark), (kind, mark));
+            let step = StepData::Route {
+                evaluation_id: capture.evaluation_id,
+                chain: "traffic",
+                plane: crate::observe::vocab::Plane::Kernel,
+                rule_id: capture.rule_id,
+                rules: capture.rules,
+                outbound: capture.outbound,
+                must: Some(capture.must),
+                mark_kind: Some(capture.mark_kind),
+                mark: Some(capture.mark),
+                input: Some(EvaluationInput::Traffic(capture.input)),
+                dns_action: None,
+            };
+            let wire = serde_json::to_value(step).unwrap();
+            assert_eq!(wire["data"]["mark_kind"], kind);
+            assert_eq!(wire["data"]["mark"], mark);
+        }
+    }
 }
 
 #[test]
@@ -433,6 +485,7 @@ fn cached_unicode_source_truncation_remains_a_visible_flow_gap() {
             rule_id: capture.rule_id,
             outbound: capture.outbound,
             must: Some(capture.must),
+            mark_kind: Some(capture.mark_kind),
             mark: Some(capture.mark),
             input: Some(EvaluationInput::Traffic(capture.input)),
             rules: capture.rules,

@@ -1,15 +1,29 @@
 //! Immutable first-captured process identity, reclaimed with the socket object.
 
 use crate::ctx::raw_skb;
-use aya_ebpf::programs::TcContext;
-use aya_ebpf_bindings::{
-    bindings::BPF_SK_STORAGE_GET_F_CREATE,
-    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_sk_storage_get},
-};
+use aya_ebpf::programs::{SockAddrContext, SockContext, TcContext};
+use aya_ebpf_bindings::{bindings::BPF_SK_STORAGE_GET_F_CREATE, helpers::bpf_sk_storage_get};
 use core::{ffi::c_void, ptr};
 use honk_ebpf_common::{conn::BpfStatsKey, redirect_need::SocketIdentity};
 
-use crate::maps::{SOCKET_IDENTITY, increment_bpf_stat};
+use crate::maps::{PARAM, SOCKET_IDENTITY, increment_bpf_stat};
+use crate::process_name::{MM_ARG_START_OFFSET, TASK_MM_OFFSET};
+
+#[inline(always)]
+pub(crate) fn capture_sock(ctx: &SockContext, argv0: bool) {
+    unsafe { capture(ctx.sock.cast(), argv0) };
+}
+
+#[inline(always)]
+pub(crate) fn capture_addr(ctx: &SockAddrContext, argv0: bool) {
+    unsafe { capture((*ctx.sock_addr).__bindgen_anon_1.sk.cast(), argv0) };
+}
+
+#[inline(always)]
+pub(crate) fn capture_connect_addr(ctx: &SockAddrContext, argv0: bool) -> i32 {
+    capture_addr(ctx, argv0);
+    1
+}
 
 /// Retain the first complete identity; a failure is counted, never enforced.
 ///
@@ -25,22 +39,15 @@ pub(crate) unsafe fn capture(socket: *mut c_void, argv0: bool) {
         return;
     }
 
-    let mut identity = SocketIdentity {
-        pid: (unsafe { bpf_get_current_pid_tgid() } >> 32) as u32,
-        pname: [0; 16],
+    let Some(mut identity) = crate::process_name::capture(
+        argv0,
+        PARAM.load().has_bpf_get_current_task != 0,
+        TASK_MM_OFFSET.load(),
+        MM_ARG_START_OFFSET.load(),
+    ) else {
+        increment_bpf_stat(BpfStatsKey::SocketIdentityCaptureFailure);
+        return;
     };
-    if !argv0 || !crate::process_name::read_argv0_basename(&mut identity.pname) {
-        let ret = unsafe {
-            bpf_get_current_comm(
-                identity.pname.as_mut_ptr().cast(),
-                identity.pname.len() as u32,
-            )
-        };
-        if ret != 0 {
-            increment_bpf_stat(BpfStatsKey::SocketIdentityCaptureFailure);
-            return;
-        }
-    }
 
     // Publish the entire value at once; never write through the returned pointer.
     let captured = unsafe {

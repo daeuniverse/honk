@@ -5,6 +5,7 @@ pub(super) mod closure;
 mod native_flow_tests;
 
 mod reclamation;
+mod scopes;
 mod score;
 
 fn transport(
@@ -160,10 +161,12 @@ async fn recv_and_ack(
 ) -> Option<EndpointRemoval> {
     let removal = rx.recv().await?;
     assert!(pool.complete_removal(
+        removal.scope,
         removal.client,
         removal.dst,
         removal.owner,
         removal.generation,
+        removal.packet_lineage,
     ));
     Some(removal)
 }
@@ -174,10 +177,12 @@ fn try_recv_and_ack(
 ) -> Result<EndpointRemoval, mpsc::error::TryRecvError> {
     let removal = rx.try_recv()?;
     assert!(pool.complete_removal(
+        removal.scope,
         removal.client,
         removal.dst,
         removal.owner,
         removal.generation,
+        removal.packet_lineage,
     ));
     Ok(removal)
 }
@@ -219,7 +224,7 @@ async fn run_endpoint_driver(
         UdpDriverContext {
             endpoint,
             queue_rx,
-            reply_socket: Arc::new(ReplySocket::untracked(reply_socket)),
+            reply_socket: Arc::new(ReplySocket::untracked(ScopeId::HOST, reply_socket)),
             foreign_replies: ForeignReplySockets::for_one_endpoint(),
             client_addr,
             client_dst,
@@ -232,7 +237,7 @@ async fn run_endpoint_driver(
             first,
             followers: Vec::new(),
         },
-        first_ack,
+        |result| drop(first_ack.send(result)),
     )
     .await
     .result
@@ -412,14 +417,28 @@ fn reserve_driver_packets(
     followers: &[&[u8]],
 ) -> (QueuedDatagram, mpsc::Receiver<QueuedDatagram>) {
     let first_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, first_data, first_permit, stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        first_data,
+        first_permit,
+        stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("driver test must reserve a fresh lease"),
     };
     for follower in followers {
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         assert!(matches!(
-            pool.reserve_or_enqueue(client, dst, follower, slow_permit, stats),
+            pool.reserve_or_enqueue(
+                honk_datapath::ScopeId::HOST,
+                client,
+                dst,
+                follower,
+                slow_permit,
+                stats
+            ),
             EndpointReservation::Enqueued
         ));
     }
@@ -463,17 +482,23 @@ async fn test_reply_socket() -> Arc<UdpSocket> {
 
 #[derive(Debug)]
 struct InjectedReplySocketFactory {
-    sockets: Mutex<std::collections::HashMap<SocketAddr, std::net::UdpSocket>>,
+    sockets: Mutex<std::collections::HashMap<(ScopeId, SocketAddr), std::net::UdpSocket>>,
     created: Mutex<Vec<SocketAddr>>,
 }
 
 impl InjectedReplySocketFactory {
-    fn new(sockets: impl IntoIterator<Item = std::net::UdpSocket>) -> Self {
+    fn new(scope: ScopeId, sockets: impl IntoIterator<Item = std::net::UdpSocket>) -> Self {
+        Self::from_scoped_sockets(sockets.into_iter().map(|socket| (scope, socket)))
+    }
+
+    fn from_scoped_sockets(
+        sockets: impl IntoIterator<Item = (ScopeId, std::net::UdpSocket)>,
+    ) -> Self {
         Self {
             sockets: Mutex::new(
                 sockets
                     .into_iter()
-                    .map(|socket| (socket.local_addr().unwrap(), socket))
+                    .map(|(scope, socket)| ((scope, socket.local_addr().unwrap()), socket))
                     .collect(),
             ),
             created: Mutex::new(Vec::new()),
@@ -486,17 +511,104 @@ impl InjectedReplySocketFactory {
 }
 
 impl UdpReplySocketFactory for InjectedReplySocketFactory {
-    fn create(&self, source: SocketAddr) -> io::Result<UdpSocket> {
-        let socket = self.sockets.lock().remove(&source).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                format!("no injected reply socket for {source}"),
-            )
-        })?;
+    fn create(
+        &self,
+        scope: ScopeId,
+        source: SocketAddr,
+        _packet_source: Option<&SourceWork>,
+    ) -> io::Result<ReplySocketFd> {
+        let socket = self
+            .sockets
+            .lock()
+            .remove(&(scope, source))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    format!("no injected reply socket for {source}"),
+                )
+            })?;
         socket.set_nonblocking(true)?;
         self.created.lock().push(source);
-        UdpSocket::from_std(socket)
+        UdpSocket::from_std(socket).map(ReplySocketFd::Kernel)
     }
+}
+
+#[test]
+fn kernel_reply_factory_rejects_non_host_scope_and_refunds_credit() {
+    let slots = Arc::new(Semaphore::new(1));
+    let Err(error) = ReplySocket::create(
+        &SystemUdpReplySocketFactory,
+        &slots,
+        ScopeId::allocate().unwrap(),
+        make_addr("127.0.0.1", 12345),
+        None,
+    ) else {
+        panic!("kernel factory accepted a foreign scope");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert_eq!(slots.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn foreign_reply_transports_isolate_scopes_under_one_global_cap() {
+    let full = MAX_REPLY_SOCKETS_PER_ENDPOINT;
+    let scopes: Vec<_> = (0..=full).map(|_| ScopeId::allocate().unwrap()).collect();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let source = socket.local_addr().unwrap();
+    let factory = Arc::new(InjectedReplySocketFactory::from_scoped_sockets(
+        scopes
+            .iter()
+            .map(|scope| (*scope, socket.try_clone().unwrap())),
+    ));
+    let pool = UdpEndpointPool::with_reply_socket_factory(1, factory.clone());
+    let primary = pool.create_reply_socket(scopes[0], source, None).unwrap();
+    let foreign = &pool.foreign_replies;
+    let first = foreign.get(scopes[1], source, None).unwrap();
+    let second = foreign.get(scopes[2], source, None).unwrap();
+    assert!(Arc::ptr_eq(
+        &first,
+        &foreign.get(scopes[1], source, None).unwrap()
+    ));
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!((first.scope(), second.scope()), (scopes[1], scopes[2]));
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut buf = [0; 16];
+    for (reply, payload) in [
+        (&first, b"first".as_slice()),
+        (&second, b"second".as_slice()),
+    ] {
+        assert_eq!(
+            reply
+                .send_to(payload, client.local_addr().unwrap())
+                .await
+                .unwrap(),
+            payload.len()
+        );
+        let (n, peer) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((&buf[..n], peer), (payload, source));
+    }
+    drop((first, second));
+    for &scope in &scopes[3..full] {
+        foreign.get(scope, source, None).unwrap();
+    }
+    assert_eq!(foreign.available_slots(), 0);
+    foreign.get(scopes[full], source, None).unwrap();
+    let mut expected: Vec<_> = scopes[1..full]
+        .iter()
+        .map(|scope| (*scope, source))
+        .collect();
+    expected.swap(0, 1);
+    expected.remove(0);
+    expected.push((scopes[full], source));
+    assert_eq!(foreign.cached(), expected);
+    assert_eq!(factory.created().len(), full + 1);
+    assert_eq!(foreign.available_slots(), 0);
+    drop(primary);
+    foreign.clear();
+    assert_eq!(foreign.available_slots(), full);
 }
 
 #[tokio::test]
@@ -508,20 +620,24 @@ async fn reply_socket_credits_cover_retained_teardown_sockets() {
         .iter()
         .map(|socket| socket.local_addr().unwrap())
         .collect();
-    let pool = UdpEndpointPool::with_reply_socket_factory(
-        1,
-        Arc::new(InjectedReplySocketFactory::new(sockets)),
-    );
+    let factory = Arc::new(InjectedReplySocketFactory::new(ScopeId::HOST, sockets));
+    let pool = UdpEndpointPool::with_reply_socket_factory(1, factory.clone());
     let mut retained: Vec<_> = sources[..MAX_REPLY_SOCKETS_PER_ENDPOINT]
         .iter()
-        .map(|source| pool.create_reply_socket(*source).unwrap())
+        .map(|source| {
+            pool.create_reply_socket(ScopeId::HOST, *source, None)
+                .unwrap()
+        })
         .collect();
-    let Err(error) = pool.create_reply_socket(sources[MAX_REPLY_SOCKETS_PER_ENDPOINT]) else {
+    let Err(error) =
+        pool.create_reply_socket(ScopeId::HOST, sources[MAX_REPLY_SOCKETS_PER_ENDPOINT], None)
+    else {
         panic!("reply socket budget admitted a ninth retained descriptor");
     };
     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(factory.created().len(), MAX_REPLY_SOCKETS_PER_ENDPOINT);
     retained.pop();
-    pool.create_reply_socket(sources[MAX_REPLY_SOCKETS_PER_ENDPOINT])
+    pool.create_reply_socket(ScopeId::HOST, sources[MAX_REPLY_SOCKETS_PER_ENDPOINT], None)
         .unwrap();
 }
 
@@ -536,31 +652,41 @@ async fn foreign_reply_sockets_share_reuse_and_yield_to_primaries() {
     // the wrong order fails the lookup instead of quietly passing.
     let pool = UdpEndpointPool::with_reply_socket_factory(
         1,
-        Arc::new(InjectedReplySocketFactory::new(sockets)),
+        Arc::new(InjectedReplySocketFactory::new(ScopeId::HOST, sockets)),
     );
-    let primary = pool.create_reply_socket(sources[0]).unwrap();
+    let primary = pool
+        .create_reply_socket(ScopeId::HOST, sources[0], None)
+        .unwrap();
     let foreign = &pool.foreign_replies;
     assert_eq!(foreign.available_slots(), full - 1);
 
-    let first = foreign.get(sources[1]).unwrap();
-    assert!(Arc::ptr_eq(&first, &foreign.get(sources[1]).unwrap()));
+    let first = foreign.get(ScopeId::HOST, sources[1], None).unwrap();
+    assert!(Arc::ptr_eq(
+        &first,
+        &foreign.get(ScopeId::HOST, sources[1], None).unwrap()
+    ));
     for source in &sources[2..full] {
-        foreign.get(*source).unwrap();
+        foreign.get(ScopeId::HOST, *source, None).unwrap();
     }
-    foreign.get(sources[1]).unwrap();
-    let mut expected = sources[1..full].to_vec();
+    foreign.get(ScopeId::HOST, sources[1], None).unwrap();
+    let mut expected: Vec<_> = sources[1..full]
+        .iter()
+        .map(|source| (ScopeId::HOST, *source))
+        .collect();
     expected.rotate_left(1);
     assert_eq!(foreign.cached(), expected);
 
     // Primary + full cache use every permit: the new peer closes the oldest.
-    foreign.get(sources[full]).unwrap();
+    foreign.get(ScopeId::HOST, sources[full], None).unwrap();
     expected.remove(0);
-    expected.push(sources[full]);
+    expected.push((ScopeId::HOST, sources[full]));
     assert_eq!(foreign.cached(), expected);
     assert_eq!(foreign.available_slots(), 0);
 
     // A primary that finds no permit takes one from the least recent foreign socket.
-    let second_primary = pool.create_reply_socket(sources[full + 1]).unwrap();
+    let second_primary = pool
+        .create_reply_socket(ScopeId::HOST, sources[full + 1], None)
+        .unwrap();
     expected.remove(0);
     assert_eq!(foreign.cached(), expected);
     drop((primary, second_primary));
@@ -579,19 +705,29 @@ async fn foreign_reply_sockets_reclaim_past_a_pinned_victim() {
     let sources: Vec<_> = sockets.iter().map(|s| s.local_addr().unwrap()).collect();
     let pool = UdpEndpointPool::with_reply_socket_factory(
         1,
-        Arc::new(InjectedReplySocketFactory::new(sockets)),
+        Arc::new(InjectedReplySocketFactory::new(ScopeId::HOST, sockets)),
     );
-    let primary = pool.create_reply_socket(sources[0]).unwrap();
+    let primary = pool
+        .create_reply_socket(ScopeId::HOST, sources[0], None)
+        .unwrap();
     let foreign = &pool.foreign_replies;
     // Holding this Arc keeps the least recently used socket's permit occupied
     // even after the cache evicts it, so one eviction cannot admit a primary.
-    let pinned = foreign.get(sources[1]).unwrap();
+    let pinned = foreign.get(ScopeId::HOST, sources[1], None).unwrap();
     for source in &sources[2..full] {
-        foreign.get(*source).unwrap();
+        foreign.get(ScopeId::HOST, *source, None).unwrap();
     }
     assert_eq!(foreign.available_slots(), 0);
-    let second_primary = pool.create_reply_socket(sources[full]).unwrap();
-    assert_eq!(foreign.cached(), sources[3..full].to_vec());
+    let second_primary = pool
+        .create_reply_socket(ScopeId::HOST, sources[full], None)
+        .unwrap();
+    assert_eq!(
+        foreign.cached(),
+        sources[3..full]
+            .iter()
+            .map(|source| (ScopeId::HOST, *source))
+            .collect::<Vec<_>>()
+    );
     drop((primary, second_primary, pinned));
     foreign.clear();
     assert_eq!(foreign.available_slots(), full);
@@ -605,15 +741,15 @@ async fn foreign_reply_sockets_expire_when_a_peer_stops_replying() {
     let sources: Vec<_> = sockets.iter().map(|s| s.local_addr().unwrap()).collect();
     let pool = UdpEndpointPool::with_reply_socket_factory(
         2,
-        Arc::new(InjectedReplySocketFactory::new(sockets)),
+        Arc::new(InjectedReplySocketFactory::new(ScopeId::HOST, sockets)),
     );
     let foreign = &pool.foreign_replies;
-    foreign.get(sources[0]).unwrap();
-    foreign.get(sources[1]).unwrap();
+    foreign.get(ScopeId::HOST, sources[0], None).unwrap();
+    foreign.get(ScopeId::HOST, sources[1], None).unwrap();
     tokio::time::advance(DEFAULT_NAT_TIMEOUT).await;
-    foreign.get(sources[1]).unwrap();
+    foreign.get(ScopeId::HOST, sources[1], None).unwrap();
     assert_eq!(pool.janitor_cycle(), 0);
-    assert_eq!(foreign.cached(), vec![sources[1]]);
+    assert_eq!(foreign.cached(), vec![(ScopeId::HOST, sources[1])]);
     tokio::time::advance(DEFAULT_NAT_TIMEOUT).await;
     assert_eq!(pool.janitor_cycle(), 0);
     assert!(foreign.cached().is_empty());
@@ -635,7 +771,14 @@ fn commit_ready(
     let slow_permit = Arc::new(Semaphore::new(1))
         .try_acquire_owned()
         .expect("test slow permit");
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"test", slow_permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"test",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("expected a new initializer lease"),
     };
@@ -647,9 +790,24 @@ fn commit_ready(
 #[test]
 fn test_endpoint_key() {
     // Key is (client, dst) not (client, relay)
-    let a = EndpointKey::new(make_addr("1.2.3.4", 80), make_addr("5.6.7.8", 443));
-    let b = EndpointKey::new(make_addr("1.2.3.4", 80), make_addr("5.6.7.8", 443));
-    let c = EndpointKey::new(make_addr("1.2.3.5", 80), make_addr("5.6.7.8", 443));
+    let a = EndpointKey::new(
+        honk_datapath::ScopeId::HOST,
+        make_addr("1.2.3.4", 80),
+        make_addr("5.6.7.8", 443),
+        None,
+    );
+    let b = EndpointKey::new(
+        honk_datapath::ScopeId::HOST,
+        make_addr("1.2.3.4", 80),
+        make_addr("5.6.7.8", 443),
+        None,
+    );
+    let c = EndpointKey::new(
+        honk_datapath::ScopeId::HOST,
+        make_addr("1.2.3.5", 80),
+        make_addr("5.6.7.8", 443),
+        None,
+    );
     assert_eq!(a, b);
     assert_ne!(a, c);
 }
@@ -657,12 +815,16 @@ fn test_endpoint_key() {
 #[test]
 fn test_endpoint_key_ipv6() {
     let a = EndpointKey::new(
+        honk_datapath::ScopeId::HOST,
         make_addr("[2001:db8::1]", 8080),
         make_addr("[2001:db8::2]", 9090),
+        None,
     );
     let b = EndpointKey::new(
+        honk_datapath::ScopeId::HOST,
         make_addr("[2001:db8::1]", 8080),
         make_addr("[2001:db8::2]", 9090),
+        None,
     );
     assert_eq!(a, b);
 }
@@ -680,7 +842,10 @@ fn test_pool_get() {
     let pool = UdpEndpointPool::new();
     let client = make_addr("10.0.0.1", 12345);
     let dst = make_addr("8.8.8.8", 53);
-    assert!(pool.get(client, dst).is_none());
+    assert!(
+        pool.get(honk_datapath::ScopeId::HOST, client, dst)
+            .is_none()
+    );
 }
 
 #[test]
@@ -690,12 +855,26 @@ fn udp_init_lease_reserves_one_initializing_incarnation_per_key() {
     let client = make_addr("10.0.0.1", 12345);
     let dst = make_addr("8.8.8.8", 53);
     let first_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let first = pool.reserve_or_enqueue(client, dst, b"first", first_permit, &stats);
+    let first = pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        first_permit,
+        &stats,
+    );
     assert!(matches!(first, EndpointReservation::Initializing(_)));
 
     let follower_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     assert!(matches!(
-        pool.reserve_or_enqueue(client, dst, b"follower", follower_permit, &stats),
+        pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            dst,
+            b"follower",
+            follower_permit,
+            &stats
+        ),
         EndpointReservation::Enqueued
     ));
     assert_eq!(pool.len(), 1);
@@ -710,6 +889,7 @@ fn initializing_raw_dns_owner_and_epoch_must_match_before_enqueue() {
     let expected_epoch = pool.initialization_epoch();
     let permit = || Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     let lease = match pool.reserve_or_enqueue_at(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         b"first",
@@ -726,6 +906,7 @@ fn initializing_raw_dns_owner_and_epoch_must_match_before_enqueue() {
 
     assert!(matches!(
         pool.reserve_or_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             b"wrong group",
@@ -740,6 +921,7 @@ fn initializing_raw_dns_owner_and_epoch_must_match_before_enqueue() {
     ));
     assert!(matches!(
         pool.reserve_or_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             b"ordinary",
@@ -754,6 +936,7 @@ fn initializing_raw_dns_owner_and_epoch_must_match_before_enqueue() {
     ));
     assert!(matches!(
         pool.reserve_or_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             b"same group",
@@ -770,6 +953,7 @@ fn initializing_raw_dns_owner_and_epoch_must_match_before_enqueue() {
     pool.advance_initialization_epoch(false);
     assert!(matches!(
         pool.reserve_or_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             b"crossed reload",
@@ -794,6 +978,7 @@ fn ready_raw_dns_owner_survives_epoch_but_rejects_other_owners() {
     let expected_epoch = pool.initialization_epoch();
     let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     let mut lease = match pool.reserve_or_enqueue_at(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         b"first",
@@ -814,6 +999,7 @@ fn ready_raw_dns_owner_survives_epoch_but_rejects_other_owners() {
 
     assert!(matches!(
         pool.fast_path_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             b"same group",
@@ -825,7 +1011,15 @@ fn ready_raw_dns_owner_survives_epoch_but_rejects_other_owners() {
     ));
     for owner in [None, Some(RawDnsRoute::Group("beta"))] {
         assert!(matches!(
-            pool.fast_path_enqueue_at(client, dst, b"wrong owner", owner, queue_now(), &stats,),
+            pool.fast_path_enqueue_at(
+                honk_datapath::ScopeId::HOST,
+                client,
+                dst,
+                b"wrong owner",
+                owner,
+                queue_now(),
+                &stats,
+            ),
             Some(EndpointReservation::IdentityMismatch)
         ));
     }
@@ -840,6 +1034,7 @@ fn raw_direct_dns_mark_is_part_of_initializing_and_ready_identity() {
     let dst = make_addr("203.0.113.53", 53);
     let permit = || Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     let mut lease = match pool.reserve_or_enqueue_at(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         b"first",
@@ -856,6 +1051,7 @@ fn raw_direct_dns_mark_is_part_of_initializing_and_ready_identity() {
     for owner in [RawDnsRoute::Direct(0x300), RawDnsRoute::Group("direct")] {
         assert!(matches!(
             pool.reserve_or_enqueue_at(
+                honk_datapath::ScopeId::HOST,
                 client,
                 dst,
                 b"wrong mark",
@@ -875,6 +1071,7 @@ fn raw_direct_dns_mark_is_part_of_initializing_and_ready_identity() {
     assert!(lease.commit_ready(endpoint));
     assert!(matches!(
         pool.fast_path_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             b"wrong mark",
@@ -886,6 +1083,7 @@ fn raw_direct_dns_mark_is_part_of_initializing_and_ready_identity() {
     ));
     assert!(matches!(
         pool.fast_path_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             b"same mark",
@@ -904,7 +1102,14 @@ fn udp_init_lease_old_generation_cannot_remove_replacement() {
     let client = make_addr("10.0.0.1", 12345);
     let dst = make_addr("8.8.8.8", 53);
     let first_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let first = match pool.reserve_or_enqueue(client, dst, b"old", first_permit, &stats) {
+    let first = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"old",
+        first_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("first reservation must initialize"),
     };
@@ -914,11 +1119,17 @@ fn udp_init_lease_old_generation_cannot_remove_replacement() {
     drop(first);
 
     let replacement_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let replacement =
-        match pool.reserve_or_enqueue(client, dst, b"replacement", replacement_permit, &stats) {
-            EndpointReservation::Initializing(lease) => lease,
-            _ => panic!("replacement reservation must initialize"),
-        };
+    let replacement = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"replacement",
+        replacement_permit,
+        &stats,
+    ) {
+        EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("replacement reservation must initialize"),
+    };
     pool.retire_if_same(key, old_token, old_generation);
     assert_eq!(pool.len(), 1, "old cleanup must not remove replacement");
     drop(replacement);
@@ -935,11 +1146,19 @@ fn udp_owned_admission_transfers_allocations_and_preserves_identity() {
     let payload = Bytes::from(vec![0x41; 37]);
     let payload_ptr = payload.as_ptr();
     let slow_permit = slow_slots.clone().try_acquire_owned().unwrap();
-    let mut lease =
-        match pool.reserve_owned_or_enqueue(client, dst, payload, 41, None, slow_permit, &stats) {
-            EndpointReservation::Initializing(lease) => lease,
-            _ => panic!("owned first payload must initialize"),
-        };
+    let mut lease = match pool.reserve_owned_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        payload,
+        41,
+        None,
+        slow_permit,
+        &stats,
+    ) {
+        EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("owned first payload must initialize"),
+    };
     assert_eq!(lease.first_payload().as_ptr(), payload_ptr);
     assert_eq!(lease.decision_token(), 41);
     assert_eq!(slow_slots.available_permits(), 0);
@@ -954,6 +1173,7 @@ fn udp_owned_admission_transfers_allocations_and_preserves_identity() {
     let follower_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     assert!(matches!(
         pool.reserve_owned_or_enqueue(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             follower,
@@ -984,8 +1204,10 @@ fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
     let dst = make_addr("8.8.8.8", 443);
     let (removed_tx, mut removed_rx) = mpsc::channel(4);
     pool.set_remove_sink(removed_tx);
+    assert!(!pool.contains(honk_datapath::ScopeId::HOST, client, dst, None));
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     let lease = match pool.reserve_owned_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         Bytes::from_static(b"held"),
@@ -998,10 +1220,19 @@ fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
         _ => panic!("staged payload must initialize"),
     };
     let generation = lease.generation();
-    assert!(pool.retire_staged_identity(client, dst, 77, generation));
+    assert!(
+        pool.contains(honk_datapath::ScopeId::HOST, client, dst, None),
+        "Initializing already owns Endpoint execution"
+    );
+    assert!(pool.retire_staged_identity(honk_datapath::ScopeId::HOST, client, dst, 77, generation));
     assert!(!lease.still_initializing());
+    assert!(
+        pool.contains(honk_datapath::ScopeId::HOST, client, dst, None),
+        "Retiring must not migrate to Core"
+    );
     assert!(matches!(
         pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             b"too-early",
@@ -1011,28 +1242,36 @@ fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
         EndpointReservation::QueueClosed
     ));
     assert!(!pool.complete_removal(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         UdpFlowOwner::new(78, None).unwrap(),
-        generation
+        generation,
+        None,
     ));
     assert!(!pool.complete_removal(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         UdpFlowOwner::new(77, None).unwrap(),
-        generation + 1
+        generation + 1,
+        None,
     ));
     let removal = removed_rx.try_recv().unwrap();
     assert_eq!(removal.owner.token, 77);
     assert_eq!(removal.generation, generation);
     assert!(pool.complete_removal(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         UdpFlowOwner::new(77, None).unwrap(),
-        generation
+        generation,
+        None,
     ));
+    assert!(!pool.contains(honk_datapath::ScopeId::HOST, client, dst, None));
 
     let replacement = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         b"replacement",
@@ -1044,19 +1283,23 @@ fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
     };
     assert_ne!(replacement.generation(), generation);
     assert!(!pool.complete_removal(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         UdpFlowOwner::new(77, None).unwrap(),
-        generation
+        generation,
+        None,
     ));
     assert!(replacement.still_initializing());
     drop(replacement);
     let replacement_removal = removed_rx.try_recv().unwrap();
     assert!(pool.complete_removal(
+        replacement_removal.scope,
         replacement_removal.client,
         replacement_removal.dst,
         replacement_removal.owner,
         replacement_removal.generation,
+        replacement_removal.packet_lineage,
     ));
 }
 
@@ -1071,6 +1314,7 @@ fn udp_kernel_incarnation_survives_ready_and_dirty_retirement() {
     pool.set_remove_sink(tx);
     for (dst, incarnation, ready) in [(first_dst, 41, true), (second_dst, 42, false)] {
         let mut lease = match pool.reserve_or_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             b"first",
@@ -1097,7 +1341,7 @@ fn udp_kernel_incarnation_survives_ready_and_dirty_retirement() {
                     .incarnation(),
                 Some(incarnation)
             );
-            pool.remove(client, dst);
+            pool.remove(honk_datapath::ScopeId::HOST, client, dst);
         }
         drop(lease);
     }
@@ -1105,10 +1349,12 @@ fn udp_kernel_incarnation_survives_ready_and_dirty_retirement() {
     assert_eq!(first.owner.incarnation(), Some(41));
     assert_eq!(first.owner.token, 0);
     assert!(!pool.complete_removal(
+        honk_datapath::ScopeId::HOST,
         client,
         first_dst,
         UdpFlowOwner::new(0, Some(42)).unwrap(),
         first.generation,
+        None,
     ));
     pool.finish_removal(&first, true);
     pool.flush_removal_dirty();
@@ -1130,6 +1376,7 @@ fn stateless_udp_retirement_has_no_kernel_flow_identity() {
         pool.set_remove_sink(tx);
         assert!(matches!(
             pool.reserve_or_enqueue_at(
+                honk_datapath::ScopeId::HOST,
                 client,
                 dst,
                 b"malformed DNS",
@@ -1143,6 +1390,7 @@ fn stateless_udp_retirement_has_no_kernel_flow_identity() {
             EndpointReservation::IdentityMismatch
         ));
         let lease = match pool.reserve_or_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             b"malformed DNS",
@@ -1175,6 +1423,7 @@ fn source53_staged_udp_keeps_token_and_incarnation_proof() {
     pool.set_remove_sink(tx);
     let permit = || Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     let lease = match pool.reserve_owned_or_enqueue_at(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         Bytes::from_static(b"first"),
@@ -1190,6 +1439,7 @@ fn source53_staged_udp_keeps_token_and_incarnation_proof() {
     for (token, incarnation) in [(48, Some(41)), (47, Some(42)), (47, None)] {
         assert!(matches!(
             pool.reserve_owned_or_enqueue_at(
+                honk_datapath::ScopeId::HOST,
                 client,
                 dst,
                 Bytes::from_static(b"foreign"),
@@ -1219,6 +1469,7 @@ fn udp_kernel_handoff_preserves_terminal_identity_until_ack() {
     let (removed_tx, mut removed_rx) = mpsc::channel(1);
     pool.set_remove_sink(removed_tx);
     let mut lease = match pool.reserve_owned_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         Bytes::from_static(b"held"),
@@ -1238,6 +1489,7 @@ fn udp_kernel_handoff_preserves_terminal_identity_until_ack() {
     assert_eq!(removal.generation, generation);
     assert!(matches!(
         pool.reserve_owned_or_enqueue(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             Bytes::from_static(b"late"),
@@ -1248,7 +1500,14 @@ fn udp_kernel_handoff_preserves_terminal_identity_until_ack() {
         ),
         EndpointReservation::QueueClosed
     ));
-    assert!(pool.complete_removal(client, dst, removal.owner, generation));
+    assert!(pool.complete_removal(
+        removal.scope,
+        client,
+        dst,
+        removal.owner,
+        generation,
+        removal.packet_lineage
+    ));
 }
 
 #[tokio::test]
@@ -1260,6 +1519,7 @@ async fn udp_exact_retirement_cancels_matching_initializer() {
     let (removed_tx, mut removed_rx) = mpsc::channel(1);
     pool.set_remove_sink(removed_tx);
     let lease = match pool.reserve_owned_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         Bytes::from_static(b"held"),
@@ -1274,16 +1534,18 @@ async fn udp_exact_retirement_cancels_matching_initializer() {
     let generation = lease.generation();
     let cancellation = lease.wait_cancellation();
 
-    assert!(pool.retire_staged_identity(client, dst, 97, generation));
+    assert!(pool.retire_staged_identity(honk_datapath::ScopeId::HOST, client, dst, 97, generation));
     tokio::time::timeout(Duration::from_millis(100), cancellation)
         .await
         .expect("exact retirement must wake the initializer");
     let removal = removed_rx.try_recv().unwrap();
     assert!(pool.complete_removal(
+        removal.scope,
         removal.client,
         removal.dst,
         removal.owner,
         removal.generation,
+        removal.packet_lineage,
     ));
     drop(lease);
 }
@@ -1296,6 +1558,7 @@ fn udp_live_reconstruction_enqueues_owned_payload_by_token() {
     let dst = make_addr("8.8.8.8", 443);
     let relay = make_addr("192.168.1.1", 1080);
     let mut lease = match pool.reserve_owned_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         Bytes::from_static(b"first"),
@@ -1312,7 +1575,7 @@ fn udp_live_reconstruction_enqueues_owned_payload_by_token() {
     let initializing_payload = Bytes::from(vec![0x44; 19]);
     let initializing_ptr = initializing_payload.as_ptr();
     assert!(matches!(
-        pool.enqueue_owned_by_token(client, dst, initializing_payload, 101, &stats),
+        pool.enqueue_owned_by_token(honk_datapath::ScopeId::HOST, client, dst, initializing_payload, 101, &stats),
         Ok(found) if found == generation
     ));
     let queued = receiver.try_recv().unwrap();
@@ -1324,7 +1587,7 @@ fn udp_live_reconstruction_enqueues_owned_payload_by_token() {
     let payload = Bytes::from(vec![0x55; 23]);
     let payload_ptr = payload.as_ptr();
     assert!(matches!(
-        pool.enqueue_owned_by_token(client, dst, payload, 101, &stats),
+        pool.enqueue_owned_by_token(honk_datapath::ScopeId::HOST, client, dst, payload, 101, &stats),
         Ok(found) if found == generation
     ));
     let queued = receiver.try_recv().unwrap();
@@ -1332,6 +1595,7 @@ fn udp_live_reconstruction_enqueues_owned_payload_by_token() {
     drop(queued);
     assert!(matches!(
         pool.reserve_owned_or_enqueue(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             Bytes::from_static(b"stale"),
@@ -1342,7 +1606,7 @@ fn udp_live_reconstruction_enqueues_owned_payload_by_token() {
         ),
         EndpointReservation::IdentityMismatch
     ));
-    pool.remove(client, dst);
+    pool.remove(honk_datapath::ScopeId::HOST, client, dst);
 }
 
 #[test]
@@ -1352,20 +1616,41 @@ fn udp_fast_path_queue_has_exact_flow_bound_and_drops_newest() {
     let client = make_addr("10.0.0.1", 12345);
     let dst = make_addr("8.8.8.8", 53);
     let first_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let lease = match pool.reserve_or_enqueue(client, dst, b"first", first_permit, &stats) {
+    let lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        first_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("first reservation must initialize"),
     };
     for _ in 0..FLOW_QUEUE_CAPACITY - 1 {
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         assert!(matches!(
-            pool.reserve_or_enqueue(client, dst, b"follower", permit, &stats),
+            pool.reserve_or_enqueue(
+                honk_datapath::ScopeId::HOST,
+                client,
+                dst,
+                b"follower",
+                permit,
+                &stats
+            ),
             EndpointReservation::Enqueued
         ));
     }
     let overflow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     assert!(matches!(
-        pool.reserve_or_enqueue(client, dst, b"newest", overflow_permit, &stats),
+        pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            dst,
+            b"newest",
+            overflow_permit,
+            &stats
+        ),
         EndpointReservation::QueueFull
     ));
     let snapshot = stats.udp_snapshot();
@@ -1382,13 +1667,27 @@ fn udp_fast_path_queue_has_exact_global_payload_bound() {
     let dst = make_addr("8.8.8.8", 53);
     let payload = vec![0x42; GLOBAL_PAYLOAD_CAPACITY];
     let first_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let lease = match pool.reserve_or_enqueue(client, dst, &payload, first_permit, &stats) {
+    let lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        &payload,
+        first_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("global-capacity packet must reserve"),
     };
     let follower_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     assert!(matches!(
-        pool.reserve_or_enqueue(client, dst, b"x", follower_permit, &stats),
+        pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            dst,
+            b"x",
+            follower_permit,
+            &stats
+        ),
         EndpointReservation::QueueFull
     ));
     assert_eq!(stats.udp_snapshot().global_payload_full, 1);
@@ -1402,7 +1701,14 @@ fn udp_fast_path_queue_closed_entry_retires_and_allows_recreation() {
     let client = make_addr("10.0.0.1", 12345);
     let dst = make_addr("8.8.8.8", 53);
     let first_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let lease = match pool.reserve_or_enqueue(client, dst, b"first", first_permit, &stats) {
+    let lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        first_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("closed queue fixture must initialize"),
     };
@@ -1411,16 +1717,28 @@ fn udp_fast_path_queue_closed_entry_retires_and_allows_recreation() {
     // Initializing is a fast-path miss; closed-queue retirement happens on
     // the slow reserve_or_enqueue path, which then creates a replacement.
     assert!(
-        pool.fast_path_enqueue(client, dst, b"after-close", &stats)
-            .is_none(),
+        pool.fast_path_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            dst,
+            b"after-close",
+            &stats
+        )
+        .is_none(),
         "Initializing (even closed) is never a direct fast-path hit"
     );
     let next_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let replacement =
-        match pool.reserve_or_enqueue(client, dst, b"replacement", next_permit, &stats) {
-            EndpointReservation::Initializing(next) => next,
-            _ => panic!("closed queue must allow recreation as Initializing"),
-        };
+    let replacement = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"replacement",
+        next_permit,
+        &stats,
+    ) {
+        EndpointReservation::Initializing(next) => next,
+        _ => panic!("closed queue must allow recreation as Initializing"),
+    };
     // The closed Initializing generation was retired; only the replacement remains.
     // The old lease identity cannot retire the newer generation.
     drop(lease);
@@ -1447,8 +1765,14 @@ async fn udp_init_started_before_cancellation_cannot_publish_after_fence() {
     let reserving_stats = Arc::clone(&stats);
     let reserver = std::thread::spawn(move || {
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-        let result =
-            reserving_pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &reserving_stats);
+        let result = reserving_pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            dst,
+            b"first",
+            slow_permit,
+            &reserving_stats,
+        );
         result_tx.send(result).unwrap();
     });
 
@@ -1491,6 +1815,7 @@ async fn udp_init_lease_registers_cancellation_before_publishing() {
     let reserver = std::thread::spawn(move || {
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let lease = match reserving_pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             b"first",
@@ -1543,7 +1868,14 @@ async fn udp_init_lease_reload_cancellation_drops_slot_before_returning() {
     let client = make_addr("10.0.0.1", 12345);
     let dst = make_addr("8.8.8.8", 53);
     let first_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let lease = match pool.reserve_or_enqueue(client, dst, b"first", first_permit, &stats) {
+    let lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        first_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("first reservation must initialize"),
     };
@@ -1561,7 +1893,14 @@ async fn udp_init_lease_reload_cancellation_drops_slot_before_returning() {
 
     let next_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     assert!(matches!(
-        pool.reserve_or_enqueue(client, dst, b"next", next_permit, &stats),
+        pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            dst,
+            b"next",
+            next_permit,
+            &stats
+        ),
         EndpointReservation::Initializing(_)
     ));
 }
@@ -1573,7 +1912,14 @@ async fn udp_init_lease_cancellation_before_commit_fences_ready_publication() {
     let client = make_addr("10.0.0.1", 12345);
     let dst = make_addr("8.8.8.8", 53);
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("fence fixture must reserve an initializer"),
     };
@@ -1609,7 +1955,14 @@ async fn udp_init_lease_commit_before_cancellation_keeps_ready_endpoint() {
     let client = make_addr("10.0.0.1", 12345);
     let dst = make_addr("8.8.8.8", 53);
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("fence fixture must reserve an initializer"),
     };
@@ -1625,10 +1978,13 @@ async fn udp_init_lease_commit_before_cancellation_keeps_ready_endpoint() {
 
     assert!(pool.cancel_initializers_and_wait().await);
     assert!(
-        Arc::ptr_eq(&pool.get(client, dst).unwrap(), &endpoint),
+        Arc::ptr_eq(
+            &pool.get(honk_datapath::ScopeId::HOST, client, dst).unwrap(),
+            &endpoint
+        ),
         "an ordinary reload only cancels Initializing work"
     );
-    pool.remove(client, dst);
+    pool.remove(honk_datapath::ScopeId::HOST, client, dst);
 }
 
 #[tokio::test]
@@ -1643,11 +1999,17 @@ async fn udp_init_lease_abort_and_panic_release_generation_for_reuse() {
     let abort_stats = Arc::clone(&stats);
     let aborted = tokio::spawn(async move {
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-        let lease =
-            match abort_pool.reserve_or_enqueue(client, dst, b"abort", slow_permit, &abort_stats) {
-                EndpointReservation::Initializing(lease) => lease,
-                _ => panic!("abort test must initialize"),
-            };
+        let lease = match abort_pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            dst,
+            b"abort",
+            slow_permit,
+            &abort_stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("abort test must initialize"),
+        };
         let _lease = lease;
         reserved_tx.send(()).unwrap();
         std::future::pending::<()>().await;
@@ -1661,18 +2023,31 @@ async fn udp_init_lease_abort_and_panic_release_generation_for_reuse() {
     let panic_stats = Arc::clone(&stats);
     let panicked = tokio::spawn(async move {
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-        let _lease =
-            match panic_pool.reserve_or_enqueue(client, dst, b"panic", slow_permit, &panic_stats) {
-                EndpointReservation::Initializing(lease) => lease,
-                _ => panic!("panic test must initialize"),
-            };
+        let _lease = match panic_pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            dst,
+            b"panic",
+            slow_permit,
+            &panic_stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("panic test must initialize"),
+        };
         panic!("intentional initializer panic");
     });
     assert!(panicked.await.unwrap_err().is_panic());
     assert!(pool.is_empty(), "panicked initializer must drop its lease");
 
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let next = pool.reserve_or_enqueue(client, dst, b"next", slow_permit, &stats);
+    let next = pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"next",
+        slow_permit,
+        &stats,
+    );
     assert!(matches!(next, EndpointReservation::Initializing(_)));
 }
 
@@ -1692,7 +2067,14 @@ async fn udp_ready_endpoint_survives_ordinary_reload_cancellation() {
         [DriverReceiveAction::Pending],
     ));
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("reload-ready fixture must initialize"),
     };
@@ -1703,6 +2085,7 @@ async fn udp_ready_endpoint_survives_ordinary_reload_cancellation() {
     ));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         lease.generation(),
@@ -1722,14 +2105,24 @@ async fn udp_ready_endpoint_survives_ordinary_reload_cancellation() {
 
     assert!(pool.cancel_initializers_and_wait().await);
     assert!(
-        Arc::ptr_eq(&pool.get(client, dst).unwrap(), &endpoint),
+        Arc::ptr_eq(
+            &pool.get(honk_datapath::ScopeId::HOST, client, dst).unwrap(),
+            &endpoint
+        ),
         "ordinary reload cancels Initializing work only"
     );
 
     // Post-reload: steady packet must still enqueue and reach transport.
     let follower_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     assert!(matches!(
-        pool.reserve_or_enqueue(client, dst, b"after-reload", follower_permit, &stats),
+        pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            dst,
+            b"after-reload",
+            follower_permit,
+            &stats
+        ),
         EndpointReservation::Enqueued
     ));
     transport.wait_for_send_count(2).await;
@@ -1738,7 +2131,7 @@ async fn udp_ready_endpoint_survives_ordinary_reload_cancellation() {
         vec![b"first".to_vec(), b"after-reload".to_vec()]
     );
 
-    pool.remove(client, dst);
+    pool.remove(honk_datapath::ScopeId::HOST, client, dst);
     tokio::task::yield_now().await;
     assert!(pool.is_empty());
 }
@@ -1763,7 +2156,14 @@ async fn local_reply_failures_do_not_become_upstream_failures() {
         let pool = Arc::new(UdpEndpointPool::new());
         let stats = Arc::new(StatsManager::new());
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-        let mut lease = match pool.reserve_or_enqueue(client, relay, b"request", permit, &stats) {
+        let mut lease = match pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            relay,
+            b"request",
+            permit,
+            &stats,
+        ) {
             EndpointReservation::Initializing(lease) => lease,
             _ => panic!("local reply fixture must initialize"),
         };
@@ -1775,7 +2175,10 @@ async fn local_reply_failures_do_not_become_upstream_failures() {
                 UdpDriverContext {
                     endpoint: Arc::clone(&endpoint),
                     queue_rx: lease.take_queue_receiver().unwrap(),
-                    reply_socket: Arc::new(ReplySocket::untracked(test_reply_socket().await)),
+                    reply_socket: Arc::new(ReplySocket::untracked(
+                        ScopeId::HOST,
+                        test_reply_socket().await,
+                    )),
                     foreign_replies: ForeignReplySockets::for_one_endpoint(),
                     client_addr: client,
                     client_dst: relay,
@@ -1789,7 +2192,7 @@ async fn local_reply_failures_do_not_become_upstream_failures() {
                     first: lease.take_first().unwrap(),
                     followers: Vec::new(),
                 },
-                first_ack,
+                |result| drop(first_ack.send(result)),
             ),
         )
         .await
@@ -1826,10 +2229,10 @@ async fn udp_endpoint_reply_sources_follow_target_policy() {
         ))
         .unwrap();
         let source_b = source_socket_b.local_addr().unwrap();
-        let factory = Arc::new(InjectedReplySocketFactory::new([
-            source_socket_a,
-            source_socket_b,
-        ]));
+        let factory = Arc::new(InjectedReplySocketFactory::new(
+            ScopeId::HOST,
+            [source_socket_a, source_socket_b],
+        ));
         let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
             1,
             factory.clone(),
@@ -1884,14 +2287,24 @@ async fn udp_endpoint_reply_sources_follow_target_policy() {
         };
         endpoint.record_pending_reply_peer(source_a);
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-        let mut lease =
-            match pool.reserve_or_enqueue(client, source_a, b"request", slow_permit, &stats) {
-                EndpointReservation::Initializing(lease) => lease,
-                _ => panic!("reply-source fixture must initialize"),
-            };
+        let mut lease = match pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            source_a,
+            b"request",
+            slow_permit,
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("reply-source fixture must initialize"),
+        };
         let queue_rx = lease.take_queue_receiver().unwrap();
-        let reply_socket = Arc::new(pool.create_reply_socket(source_a).unwrap());
+        let reply_socket = Arc::new(
+            pool.create_reply_socket(lease.scope(), source_a, None)
+                .unwrap(),
+        );
         let mut driver = pool.spawn_driver(
+            honk_datapath::ScopeId::HOST,
             client,
             source_a,
             lease.generation(),
@@ -1943,6 +2356,7 @@ async fn udp_endpoint_serves_more_foreign_peers_than_it_caches_sockets_for() {
         .map(|socket| socket.local_addr().unwrap())
         .collect();
     let factory = Arc::new(InjectedReplySocketFactory::new(
+        ScopeId::HOST,
         std::iter::once(primary_socket).chain(foreign_sockets),
     ));
     let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
@@ -2001,13 +2415,24 @@ async fn start_ordinary_flow(
     let endpoint = driver_test_endpoint(transport, primary);
     endpoint.record_pending_reply_peer(primary);
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, primary, b"request", slow_permit, stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        primary,
+        b"request",
+        slow_permit,
+        stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("reply-source fixture must initialize"),
     };
     let queue_rx = lease.take_queue_receiver().unwrap();
-    let reply_socket = Arc::new(pool.create_reply_socket(primary).unwrap());
+    let reply_socket = Arc::new(
+        pool.create_reply_socket(lease.scope(), primary, None)
+            .unwrap(),
+    );
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client,
         primary,
         lease.generation(),
@@ -2040,6 +2465,7 @@ async fn udp_endpoints_share_one_reply_socket_per_foreign_peer() {
     let foreign_socket = std::net::UdpSocket::bind("127.0.0.4:0").unwrap();
     let foreign = foreign_socket.local_addr().unwrap();
     let factory = Arc::new(InjectedReplySocketFactory::new(
+        ScopeId::HOST,
         primary_sockets.into_iter().chain([foreign_socket]),
     ));
     let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
@@ -2509,15 +2935,23 @@ async fn udp_endpoint_driver_reply_idle_timeout_cleans_up_once() {
     let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
     pool.set_remove_sink(removed_tx);
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("idle fixture must initialize"),
     };
     let transport = Arc::new(ScriptedPacketTransport::new(relay, [DriverSendAction::Ok]));
     let endpoint = driver_test_endpoint(transport, relay);
-    endpoint.set_tracker("idle-tracker".to_owned());
+    endpoint.set_tracker(uuid::Uuid::from_u128(1));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         lease.generation(),
@@ -2539,11 +2973,13 @@ async fn udp_endpoint_driver_reply_idle_timeout_cleans_up_once() {
     assert_eq!(
         recv_and_ack(&pool, &mut removed_rx).await,
         Some(EndpointRemoval {
+            scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("idle-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(1)),
             reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
@@ -2576,7 +3012,14 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
     let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
     pool.set_remove_sink(removed_tx);
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("shutdown fixture must initialize"),
     };
@@ -2589,9 +3032,10 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
         [DriverReceiveAction::Pending],
     ));
     let endpoint = driver_test_endpoint(transport, relay);
-    endpoint.set_tracker("shutdown-tracker".to_owned());
+    endpoint.set_tracker(uuid::Uuid::from_u128(2));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         lease.generation(),
@@ -2639,11 +3083,13 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
     assert_eq!(
         removal,
         Some(EndpointRemoval {
+            scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("shutdown-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(2)),
             reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
@@ -2653,10 +3099,17 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
         GLOBAL_PAYLOAD_CAPACITY
     );
     assert!(matches!(
-        pool.fast_path_enqueue(client, dst, b"late-fast", &stats),
+        pool.fast_path_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            dst,
+            b"late-fast",
+            &stats
+        ),
         Some(EndpointReservation::QueueClosed)
     ));
     let rejected = pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         b"late",
@@ -2676,7 +3129,14 @@ async fn udp_endpoint_pool_shutdown_aborts_stuck_initializer_task() {
     let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
     pool.set_remove_sink(removed_tx);
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"held", slow_permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"held",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("stuck initializer fixture must initialize"),
     };
@@ -2709,6 +3169,8 @@ async fn udp_endpoint_pool_shutdown_aborts_stuck_initializer_task() {
     assert_eq!(
         removal,
         Some(EndpointRemoval {
+            scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -2758,15 +3220,23 @@ async fn udp_endpoint_driver_receive_and_reply_errors_clean_up() {
         let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
         pool.set_remove_sink(removed_tx);
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-        let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
+        let mut lease = match pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            dst,
+            b"first",
+            slow_permit,
+            &stats,
+        ) {
             EndpointReservation::Initializing(lease) => lease,
             _ => panic!("receive-error fixture must initialize"),
         };
         let endpoint = driver_test_endpoint(transport, relay);
         endpoint.record_pending_reply_peer(relay);
-        endpoint.set_tracker("receive-tracker".to_owned());
+        endpoint.set_tracker(uuid::Uuid::from_u128(3));
         let queue_rx = lease.take_queue_receiver().unwrap();
         let mut driver = pool.spawn_driver(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             lease.generation(),
@@ -2786,11 +3256,13 @@ async fn udp_endpoint_driver_receive_and_reply_errors_clean_up() {
         assert_eq!(
             recv_and_ack(&pool, &mut removed_rx).await,
             Some(EndpointRemoval {
+                scope: ScopeId::HOST,
+                packet_lineage: None,
                 client,
                 dst,
                 owner: UdpFlowOwner::new(0, None).unwrap(),
                 generation: 1,
-                conn_id: Some("receive-tracker".to_owned()),
+                conn_id: Some(uuid::Uuid::from_u128(3)),
                 reason: RemovalReason::RawDnsEndpointRetired,
             })
         );
@@ -2824,14 +3296,28 @@ async fn udp_endpoint_receive_failure_cancels_blocked_steady_send_and_releases_p
     pool.set_remove_sink(removed_tx);
     let receive_failure = Arc::new(tokio::sync::Notify::new());
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("blocked-send fixture must initialize"),
     };
     for data in [b"steady".as_slice(), b"queued".as_slice()] {
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         assert!(matches!(
-            pool.reserve_or_enqueue(client, dst, data, permit, &stats),
+            pool.reserve_or_enqueue(
+                honk_datapath::ScopeId::HOST,
+                client,
+                dst,
+                data,
+                permit,
+                &stats
+            ),
             EndpointReservation::Enqueued
         ));
     }
@@ -2843,9 +3329,10 @@ async fn udp_endpoint_receive_failure_cancels_blocked_steady_send_and_releases_p
         ))],
     ));
     let endpoint = driver_test_endpoint(Arc::clone(&transport), relay);
-    endpoint.set_tracker("blocked-receive-tracker".to_owned());
+    endpoint.set_tracker(uuid::Uuid::from_u128(4));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         lease.generation(),
@@ -2867,11 +3354,13 @@ async fn udp_endpoint_receive_failure_cancels_blocked_steady_send_and_releases_p
     assert_eq!(
         recv_and_ack(&pool, &mut removed_rx).await,
         Some(EndpointRemoval {
+            scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("blocked-receive-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(4)),
             reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
@@ -2966,14 +3455,28 @@ async fn udp_driver_scores_transport_failure_before_synchronous_node_retirement(
         }
 
         let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-        let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
+        let mut lease = match pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            dst,
+            b"first",
+            slow_permit,
+            &stats,
+        ) {
             EndpointReservation::Initializing(lease) => lease,
             _ => panic!("score retirement fixture must initialize"),
         };
         if failure_at != "first" {
             let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
             assert!(matches!(
-                pool.reserve_or_enqueue(client, dst, b"follower", permit, &stats),
+                pool.reserve_or_enqueue(
+                    honk_datapath::ScopeId::HOST,
+                    client,
+                    dst,
+                    b"follower",
+                    permit,
+                    &stats
+                ),
                 EndpointReservation::Enqueued
             ));
         }
@@ -2984,6 +3487,7 @@ async fn udp_driver_scores_transport_failure_before_synchronous_node_retirement(
             Vec::new()
         };
         let mut driver = pool.spawn_driver(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             lease.generation(),
@@ -3037,7 +3541,14 @@ async fn udp_endpoint_worker_failure_removes_tracker_once() {
     let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
     pool.set_remove_sink(removed_tx);
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("worker cleanup test must initialize"),
     };
@@ -3046,9 +3557,10 @@ async fn udp_endpoint_worker_failure_removes_tracker_once() {
         [DriverSendAction::Error],
     ));
     let endpoint = driver_test_endpoint(transport, relay);
-    endpoint.set_tracker("worker-tracker".to_owned());
+    endpoint.set_tracker(uuid::Uuid::from_u128(5));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         lease.generation(),
@@ -3070,11 +3582,13 @@ async fn udp_endpoint_worker_failure_removes_tracker_once() {
             .await
             .unwrap(),
         Some(EndpointRemoval {
+            scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("worker-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(5)),
             reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
@@ -3096,7 +3610,14 @@ async fn udp_endpoint_driver_panic_releases_all_resources_exactly_once() {
     let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
     pool.set_remove_sink(removed_tx);
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"panic", slow_permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"panic",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("panic fixture must initialize"),
     };
@@ -3108,9 +3629,10 @@ async fn udp_endpoint_driver_panic_releases_all_resources_exactly_once() {
         [DriverSendAction::Panic],
     ));
     let endpoint = driver_test_endpoint(transport, relay);
-    endpoint.set_tracker("panic-tracker".to_owned());
+    endpoint.set_tracker(uuid::Uuid::from_u128(6));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         lease.generation(),
@@ -3133,11 +3655,13 @@ async fn udp_endpoint_driver_panic_releases_all_resources_exactly_once() {
             .await
             .expect("panic cleanup must notify the removal sink"),
         Some(EndpointRemoval {
+            scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("panic-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(6)),
             reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
@@ -3169,7 +3693,14 @@ async fn udp_endpoint_driver_abort_releases_ready_mapping_and_allows_reuse() {
     let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
     pool.set_remove_sink(removed_tx);
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"abort", slow_permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"abort",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("abort fixture must initialize"),
     };
@@ -3178,9 +3709,10 @@ async fn udp_endpoint_driver_abort_releases_ready_mapping_and_allows_reuse() {
     );
     let transport = Arc::new(ScriptedPacketTransport::new(relay, [DriverSendAction::Ok]));
     let endpoint = driver_test_endpoint(transport, relay);
-    endpoint.set_tracker("abort-tracker".to_owned());
+    endpoint.set_tracker(uuid::Uuid::from_u128(7));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         lease.generation(),
@@ -3204,11 +3736,13 @@ async fn udp_endpoint_driver_abort_releases_ready_mapping_and_allows_reuse() {
             .await
             .expect("aborted driver must notify the removal sink"),
         Some(EndpointRemoval {
+            scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("abort-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(7)),
             reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
@@ -3222,11 +3756,17 @@ async fn udp_endpoint_driver_abort_releases_ready_mapping_and_allows_reuse() {
     );
 
     let replacement_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let replacement =
-        match pool.reserve_or_enqueue(client, dst, b"replacement", replacement_permit, &stats) {
-            EndpointReservation::Initializing(lease) => lease,
-            _ => panic!("abort cleanup must release capacity for a new generation"),
-        };
+    let replacement = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"replacement",
+        replacement_permit,
+        &stats,
+    ) {
+        EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("abort cleanup must release capacity for a new generation"),
+    };
     assert!(replacement.still_initializing());
     assert_eq!(
         pool.len(),
@@ -3247,7 +3787,14 @@ async fn udp_endpoint_worker_old_generation_cannot_remove_replacement() {
     pool.set_remove_sink(removed_tx);
     let release = Arc::new(tokio::sync::Notify::new());
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut old_lease = match pool.reserve_or_enqueue(client, dst, b"old", slow_permit, &stats) {
+    let mut old_lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"old",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("old worker must initialize"),
     };
@@ -3256,9 +3803,10 @@ async fn udp_endpoint_worker_old_generation_cannot_remove_replacement() {
         [DriverSendAction::WaitThenError(Arc::clone(&release))],
     ));
     let old_endpoint = driver_test_endpoint(old_transport.clone(), relay);
-    old_endpoint.set_tracker("old-tracker".to_owned());
+    old_endpoint.set_tracker(uuid::Uuid::from_u128(8));
     let old_queue_rx = old_lease.take_queue_receiver().unwrap();
     let mut old_driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         old_lease.generation(),
@@ -3275,21 +3823,29 @@ async fn udp_endpoint_worker_old_generation_cannot_remove_replacement() {
     old_driver.start(old_lease.take_first().unwrap()).unwrap();
     old_transport.wait_for_send_count(1).await;
 
-    pool.remove(client, dst);
+    pool.remove(honk_datapath::ScopeId::HOST, client, dst);
     assert_eq!(
         try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
         EndpointRemoval {
+            scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("old-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(8)),
             reason: RemovalReason::RawDnsEndpointRetired,
         }
     );
     let replacement_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let replacement =
-        pool.reserve_or_enqueue(client, dst, b"replacement", replacement_permit, &stats);
+    let replacement = pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"replacement",
+        replacement_permit,
+        &stats,
+    );
     assert!(matches!(replacement, EndpointReservation::Initializing(_)));
 
     release.notify_waiters();
@@ -3316,7 +3872,14 @@ async fn udp_endpoint_node_death_before_dial_sends_nothing() {
     let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
     pool.set_remove_sink(removed_tx);
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("death-before-dial fixture must initialize"),
     };
@@ -3332,6 +3895,8 @@ async fn udp_endpoint_node_death_before_dial_sends_nothing() {
     assert_eq!(
         try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
         EndpointRemoval {
+            scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -3358,11 +3923,17 @@ async fn udp_endpoint_node_death_before_dial_sends_nothing() {
 
     // A newer generation must not be deleted by the old lease Drop.
     let replacement_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let replacement =
-        match pool.reserve_or_enqueue(client, dst, b"next", replacement_permit, &stats) {
-            EndpointReservation::Initializing(lease) => lease,
-            _ => panic!("replacement must initialize"),
-        };
+    let replacement = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"next",
+        replacement_permit,
+        &stats,
+    ) {
+        EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("replacement must initialize"),
+    };
     assert_ne!(replacement.generation(), generation);
     assert!(replacement.still_initializing());
     drop(replacement);
@@ -3377,7 +3948,14 @@ async fn udp_endpoint_node_death_during_dial_sends_nothing() {
     let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
     pool.set_remove_sink(removed_tx);
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("death-during-dial fixture must initialize"),
     };
@@ -3388,6 +3966,8 @@ async fn udp_endpoint_node_death_during_dial_sends_nothing() {
     assert_eq!(
         try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
         EndpointRemoval {
+            scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -3426,7 +4006,14 @@ async fn udp_endpoint_node_death_before_commit_sends_nothing() {
     let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
     pool.set_remove_sink(removed_tx);
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("death-before-commit fixture must initialize"),
     };
@@ -3439,6 +4026,7 @@ async fn udp_endpoint_node_death_before_commit_sends_nothing() {
     ));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         lease.generation(),
@@ -3458,6 +4046,8 @@ async fn udp_endpoint_node_death_before_commit_sends_nothing() {
     assert_eq!(
         try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
         EndpointRemoval {
+            scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -3493,16 +4083,24 @@ async fn udp_endpoint_node_death_before_driver_start_sends_nothing() {
     let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
     pool.set_remove_sink(removed_tx);
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", slow_permit, &stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("node-death fixture must initialize"),
     };
     let transport = Arc::new(ScriptedPacketTransport::new(relay, [DriverSendAction::Ok]));
     let proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport> = transport.clone();
     let endpoint = Arc::new(UdpEndpoint::new(proxy_socket, relay, DEAD_NODE_ID));
-    endpoint.set_tracker("dead-before-start".to_owned());
+    endpoint.set_tracker(uuid::Uuid::from_u128(9));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         lease.generation(),
@@ -3521,18 +4119,26 @@ async fn udp_endpoint_node_death_before_driver_start_sends_nothing() {
     assert_eq!(
         try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
         EndpointRemoval {
+            scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("dead-before-start".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(9)),
             reason: RemovalReason::RawDnsEndpointRetired,
         }
     );
     assert!(pool.is_empty(), "acknowledged node death must remove Ready");
     let replacement_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let replacement =
-        pool.reserve_or_enqueue(client, dst, b"replacement", replacement_permit, &stats);
+    let replacement = pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"replacement",
+        replacement_permit,
+        &stats,
+    );
     assert!(matches!(replacement, EndpointReservation::Initializing(_)));
 
     driver.start(lease.take_first().unwrap()).unwrap();
@@ -3584,6 +4190,7 @@ fn test_remove_by_node() {
     );
     let init_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     let initializing = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         make_addr("10.0.0.3", 12345),
         dst,
         b"init",
@@ -3597,8 +4204,22 @@ fn test_remove_by_node() {
     assert_eq!(pool.len(), 3);
     pool.remove_by_node(DEAD_NODE_ID);
     assert_eq!(pool.len(), 2);
-    assert!(pool.get(make_addr("10.0.0.1", 12345), dst).is_none());
-    assert!(pool.get(make_addr("10.0.0.2", 12345), dst).is_some());
+    assert!(
+        pool.get(
+            honk_datapath::ScopeId::HOST,
+            make_addr("10.0.0.1", 12345),
+            dst
+        )
+        .is_none()
+    );
+    assert!(
+        pool.get(
+            honk_datapath::ScopeId::HOST,
+            make_addr("10.0.0.2", 12345),
+            dst
+        )
+        .is_some()
+    );
     assert!(initializing.still_initializing());
 
     assert!(initializing.bind_selected(DEAD_NODE_ID, None));
@@ -3628,17 +4249,19 @@ async fn udp_endpoint_node_and_janitor_cleanup_notify_tracker_once() {
         relay,
         DEAD_NODE_ID,
     );
-    node_endpoint.set_tracker("node-tracker".to_owned());
+    node_endpoint.set_tracker(uuid::Uuid::from_u128(10));
 
     pool.remove_by_node(DEAD_NODE_ID);
     assert_eq!(
         try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
         EndpointRemoval {
+            scope: ScopeId::HOST,
+            packet_lineage: None,
             client: node_client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("node-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(10)),
             reason: RemovalReason::RawDnsEndpointRetired,
         }
     );
@@ -3652,7 +4275,7 @@ async fn udp_endpoint_node_and_janitor_cleanup_notify_tracker_once() {
         relay,
         JANITOR_NODE_ID,
     );
-    janitor_endpoint.set_tracker("janitor-tracker".to_owned());
+    janitor_endpoint.set_tracker(uuid::Uuid::from_u128(11));
     janitor_endpoint.release();
     janitor_endpoint
         .expires_at
@@ -3662,11 +4285,13 @@ async fn udp_endpoint_node_and_janitor_cleanup_notify_tracker_once() {
     assert_eq!(
         try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
         EndpointRemoval {
+            scope: ScopeId::HOST,
+            packet_lineage: None,
             client: janitor_client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 2,
-            conn_id: Some("janitor-tracker".to_owned()),
+            conn_id: Some(uuid::Uuid::from_u128(11)),
             reason: RemovalReason::RawDnsEndpointRetired,
         }
     );

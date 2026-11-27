@@ -2,6 +2,7 @@
 
 mod fields;
 pub(super) mod options;
+mod wireguard;
 mod xhttp;
 
 use honk_config::node::{Node, OutboundConfig};
@@ -375,6 +376,7 @@ fn apply_protocol(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str
             config.idle_session_timeout =
                 yaml_duration_alias(mapping, &["idle-session-timeout", "idle_session_timeout"])?;
         }
+        OutboundConfig::WireGuard(_) => unreachable!("WireGuard has a dedicated record adapter"),
         OutboundConfig::Direct | OutboundConfig::Block | OutboundConfig::Chain(_) => {
             unreachable!()
         }
@@ -687,6 +689,12 @@ pub(super) fn parse_clash_proxy(
     tuic_default_alpn: Option<&str>,
 ) -> Result<Node, (Option<&'static str>, &'static str)> {
     let entry_error = |message| (None, message);
+    if yaml_value(mapping, "type")
+        .and_then(serde_yaml::Value::as_str)
+        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("wireguard"))
+    {
+        return wireguard::parse(mapping, subscription_id).map_err(entry_error);
+    }
     let ProxySource {
         protocol,
         name,

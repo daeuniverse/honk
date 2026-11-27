@@ -83,7 +83,7 @@ fn routing_rule(name: &str, address: SocketAddr) -> RoutingRule {
         outbound: RoutingOutbound::Simple(name.into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }
 }
 
@@ -105,10 +105,14 @@ async fn initialize(handle: &ControlPlaneHandle, client: SocketAddr, target: Soc
     let permit = Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()
         .unwrap();
-    let reservation =
-        handle
-            .udp_pool
-            .reserve_or_enqueue(client, target, BUSINESS_REQUEST, permit, &handle.stats);
+    let reservation = handle.udp_pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        target,
+        BUSINESS_REQUEST,
+        permit,
+        &handle.stats,
+    );
     let EndpointReservation::Initializing(lease) = reservation else {
         panic!("expected a fresh UDP initializer");
     };
@@ -129,7 +133,13 @@ async fn business(handle: &ControlPlaneHandle, origin: &UdpSocket) {
     );
     let (len, _) = client.recv_from(&mut buffer).await.unwrap();
     assert_eq!(&buffer[..len], BUSINESS_REPLY);
-    assert!(handle.udp_pool.get(src, dst).unwrap().has_reply());
+    assert!(
+        handle
+            .udp_pool
+            .get(honk_datapath::ScopeId::HOST, src, dst)
+            .unwrap()
+            .has_reply()
+    );
 }
 
 async fn slot(plane: &ControlPlane, group: &str, family: IpVersion) -> bool {
@@ -348,7 +358,7 @@ async fn check_recovery(response: Recovery) {
     // Drive the real publisher from health notifications, without starting the
     // listener epoch. Slot writes still come from the admitted routing plan.
     let publisher = Arc::new(OutboundHealthPublisher::new(
-        plane.ebpf_handle(),
+        plane.policy_backend_handle(),
         plane.config_handle(),
         Arc::clone(&plane.active_routing_plan),
         plane.group_manager(),
@@ -397,7 +407,12 @@ async fn check_recovery(response: Recovery) {
         let client = loopback_udp().await;
         let src = client.local_addr().unwrap();
         initialize(&handle, src, targets[1]).await;
-        assert!(handle.udp_pool.get(src, targets[1]).is_none());
+        assert!(
+            handle
+                .udp_pool
+                .get(honk_datapath::ScopeId::HOST, src, targets[1])
+                .is_none()
+        );
         assert_eq!(a_peer.count(), strike + usize::from(delayed.is_some()));
         assert_eq!(b_peer.count(), 0);
         assert_eq!(exit_peer.count(), 0);

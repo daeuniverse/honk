@@ -15,6 +15,10 @@ pub(super) struct PreparedEndpoint {
     pub(super) attempt: Option<super::super::observation::ConnectionAttempt>,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "keep source preparation inline without a per-attempt allocation"
+)]
 pub(super) enum PreparedEndpointTransport {
     Flow(honk_outbound::proxy::PreparedUdpTransport),
     Source(crate::control::udp_endpoint::SourcePreparation),
@@ -71,6 +75,8 @@ impl ControlPlaneHandle {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn prepare_udp_candidates(
         &self,
+        scope: honk_datapath::ScopeId,
+        packet_source: Option<crate::control::netstack::SourceWork>,
         plan: ResolvedScorePlan,
         mark: Option<honk_outbound::proxy::DirectMark>,
         client_addr: SocketAddr,
@@ -113,7 +119,12 @@ impl ControlPlaneHandle {
             let manager = Arc::clone(selection_manager);
             let target_domain = target_domain.clone();
             #[cfg(feature = "native-api")]
-            let native = observation.shared();
+            let native = observation.shared(
+                packet_source
+                    .as_ref()
+                    .map(|source| source.memory_budget())
+                    .or(udp_pool.packet_memory_budget()),
+            )?;
             Arc::new(move |_, (index, target)| {
                 let registry = registry.clone();
                 let stats = stats.clone();
@@ -125,6 +136,20 @@ impl ControlPlaneHandle {
                 let udp_pool = Arc::clone(&udp_pool);
                 let alive_set = Arc::clone(&alive_set);
                 let target_domain = target_domain.clone();
+                // A composed route has no source keyed by its hop runtimes.
+                let path = target
+                    .route()
+                    .is_none()
+                    .then(|| {
+                        source_path(
+                            &registry,
+                            &runtime_generation,
+                            &target.node,
+                            original_dst.port(),
+                        )
+                    })
+                    .flatten();
+                let packet_source = path.and_then(|_| packet_source.clone());
                 #[cfg(feature = "native-api")]
                 let native = native.clone();
                 Box::pin(async move {
@@ -153,7 +178,7 @@ impl ControlPlaneHandle {
                     }
                     .map(Arc::new);
                     #[cfg(feature = "native-api")]
-                    let mut native_attempt = native.as_ref().and_then(|observation| {
+                    let mut native_attempt = native.as_ref().map(|observation| {
                         observation.attempt(&selection_chain, &target, target_domain.as_deref())
                     });
                     let reporter = feedback
@@ -235,21 +260,7 @@ impl ControlPlaneHandle {
                                 return Err(PacketRejection::Policy.into());
                             }
                         }
-                        // A route dials over hop runtimes no source is keyed
-                        // by, so it never shares one.
-                        if let Some(path) = target
-                            .route()
-                            .is_none()
-                            .then(|| {
-                                source_path(
-                                    &registry,
-                                    &runtime_generation,
-                                    node,
-                                    original_dst.port(),
-                                )
-                            })
-                            .flatten()
-                        {
+                        if let Some(path) = path {
                             let runtime = runtime_generation.get(&node.id).ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "node {} is not in the captured runtime generation",
@@ -270,6 +281,7 @@ impl ControlPlaneHandle {
                                 };
                             udp_pool
                                 .prepare_source(
+                                    scope,
                                     &registry,
                                     Arc::clone(&runtime_generation),
                                     runtime,
@@ -283,6 +295,7 @@ impl ControlPlaneHandle {
                                     Arc::clone(&stats),
                                     scheduler_ipver,
                                     plan_mode == SelectionPlanMode::ColdUrlTest,
+                                    packet_source,
                                 )
                                 .await
                                 .map(|source| {

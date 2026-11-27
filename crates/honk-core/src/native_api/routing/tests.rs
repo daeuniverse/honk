@@ -11,7 +11,7 @@ fn rule(condition: RoutingCondition, outbound: &str, priority: u32) -> ConfigRul
         outbound: RoutingOutbound::Simple(outbound.into()),
         priority,
         must: false,
-        mark: 0,
+        mark: None,
     }
 }
 
@@ -595,7 +595,7 @@ fn observed_route_uses_authoritative_domain_bitmap_and_preserves_action() {
         1,
     );
     negative.must = true;
-    negative.mark = 42;
+    negative.mark = Some(42);
     let router = Router::new(&[positive, negative], "fallback").unwrap();
     let mut conn = connection();
     conn.domain = Some("example.test".into());
@@ -606,10 +606,7 @@ fn observed_route_uses_authoritative_domain_bitmap_and_preserves_action() {
         (
             matched.action.outbound.as_str(),
             matched.action.must,
-            matched
-                .action
-                .mark
-                .map_or(0, honk_outbound::proxy::DirectMark::get)
+            matched.action.mark.unwrap_or(0)
         ),
         ("direct", true, 42)
     );
@@ -626,7 +623,7 @@ fn observed_route_uses_authoritative_domain_bitmap_and_preserves_action() {
 #[test]
 fn observed_route_budget_only_truncates_evidence_never_decisions() {
     let mut winner = rule(ip(), "winner", 1);
-    winner.mark = 42;
+    winner.mark = Some(42);
     winner.must = true;
     let router = Router::new(
         &[
@@ -657,10 +654,7 @@ fn observed_route_budget_only_truncates_evidence_never_decisions() {
             (
                 matched.action.outbound.as_str(),
                 matched.action.must,
-                matched
-                    .action
-                    .mark
-                    .map_or(0, honk_outbound::proxy::DirectMark::get)
+                matched.action.mark.unwrap_or(0)
             ),
             ("winner", true, 42)
         );

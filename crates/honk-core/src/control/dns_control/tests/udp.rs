@@ -10,14 +10,39 @@ async fn udp_client_limit_cannot_consume_the_combined_query_ceiling() {
         }),
         usize::MAX,
     );
+    let (scope, _scope_owner) = packet_scope(&controller);
     let udp: Vec<_> = (0..super::super::MAX_UDP_CLIENT_QUERIES)
-        .map(|_| controller.try_admit_query(true).unwrap())
+        .map(|index| {
+            if index % 2 == 0 {
+                controller.try_admit_query(true)
+            } else {
+                controller.try_admit_packet_query(true, scope.scope())
+            }
+            .unwrap()
+        })
         .collect();
     assert!(controller.try_admit_query(true).is_err());
+    assert!(
+        controller
+            .try_admit_packet_query(true, scope.scope())
+            .is_err()
+    );
     let tcp: Vec<_> = (0..2048 - super::super::MAX_UDP_CLIENT_QUERIES)
-        .map(|_| controller.try_admit_query(false).unwrap())
+        .map(|index| {
+            if index % 2 == 0 {
+                controller.try_admit_query(false)
+            } else {
+                controller.try_admit_packet_query(false, scope.scope())
+            }
+            .unwrap()
+        })
         .collect();
     assert!(controller.try_admit_query(false).is_err());
+    assert!(
+        controller
+            .try_admit_packet_query(false, scope.scope())
+            .is_err()
+    );
     drop((udp, tcp));
 }
 
@@ -40,9 +65,9 @@ async fn native_log_captures_transparent_udp_completion_with_full_source() {
         .handle_udp_dns_admitted(
             &admission,
             &query,
-            source,
-            "[::1]:53".parse().unwrap(),
+            (source, "[::1]:53".parse().unwrap()),
             crate::dns::query::validate_exact_dns_query(&query).unwrap(),
+            crate::control::dns_control::DnsUdpReply::Kernel,
             None,
         )
         .await;
@@ -70,9 +95,9 @@ async fn transparent_udp_completion_is_exported_to_dns_syslog() {
         .handle_udp_dns_admitted(
             &admission,
             &query,
-            source,
-            "127.0.0.1:53".parse().unwrap(),
+            (source, "127.0.0.1:53".parse().unwrap()),
             validated,
+            crate::control::dns_control::DnsUdpReply::Kernel,
             pending,
         )
         .await;
@@ -129,9 +154,9 @@ async fn admitted_transparent_udp_routes_by_client_source() {
             .handle_udp_dns_admitted(
                 &admission,
                 &query,
-                client_addr.parse().expect("client"),
-                original_dst,
+                (client_addr.parse().expect("client"), original_dst),
                 validated,
+                crate::control::dns_control::DnsUdpReply::Kernel,
                 None,
             )
             .await;
@@ -173,12 +198,14 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
     let snapshot = Arc::clone(runtime.runtime().routing_projection());
     let learned_ip = "192.0.2.10".parse().expect("learned IP");
     controller.routing_projection.submit(
+        honk_datapath::ScopeId::HOST,
         Arc::clone(&snapshot),
         crate::dns::projection::ProjectionObservation::Positive {
             domain: "example.com",
             family: honk_outbound::alive::IpVersion::V4,
             ips: &[learned_ip],
             expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
+            source: Default::default(),
         },
     );
     let projected = controller.project_routes(&snapshot);
@@ -199,7 +226,12 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
         .expect("truncated outcome");
     assert!(outcome.answer_ips().is_empty());
     assert!(!outcome.expiry().is_cacheable());
-    controller.try_submit_projection(runtime.runtime(), &outcome, tokio::time::Instant::now());
+    controller.try_submit_projection(
+        runtime.runtime(),
+        crate::dns::projection::QueryScope::HOST,
+        &outcome,
+        tokio::time::Instant::now(),
+    );
     drop(runtime);
 
     assert!(cache.lock().await.is_empty());
@@ -268,12 +300,14 @@ async fn alias_failures_preserve_routing_projection() {
             (honk_outbound::alive::IpVersion::V6, v6),
         ] {
             controller.routing_projection.submit(
+                honk_datapath::ScopeId::HOST,
                 Arc::clone(&snapshot),
                 crate::dns::projection::ProjectionObservation::Positive {
                     domain: "example.com",
                     family,
                     ips: &[ip],
                     expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
+                    source: crate::dns::outcome::ProjectionSource::Fresh,
                 },
             );
         }
@@ -343,12 +377,14 @@ async fn projection_follows_query_family_until_nxdomain() {
     let v4 = std::net::IpAddr::from([192, 0, 2, 10]);
     let v6 = std::net::IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10]);
     controller.routing_projection.submit(
+        honk_datapath::ScopeId::HOST,
         Arc::clone(&snapshot),
         crate::dns::projection::ProjectionObservation::Positive {
             domain: "example.com",
             family: honk_outbound::alive::IpVersion::V6,
             ips: &[v6],
             expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
+            source: Default::default(),
         },
     );
     // The A answer, HTTPS NODATA and AAAA NODATA a dual-stack browser sees,

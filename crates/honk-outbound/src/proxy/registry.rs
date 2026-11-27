@@ -18,6 +18,7 @@ use super::tuic::TuicHandler;
 use super::vless::VLessHandler;
 #[cfg(feature = "rprx")]
 use super::vmess::VmessHandler;
+use super::wireguard::WireGuardHandler;
 use super::{
     DirectMark, MissingProtocolHandler, MultiTargetTransport, PacketOutbound, PacketRejection,
     PacketTransport, PreparedUdpTransport, ProbeableOutbound, ProxyStream, SharedSourceOutbound,
@@ -162,6 +163,7 @@ impl ProtocolEntry {
 
 pub struct ProxyRegistry {
     pub(super) entries: Vec<ProtocolEntry>,
+    stock_direct: bool,
     /// The chain handler, also registered for `NodeProtocol::Chain`, for
     /// routes through group exits, which have no protocol entry of their own.
     chain: Option<Arc<ChainHandler>>,
@@ -179,6 +181,7 @@ impl ProxyRegistry {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            stock_direct: false,
             chain: None,
         }
     }
@@ -212,6 +215,8 @@ impl ProxyRegistry {
                 .with_packet(direct.clone())
                 .with_probeable(direct),
         );
+        // Registration only appends; the first Direct handler remains authoritative.
+        registry.stock_direct = true;
         let block = Arc::new(BlockHandler::new());
         registry.register(
             ProtocolEntry::new(NodeProtocol::Block, block.clone())
@@ -283,6 +288,14 @@ impl ProxyRegistry {
                 .with_warmable(juicity.clone())
                 .with_probeable(juicity),
         );
+        let wireguard = Arc::new(WireGuardHandler::new());
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::WireGuard, wireguard.clone())
+                .with_packet(wireguard.clone())
+                .with_shared(wireguard.clone())
+                .with_warmable(wireguard.clone())
+                .with_probeable(wireguard),
+        );
         registry.register_chain();
         for entry in &registry.entries {
             entry.validate_consistency();
@@ -292,6 +305,25 @@ impl ProxyRegistry {
 
     pub fn register(&mut self, entry: ProtocolEntry) {
         self.entries.push(entry);
+    }
+
+    /// The first Direct entry is the built-in unpooled OS TCP connector.
+    pub fn has_stock_direct(&self) -> bool {
+        self.stock_direct
+    }
+
+    /// The selected TCP dial can transfer its OS socket to a packet Direct worker.
+    pub fn can_handoff_packet_direct(
+        &self,
+        generation: &crate::runtime::OutboundRuntimeRegistry,
+        target: &crate::group::OwnedTarget,
+    ) -> bool {
+        target.route().is_none()
+            && target.node.protocol() == NodeProtocol::Direct
+            && self.has_stock_direct()
+            && generation
+                .get_ref(&target.node.id)
+                .is_none_or(|runtime| runtime.node.protocol() == NodeProtocol::Direct)
     }
 
     pub(super) fn register_chain(&mut self) {

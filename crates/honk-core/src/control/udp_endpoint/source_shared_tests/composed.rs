@@ -45,6 +45,7 @@ async fn composed_source_installation_drops_a_second_prepared_carrier() {
         let stats = Arc::new(StatsManager::new());
         let prepare = |port| {
             pool.prepare_source(
+                honk_datapath::ScopeId::HOST,
                 &proxy,
                 Arc::clone(&generation),
                 Arc::clone(&runtime),
@@ -58,6 +59,7 @@ async fn composed_source_installation_drops_a_second_prepared_carrier() {
                 Arc::clone(&stats),
                 IpVersion::V4,
                 true,
+                None,
             )
         };
         let (a, mut wire_a) = tokio::join!(prepare(53), accept_association(&listener));
@@ -78,6 +80,7 @@ async fn composed_source_installation_drops_a_second_prepared_carrier() {
             node_id,
             node_name,
             health_family,
+            packet_source,
             evidence,
         } = b
         else {
@@ -100,6 +103,7 @@ async fn composed_source_installation_drops_a_second_prepared_carrier() {
             node_id,
             node_name,
             health_family,
+            packet_source,
             evidence,
         };
         let (a, b) = tokio::join!(
@@ -207,7 +211,12 @@ async fn collapsed_first_datagram_uses_the_selecting_view_until_admission() {
                     attachment,
                     target,
                     None,
-                    Arc::new(fixture.pool.create_reply_socket(target).unwrap()),
+                    Arc::new(
+                        fixture
+                            .pool
+                            .create_reply_socket(honk_datapath::ScopeId::HOST, target, None)
+                            .unwrap(),
+                    ),
                     fixture
                         .stats
                         .outbound_tracker(&exit.name, crate::stats::OutboundKind::Node),

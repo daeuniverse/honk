@@ -137,7 +137,7 @@ mod tests {
                 outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
                 priority: 0,
                 must: false,
-                mark: 0,
+                mark: None,
             });
         assert!(!routing_state_reusable(&first, &second));
     }

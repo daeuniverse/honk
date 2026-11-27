@@ -211,7 +211,7 @@ fn put_queue_rule_expressions(buffer: &mut Vec<u8>) {
     put_queue(buffer);
 }
 
-fn put_expression(buffer: &mut Vec<u8>, name: &str, data: impl FnOnce(&mut Vec<u8>)) {
+pub(crate) fn put_expression(buffer: &mut Vec<u8>, name: &str, data: impl FnOnce(&mut Vec<u8>)) {
     let element = netlink::begin_nested(buffer, NFTA_LIST_ELEM);
     netlink::put_attribute_string(buffer, NFTA_EXPR_NAME, name);
     let expression_data = netlink::begin_nested(buffer, NFTA_EXPR_DATA);
@@ -265,7 +265,7 @@ fn put_bitwise_signature_mark(buffer: &mut Vec<u8>) {
     });
 }
 
-fn put_ct_state_load(buffer: &mut Vec<u8>) {
+pub(crate) fn put_ct_state_load(buffer: &mut Vec<u8>) {
     put_expression(buffer, "ct", |buffer| {
         netlink::put_attribute_be32(buffer, NFTA_CT_DREG, NFT_REG_1);
         netlink::put_attribute_be32(buffer, NFTA_CT_KEY, NFT_CT_STATE);

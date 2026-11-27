@@ -7,6 +7,7 @@ honk uses a dialect of dae configuration syntax; the [dialect reference](./refer
 | Section | Purpose | Reference |
 | --- | --- | --- |
 | `global` | Select interfaces, dial behavior, health checks, and runtime paths. | [Global reference](./reference/global.md) |
+| `datapath` | Explicitly select Linux XDP capture and Direct execution, with optional Core firewall/NAT. Omission preserves TC. | [Capture backend selection](./reference/global.md#capture-backend-selection), [firewall/NAT](./reference/routing.md#core-forwarding-firewall-and-ipv4-nat) |
 | `node` | Declare static proxy nodes as share links. | [Node reference](./reference/nodes.md) |
 | `group` | Select among nodes and nested groups. | [Group reference](./reference/groups.md) |
 | `routing` | Apply ordered traffic rules and a fallback outbound. | [Routing reference](./reference/routing.md) |
@@ -31,7 +32,7 @@ The entry file and included `.dae` files must be UTF-8; other encodings are reje
 - Millisecond settings such as `check_tolerance` take bare milliseconds, an integer with `ms`, or seconds with `s`, so `1.5s` is 1500 ms. Fractions of a millisecond are dropped; `1.5ms` and the `m` and `h` suffixes are invalid. An invalid value warns and keeps the default.
 - An unquoted token-head `#` starts a comment; hashes inside bare values remain data. Entry readers also accept a glued `#` after a closing link quote or subscription `(UA)` suffix, with `legacy-glued-hash`; put whitespace before comments. Braces inside a token-head comment never close a block.
 - Braces inside matching single or double quotes are data. An unmatched closing `}` is ignored with a diagnostic; an unclosed block rejects the document. Detailed diagnostics carry physical line numbers where the current reader provides them; error text never echoes arbitrary input.
-- Unknown scalar keys are diagnosed and ignored. Unknown nested blocks are skipped as complete balanced subtrees, not flattened into their parent. Only documented node/subscription wrapper compatibility remains. Some unknown content is an error instead: unknown outer `experimental` settings, unknown content in `experimental.native_api`, unsupported legacy NFQUEUE content, and a block named after a group scalar such as `tolerance`. See the [dialect reference](./reference/dialect.md#sections-and-includes).
+- In lenient sections, unknown scalar keys are diagnosed and ignored, and unknown nested blocks are skipped as complete balanced subtrees, not flattened into their parent. Only documented node/subscription wrapper compatibility remains. Unknown outer `experimental` settings and unsupported legacy NFQUEUE content are errors. The `datapath` extension is strict: unknown settings/blocks, duplicate settings/subblocks, invalid values, and unsupported firewall/NAT compositions reject the configuration; they are not ignored. See the [dialect reference](./reference/dialect.md#sections-and-includes).
 
 ### Splitting a configuration with `include {}`
 
@@ -52,6 +53,28 @@ Only top-level `include` accepts an opener on a later line, with a `legacy-inclu
 Every relative include, including one in a nested included file, resolves against the directory containing the entry config passed to `--config`. The loader canonicalizes the entry directory and every match. It rejects any absolute path or symlink target that resolves outside that directory. It also rejects loading the same canonical file twice, directly or through a cycle.
 
 The entry file's own sections merge first regardless of where its `include` block appears, followed by each included file and its descendants. Later scalar keys override earlier values. Collection entries such as nodes, subscriptions, groups, DNS upstreams, fixed TTLs, and routing rules append in merge order.
+
+The strict `datapath` section is an exception to scalar override merging. Each setting or nested block, including `dns_projection`, may occur at most once across all merged sections and included files.
+
+For an XDP Endpoint gateway, configure the logical LAN interface (a numbered Ethernet interface or bond is allowed) and optionally select Auto per member:
+
+```dae
+global { nfqueue_enable: false }
+datapath {
+    backend: xdp
+    direct: endpoint
+    xsk_mode: auto
+    interface { bond0: lan }
+}
+routing {
+    dip(10.10.10.1) && dport(53) -> direct(must)
+    fallback: direct
+}
+```
+
+The DNS rule is only needed when that address and local listener should receive port 53; put it before domain rules. See [gateway admission and limits](./design/datapath.md#full-xdp-startup).
+
+On an XDP Endpoint LAN, an eligible TCP SYN or complete UDP datagram can follow the kernel route using DNS answers learned on that LAN. IP fragments requiring reassembly cannot establish a DNS-native UDP flow. Alongside a physical interface you can declare, for example, `wg0: l3_lan` as a separate [auxiliary LAN](./reference/global.md#auxiliary-l3-lan). Set `datapath.dns_projection: false` and restart to disable [DNS-derived routing](./reference/global.md#xdp-endpoint-dns-projection) for both protocols. An optional [Host egress](./reference/global.md#xdp-host-endpoint) uses a separate shared DNS scope; it does not supply LAN facts.
 
 ## Runtime data directory
 

@@ -64,6 +64,9 @@ fn classify_send_error(endpoint: &UdpEndpoint, error: io::Error) -> PacketSendFa
 }
 
 fn duplicate_send_error(error: &mut io::Error) -> io::Error {
+    if is_auxiliary_retirement(error) {
+        return io::Error::new(error.kind(), AuxiliaryBindingRetired);
+    }
     let kind = error.kind();
     let original = std::mem::replace(error, io::Error::from(io::ErrorKind::Other));
     let shared = honk_outbound::SharedError::new(original.into());
@@ -71,22 +74,8 @@ fn duplicate_send_error(error: &mut io::Error) -> io::Error {
     io::Error::new(kind, shared)
 }
 
-pub(super) struct TaskRegistry {
-    pub(super) closed: bool,
-    pub(super) tasks: tokio::task::JoinSet<()>,
-}
-
-impl Default for TaskRegistry {
-    fn default() -> Self {
-        Self {
-            closed: false,
-            tasks: tokio::task::JoinSet::new(),
-        }
-    }
-}
-
 async fn drain_registered_tasks(
-    tasks: &mut tokio::task::JoinSet<()>,
+    tasks: &mut TaskRegistry,
     label: &str,
     disposition: &mut UdpShutdown,
 ) {
@@ -102,7 +91,7 @@ async fn drain_registered_tasks(
 }
 
 pub(super) async fn join_registered_tasks(
-    mut tasks: tokio::task::JoinSet<()>,
+    mut tasks: TaskRegistry,
     label: &str,
     graceful_timeout: Duration,
     abort_first: bool,
@@ -138,8 +127,16 @@ pub(super) async fn join_registered_tasks(
         .await
         .is_err()
         {
-            debug!("Timed out joining aborted UDP {} tasks", label);
-            disposition.joined = false;
+            if tasks.is_accounted() {
+                tracing::warn!(
+                    label,
+                    "Packet task cleanup exceeded its deadline; retaining allocation credit until join"
+                );
+                drain_registered_tasks(&mut tasks, label, &mut disposition).await;
+            } else {
+                debug!("Timed out joining aborted UDP {} tasks", label);
+                disposition.joined = false;
+            }
         }
     }
     disposition
@@ -157,6 +154,7 @@ pub(in crate::control) struct UdpDriverHandle {
     ready: Option<oneshot::Receiver<()>>,
     start: Option<oneshot::Sender<UdpDriverStart>>,
     first_ack: Option<oneshot::Receiver<io::Result<()>>>,
+    admission_error: Option<io::Error>,
     /// Test-only cancellation handle; production ownership remains in the
     /// pool's driver registry until terminal shutdown joins every task.
     #[cfg(test)]
@@ -223,11 +221,11 @@ impl From<Arc<UdpSocket>> for DriverReplySocket {
 }
 
 impl DriverReplySocket {
-    fn into_socket(self) -> Arc<ReplySocket> {
+    fn into_socket(self, _scope: ScopeId) -> Arc<ReplySocket> {
         match self {
             Self::Bounded(socket) => socket,
             #[cfg(test)]
-            Self::Untracked(socket) => Arc::new(ReplySocket::untracked(socket)),
+            Self::Untracked(socket) => Arc::new(ReplySocket::untracked(_scope, socket)),
         }
     }
 }
@@ -241,7 +239,7 @@ pub(super) struct UdpDriverContext {
     pub(super) client_dst: SocketAddr,
     pub(super) alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
     pub(super) stats: Arc<StatsManager>,
-    pub(super) outbound_tracker: OutboundTracker,
+    pub(super) outbound_tracker: Arc<OutboundTracker>,
     pub(super) health_family: honk_outbound::alive::IpVersion,
 }
 
@@ -262,6 +260,9 @@ impl Drop for UdpDriverCleanupGuard {
 
 impl UdpDriverHandle {
     pub(in crate::control) async fn wait_ready(&mut self) -> io::Result<()> {
+        if let Some(error) = self.admission_error.take() {
+            return Err(error);
+        }
         self.ready
             .take()
             .ok_or_else(|| io::Error::other("UDP endpoint driver ready already consumed"))?
@@ -294,6 +295,21 @@ impl UdpDriverHandle {
             .map_err(|_| io::Error::other("UDP endpoint driver exited before first send"))?
     }
 
+    /// False means the auxiliary binding retired before the driver acknowledged the first flight.
+    pub(in crate::control) async fn confirm_first_send(
+        &mut self,
+        outbound: &OutboundTracker,
+    ) -> io::Result<bool> {
+        match self.wait_first_ack().await {
+            Ok(()) => Ok(true),
+            Err(error) if is_auxiliary_retirement(&error) => Ok(false),
+            Err(error) => {
+                outbound.increment_errors();
+                Err(error)
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn abort(&self) {
         if let Some(task) = &self.task {
@@ -306,7 +322,7 @@ pub(super) fn score_driver_outcome(
     endpoint: &UdpEndpoint,
     result: &io::Result<()>,
 ) -> ScoreOutcome {
-    if endpoint.dead.load(Ordering::Acquire) {
+    if endpoint.retired() {
         return if endpoint.has_reply() {
             ScoreOutcome::Success
         } else {
@@ -391,7 +407,7 @@ impl UdpEndpoint {
             self.finish_native_source(retirement);
             return;
         }
-        let outcome = if self.dead.load(Ordering::Acquire) {
+        let outcome = if self.retired() {
             UdpTerminal::IntentionalRetirement
         } else {
             match result {
@@ -421,6 +437,7 @@ impl UdpEndpointPool {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::control) fn spawn_driver(
         self: &Arc<Self>,
+        scope: ScopeId,
         client_addr: SocketAddr,
         client_dst: SocketAddr,
         generation: u64,
@@ -430,21 +447,34 @@ impl UdpEndpointPool {
         reply_socket: impl Into<DriverReplySocket>,
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
         stats: Arc<StatsManager>,
-        outbound_tracker: OutboundTracker,
+        outbound_tracker: Arc<OutboundTracker>,
     ) -> UdpDriverHandle {
-        let reply_socket = reply_socket.into().into_socket();
-        let key = EndpointKey::new(client_addr, client_dst);
+        let reply_socket = reply_socket.into().into_socket(scope);
+        let key = EndpointKey::new(
+            scope,
+            client_addr,
+            client_dst,
+            endpoint
+                .packet_source()
+                .and_then(SourceWork::optional_context)
+                .map(|source| source.lineage),
+        );
         let (ready_tx, ready) = oneshot::channel();
         let (start, start_rx) = oneshot::channel();
         let (first_ack_tx, first_ack) = oneshot::channel();
         let pool = Arc::clone(self);
         let mut drivers = self.drivers.lock();
-        while let Some(result) = drivers.tasks.try_join_next() {
+        while let Some(result) = drivers.try_join_next() {
             if let Err(error) = result {
                 debug!("UDP endpoint driver join failed: {}", error);
             }
         }
-        if drivers.closed {
+        if drivers.closed
+            || reply_socket.packet_source
+                != endpoint
+                    .packet_source()
+                    .and_then(SourceWork::optional_context)
+        {
             drop(ready_tx);
             drop(start_rx);
             drop(first_ack_tx);
@@ -452,57 +482,90 @@ impl UdpEndpointPool {
                 ready: Some(ready),
                 start: Some(start),
                 first_ack: Some(first_ack),
+                admission_error: None,
                 #[cfg(test)]
                 task: None,
             };
         }
-        let mut io = endpoint.retirement.0.start_driver();
-        let task = drivers.tasks.spawn(async move {
+        let future = move || {
+            let mut io = endpoint.retirement.0.start_driver();
             async move {
-                // Construct before every await so abort and panic take the same
-                // cleanup path as an ordinary driver return.
-                let mut _cleanup = UdpDriverCleanupGuard::new(
+                let mut cleanup = UdpDriverCleanupGuard::new(
                     Arc::clone(&pool),
                     key,
                     generation,
                     decision_token,
                     Arc::clone(&endpoint),
                 );
-                let _ = ready_tx.send(());
-                let initial = match start_rx.await {
-                    Ok(initial) => initial,
-                    Err(_) => return,
-                };
-                let driver_result = run_endpoint_driver(
-                    UdpDriverContext {
-                        endpoint: Arc::clone(&endpoint),
-                        queue_rx,
-                        reply_socket,
-                        foreign_replies: Arc::clone(&pool.foreign_replies),
-                        client_addr,
-                        client_dst,
-                        alive_set,
-                        stats,
-                        outbound_tracker,
-                        health_family: endpoint.health_family,
-                    },
-                    initial,
-                    first_ack_tx,
-                )
-                .await;
-                let UdpDriverResult { result, outcome } = driver_result;
-                _cleanup.set_outcome(outcome);
-                if let Err(error) = result {
-                    debug!(
-                        "UDP endpoint driver {} -> {} stopped: {}",
-                        client_addr, client_dst, error
+                let mut first_ack = Some(first_ack_tx);
+                let run = async {
+                    let _ = ready_tx.send(());
+                    let initial = match start_rx.await {
+                        Ok(initial) => initial,
+                        Err(_) => return,
+                    };
+                    let operation = run_endpoint_driver(
+                        UdpDriverContext {
+                            endpoint: Arc::clone(&endpoint),
+                            queue_rx,
+                            reply_socket,
+                            foreign_replies: Arc::clone(&pool.foreign_replies),
+                            client_addr,
+                            client_dst,
+                            alive_set,
+                            stats,
+                            outbound_tracker,
+                            health_family: endpoint.health_family,
+                        },
+                        initial,
+                        |result| {
+                            let ack = first_ack.take().expect("one first-send acknowledgement");
+                            let _ = ack.send(result);
+                        },
                     );
+                    #[cfg(all(target_os = "linux", feature = "native-api"))]
+                    let operation = std::pin::pin!(operation);
+                    #[cfg(all(target_os = "linux", feature = "native-api"))]
+                    let operation = super::observation::observe_packet_drops(
+                        endpoint.native.terminal(),
+                        operation,
+                    );
+                    let driver_result = operation.await;
+                    let UdpDriverResult { result, outcome } = driver_result;
+                    cleanup.set_outcome(outcome);
+                    if let Err(error) = result {
+                        debug!(
+                            "UDP endpoint driver {} -> {} stopped: {}",
+                            client_addr, client_dst, error
+                        );
+                    }
+                };
+                if !run_while_bound(endpoint.packet_source(), run).await {
+                    endpoint.kill(true);
+                    endpoint.native.finish(UdpTerminal::IntentionalRetirement);
+                    if let Some(ack) = first_ack {
+                        let _ = ack.send(Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            AuxiliaryBindingRetired,
+                        )));
+                    }
                 }
+                drop(cleanup);
+                io.completed = true;
+                drop(io);
             }
-            .await;
-            io.completed = true;
-            drop(io);
-        });
+        };
+        let (task, admission_error) = match drivers.spawn_with(future, super::budget::RECEIVE_BYTES)
+        {
+            Ok(task) => (Some(task), None),
+            Err(_) => (
+                None,
+                Some(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    honk_outbound::proxy::PacketRejection::Capacity,
+                )),
+            ),
+        };
         drop(drivers);
         #[cfg(not(test))]
         drop(task);
@@ -510,15 +573,16 @@ impl UdpEndpointPool {
             ready: Some(ready),
             start: Some(start),
             first_ack: Some(first_ack),
+            admission_error,
             #[cfg(test)]
-            task: Some(task),
+            task,
         }
     }
 }
 pub(super) async fn run_endpoint_driver(
     context: UdpDriverContext,
     initial: UdpDriverStart,
-    first_ack: oneshot::Sender<io::Result<()>>,
+    first_ack: impl FnOnce(io::Result<()>),
 ) -> UdpDriverResult {
     let UdpDriverContext {
         endpoint,
@@ -560,11 +624,11 @@ pub(super) async fn run_endpoint_driver(
         if let Err(error) = &result
             && !neutral
             && !endpoint.is_source()
-            && !endpoint.dead.load(Ordering::Acquire)
+            && !endpoint.retired()
         {
             report_flow_failure(&endpoint, &alive_set, health_family, error);
         }
-        let _ = first_ack.send(result.as_mut().map(|_| ()).map_err(duplicate_send_error));
+        first_ack(result.as_mut().map(|_| ()).map_err(duplicate_send_error));
         return UdpDriverResult { result, outcome };
     }
 
@@ -591,7 +655,7 @@ pub(super) async fn run_endpoint_driver(
                 let outcome = score_driver_outcome(&endpoint, &result);
                 #[cfg(feature = "native-api")]
                 endpoint.finish_native_driver(&result);
-                let _ = first_ack.send(result.as_mut().map(|_| ()).map_err(duplicate_send_error));
+                first_ack(result.as_mut().map(|_| ()).map_err(duplicate_send_error));
                 return UdpDriverResult { result, outcome };
             }
             Err(PacketSendFailure::Transport(error)) => {
@@ -601,16 +665,16 @@ pub(super) async fn run_endpoint_driver(
                 endpoint.finish_native_driver(&result);
                 if let Err(error) = &result
                     && !endpoint.is_source()
-                    && !endpoint.dead.load(Ordering::Acquire)
+                    && !endpoint.retired()
                 {
                     report_flow_failure(&endpoint, &alive_set, health_family, error);
                 }
-                let _ = first_ack.send(result.as_mut().map(|_| ()).map_err(duplicate_send_error));
+                first_ack(result.as_mut().map(|_| ()).map_err(duplicate_send_error));
                 return UdpDriverResult { result, outcome };
             }
         }
     }
-    let _ = first_ack.send(Ok(()));
+    first_ack(Ok(()));
 
     let result = if endpoint.is_source() {
         send_source_followers(
@@ -655,7 +719,7 @@ pub(super) async fn run_endpoint_driver(
     let outcome = score_driver_outcome(&endpoint, &result);
     if let Err(error) = &result
         && !endpoint.is_source()
-        && !endpoint.dead.load(Ordering::Acquire)
+        && !endpoint.retired()
         && !is_local_reply_error(error)
         && !matches!(
             honk_outbound::proxy::packet_error_class(error),
@@ -673,7 +737,7 @@ async fn send_followers(
     endpoint: Arc<UdpEndpoint>,
     mut queue_rx: mpsc::Receiver<QueuedDatagram>,
     stats: Arc<StatsManager>,
-    outbound_tracker: OutboundTracker,
+    outbound_tracker: Arc<OutboundTracker>,
     mut send_timeout: std::pin::Pin<&mut tokio::time::Sleep>,
 ) -> io::Result<()> {
     while let Some(packet) = queue_rx.recv().await {
@@ -708,7 +772,7 @@ async fn send_source_followers(
     endpoint: Arc<UdpEndpoint>,
     mut queue_rx: mpsc::Receiver<QueuedDatagram>,
     stats: Arc<StatsManager>,
-    outbound_tracker: OutboundTracker,
+    outbound_tracker: Arc<OutboundTracker>,
     mut send_timeout: std::pin::Pin<&mut tokio::time::Sleep>,
 ) -> io::Result<()> {
     let mut reply_epoch = endpoint.reply_epoch.load(Ordering::Acquire);
@@ -774,6 +838,9 @@ async fn send_one(
         )));
     }
     if let Err(error) = endpoint.begin_send_attempt(first) {
+        if is_auxiliary_retirement(&error) {
+            return Err(PacketSendFailure::Transport(error));
+        }
         endpoint
             .native
             .dropped("endpoint_retired", Some("send_cancelled"));
@@ -816,7 +883,7 @@ async fn send_one(
             Ok(Err(_)) | Err(_) => attempt.failure(),
         }
     }
-    let result = if endpoint_retired {
+    let result = if endpoint_retired && packet_binding_active(endpoint.packet_source()) {
         Err(PacketSendFailure::Transport(io::Error::new(
             io::ErrorKind::ConnectionAborted,
             "UDP endpoint retired while sending",
@@ -824,6 +891,9 @@ async fn send_one(
     } else {
         match sent {
             Ok(Ok(started_at)) => Ok(started_at),
+            Ok(Err(error)) if is_auxiliary_retirement(&error) => {
+                return Err(PacketSendFailure::Transport(error));
+            }
             Ok(Err(error)) => Err(classify_send_error(endpoint, error)),
             Err(error) if gate_only => {
                 let stalled = endpoint

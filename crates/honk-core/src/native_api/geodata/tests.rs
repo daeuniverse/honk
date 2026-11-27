@@ -132,7 +132,7 @@ fn world_with(outbound: Arc<impl TcpOutbound + 'static>, dials: Arc<AtomicUsize>
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
     let mut proxy_registry = ProxyRegistry::new();
     proxy_registry.register(ProtocolEntry::new(NodeProtocol::Socks5, outbound));

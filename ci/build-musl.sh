@@ -13,11 +13,13 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: ci/build-musl.sh <honk-core|honk-tool> [cargo build args...]
+usage: ci/build-musl.sh [--preflight-only] <honk-core|honk-tool> [cargo build args...]
 EOF
   exit 2
 }
 
+preflight_only=false
+if [[ "${1:-}" == --preflight-only ]]; then preflight_only=true; shift; fi
 (( $# >= 1 )) || usage
 pkg=$1
 shift
@@ -46,21 +48,6 @@ case "$(uname -m)" in
     exit 2
     ;;
 esac
-
-if [[ -n "${HONK_CONTAINER_ENGINE:-}" ]]; then
-  engine=$HONK_CONTAINER_ENGINE
-  if ! command -v "$engine" >/dev/null 2>&1; then
-    echo "error: HONK_CONTAINER_ENGINE='$engine' not found in PATH" >&2
-    exit 2
-  fi
-elif command -v docker >/dev/null 2>&1; then
-  engine=docker
-elif command -v podman >/dev/null 2>&1; then
-  engine=podman
-else
-  echo "error: neither docker nor podman found in PATH (set HONK_CONTAINER_ENGINE to override)" >&2
-  exit 2
-fi
 
 # Collect feature flags and reject conflicting --target overrides.
 all_features=""
@@ -96,42 +83,19 @@ done
 all_features=$(printf '%s' "$all_features" | tr ' ' ',')
 
 has_feature() {
-  [[ ",${all_features}," == *",$1,"* ]]
+  [[ ",${all_features}," == *",$1,"* || ",${all_features}," == *",${pkg}/$1,"* ]]
 }
 
-# Pre-flight: eBPF object freshness, BTF presence, and exact toolchain pin.
-if [[ "$pkg" == "honk-core" ]] && has_feature ebpf; then
-  ebpf_crate="$repo_root/crates/honk-ebpf"
-  ebpf_obj="$ebpf_crate/target/bpfel-unknown-none/release/honk-ebpf"
-  ebpf_tc="${ebpf_obj}.toolchain"
-  ebpf_channel=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$ebpf_crate/rust-toolchain.toml")
-  if [[ -z "$ebpf_channel" ]]; then
-    echo "error: failed to parse channel from crates/honk-ebpf/rust-toolchain.toml" >&2
-    exit 1
+prebuilt_args=()
+if [[ "$pkg" == honk-core ]]; then
+  profile=""
+  if has_feature ebpf || has_feature legacy-tc; then profile=legacy-tc
+  elif has_feature packet-ebpf; then profile=packet-ebpf
   fi
-  if [[ ! -f "$ebpf_obj" ]]; then
-    echo "error: missing eBPF object at $ebpf_obj (run 'just build-ebpf' first)" >&2
-    exit 1
-  fi
-  if command -v readelf >/dev/null 2>&1; then
-    if ! readelf -S "$ebpf_obj" | grep -q '\.BTF'; then
-      echo "error: eBPF object at $ebpf_obj has no .BTF section (run 'just build-ebpf')" >&2
-      exit 1
-    fi
-  fi
-  if [[ ! -f "$ebpf_tc" ]] || ! cmp -s "$ebpf_tc" <(printf '%s' "$ebpf_channel"); then
-    echo "error: $ebpf_tc is missing or does not exactly match '$ebpf_channel' (run 'just build-ebpf')" >&2
-    exit 1
-  fi
-  stale_src=$(find "$ebpf_crate/src" "$repo_root/crates/honk-ebpf-common/src" "$ebpf_crate/rust-toolchain.toml" \
-    -type f -newer "$ebpf_obj" -print -quit)
-  if [[ -n "$stale_src" ]]; then
-    echo "error: eBPF object $ebpf_obj is older than $stale_src (run 'just build-ebpf')" >&2
-    exit 1
-  fi
-  if [[ "$repo_root/crates/honk-core/build.rs" -nt "$ebpf_tc" ]]; then
-    echo "error: $ebpf_tc is older than crates/honk-core/build.rs (run 'just build-ebpf')" >&2
-    exit 1
+  if [[ -n "$profile" ]]; then
+    prebuilt=$(cd "$repo_root" && realpath "${HONK_EBPF_PREBUILT_DIR:-crates/honk-ebpf/target/bpfel-unknown-none/release/prebuilt}")
+    HONK_EBPF_PREBUILT_DIR="$prebuilt" sh "$repo_root/ci/ebpf-objects.sh" verify "$profile"
+    prebuilt_args=(-v "$prebuilt:/honk-prebuilt:ro" -e HONK_EBPF_PREBUILT_DIR=/honk-prebuilt)
   fi
 fi
 
@@ -159,6 +123,23 @@ if [[ "$pkg" == "honk-core" ]] && has_feature native-ui; then
   doona_parent=$(dirname "$doona_dir")
   doona_base=$(basename "$doona_dir")
   doona_args=(-v "$doona_parent:/doona:ro" -e "HONK_DOONA_DIR=/doona/$doona_base")
+fi
+
+if "$preflight_only"; then exit 0; fi
+
+if [[ -n "${HONK_CONTAINER_ENGINE:-}" ]]; then
+  engine=$HONK_CONTAINER_ENGINE
+  if ! command -v "$engine" >/dev/null 2>&1; then
+    echo "error: HONK_CONTAINER_ENGINE='$engine' not found in PATH" >&2
+    exit 2
+  fi
+elif command -v docker >/dev/null 2>&1; then
+  engine=docker
+elif command -v podman >/dev/null 2>&1; then
+  engine=podman
+else
+  echo "error: neither docker nor podman found in PATH (set HONK_CONTAINER_ENGINE to override)" >&2
+  exit 2
 fi
 
 # Resolve Git metadata and external worktree gitdir mounts before entering the container.
@@ -232,6 +213,7 @@ fi
   -v "$host_cargo_home/git:/cargo/git" \
   "${git_mounts[@]}" \
   "${doona_args[@]}" \
+  "${prebuilt_args[@]}" \
   "${extra_env[@]}" \
   -e "HOME=/tmp" \
   -e "CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto}" \

@@ -6,12 +6,32 @@ async fn connections_filter_before_combined_limit_and_preserve_full_width_live_b
     let tracker = app.control.connection_tracker();
     let now = Instant::now();
     for row in [
-        entry("old", "tcp", "192.0.2.1:4000", now - Duration::from_secs(1)),
-        entry("a", "udp", "[::ffff:192.0.2.1]:4001", now),
-        entry("b", "tcp", "192.0.2.1:4002", now),
-        entry("c", "tcp", "192.0.2.1:4003", now),
         entry(
-            "other-source",
+            "00000000-0000-0000-0000-000000000004",
+            "tcp",
+            "192.0.2.1:4000",
+            now - Duration::from_secs(1),
+        ),
+        entry(
+            "00000000-0000-0000-0000-000000000001",
+            "udp",
+            "[::ffff:192.0.2.1]:4001",
+            now,
+        ),
+        entry(
+            "00000000-0000-0000-0000-000000000002",
+            "tcp",
+            "192.0.2.1:4002",
+            now,
+        ),
+        entry(
+            "00000000-0000-0000-0000-000000000003",
+            "tcp",
+            "192.0.2.1:4003",
+            now,
+        ),
+        entry(
+            "00000000-0000-0000-0000-000000000005",
             "tcp",
             "192.0.2.2:4000",
             now + Duration::from_secs(1),
@@ -20,7 +40,11 @@ async fn connections_filter_before_combined_limit_and_preserve_full_width_live_b
         tracker.register(row);
     }
     let big = u64::from(u32::MAX) + 123;
-    tracker.update_bytes("a", big, u64::MAX);
+    tracker.update_bytes(
+        &uuid::uuid!("00000000-0000-0000-0000-000000000001"),
+        big,
+        u64::MAX,
+    );
     let summary = response_json(
         app.get("/api/v1/connections?src=192.0.2.1&limit=1")
             .send()
@@ -33,7 +57,10 @@ async fn connections_filter_before_combined_limit_and_preserve_full_width_live_b
         (Some(3), Some(1))
     );
     assert_eq!(summary["tcp"], json!([]));
-    assert_eq!(summary["udp"][0]["id"], "a");
+    assert_eq!(
+        summary["udp"][0]["id"],
+        "00000000-0000-0000-0000-000000000001"
+    );
     assert_eq!(summary["truncated"], true);
     assert_eq!(summary["visibility"], "partial");
     let row = &summary["udp"][0];
@@ -75,9 +102,12 @@ async fn connections_filter_before_combined_limit_and_preserve_full_width_live_b
             .iter()
             .map(|row| row["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["b", "c"]
+        [
+            "00000000-0000-0000-0000-000000000002",
+            "00000000-0000-0000-0000-000000000003"
+        ]
     );
-    assert_eq!(full["udp"][0]["id"], "a");
+    assert_eq!(full["udp"][0]["id"], "00000000-0000-0000-0000-000000000001");
     assert_eq!(full["udp"][0]["src"], "[::ffff:192.0.2.1]:4001");
     assert_eq!(full["udp"][0]["dst"], "198.51.100.10:443");
     assert_eq!(full["udp"][0].get("domain"), Some(&Value::Null));
@@ -98,11 +128,18 @@ async fn connections_filter_before_combined_limit_and_preserve_full_width_live_b
             .iter()
             .map(|row| row["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["b", "c", "old"]
+        [
+            "00000000-0000-0000-0000-000000000002",
+            "00000000-0000-0000-0000-000000000003",
+            "00000000-0000-0000-0000-000000000004"
+        ]
     );
     let latest = response_json(app.get("/api/v1/connections?limit=1").send().await.unwrap()).await;
-    assert_eq!(latest["tcp"][0]["id"], "other-source");
-    tracker.remove("a");
+    assert_eq!(
+        latest["tcp"][0]["id"],
+        "00000000-0000-0000-0000-000000000005"
+    );
+    tracker.remove(&uuid::uuid!("00000000-0000-0000-0000-000000000001"));
     let removed = response_json(
         app.get("/api/v1/connections?type=udp")
             .send()
@@ -225,6 +262,58 @@ async fn native_events_replay_actual_commits_after_ready_and_reject_changed_filt
         after["generation"]["active_id"],
         runtime["generation"]["active_id"]
     );
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_userspace_backend_matches_datapath_contract_without_kernel_claims() {
+    use honk_core::ebpf::userspace::UserspaceBackend;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let app = TestApp::new(|_| {}).await;
+    let admission = Arc::new(AtomicBool::new(false));
+    *app.control.policy_backend_handle().write().await = Box::new(UserspaceBackend::new(
+        Arc::clone(&admission),
+        Arc::new(parking_lot::RwLock::new(
+            honk_core::ebpf::PnameSupport::Unavailable,
+        )),
+    ));
+    let capabilities = response_json(app.get("/api/v1/capabilities").send().await.unwrap()).await;
+    assert!(
+        capabilities["resources"]["datapath"]["kinds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("userspace"))
+    );
+
+    for admitted in [false, true] {
+        admission.store(admitted, Ordering::Release);
+        for query in ["", "?detail=summary", "?detail=full"] {
+            let runtime = response_json(
+                app.get(&format!("/api/v1/runtime{query}"))
+                    .send()
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let datapath = response_json(
+                app.get(&format!("/api/v1/datapath{query}"))
+                    .send()
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                runtime["datapath"],
+                json!({"kind":"userspace", "state":"unknown", "visibility":"none", "ebpf":null})
+            );
+            for field in ["kind", "state", "visibility", "ebpf"] {
+                assert_eq!(datapath[field], runtime["datapath"][field]);
+            }
+            assert_eq!(datapath["errors"], json!([]));
+            assert_eq!(admission.load(Ordering::Acquire), admitted);
+        }
+    }
     app.shutdown().await;
 }
 

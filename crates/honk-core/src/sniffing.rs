@@ -39,7 +39,9 @@ use tracing::debug;
 
 /// Maximum bytes buffered while sniffing TLS ClientHello or HTTP headers.
 /// This is a hard bound: untrusted length fields never grow the buffer.
-const MAX_CLIENT_HELLO_SIZE: usize = 4096;
+pub(crate) const MAX_CLIENT_HELLO_SIZE: usize = 4096;
+pub(crate) const SNIFF_MEMORY: usize = 2 * MAX_CLIENT_HELLO_SIZE;
+pub(crate) const SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Supported traffic types detected by sniffing; the domain lives in
 /// [`SniffResult::domain`].
@@ -96,8 +98,7 @@ impl SniffResult {
 /// A `SniffResult` containing the extracted domain (if any) and
 /// the buffered initial bytes that must be forwarded.
 pub async fn sniff_tcp(stream: &mut (impl AsyncRead + Unpin)) -> SniffResult {
-    const SNIFF_DEADLINE: std::time::Duration = std::time::Duration::from_millis(100);
-    let deadline = tokio::time::Instant::now() + SNIFF_DEADLINE;
+    let deadline = tokio::time::Instant::now() + SNIFF_TIMEOUT;
     let mut buf = BytesMut::with_capacity(MAX_CLIENT_HELLO_SIZE);
 
     loop {
@@ -122,28 +123,45 @@ pub async fn sniff_tcp(stream: &mut (impl AsyncRead + Unpin)) -> SniffResult {
         }
     }
 
-    let data = buf.to_vec();
-    if let Some(sni) = parse_tls_sni(&data) {
-        return SniffResult::tls_sni(sni, data);
+    let mut result = classify_tcp(&buf);
+    result.buffered = buf.to_vec();
+    result
+}
+
+/// Inspect the packet stack's prefix without consuming application bytes.
+#[cfg(target_os = "linux")]
+pub(crate) fn sniff_packet_tcp(data: &[u8], done: bool) -> Option<SniffResult> {
+    let data = &data[..data.len().min(MAX_CLIENT_HELLO_SIZE)];
+    if !done && data.len() < sniff_required_len(data) {
+        return None;
     }
-    if let Some(host) = parse_http_host(&data) {
+    let data = if is_http_request_prefix(data) {
+        data.windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map_or(data, |end| &data[..end + 4])
+    } else {
+        data
+    };
+    Some(classify_tcp(data))
+}
+
+fn classify_tcp(data: &[u8]) -> SniffResult {
+    if let Some(sni) = parse_tls_sni(data) {
+        return SniffResult::tls_sni(sni, Vec::new());
+    }
+    if let Some(host) = parse_http_host(data) {
         return SniffResult {
             traffic_type: TrafficType::Http,
             domain: Some(host),
-            buffered: data,
+            buffered: Vec::new(),
         };
     }
-    SniffResult {
-        traffic_type: TrafficType::Unknown,
-        domain: None,
-        buffered: data,
-    }
+    SniffResult::unknown()
 }
 
 /// Return the prefix length needed to make a bounded sniffing decision.
 /// TLS waits for its declared first record and ClientHello handshake; HTTP
-/// waits for the complete header terminator.  Unknown protocols get only the
-/// initial five-byte classification prefix, avoiding an unnecessary delay.
+/// waits for the complete header terminator. Unknown prefixes need no further reads.
 fn sniff_required_len(data: &[u8]) -> usize {
     if data.is_empty() {
         return 1;
@@ -172,13 +190,7 @@ fn sniff_required_len(data: &[u8]) -> usize {
             MAX_CLIENT_HELLO_SIZE
         };
     }
-    if data
-        .iter()
-        .all(|byte| byte.is_ascii_graphic() || *byte == b'\r' || *byte == b'\n' || *byte == b'\t')
-    {
-        return MAX_CLIENT_HELLO_SIZE;
-    }
-    5
+    data.len()
 }
 
 /// Whether `data` can still be the start of a supported HTTP request method.
@@ -510,6 +522,57 @@ mod tests {
 
         buf
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn borrowed_sniff_waits_for_the_header_and_keeps_the_payload() {
+        let hello = build_tls_client_hello("fragmented.example");
+        assert!(sniff_packet_tcp(&hello[..9], false).is_none());
+        assert!(
+            sniff_packet_tcp(&hello[..9], true)
+                .unwrap()
+                .buffered
+                .is_empty()
+        );
+        let result = sniff_packet_tcp(&hello, false).unwrap();
+        assert_eq!(result.domain.as_deref(), Some("fragmented.example"));
+        assert!(result.buffered.is_empty());
+
+        let request = b"POST / HTTP/1.1\r\nHost: example.test\r\n\r\n\xff";
+        let result = sniff_packet_tcp(request, false).unwrap();
+        assert_eq!(result.domain.as_deref(), Some("example.test"));
+        assert!(result.buffered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn short_non_http_prefix_returns_while_peer_remains_open() {
+        let (mut peer, mut stream) = tokio::io::duplex(16);
+        peer.write_all(b"*").await.unwrap();
+        let mut sniff = std::pin::pin!(sniff_tcp(&mut stream));
+        let std::task::Poll::Ready(result) = futures::poll!(&mut sniff) else {
+            panic!("non-HTTP prefix waited for more data")
+        };
+        assert_eq!(result.buffered, b"*");
+        assert_eq!(result.traffic_type, TrafficType::Unknown);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_method_prefix_waits_for_the_remaining_header() {
+        let (mut peer, mut stream) = tokio::io::duplex(128);
+        peer.write_all(b"G").await.unwrap();
+        let mut sniff = std::pin::pin!(sniff_tcp(&mut stream));
+        assert!(futures::poll!(&mut sniff).is_pending());
+        peer.write_all(b"ET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            .await
+            .unwrap();
+        let result = sniff.await;
+        assert_eq!(result.domain.as_deref(), Some("example.test"));
+        assert_eq!(
+            result.buffered,
+            b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"
+        );
+    }
+
     #[tokio::test]
     async fn sniff_tcp_reassembles_fragmented_client_hello() {
         let hello = build_tls_client_hello("fragmented.example");

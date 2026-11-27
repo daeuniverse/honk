@@ -216,7 +216,7 @@ impl LegacySockOps {
         attr.__bindgen_anon_5.__bindgen_anon_1.target_fd = self.cgroup.as_raw_fd() as u32;
         attr.__bindgen_anon_5.attach_bpf_fd = self.program.as_raw_fd() as u32;
         attr.__bindgen_anon_5.attach_type = BPF_CGROUP_SOCK_OPS as u32;
-        unsafe { syscall::bpf_syscall(command, &mut attr) }
+        unsafe { bpf_syscall(command, &mut attr) }
             .map(|_| ())
             .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))
     }

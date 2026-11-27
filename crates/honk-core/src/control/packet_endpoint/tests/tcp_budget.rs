@@ -1,0 +1,523 @@
+use super::*;
+use crate::control::netstack::{CAPTURE_MEMORY, DirectRelayFence, capture_realm};
+use honk_netstack::FlowId;
+use std::future::poll_fn;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::runtime::{Builder, Handle};
+
+async fn drive<F: Future>(driver: &mut PacketDriver, operation: F) -> F::Output {
+    let mut operation = std::pin::pin!(operation);
+    poll_fn(|cx| {
+        driver.service(cx, Instant::now());
+        operation.as_mut().poll(cx)
+    })
+    .await
+}
+
+fn receive_segment(
+    scope: &PacketScope,
+    client: SocketAddr,
+    destination: SocketAddr,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+) {
+    let mut packet = [0; 128];
+    let length = wire::tcp::emit_packet(
+        &mut packet,
+        client.ip(),
+        destination.ip(),
+        &wire::tcp::Header {
+            src_port: client.port(),
+            dst_port: destination.port(),
+            seq,
+            ack,
+            flags,
+            window: 4096,
+            urgent: 0,
+            options: wire::tcp::Options::default(),
+        },
+        [payload, &[]],
+    )
+    .unwrap();
+    assert_eq!(
+        scope.receive(&packet[..length], Instant::now()),
+        Rx::Consumed
+    );
+}
+
+async fn exchange_byte_and_fin(
+    driver: &mut PacketDriver,
+    scope: &PacketScope,
+    listener: &TcpListener,
+    client: SocketAddr,
+    flow_id: FlowId,
+    initial_ack: u32,
+    pressure: Option<honk_netstack::MemoryReservation>,
+) {
+    let mut peer = drive(driver, async {
+        loop {
+            tokio::select! {
+                biased;
+                output = scope.next_output() => {
+                    let output = output.expect("original flow closed before its Direct dial");
+                    let ip = wire::parse_ip(output.packet()).unwrap();
+                    assert_eq!(output.flow_id(), Some(flow_id));
+                    let (header, _) = wire::tcp::parse(&output.packet()[ip.payload]).unwrap();
+                    assert_eq!(header.flags & wire::tcp::RST, 0, "original flow reset before relaying its byte");
+                    output.release();
+                }
+                accepted = listener.accept() => break accepted.unwrap().0,
+            }
+        }
+    })
+    .await;
+    drop(pressure);
+    let destination = listener.local_addr().unwrap();
+    // An unread upload would be aborted again during refusal cleanup before
+    // the driver could emit the original reset.
+    receive_segment(
+        scope,
+        client,
+        destination,
+        101,
+        initial_ack,
+        wire::tcp::ACK | wire::tcp::FIN,
+        b"u",
+    );
+    let acknowledge =
+        |ack| receive_segment(scope, client, destination, 103, ack, wire::tcp::ACK, b"");
+    let mut byte = [0];
+    peer.read_exact(&mut byte)
+        .await
+        .expect("original upload byte");
+    assert_eq!(&byte, b"u");
+    assert_eq!(
+        peer.read(&mut byte).await.unwrap(),
+        0,
+        "original FIN with no replay"
+    );
+    peer.write_all(b"d").await.unwrap();
+    peer.shutdown().await.unwrap();
+
+    let mut ack = initial_ack;
+    let mut downloaded = false;
+    loop {
+        let output = drive(driver, scope.next_output())
+            .await
+            .expect("original download and FIN");
+        let ip = wire::parse_ip(output.packet()).unwrap();
+        let segment = &output.packet()[ip.payload];
+        let (header, offset) = wire::tcp::parse(segment).unwrap();
+        assert_eq!(header.flags & wire::tcp::RST, 0);
+        let fin = header.flags & wire::tcp::FIN != 0;
+        let payload = &segment[offset..];
+        if payload.is_empty() && !fin {
+            output.release();
+            continue;
+        }
+        assert_eq!(output.flow_id(), Some(flow_id));
+        assert_eq!(header.seq, ack);
+        if !payload.is_empty() {
+            assert!(!downloaded, "replayed download");
+            assert_eq!(payload, b"d");
+            downloaded = true;
+            ack = ack.wrapping_add(1);
+        }
+        output.release();
+        if fin {
+            assert!(downloaded, "FIN preceded the original download byte");
+            acknowledge(ack.wrapping_add(1));
+            break;
+        }
+        acknowledge(ack);
+    }
+}
+
+async fn dispatch_charge(
+    listener: &TcpListener,
+    parked_owner: Option<&Handle>,
+    headroom: Option<usize>,
+    hold_to_dial: bool,
+) -> usize {
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, owners) = capture_realm(1280, 1, 2, 1, 1, &budget).unwrap();
+    let scope = realm.owner(0).unwrap().clone();
+    let (plane, _health) = local_plane_with(|config| config.groups.clear()).await;
+    assert!(plane.proxy_registry.has_stock_direct());
+    assert!(!plane.connection_tracker.is_enabled());
+    let router = Arc::clone(&plane.router);
+    let draining = Arc::clone(&plane.drain_tracker);
+    let permit_target = Arc::clone(&plane.tcp_admission_target);
+    let (endpoints, mut supervisor, mut drivers) =
+        PacketEndpoints::start_driven(plane, vec![(realm, owners)], 1, None, ScopeId::HOST)
+            .await
+            .unwrap();
+    let driver = drivers.first_mut().unwrap();
+    if let Some(owner) = parked_owner {
+        let driver_scope = driver.owner_scope();
+        assert!(driver_scope.same_owner(&scope));
+        driver_scope
+            .publish_direct_relay_runtime(owner.clone(), DirectRelayFence::new(&budget).unwrap())
+            .unwrap();
+    }
+    drive(driver, poll_fn(|cx| supervisor.poll_ready(cx)))
+        .await
+        .unwrap();
+    let (flow, ack) = drive(
+        driver,
+        established_tcp(&scope, listener.local_addr().unwrap()),
+    )
+    .await;
+    assert_eq!(flow.scope(), scope.scope());
+    assert_eq!(
+        flow.direct_relay_runtime().map(|owner| owner.runtime.id()),
+        parked_owner.map(Handle::id),
+    );
+    let client = flow.peer_addr();
+    let id = flow.flow_id();
+    let mut retirement = flow.retirement();
+    let slots = &endpoints.shared.tcp_slots;
+    let slot = Arc::clone(slots).try_acquire_owned().unwrap();
+    let route_gate = router.write().await;
+    let baseline = budget.used();
+    let pressure = headroom.map(|bytes| budget.reserve(budget.limit() - baseline - bytes).unwrap());
+    let before_dispatch = budget.used();
+    endpoints
+        .sender
+        .send(Work::Tcp(flow, slot, None))
+        .await
+        .unwrap();
+    // On this current-thread runtime the synchronous Work::Tcp arm completes
+    // before the test can regain every queue slot. Keep packet service stopped
+    // and routing blocked so only the funded task can change the charge.
+    drop(
+        endpoints
+            .sender
+            .reserve_many(INGRESS_CAPACITY)
+            .await
+            .unwrap(),
+    );
+    let after_dispatch = budget.used();
+    let occupied_slots = permit_target.load(Ordering::Acquire) - slots.available_permits();
+
+    if let Some(ordinary) = headroom {
+        drop(route_gate);
+        let pressure = if hold_to_dial {
+            pressure
+        } else {
+            drop(pressure);
+            None
+        };
+        exchange_byte_and_fin(driver, &scope, listener, client, id, ack, pressure).await;
+        drive(driver, retirement.wait()).await.unwrap();
+        assert!(scope.is_protocol_quiescent());
+        if !hold_to_dial {
+            assert_eq!(after_dispatch - before_dispatch, ordinary);
+        }
+        assert_eq!(occupied_slots, 1);
+    } else {
+        assert_eq!(draining.active_count(), 1, "calibration must fund one task");
+        // Cancel both calibration tasks at the routing gate, before any dial.
+        endpoints.close();
+        drive(driver, retirement.wait()).await.unwrap();
+        drop(route_gate);
+    }
+    drop(retirement);
+    while draining.active_count() != 0 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        slots.available_permits(),
+        permit_target.load(Ordering::Acquire)
+    );
+    endpoints.close();
+    let (plane, result) = drive(driver, poll_fn(|cx| supervisor.poll_join_plane(cx)))
+        .await
+        .unwrap();
+    result.unwrap();
+    endpoints.shutdown().await.unwrap();
+    drop((plane, supervisor, endpoints, drivers, scope));
+    assert_eq!(budget.used(), 0);
+    after_dispatch - before_dispatch
+}
+
+#[test]
+fn owned_packet_scoped_task_budget_refusal_relays_original_tcp_on_shared() {
+    let owner = Builder::new_current_thread().enable_all().build().unwrap();
+    let shared = Builder::new_current_thread().enable_all().build().unwrap();
+    assert_ne!(owner.handle().id(), shared.handle().id());
+    shared.block_on(async {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let ordinary = dispatch_charge(&listener, None, None, false).await;
+            let scoped = dispatch_charge(&listener, Some(owner.handle()), None, false).await;
+            assert!(
+                ordinary > 0 && ordinary < scoped,
+                "ordinary {ordinary}, scoped {scoped}"
+            );
+            dispatch_charge(&listener, Some(owner.handle()), Some(ordinary), false).await;
+            let listener = listener.into_std().unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock,
+                "unexpected additional Direct dial",
+            );
+        })
+        .await
+        .expect("the original Direct flow must exchange bytes and retire with the owner unpolled");
+    });
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn physical_worker_dispatch_copy_budget_boundary() {
+    use super::super::worker_copy_tests::{COPY_BYTES, CopyPressure, accept_local_syn};
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for headroom in [COPY_BYTES - 1, COPY_BYTES] {
+            let admit = headroom == COPY_BYTES;
+            let budget = MemoryBudget::new(CAPTURE_MEMORY);
+            let (realm, owners) = capture_realm(1280, 1, 2, 1, 1, &budget).unwrap();
+            let (plane, _health) = local_plane_with(|config| config.groups.clear()).await;
+            let draining = Arc::clone(&plane.drain_tracker);
+            let permit_target = Arc::clone(&plane.tcp_admission_target);
+            let (endpoints, mut supervisor, mut drivers) =
+                PacketEndpoints::start_driven(plane, vec![(realm, owners)], 1, None, ScopeId::HOST)
+                    .await
+                    .unwrap();
+            let mut driver = drivers.pop().unwrap();
+            driver.make_local(1).unwrap();
+            drive(&mut driver, poll_fn(|cx| supervisor.poll_ready(cx)))
+                .await
+                .unwrap();
+
+            // Park before the handshake ACK so a started task holds its copy and task credits.
+            let flow = accept_local_syn(&mut driver, "203.0.113.9:443".parse().unwrap());
+            let completion = flow.worker_completion_credit().unwrap().bytes();
+            let slots = &endpoints.shared.tcp_slots;
+            let slot = Arc::clone(slots).try_acquire_owned().unwrap();
+            let baseline = budget.used();
+            // Completion is reserved before copy. The probe releases the competing charge
+            // after copy succeeds, so the scoped task funds its own future afterwards.
+            let pressure = CopyPressure::new(&budget, completion + headroom);
+            endpoints
+                .sender
+                .send(Work::Tcp(flow, slot, None))
+                .await
+                .unwrap();
+            drop(endpoints.sender.reserve_many(INGRESS_CAPACITY).await.unwrap());
+            let grant = pressure.granted();
+            assert_eq!(grant, admit.then_some(COPY_BYTES), "headroom {headroom}");
+            assert_eq!(draining.active_count(), usize::from(admit));
+            // The scaler can resize admission while the supervisor handles the flow.
+            assert_eq!(
+                slots.available_permits() + usize::from(admit),
+                permit_target.load(Ordering::Acquire)
+            );
+            drop(pressure);
+            let task = if admit {
+                let bytes = budget
+                    .used()
+                    .checked_sub(baseline + completion + COPY_BYTES)
+                    .unwrap();
+                assert!(bytes > 0);
+                bytes
+            } else {
+                assert_eq!(budget.used(), baseline);
+                0
+            };
+
+            endpoints.close();
+            let (plane, result) = poll_fn(|cx| {
+                driver.service_closing(cx, Instant::now());
+                supervisor.poll_join_plane(cx)
+            })
+            .await
+            .unwrap();
+            result.unwrap();
+            assert_eq!(draining.active_count(), 0);
+            assert_eq!(slots.available_permits(), permit_target.load(Ordering::Acquire));
+            drop((plane, supervisor, endpoints, driver));
+            assert_eq!(budget.used(), 0);
+            eprintln!(
+                "worker_dispatch_copy_budget headroom={headroom} grant={grant:?} completion={completion} task={task} final_used=0"
+            );
+        }
+    })
+    .await
+    .expect("physical Worker admissions must retire and refund");
+}
+
+#[tokio::test]
+async fn auxiliary_pause_cancels_active_tcp_and_dns_and_drains_late_ingress() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let budget = MemoryBudget::new(32 << 20);
+        let (scope, owner) = crate::control::netstack::auxiliary_scope(1500, &budget).unwrap();
+        let (plane, _health) = local_plane().await;
+        let router = Arc::clone(&plane.router);
+        let (endpoints, mut supervisor, mut drivers) = PacketEndpoints::start_driven(
+            plane,
+            vec![(scope.clone(), owner)],
+            2,
+            None,
+            ScopeId::HOST,
+        )
+        .await
+        .unwrap();
+        let driver = drivers.first_mut().unwrap();
+        drive(driver, poll_fn(|cx| supervisor.poll_ready(cx)))
+            .await
+            .unwrap();
+        endpoints.resume_auxiliary(driver, 1500).unwrap();
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut packet = [0; 128];
+        let length = syn_packet(upstream.local_addr().unwrap(), &mut packet);
+        endpoints
+            .receive(scope.scope(), &packet[..length], Instant::now())
+            .unwrap();
+        let (mut peer, _) = drive(driver, upstream.accept()).await.unwrap();
+
+        let producer = endpoints.sender.try_reserve().unwrap();
+        let permit = Arc::clone(&endpoints.shared.tcp_slots)
+            .try_acquire_owned()
+            .unwrap();
+        let late_flow = pending_tcp(&scope, "203.0.113.9:443".parse().unwrap());
+        let late_binding = scope.auxiliary_work().unwrap().unwrap();
+        let route_gate = router.write().await;
+        let length = wire::udp::emit_packet(
+            &mut packet,
+            "192.0.2.10:41001".parse().unwrap(),
+            "198.51.100.53:53".parse().unwrap(),
+            &crate::control::tests::support::dns_query_payload(),
+        )
+        .unwrap();
+        endpoints
+            .receive(scope.scope(), &packet[..length], Instant::now())
+            .unwrap();
+        // The supervisor must take the DNS query and park on routing before pause.
+        drop(
+            endpoints
+                .sender
+                .reserve_many(INGRESS_CAPACITY - 1)
+                .await
+                .unwrap(),
+        );
+
+        let epoch = endpoints.shared.udp_pool.initialization_epoch();
+        {
+            let mut pause = std::pin::pin!(endpoints.pause_auxiliary(driver));
+            assert!(futures::poll!(&mut pause).is_pending());
+            assert!(!late_binding.is_active());
+            assert!(
+                endpoints
+                    .receive(scope.scope(), &packet[..length], Instant::now())
+                    .is_err()
+            );
+            assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+            producer.send(Work::Tcp(late_flow, permit, Some(late_binding)));
+            pause.await.unwrap();
+        }
+        drop(route_gate);
+        assert_eq!(endpoints.shared.udp_pool.initialization_epoch(), epoch);
+        endpoints.resume_auxiliary(driver, 1280).unwrap();
+        endpoints.close();
+        assert!(endpoints.resume_auxiliary(driver, 1500).is_err());
+        let (_, result) = drive(driver, poll_fn(|cx| supervisor.poll_join_plane(cx)))
+            .await
+            .unwrap();
+        result.unwrap();
+    })
+    .await
+    .expect("pause must release old auxiliary work while routing is blocked");
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn terminal_shutdown_retires_active_auxiliary_tcp_neutrally() {
+    use crate::control::ControlCommand;
+    use crate::native_api::observation::NativeObservation;
+    use crate::observe::flows::Filters;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let budget = MemoryBudget::new(32 << 20);
+        let (scope, owner) = crate::control::netstack::auxiliary_scope(1500, &budget).unwrap();
+        let id = scope.scope();
+        let (mut plane, _health) = local_plane_with(|config| {
+            config.experimental.native_api.record_flows = true;
+        })
+        .await;
+        let native = NativeObservation::attach(&mut plane).await;
+        native.attach_for_test();
+        let commands = plane.command_sender();
+        let (endpoints, mut supervisor, mut drivers) =
+            PacketEndpoints::start_driven(plane, vec![(scope, owner)], 1, None, ScopeId::HOST)
+                .await
+                .unwrap();
+        let driver = drivers.first_mut().unwrap();
+        drive(driver, poll_fn(|cx| supervisor.poll_ready(cx)))
+            .await
+            .unwrap();
+        endpoints.resume_auxiliary(driver, 1500).unwrap();
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut packet = [0; 128];
+        let length = syn_packet(upstream.local_addr().unwrap(), &mut packet);
+        endpoints
+            .receive(id, &packet[..length], Instant::now())
+            .unwrap();
+        let (mut peer, _) = drive(driver, upstream.accept()).await.unwrap();
+        commands.send(ControlCommand::Shutdown).await.unwrap();
+        let (_, result) = drive(driver, poll_fn(|cx| supervisor.poll_join_plane(cx)))
+            .await
+            .unwrap();
+        result.unwrap();
+        assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+
+        let flows = &native.core.flows;
+        let page = flows
+            .page(
+                Filters::new("tcp".into(), "all".into(), None, false, 1),
+                None,
+            )
+            .unwrap();
+        let detail = flows.test_detail(page["flows"][0]["id"].as_str().unwrap());
+        assert_eq!(detail["state"], "closed");
+        let terminal = detail["trace"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["data"]["milestone"] == "terminal")
+            .unwrap();
+        assert_eq!(terminal["data"]["reason"], "intentional_retirement");
+    })
+    .await
+    .expect("shutdown must join the observing TCP task and close its real upstream");
+}
+
+#[test]
+fn optional_relay_owner_does_not_displace_required_tcp_completion() {
+    let owner = Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let shared = Builder::new_current_thread().enable_all().build().unwrap();
+    shared.block_on(async {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let available = dispatch_charge(&listener, Some(owner.handle()), None, false).await;
+            for runtime in [None, Some(owner.handle())] {
+                dispatch_charge(&listener, runtime, Some(available), true).await;
+            }
+            assert_eq!(
+                listener.into_std().unwrap().accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        })
+        .await
+        .expect("the original flow must complete at the same headroom with or without an owner");
+    });
+}

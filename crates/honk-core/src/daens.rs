@@ -1,17 +1,14 @@
 //! FD-owned daens namespace and host-link setup.
 
-#[cfg(feature = "ebpf")]
+use crate::dae0_addresses::{DAENS_HOST_IP, DAENS_HOST_IPV6, DAENS_PEER_IP, DAENS_PEER_IPV6};
 use crate::netlink;
-#[cfg(feature = "ebpf")]
 use crate::sysctl::{require_off, set_sysctl};
-#[cfg(feature = "ebpf")]
 use tracing::{info, warn};
 
 /// Validated identity of the daemon-owned `dae0`/`dae0peer` pair, read once
 /// over netlink right after creation (both ends still in the host namespace).
 /// The datapath PARAM is built only from this, so a zero ifindex or MAC never
 /// reaches the kernel.
-#[cfg(feature = "ebpf")]
 #[derive(Debug, Clone)]
 pub struct Dae0Setup {
     ifindex: u32,
@@ -19,7 +16,6 @@ pub struct Dae0Setup {
     peer_mac: [u8; 6],
 }
 
-#[cfg(feature = "ebpf")]
 impl Dae0Setup {
     pub fn ifindex(&self) -> u32 {
         self.ifindex
@@ -64,19 +60,16 @@ impl Dae0Setup {
 /// Link-local addressing (169.254.0.1/32 on dae0, 169.254.0.11/32 on dae0peer)
 /// eliminates the need for iptables MASQUERADE and TCP MSS clamping — the kernel
 /// already treats link-local traffic as local.
-#[cfg(feature = "ebpf")]
 pub(crate) struct Dae0Guard {
     pub ifindex: u32,
 }
 
-#[cfg(feature = "ebpf")]
 impl Dae0Guard {
     fn new() -> Self {
         Self { ifindex: 0 }
     }
 }
 
-#[cfg(feature = "ebpf")]
 impl Drop for Dae0Guard {
     fn drop(&mut self) {
         info!("Cleaning up dae0 side effects");
@@ -86,7 +79,6 @@ impl Drop for Dae0Guard {
     }
 }
 
-#[cfg(feature = "ebpf")]
 pub(crate) fn create_dae0_link() -> anyhow::Result<(Dae0Guard, Dae0Setup)> {
     let mut guard = Dae0Guard::new();
 
@@ -158,7 +150,6 @@ pub(crate) fn create_dae0_link() -> anyhow::Result<(Dae0Guard, Dae0Setup)> {
     Ok((guard, setup))
 }
 
-#[cfg(feature = "ebpf")]
 pub(crate) fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<()> {
     let _ = tproxy_port;
     use crate::netlink::{FAM_V4, FAM_V6, NlSock};
@@ -338,25 +329,21 @@ pub(crate) static DAENS_READY: std::sync::atomic::AtomicBool =
 /// Whether THIS instance created the compat bind-mount at
 /// [`DAENS_NS_PATH`]. Cleanup only ever unmounts what it mounted —
 /// never a same-named mount belonging to another tool.
-#[cfg(feature = "ebpf")]
 static COMPAT_MOUNTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Whether THIS instance created the regular file used as the compat
 /// bind-mount target. If `/run/netns` belongs to iproute2, unmounting the
 /// child does not remove that file, so cleanup must remove its own target.
-#[cfg(feature = "ebpf")]
 static COMPAT_FILE_CREATED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// The engine-owned daens namespace FD, created by
 /// [`create_daens_namespace`] at startup. An open namespace FD pins the
 /// namespace for the process lifetime — no `ip netns` registry involved.
-#[cfg(feature = "ebpf")]
 static DAENS_FD: std::sync::OnceLock<std::os::unix::io::OwnedFd> = std::sync::OnceLock::new();
 
 /// Whether THIS instance mounted the tmpfs at /run/netns (the compat
 /// bind-mount's parent). Tracked separately from [`COMPAT_MOUNTED`]:
 /// cleanup unmounts the parent only when it is ours.
-#[cfg(feature = "ebpf")]
 static PARENT_TMPFS_MOUNTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -366,7 +353,6 @@ static PARENT_TMPFS_MOUNTED: std::sync::atomic::AtomicBool =
 /// process-wide. For external tooling compatibility the namespace is also
 /// bind-mounted to [`DAENS_NS_PATH`] (best-effort — the engine works fine
 /// without the mount).
-#[cfg(feature = "ebpf")]
 fn create_daens_namespace() -> anyhow::Result<&'static std::os::unix::io::OwnedFd> {
     use std::os::unix::io::OwnedFd;
 
@@ -459,12 +445,10 @@ fn create_daens_namespace() -> anyhow::Result<&'static std::os::unix::io::OwnedF
 }
 
 /// The process-wide daens FD (created on demand).
-#[cfg(feature = "ebpf")]
 pub(crate) fn daens_fd() -> anyhow::Result<&'static std::os::unix::io::OwnedFd> {
     create_daens_namespace()
 }
 
-#[cfg(feature = "ebpf")]
 pub(crate) fn daens_netns_id() -> anyhow::Result<i32> {
     use std::os::fd::AsFd as _;
 
@@ -473,7 +457,6 @@ pub(crate) fn daens_netns_id() -> anyhow::Result<i32> {
 
 /// `SO_NETNS_COOKIE` of the owned daens: the id `bpf_get_netns_cookie` reports for sockets
 /// living there, which is how sock_ops tells honk's listeners from every other host socket.
-#[cfg(feature = "ebpf")]
 pub(crate) fn daens_netns_cookie() -> anyhow::Result<u64> {
     use anyhow::Context as _;
     use std::os::fd::AsRawFd as _;
@@ -559,27 +542,14 @@ pub(crate) fn with_daens_netns<R>(
     let orig_ns = std::fs::File::open("/proc/thread-self/ns/net")
         .map_err(|e| anyhow::anyhow!("{}: open /proc/thread-self/ns/net: {}", op, e))?;
 
-    // The FD-owned namespace is the primary handle; the compat bind-mount
-    // path is the fallback for tests, mock mode, and non-ebpf builds.
-    #[cfg(feature = "ebpf")]
-    {
-        let daens = daens_fd()
-            .map_err(|error| anyhow::anyhow!("{op}: daens namespace unavailable: {error:#}"))?;
-        nix::sched::setns(daens, nix::sched::CloneFlags::CLONE_NEWNET)
-            .map_err(|error| anyhow::anyhow!("{op}: setns(daens): {error}"))?;
-    }
-    #[cfg(not(feature = "ebpf"))]
-    {
-        let daens = std::fs::File::open(DAENS_NS_PATH)
-            .map_err(|error| anyhow::anyhow!("{op}: open {DAENS_NS_PATH}: {error}"))?;
-        nix::sched::setns(&daens, nix::sched::CloneFlags::CLONE_NEWNET)
-            .map_err(|error| anyhow::anyhow!("{op}: setns(daens): {error}"))?;
-    }
+    let daens = daens_fd()
+        .map_err(|error| anyhow::anyhow!("{op}: daens namespace unavailable: {error:#}"))?;
+    nix::sched::setns(daens, nix::sched::CloneFlags::CLONE_NEWNET)
+        .map_err(|error| anyhow::anyhow!("{op}: setns(daens): {error}"))?;
     let _restore_guard = RestoreNs { fd: orig_ns, op };
     f()
 }
 
-#[cfg(feature = "ebpf")]
 fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
     // Unmount the compat bind-mount only when THIS instance mounted it —
     // a same-named mount from another tool is never ours to tear down.
@@ -630,31 +600,7 @@ fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
     );
 }
 
-/// Addressing for the dae0/dae0peer link pair between the host namespace and
-/// the isolated `daens` namespace.  These strings are the canonical values:
-/// the netns setup consumes them (ebpf feature only), while the control
-/// plane's internal-traffic filter (`control::is_honk_internal_addr`) and the
-/// kernel datapath use the numeric forms `DAE0_IPV6_PREFIX_HI` /
-/// `DAE0_IPV4_NET` in `honk-ebpf-common` in every build.  `control` tests
-/// assert both forms agree.
-///
-/// Link-local addresses (169.254.0.0/16) are used instead of a private
-/// subnet so that the kernel treats daens-originated traffic as local — no
-/// iptables MASQUERADE or TCP MSS clamping is needed.
-#[cfg(any(feature = "ebpf", test))]
-pub(crate) const DAENS_HOST_IP: &str = "169.254.0.1";
-#[cfg(any(feature = "ebpf", test))]
-pub(crate) const DAENS_PEER_IP: &str = "169.254.0.11";
-/// IPv6 ULA addresses of the dae0/dae0peer link pair (fd00:686f:6e6b::/64).
-/// The middle hextets are ASCII "honk" (`68 6f 6e 6b`) so the mnemonic
-/// stays readable while remaining a valid IPv6 ULA prefix.
-#[cfg(any(feature = "ebpf", test))]
-pub(crate) const DAENS_HOST_IPV6: &str = "fd00:686f:6e6b::1";
-#[cfg(any(feature = "ebpf", test))]
-pub(crate) const DAENS_PEER_IPV6: &str = "fd00:686f:6e6b::2";
-
 /// Whether `path` is a mountpoint (appears in /proc/mounts).
-#[cfg(feature = "ebpf")]
 fn is_mountpoint(path: &str) -> bool {
     std::fs::read_to_string("/proc/mounts")
         .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some(path)))
@@ -664,7 +610,7 @@ fn is_mountpoint(path: &str) -> bool {
 /// Fixture for production-load tests: a real `dae0`/`dae0peer` pair in the
 /// caller's (disposable) network namespace, read through the same validated
 /// path as startup. Dropping the guard deletes the pair.
-#[cfg(all(test, feature = "ebpf"))]
+#[cfg(test)]
 pub(crate) fn create_test_dae0_pair() -> anyhow::Result<(Dae0Guard, Dae0Setup)> {
     let mut nl = netlink::NlSock::new()?;
     if let Ok((stale, _)) = nl.get_link("dae0") {
@@ -680,7 +626,7 @@ pub(crate) fn create_test_dae0_pair() -> anyhow::Result<(Dae0Guard, Dae0Setup)> 
     ))
 }
 
-#[cfg(all(test, feature = "ebpf"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

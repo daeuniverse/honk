@@ -64,7 +64,7 @@ SIGHUP reload 会把 `bind` 的主机、端口或传输集合变化当作需重�
 
 ## 独立 listener（`bind`）
 
-独立 listener 用主机网络命名空间里的普通 socket，不设置 bypass mark。关掉它不影响透明 TCP/UDP 53 端口拦截；透明路径遵循[流量规则所有权](./routing.md#出站目标与-must)。
+独立监听使用普通 host-netns socket。TUN 和启用 Host 出口的 XDP 在 bind/listen 前必须设置并回读有效的 `global.so_mark_from_dae`，accepted TCP 继承它；两者均在捕获前预备已启用的监听地址。独立 TUN DNS 始终在 plain 域学习，包括回环客户端。XDP Host 的回环客户端使用活动出口共享的 Host 事实域，其他客户端使用独立监听域。所有 Host 出口离线时，回环查询仍有应答，但不发布 Host 事实。持久 TCP 每帧重查准入。其他 XDP、TC 和普通嵌入保留原先不打 mark 的独立监听。
 
 | 值 | 结果 |
 | --- | --- |
@@ -80,7 +80,7 @@ SIGHUP reload 会把 `bind` 的主机、端口或传输集合变化当作需重�
 
 listener 归进程所有。SIGHUP reload 接受语义等价的不同写法；但主机、端口或传输集合只要变了，就算需重启项，SIGHUP 会拒绝。通配绑定或绑在 LAN 侧会暴露一个无认证的递归解析器，必须用主机防火墙限制来源，绝不能发布到不可信网络。
 
-监听 `:53` 不会抢在 LAN 流量策略之前收到查询。即使 dnsmasq 或 `dns.bind` 占着这个 socket，不带 `must` 的 LAN TCP/UDP53 查询仍然进入 honk 透明 DNS。主机 loopback 上的查询，以及显式原生 `direct(must)` 交付的查询，仍能到达这个普通 listener；见[listener 矩阵](../design/dns.md#dns-所有权状态机)。
+TC 上监听 `:53` 不会抢先于 LAN 流量策略接收查询：即使 dnsmasq 或 `dns.bind` 占用 socket，非 `must` 的 LAN TCP/UDP53 仍进入 honk 透明 DNS。Host-loopback 与显式 native `direct(must)` 仍可到达普通 listener，见[监听器矩阵](../design/dns.md#dns-所有权状态机)。TUN 的系统 local RPDB rule 在捕获前处理本地目的；被捕获的 Direct 使用 Endpoint relay，不是 TC native 投递。
 
 ```dae
 dns {

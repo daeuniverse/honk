@@ -1,18 +1,26 @@
 //! eBPF backend abstraction.
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
+pub(crate) mod common;
+#[cfg(feature = "packet-ebpf")]
+pub(crate) mod host_bank;
+#[cfg(feature = "legacy-tc")]
 pub(crate) mod interface;
 pub mod map_snapshot;
 pub mod maps;
 pub mod mock;
+mod policy_state;
 pub mod probe;
 mod retirement;
+pub mod userspace;
+#[cfg(target_os = "linux")]
+pub use crate::xdp::gateway::GatewayPublisher;
 pub use retirement::*;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub mod real;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub use real::TcpKernelPin;
-#[cfg(all(test, feature = "ebpf"))]
+#[cfg(all(test, feature = "legacy-tc"))]
 pub(crate) mod test_support;
 
 /// Resume state for a bounded traversal of one tuple map. A completed traversal
@@ -48,7 +56,7 @@ pub struct TcpChildProofPending;
 
 pub enum TcpPin {
     Model,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     Kernel(TcpKernelPin),
 }
 
@@ -56,7 +64,7 @@ impl TcpPin {
     pub(crate) fn release(self) -> anyhow::Result<()> {
         match self {
             Self::Model => Ok(()),
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             Self::Kernel(pin) => pin.release(),
         }
     }
@@ -65,14 +73,16 @@ impl TcpPin {
 use async_trait::async_trait;
 use honk_ebpf_common::*;
 
-/// Captured once at admission; `None` is reserved for stateless or model flows.
+/// Admission identity. Packet-owned flows carry no kernel mutation authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct UdpFlowOwner {
     pub token: u32,
     pub incarnation: Option<std::num::NonZeroU64>,
+    kernel_capture: bool,
 }
 
 impl UdpFlowOwner {
+    /// Captured by a kernel intake or its model, never by packet ingress.
     pub fn new(token: u32, incarnation: Option<u64>) -> anyhow::Result<Self> {
         let incarnation = incarnation
             .map(|incarnation| {
@@ -84,7 +94,23 @@ impl UdpFlowOwner {
                     .ok_or_else(|| anyhow::anyhow!("UDP flow incarnation must be nonzero"))
             })
             .transpose()?;
-        Ok(Self { token, incarnation })
+        Ok(Self {
+            token,
+            incarnation,
+            kernel_capture: true,
+        })
+    }
+
+    pub(crate) fn packet() -> Self {
+        Self {
+            token: 0,
+            incarnation: None,
+            kernel_capture: false,
+        }
+    }
+
+    pub(crate) fn has_kernel_capture(self) -> bool {
+        self.kernel_capture
     }
 
     pub fn incarnation(self) -> Option<u64> {
@@ -294,6 +320,7 @@ pub const MAX_DATAPATH_ATTACHMENTS: usize = 128;
 pub enum DatapathKind {
     Real,
     Mock,
+    PacketUserspace,
     Unknown,
 }
 
@@ -412,15 +439,21 @@ pub enum PnameSupport {
     Full,
     /// Kernel argv capture is unavailable; rules see the thread name.
     ThreadName,
+    /// Argv-derived names are available only for Host sockets with captured identity.
+    HostFull,
+    /// Thread names are available only for Host sockets with captured identity.
+    HostThreadName,
     /// The cgroup hooks are not attached; `pname()` never matches and
     /// `!pname()` always does.
     Unavailable,
 }
 
+pub type PnameSupportCell = std::sync::Arc<parking_lot::RwLock<PnameSupport>>;
+
 /// Lists `pname_routing` while `router` has a `pname()` rule that `backend` reduces.
 pub(crate) fn record_pname_routing(
     router: &crate::routing::Router,
-    backend: &dyn EbpfBackend,
+    backend: &dyn PolicyBackend,
     degradations: &crate::degradations::Degradations,
 ) {
     use crate::degradations::{Component, Issue};
@@ -432,9 +465,19 @@ pub(crate) fn record_pname_routing(
             message: "Kernel argv capture is unavailable; process-name rules match the thread name.",
             reason: "comm_fallback",
         }),
+        PnameSupport::HostFull => Some(Issue {
+            code: "pname_routing_host_only",
+            message: "Process names are available only for Host sockets with captured identity. Other traffic retains Missing semantics.",
+            reason: "host_only",
+        }),
+        PnameSupport::HostThreadName => Some(Issue {
+            code: "pname_routing_host_only",
+            message: "Kernel argv capture is unavailable; only Host sockets with captured identity can match thread names. Other traffic retains Missing semantics.",
+            reason: "host_only_comm_fallback",
+        }),
         PnameSupport::Unavailable => Some(Issue {
             code: "pname_routing_disabled",
-            message: "cgroup v2 is unavailable; pname() conditions see no process name, so positive ones never match and negated ones always match.",
+            message: "Process names are unavailable because cgroup hooks are missing or XDP Host capture is not enabled; pname() conditions see no process name, so positive ones never match and negated ones always match.",
             reason: "cgroup_unavailable",
         }),
     };
@@ -444,8 +487,63 @@ pub(crate) fn record_pname_routing(
     }
 }
 
+/// Writes individual DNS facts into the active routing generation.
+pub trait DomainProjectionSink: Send + Sync {
+    /// Replace one entry in the active generation-owned domain HASH map.
+    /// A present all-zero value is meaningful and must not be removed.
+    fn set_domain_ip_bitmap(
+        &mut self,
+        ip_key: &LpmKey,
+        bitmap: &DomainRouting,
+    ) -> Result<(), DomainRouteWriteError>;
+
+    /// Remove an entry from the active generation-owned domain HASH map.
+    fn remove_domain_ip_bitmap(&mut self, ip_key: &LpmKey) -> Result<(), DomainRouteWriteError>;
+}
+
+/// Policy publication shared by kernel and software execution owners.
 #[async_trait]
-pub trait EbpfBackend: Send + Sync {
+pub trait PolicyBackend: DomainProjectionSink {
+    fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)>;
+    fn tc_mut(&mut self) -> anyhow::Result<&mut (dyn EbpfBackend + 'static)>;
+
+    #[cfg(target_os = "linux")]
+    fn gateway_reload(&mut self) -> Option<&mut dyn userspace::GatewayReload> {
+        None
+    }
+
+    #[cfg(test)]
+    fn userspace_mut(&mut self) -> anyhow::Result<&mut userspace::UserspaceBackend> {
+        anyhow::bail!("policy backend is not the userspace backend")
+    }
+
+    /// Install or unregister the Linux packet gateway's publisher.
+    #[cfg(target_os = "linux")]
+    fn install_gateway(
+        &mut self,
+        _gateway: Option<std::sync::Arc<GatewayPublisher>>,
+    ) -> anyhow::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "policy backend does not support a gateway publisher",
+        )
+        .into())
+    }
+
+    /// Finish startup only for the installed publisher and the admitted policy.
+    #[cfg(target_os = "linux")]
+    fn activate_gateway_start(
+        &mut self,
+        _publisher: &std::sync::Arc<GatewayPublisher>,
+        _fingerprint: [u8; 32],
+        _generation: u64,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "policy backend does not support gateway startup",
+        ))
+    }
+
     /// Bounded readonly kernel/owner facts; never repairs or reopens the datapath.
     fn observe_datapath(&self) -> DatapathObservation {
         DatapathObservation::unknown(DatapathKind::Unknown)
@@ -484,36 +582,38 @@ pub trait EbpfBackend: Send + Sync {
     }
     #[cfg(test)]
     fn clear_projection_write_log(&mut self) {}
-    fn detach_hooks(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn attach_dae0_programs(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-    /// Open or close admission at the TC entry points. Implementations must
-    /// publish listener sockets before setting this to `true`.
-    fn set_datapath_ready(&mut self, _ready: bool) -> anyhow::Result<()> {
-        Ok(())
+
+    /// Open or close this backend's admission; TC requires published listeners.
+    fn set_datapath_ready(&mut self, ready: bool) -> anyhow::Result<()>;
+
+    /// Publish the composed mode/admission flags supported by this backend.
+    fn set_datapath_flags(&mut self, flags: u32) -> anyhow::Result<()>;
+
+    /// Read the current flags for seeding a packet-owned gateway map.
+    fn mode_flags(&self) -> std::io::Result<u32> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "policy backend does not support reading packet mode flags",
+        ))
     }
 
-    /// Write the mode-based direct-offload policy (the
-    /// `DATAPATH_FLAG_OFFLOAD_*` bits) into `DATAPATH_FLAGS_MAP`.  The
-    /// control plane recomputes and pushes the full word on startup, at the
-    /// reload commit point, and on every clash mode switch; `lan_ingress`
-    /// reads it once per new flow and caches the decision per flow, so the
-    /// write takes effect for new flows only — established flows keep the
-    /// decision they were created with.
-    fn set_datapath_flags(&mut self, _flags: u32) -> anyhow::Result<()> {
-        Ok(())
+    /// After READY was cleared, quiesce TC staging. `Ok(false)` means
+    /// TC staging is unavailable; a failed quiescence always returns `Err`.
+    fn quiesce_udp_staging_if_supported(&mut self) -> anyhow::Result<bool> {
+        Ok(false)
     }
+
+    #[cfg(feature = "native-api")]
+    fn supports_kernel_trace(&self) -> bool {
+        false
+    }
+
     #[cfg(test)]
     fn arm_datapath_flags_write_fault(&mut self, _nth: usize) -> anyhow::Result<()> {
         anyhow::bail!("datapath flag fault injection is unsupported")
     }
     #[cfg(test)]
     fn mark_datapath_flags_write_origin(&mut self, _origin: DatapathFlagsWriteOrigin) {}
-    #[cfg(test)]
-    fn arm_quiesce_fault(&mut self) {}
     #[cfg(test)]
     fn datapath_flags_write_log(&self) -> Vec<u32> {
         Vec::new()
@@ -524,6 +624,83 @@ pub trait EbpfBackend: Send + Sync {
     }
     #[cfg(test)]
     fn clear_datapath_flags_write_log(&mut self) {}
+
+    async fn cleanup(&mut self) -> anyhow::Result<()>;
+
+    /// Atomically publish a complete compiled routing plan into an inactive slot.
+    /// Implementations stage every generation-owned fact map and program before
+    /// committing the stable policy root; errors leave the prior root untouched.
+    fn publish_routing_plan(
+        &mut self,
+        plan: &crate::control::routing_matcher::RoutingPushPlan,
+        learned_domains: &[(LpmKey, DomainRouting)],
+    ) -> anyhow::Result<()>;
+    /// Return the committed compiled-policy generation, not the active slot.
+    fn routing_policy_generation(&self) -> u64;
+
+    /// Bind a dictionary to the current routing owner. Packet backends have no kernel witnesses.
+    #[cfg(feature = "native-api")]
+    fn bind_kernel_trace_dictionary(
+        &mut self,
+        _dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
+    ) {
+    }
+
+    /// Return the slot currently selected by the stable policy root.
+    fn active_routing_slot(&self) -> anyhow::Result<u32> {
+        Ok(0)
+    }
+    /// OR a learned domain bitmap into the active generation-owned map.
+    fn add_domain_ip_bitmap(
+        &mut self,
+        ip_key: &LpmKey,
+        bitmap: &DomainRouting,
+    ) -> anyhow::Result<()>;
+    fn set_domain_ip_bitmap_batch(
+        &mut self,
+        entries: &[(LpmKey, DomainRouting)],
+    ) -> Result<(), (usize, DomainRouteWriteError)> {
+        for (index, (key, bitmap)) in entries.iter().enumerate() {
+            self.set_domain_ip_bitmap(key, bitmap)
+                .map_err(|error| (index, error))?;
+        }
+        Ok(())
+    }
+    fn remove_domain_ip_bitmap_batch(
+        &mut self,
+        keys: &[LpmKey],
+    ) -> Result<(), (usize, DomainRouteWriteError)> {
+        for (index, key) in keys.iter().enumerate() {
+            self.remove_domain_ip_bitmap(key)
+                .map_err(|error| (index, error))?;
+        }
+        Ok(())
+    }
+
+    fn pname_support(&self) -> PnameSupport {
+        PnameSupport::Full
+    }
+
+    fn set_outbound_alive(
+        &mut self,
+        outbound: u8,
+        domain: u32,
+        ipver: u32,
+        alive: bool,
+    ) -> anyhow::Result<()>;
+    fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool>;
+}
+
+/// TC hooks, transparent socket ownership and fenced kernel tuple operations.
+pub trait EbpfBackend: PolicyBackend {
+    fn detach_hooks(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn attach_dae0_programs(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    #[cfg(test)]
+    fn arm_quiesce_fault(&mut self) {}
 
     /// After READY has been cleared, wait for every kernel invocation that
     /// observed the prior fence to finish, then remove all unpublished or
@@ -569,15 +746,13 @@ pub trait EbpfBackend: Send + Sync {
     /// and the caller has joined ingress. Errors never authorize reopening.
     fn clear_listener_sockets(&mut self) -> anyhow::Result<()>;
 
-    async fn cleanup(&mut self) -> anyhow::Result<()>;
-
     /// Snapshot what this backend owns for the interface reconciler: program
     /// FDs plus dup'd link FDs.
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     fn interface_binding_snapshot(&self) -> anyhow::Result<interface::BindingSnapshot>;
 
     /// Prepare a blocking verifier job without retaining backend ownership.
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     fn prepare_tc_programs(
         &self,
         _programs: &[interface::TcProgram],
@@ -586,68 +761,18 @@ pub trait EbpfBackend: Send + Sync {
     }
 
     /// Install the current routing generation before making prepared targets bindable.
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     fn commit_tc_programs(&mut self, _batch: real::programs::TcProgramBatch) -> anyhow::Result<()> {
         Ok(())
     }
 
     /// Apply the commit and return replaced or removed link FDs. The caller
     /// must close them outside any lock: the last close takes the rtnl lock.
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     fn commit_interface_bindings(
         &mut self,
         commit: interface::BindingCommit,
     ) -> Vec<std::os::fd::OwnedFd>;
-
-    /// Atomically publish a complete compiled routing plan into an inactive slot.
-    /// Implementations stage every generation-owned fact map and program before
-    /// committing the stable policy root; errors leave the prior root untouched.
-    fn publish_routing_plan(
-        &mut self,
-        plan: &crate::control::routing_matcher::RoutingPushPlan,
-        learned_domains: &[(LpmKey, DomainRouting)],
-    ) -> anyhow::Result<()>;
-    /// Return the committed compiled-policy generation, not the active slot.
-    fn routing_policy_generation(&self) -> u64;
-    /// Return the slot currently selected by the stable policy root.
-    fn active_routing_slot(&self) -> anyhow::Result<u32> {
-        Ok(0)
-    }
-    /// OR a learned domain bitmap into the active generation-owned map.
-    fn add_domain_ip_bitmap(
-        &mut self,
-        ip_key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> anyhow::Result<()>;
-    /// Replace one entry in the active generation-owned domain HASH map.
-    /// A present all-zero value is meaningful and must not be removed.
-    fn set_domain_ip_bitmap(
-        &mut self,
-        ip_key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> Result<(), DomainRouteWriteError>;
-    fn set_domain_ip_bitmap_batch(
-        &mut self,
-        entries: &[(LpmKey, DomainRouting)],
-    ) -> Result<(), (usize, DomainRouteWriteError)> {
-        for (index, (key, bitmap)) in entries.iter().enumerate() {
-            self.set_domain_ip_bitmap(key, bitmap)
-                .map_err(|error| (index, error))?;
-        }
-        Ok(())
-    }
-    /// Remove an entry from the active generation-owned domain HASH map.
-    fn remove_domain_ip_bitmap(&mut self, ip_key: &LpmKey) -> Result<(), DomainRouteWriteError>;
-    fn remove_domain_ip_bitmap_batch(
-        &mut self,
-        keys: &[LpmKey],
-    ) -> Result<(), (usize, DomainRouteWriteError)> {
-        for (index, key) in keys.iter().enumerate() {
-            self.remove_domain_ip_bitmap(key)
-                .map_err(|error| (index, error))?;
-        }
-        Ok(())
-    }
 
     /// Locked snapshot of one tuple's conn state, for either protocol.
     fn conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>>;
@@ -670,6 +795,10 @@ pub trait EbpfBackend: Send + Sync {
         tuples: &TuplesKey,
         owner: UdpFlowOwner,
     ) -> anyhow::Result<(Option<RoutingHandoffEntry>, Option<u8>)> {
+        anyhow::ensure!(
+            owner.has_kernel_capture(),
+            "packet-owned UDP has no kernel admission authority"
+        );
         let entry = self.routing_handoff_lookup(tuples)?;
         let mut cached_group = None;
         if !owner.is_stateless(tuples.src_port, tuples.dst_port) {
@@ -781,13 +910,6 @@ pub trait EbpfBackend: Send + Sync {
     }
 
     #[cfg(feature = "native-api")]
-    fn bind_kernel_trace_dictionary(
-        &mut self,
-        _dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
-    ) {
-    }
-
-    #[cfg(feature = "native-api")]
     fn capture_kernel_route(
         &self,
         _key: &TuplesKey,
@@ -796,23 +918,10 @@ pub trait EbpfBackend: Send + Sync {
         Err("kernel_trace_unsupported")
     }
 
-    #[cfg(all(feature = "ebpf", feature = "native-api"))]
+    #[cfg(all(feature = "legacy-tc", feature = "native-api"))]
     fn prepare_receive_trace(&self) -> Option<real::programs::ReceiveTracePreparation> {
         None
     }
-
-    fn pname_support(&self) -> PnameSupport {
-        PnameSupport::Full
-    }
-
-    fn set_outbound_alive(
-        &mut self,
-        outbound: u8,
-        domain: u32,
-        ipver: u32,
-        alive: bool,
-    ) -> anyhow::Result<()>;
-    fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool>;
 
     fn get_bpf_stats(&self, key: u32) -> anyhow::Result<Option<u64>>;
 

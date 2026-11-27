@@ -7,9 +7,11 @@
 
 #[cfg(test)]
 use crate::dns::forwarder::DnsForwarder;
-use crate::ebpf::EbpfBackend;
+use crate::dns::projection::QueryScope;
+use crate::ebpf::PolicyBackend;
 #[cfg(test)]
 use crate::routing::Router;
+use honk_datapath::ScopeId;
 use std::future::Future;
 #[cfg(test)]
 use std::net::SocketAddr;
@@ -19,6 +21,7 @@ use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError};
 use tracing::warn;
 
 mod transport;
+pub(in crate::control) use transport::{DnsUdpReply, PacketDnsScopeRetired};
 
 #[cfg(test)]
 mod tests;
@@ -74,6 +77,7 @@ pub(crate) struct AdmittedDnsQuery {
     runtime: crate::dns::runtime::RuntimeLease,
     _query_permit: OwnedSemaphorePermit,
     _udp_permit: Option<OwnedSemaphorePermit>,
+    projection_scope: QueryScope,
 }
 
 pub(crate) struct DnsAdmissionError {
@@ -88,6 +92,13 @@ impl std::fmt::Debug for DnsAdmissionError {
 }
 
 impl DnsAdmissionError {
+    fn closed() -> Self {
+        Self {
+            error: TryAcquireError::Closed,
+            udp_reply: None,
+        }
+    }
+
     pub(crate) async fn run_reply<T>(
         &self,
         operation: impl Future<Output = T>,
@@ -112,7 +123,7 @@ impl DnsController {
     #[cfg(test)]
     pub fn new(
         forwarder: Arc<DnsForwarder>,
-        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        ebpf: Arc<RwLock<Box<dyn PolicyBackend>>>,
         _router: Arc<RwLock<Router>>,
         udp_query_limit: usize,
     ) -> Self {
@@ -141,7 +152,7 @@ impl DnsController {
     #[cfg(test)]
     pub(crate) fn new_with_runtime(
         runtime_provider: Arc<crate::dns::runtime::DnsServiceProvider>,
-        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        ebpf: Arc<RwLock<Box<dyn PolicyBackend>>>,
         udp_query_limit: usize,
     ) -> Self {
         Self::new_with_service(
@@ -153,7 +164,7 @@ impl DnsController {
 
     pub(crate) fn new_with_service(
         dns_service: crate::dns::DnsService,
-        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        ebpf: Arc<RwLock<Box<dyn PolicyBackend>>>,
         udp_query_limit: usize,
     ) -> Self {
         let snapshot = {
@@ -232,13 +243,88 @@ impl DnsController {
         self.routing_projection.prepare_snapshot_publication()
     }
 
+    pub(in crate::control) fn register_packet_scopes(
+        &self,
+        scopes: &[super::netstack::PacketScope],
+    ) -> anyhow::Result<()> {
+        let budget = scopes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("packet DNS scopes must not be empty"))?
+            .budget();
+        anyhow::ensure!(
+            scopes
+                .iter()
+                .all(|scope| Arc::ptr_eq(&budget, &scope.budget())),
+            "packet DNS scopes must share one memory budget"
+        );
+        self.routing_projection.register_packet_scopes(
+            scopes.iter().map(super::netstack::PacketScope::scope),
+            &budget,
+        )
+    }
+
+    pub(in crate::control) fn packet_domain_bitmap(
+        &self,
+        scope: ScopeId,
+        ip: std::net::IpAddr,
+        router: &crate::routing::Router,
+        generation: u64,
+    ) -> anyhow::Result<crate::dns::projection::PacketDomainBitmap> {
+        self.routing_projection
+            .packet_domain_bitmap(scope, ip, router, generation)
+    }
+
+    pub(in crate::control) fn hot_fill_packet_domain(
+        &self,
+        facts: crate::dns::projection::PacketDomainBitmap,
+    ) {
+        #[cfg(target_os = "linux")]
+        self.routing_projection.hot_fill_packet_domain(facts);
+        #[cfg(not(target_os = "linux"))]
+        let _ = facts;
+    }
+
+    #[cfg(test)]
+    fn owns_packet_scope(&self, scope: ScopeId) -> bool {
+        self.routing_projection.owns_packet_scope(scope)
+    }
+
+    pub(in crate::control) fn routing_projection(
+        &self,
+    ) -> Arc<crate::dns::projection::RoutingProjection> {
+        Arc::clone(&self.routing_projection)
+    }
+
     pub async fn cache(&self) -> Arc<tokio::sync::Mutex<crate::dns::cache::DnsCache>> {
         self.dns_service.cache()
+    }
+
+    pub(in crate::control) fn query_scope(&self, scope: ScopeId) -> Option<QueryScope> {
+        if scope == ScopeId::HOST {
+            Some(QueryScope::HOST)
+        } else {
+            self.routing_projection.packet_query_scope(scope)
+        }
+    }
+
+    pub(super) fn listener_query_scopes(
+        &self,
+        standalone: ScopeId,
+    ) -> (Option<QueryScope>, Option<QueryScope>) {
+        self.routing_projection.listener_query_scopes(standalone)
     }
 
     /// Acquire a generation-pinned query admission. The runtime lease and
     /// permits remain owned by the caller through response I/O.
     pub(crate) fn try_admit_query(&self, udp: bool) -> Result<AdmittedDnsQuery, DnsAdmissionError> {
+        self.admit_query_in(udp, QueryScope::HOST)
+    }
+
+    fn admit_query_in(
+        &self,
+        udp: bool,
+        projection_scope: QueryScope,
+    ) -> Result<AdmittedDnsQuery, DnsAdmissionError> {
         let runtime = self
             .dns_service
             .try_acquire_runtime()
@@ -271,7 +357,34 @@ impl DnsController {
             runtime,
             _query_permit: query_permit,
             _udp_permit: udp_permit,
+            projection_scope,
         })
+    }
+
+    pub(in crate::control) fn try_admit_packet_query(
+        &self,
+        udp: bool,
+        scope: ScopeId,
+    ) -> Result<AdmittedDnsQuery, DnsAdmissionError> {
+        let scope = self
+            .routing_projection
+            .packet_query_scope(scope)
+            .ok_or_else(DnsAdmissionError::closed)?;
+        self.admit_query_in(udp, scope)
+    }
+
+    pub(in crate::control) fn try_admit_bound_query(
+        &self,
+        udp: bool,
+        scope: Option<QueryScope>,
+    ) -> Result<AdmittedDnsQuery, DnsAdmissionError> {
+        // Losing the Host activity stamp withdraws listener facts while its socket stays live.
+        let scope = scope
+            .filter(|scope| {
+                scope.is_host_listener() || self.routing_projection.query_scope_is_current(*scope)
+            })
+            .ok_or_else(DnsAdmissionError::closed)?;
+        self.admit_query_in(udp, scope)
     }
 
     /// Resolve and project one generation-pinned DNS query.
@@ -327,7 +440,10 @@ impl DnsController {
                     break 'failed build_dns_servfail(data);
                 }
             };
-            match self.project_answer(&admission.runtime, outcome).await {
+            match self
+                .project_answer(&admission.runtime, admission.projection_scope, outcome)
+                .await
+            {
                 Ok(answer) => return answer,
                 Err(error) => {
                     crate::observe::flows::dns::decision("cancelled", Some("runtime_retired"));
@@ -351,16 +467,17 @@ impl DnsController {
     async fn project_answer(
         &self,
         lease: &crate::dns::runtime::RuntimeLease,
+        scope: QueryScope,
         outcome: crate::dns::outcome::DnsOutcome,
     ) -> Result<DnsClientAnswer, crate::dns::runtime::RuntimeCancelled> {
         let observed_at = tokio::time::Instant::now();
-        if !self.try_submit_projection(lease.runtime(), &outcome, observed_at) {
+        if !self.try_submit_projection(lease.runtime(), scope, &outcome, observed_at) {
             return Box::pin(async move {
                 tokio::select! {
                     biased;
                     error = lease.cancelled() => return Err(error),
                     () = self.routing_projection.submit_after_publication(|| {
-                        self.try_submit_projection(lease.runtime(), &outcome, observed_at)
+                        self.try_submit_projection(lease.runtime(), scope, &outcome, observed_at)
                     }) => {}
                 }
                 Ok(DnsClientAnswer(Ok(outcome)))
@@ -390,6 +507,7 @@ impl DnsController {
     fn try_submit_projection(
         &self,
         runtime: &crate::dns::runtime::DnsRuntime,
+        scope: QueryScope,
         outcome: &crate::dns::outcome::DnsOutcome,
         observed_at: tokio::time::Instant,
     ) -> bool {
@@ -422,30 +540,18 @@ impl DnsController {
         } else {
             match (outcome.status(), outcome.response_class(), family) {
                 (OutcomeStatus::Accepted, ResponseClass::Positive, Some(family)) => {
-                    // Uncacheable does not mean the accepted address has no routing lifetime.
-                    let advertised_ttl = if outcome.expiry().is_cacheable() {
-                        outcome.expiry().ttl()
-                    } else {
-                        Duration::from_secs(u64::from(crate::dns::forwarder::extract_min_ttl(
-                            outcome.reusable(),
-                        )))
-                    };
-                    let expires_at = observed_at + advertised_ttl;
-                    if outcome.provenance() == crate::dns::outcome::Provenance::Cache {
-                        return projection.try_submit_cache_hit(
-                            snapshot,
-                            domain,
-                            family,
-                            outcome.answer_ips(),
-                            expires_at,
-                        );
-                    }
-                    ProjectionObservation::Positive {
+                    let lifetime = outcome.routing_lifetime(observed_at);
+                    let positive = ProjectionObservation::Positive {
                         domain,
                         family,
                         ips: outcome.answer_ips(),
-                        expires_at,
+                        expires_at: lifetime.expires_at,
+                        source: lifetime.source,
+                    };
+                    if outcome.provenance() == crate::dns::outcome::Provenance::Cache {
+                        return projection.try_submit_cache_hit(scope, snapshot, positive);
                     }
+                    positive
                 }
                 (OutcomeStatus::Accepted, ResponseClass::Nodata, Some(family)) => {
                     ProjectionObservation::Clear { domain, family }
@@ -463,6 +569,6 @@ impl DnsController {
                 | (OutcomeStatus::Rejected, _, _) => ProjectionObservation::Retain,
             }
         };
-        projection.try_submit(snapshot, observation)
+        projection.try_submit(scope, snapshot, observation)
     }
 }

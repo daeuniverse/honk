@@ -18,8 +18,8 @@ honk follows the design of dae's eBPF datapath and configuration syntax, and of 
 
 ## Capabilities
 
-- Transparent TCP/UDP for LAN-forwarded and host-originated traffic through TC eBPF, `dae0`/`daens`, and compiled routing.
-- Outbounds include SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, VLESS, `direct`, and `block`. Trojan, VMess, and VLESS support H2 XHTTP (`packet-up`, `stream-up`, `stream-one`). VMess is TCP-only. [Proxy chains](doc/en/reference/nodes.md#proxy-chains) (`front -> land`) carry TCP through two to four supported proxies. For UDP, every hop must qualify for tunneled TCP, including the entry, and the exit must be an eligible Trojan or native-UDP VLESS node. See [protocol limits](doc/en/reference/nodes.md).
+- Transparent TCP/UDP for LAN-forwarded and host-originated traffic through TC eBPF, `dae0`/`daens`, and compiled routing. An explicitly configured [XDP backend](doc/en/design/datapath.md#full-xdp-startup) provides Endpoint/Core execution, with optional Core firewall/NAT and no automatic fallback.
+- Outbounds include SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, VLESS, single-peer WireGuard, `direct`, and `block`. Trojan, VMess, and VLESS support H2 XHTTP (`packet-up`, `stream-up`, `stream-one`). VMess is TCP-only. [Proxy chains](doc/en/reference/nodes.md#proxy-chains) (`front -> land`) carry TCP through two to four supported proxies. For UDP, every hop must qualify for tunneled TCP, including the entry, and the exit must be an eligible Trojan or native-UDP VLESS node. See [protocol limits](doc/en/reference/nodes.md).
 - Groups: Selector (the default), URLTest, LoadBalance, Fallback, and Score. Score uses business observations and bounded validation; see [group policies](doc/en/reference/groups.md#score-policy). A group [`exit`](doc/en/reference/groups.md#exit) appends a fixed exit to the selected path. Multi-hop UDP follows the same hop requirements as a chain.
 - DNS: UDP, TCP, DoT, DoH, DoQ, and DoH3 upstreams, optionally through a node or group, with routing and caching.
 - Configuration and control: dae syntax, subscriptions, reload, a Clash-compatible REST/WebSocket API, and the `honk-tool` CLI toolbox.
@@ -70,7 +70,7 @@ The [documentation index](doc/README.md) links configuration guides, native and 
 
 ## Development
 
-The workspace contains configuration, shared eBPF types, NFQUEUE, outbound, core, and tooling crates; `crates/honk-ebpf` builds separately. See the [Justfile](Justfile) and [contribution policy](CONTRIBUTING.md).
+The workspace contains configuration, shared eBPF types, NFQUEUE, netstack, datapath, XSK, outbound, core, and tooling crates; `crates/honk-ebpf` builds separately. See the [Justfile](Justfile) and [contribution policy](CONTRIBUTING.md).
 
 Use [mock mode](doc/en/how-to-start.md#unprivileged-development) for unprivileged userspace development. `--mock-ebpf` does not intercept traffic or test the datapath.
 
@@ -81,6 +81,8 @@ The rolling [Debug prerelease](https://github.com/daeuniverse/honk/releases/tag/
 Report proxy, routing, and DNS problems in [honk issues](https://github.com/daeuniverse/honk/issues); report web interface problems in [doona issues](https://github.com/Zakkaus/doona/issues).
 
 For vulnerabilities, follow [SECURITY.md](.github/SECURITY.md).
+
+Most userspace subsystems were largely AI-authored with partial maintainer review; the maintainer's primary focus is eBPF. WireGuard, `honk-netstack` and the explicit XDP/Core path still require maintainer review. Automated checks do not replace the [human review and AI disclosure requirements](CONTRIBUTING.md#5-responsibility-for-ai-assisted-work).
 
 ## Acknowledgments
 
@@ -103,7 +105,6 @@ The development-only [dae parser oracle](tools/dae-parse/README.md) links dae (A
 
 ## TODO
 
-- [ ] Evaluate AF_XDP and XDP paths for further performance gains
-- [ ] Add a honk-specific REST API beyond Clash compatibility
+- [ ] Measure AF_XDP/XDP performance on real hardware; the implemented backend does not establish hardware, ARM or performance acceptance
 - [ ] Add inbound support
 - [ ] Explore macOS and Windows support; the datapath is Linux eBPF, so these platforms need another way to capture traffic

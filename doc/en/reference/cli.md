@@ -23,6 +23,7 @@ honk-core [OPTIONS] [COMMAND]
 | `--mock-ebpf` | Omitted; off | Use `MockEbpfBackend` instead of loading kernel eBPF. See [`--mock-ebpf`](#--mock-ebpf). |
 | `--store file\|db` | Omitted; `file` | Run from the revisions in `<data-dir>/state/honk.db`. See [`--store`](#--store). |
 | `--data-dir PATH` | Omitted; `/var/lib/honk` | Data directory holding `state/honk.db`. See [`--data-dir`](#--data-dir). |
+| `--busy-poll-calibration-experiment` | Off | XDP-only laboratory admission for a fully bound `status: candidate` polling record. It uses the same finite runtime/ledger as qualified adaptive polling; it bypasses neither identity checks nor dwell, quota or explicit Event. The record binds an already written preregistration, not a future successful result. Product launches omit this flag; reload cannot change it. |
 
 Both binaries provide `-h`/`--help` and `-v`/`--version`.
 
@@ -292,6 +293,8 @@ UDP NFQUEUE has no environment-variable switch. It is enabled by default through
 ### eBPF object
 
 With the `ebpf` feature, `build.rs` supplies the object embedded by `include_bytes!`. The `--bpf-object` option replaces those bytes at runtime.
+
+`packet-ebpf` selects XDP/TUN without the traditional TC loader. This build requires an explicit XDP or TUN configuration with `global.nfqueue_enable: false` and rejects `--bpf-object` (`-b`). `legacy-tc` and the compatible `ebpf` feature include all three objects.
 
 Object-declared `ByName` pinning is refused before probe/loading: rebuild with unpinned maps, leaving pin paths to core. Builds without `ebpf` use the mock backend.
 

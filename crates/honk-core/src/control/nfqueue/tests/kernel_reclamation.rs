@@ -26,7 +26,8 @@ fn kernel_conn(state: UdpDecisionState, token: u32, incarnation: u64) -> ConnSta
 }
 
 struct Fixture {
-    backend: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
+    controller: Arc<crate::control::TcKernelController>,
     endpoints: Arc<UdpEndpointPool>,
     pending: Arc<PendingUdpVerdicts>,
     hints: mpsc::Sender<FlowExpiryHint>,
@@ -40,7 +41,8 @@ impl Fixture {
     }
 
     fn with_backend(mock: MockEbpfBackend) -> Self {
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+        let (backend, controller) = crate::control::TcKernelController::share(Box::new(mock));
+        let controller = controller.expect("mock TC capability");
         let endpoints = Arc::new(UdpEndpointPool::new());
         let stats = Arc::new(StatsManager::new());
         let (pending, _) =
@@ -52,7 +54,7 @@ impl Fixture {
         let (fatal_tx, fatal) = mpsc::unbounded_channel();
         let worker = spawn_retirement_worker(
             Arc::clone(&endpoints),
-            Arc::clone(&backend),
+            Arc::clone(&controller),
             Arc::new(ConnectionTracker::new()),
             fatal_tx,
             Arc::new(TcpFlowPins::default()),
@@ -60,6 +62,7 @@ impl Fixture {
         );
         Self {
             backend,
+            controller,
             endpoints,
             pending: Arc::new(pending),
             hints,
@@ -72,9 +75,12 @@ impl Fixture {
         self.backend
             .write()
             .await
+            .tc_mut()
+            .unwrap()
             .udp_conn_state_store(&key.tuples(), &kernel)
             .unwrap();
         match self.endpoints.reserve_owned_or_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             key.client,
             key.destination,
             bytes::Bytes::from_static(b"old flow"),
@@ -91,7 +97,12 @@ impl Fixture {
 
     async fn wait_until_endpoint_gone(&self, key: FlowKey) {
         tokio::time::timeout(Duration::from_secs(2), async {
-            while self.endpoints.contains(key.client, key.destination) {
+            while self.endpoints.contains(
+                honk_datapath::ScopeId::HOST,
+                key.client,
+                key.destination,
+                None,
+            ) {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
@@ -103,6 +114,8 @@ impl Fixture {
         self.backend
             .write()
             .await
+            .tc_mut()
+            .unwrap()
             .udp_conn_state_store(
                 &key.tuples(),
                 &kernel_conn(UdpDecisionState::Pending, NEW_TOKEN, NEW_INCARNATION),
@@ -158,7 +171,7 @@ async fn kernel_reclamation_lets_a_staged_successor_initialize() {
                 .unwrap();
         } else {
             BpfJanitor::new(
-                Arc::clone(&fixture.backend),
+                Arc::clone(&fixture.controller),
                 Arc::new(TcpFlowPins::default()),
             )
             .with_udp_pool(Arc::clone(&fixture.endpoints))
@@ -204,16 +217,19 @@ async fn hint_retirement_preserves_foreign_endpoint_incarnations() {
         }
         // Hints settle in order, so the sentinel's retirement proves the first was handled.
         fixture.wait_until_endpoint_gone(sentinel).await;
-        assert!(
-            fixture
-                .endpoints
-                .contains(foreign.client, foreign.destination)
-        );
+        assert!(fixture.endpoints.contains(
+            honk_datapath::ScopeId::HOST,
+            foreign.client,
+            foreign.destination,
+            None,
+        ));
         assert_eq!(
             fixture
                 .backend
                 .read()
                 .await
+                .tc()
+                .unwrap()
                 .conn_state_lookup(&foreign.tuples())
                 .unwrap()
                 .is_some(),

@@ -64,7 +64,7 @@ A SIGHUP reload rejects a change to the `bind` host, port or transport set as re
 
 ## Standalone listener (`bind`)
 
-The standalone listener uses ordinary, unmarked sockets in the host network namespace. Disabling it does not disable transparent TCP/UDP port-53 interception, which follows [traffic-rule ownership](./routing.md#outbound-targets-and-must).
+The standalone listener uses ordinary host-netns sockets. TUN and XDP with Host egress require the effective `global.so_mark_from_dae` before bind/listen (including readback); accepted TCP inherits it. Both prepare enabled bind addresses before capture. Standalone TUN DNS learns in its plain scope, even on loopback. With XDP Host, loopback clients use the active shared Host fact scope and other clients use a separate standalone scope. With no active Host egress, loopback DNS still serves without publishing Host facts. Persistent TCP rechecks admission per frame. Other XDP configurations, TC and ordinary embeddings keep their existing unmarked standalone path.
 
 | Value | Result |
 | --- | --- |
@@ -80,7 +80,7 @@ A bare hostname is invalid. The parser also rejects userinfo, paths, queries, fr
 
 Listener ownership is process-scoped. A SIGHUP reload accepts a semantically equivalent spelling but rejects any change to the host, port or transport set as restart-required. A wildcard or LAN-facing bind exposes an unauthenticated recursive resolver. Restrict source access with the host firewall and never publish it to an untrusted network.
 
-Listening on `:53` does not preempt LAN traffic policy: non-`must` LAN TCP/UDP53 queries use transparent honk DNS even when dnsmasq or `dns.bind` owns the socket. Host-loopback and explicit native `direct(must)` delivery can still reach that ordinary listener; see the [listener matrix](../design/dns.md#dns-ownership-state-machine).
+On TC, listening on `:53` does not preempt LAN traffic policy: non-`must` LAN TCP/UDP53 queries use transparent honk DNS even when dnsmasq or `dns.bind` owns the socket. Host-loopback and explicit native `direct(must)` delivery can still reach that ordinary listener; see the [listener matrix](../design/dns.md#dns-ownership-state-machine). TUN's standard local RPDB rule handles local destinations before capture; captured Direct uses Endpoint relay, not TC native delivery.
 
 ```dae
 dns {

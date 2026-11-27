@@ -50,7 +50,11 @@ impl Retirement {
 
     fn request(&self, pins: &TcpFlowPins, now_ns: Option<u64>) -> Option<RetireRequest<'static>> {
         let request = match self {
-            Self::Udp(removal) if removal.reason == RemovalReason::UserspaceEndpointRetired => {
+            Self::Udp(removal)
+                if removal.reason == RemovalReason::UserspaceEndpointRetired
+                    && removal.owner.has_kernel_capture()
+                    && removal.scope == honk_datapath::ScopeId::HOST =>
+            {
                 RetireRequest {
                     key: connection::build_tuples_key(
                         removal.dst.ip(),
@@ -93,7 +97,7 @@ impl Retirement {
     ) {
         match self {
             Self::Udp(removal) => {
-                if ok && let Some(id) = removal.conn_id.as_deref() {
+                if ok && let Some(id) = removal.conn_id.as_ref() {
                     tracker.remove(id);
                 }
                 pool.finish_removal(&removal, ok);
@@ -223,32 +227,66 @@ impl Ingress {
 /// Admitted I/O and guards stay with this joined owner after waiter cancellation.
 pub(in crate::control) fn spawn_retirement_worker(
     udp_pool: Arc<UdpEndpointPool>,
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    tc: Arc<TcKernelController>,
     tracker: Arc<ConnectionTracker>,
     fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
     tcp_flow_pins: Arc<TcpFlowPins>,
     port: Arc<RetirementPort>,
 ) -> RetirementWorker {
-    const REMOVAL_QUEUE_CAPACITY: usize = 1024;
-    let (remove_tx, remove_rx) = mpsc::channel(REMOVAL_QUEUE_CAPACITY);
-    let (tcp_tx, tcp_rx) = mpsc::channel(REMOVAL_QUEUE_CAPACITY);
-    udp_pool.set_remove_sink(remove_tx);
+    let (tcp_tx, tcp_rx) = mpsc::channel(1024);
     *port.sink.lock() = Some(tcp_tx);
     *port.pin_errors.lock() = Some(fatal_tx.clone());
     let retained_hints = port.hints.lock().take();
+    spawn_worker(
+        udp_pool,
+        tracker,
+        fatal_tx,
+        Some((tc, tcp_flow_pins)),
+        Some(tcp_rx),
+        retained_hints,
+    )
+}
+
+pub(in crate::control) fn spawn_packet_retirement_worker(
+    udp_pool: Arc<UdpEndpointPool>,
+    tracker: Arc<ConnectionTracker>,
+    fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
+) -> RetirementWorker {
+    spawn_worker(udp_pool, tracker, fatal_tx, None, None, None)
+}
+
+type KernelRetirement = (Arc<TcKernelController>, Arc<TcpFlowPins>);
+
+fn spawn_worker(
+    udp_pool: Arc<UdpEndpointPool>,
+    tracker: Arc<ConnectionTracker>,
+    fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
+    kernel: Option<KernelRetirement>,
+    tcp: Option<mpsc::Receiver<TcpRetirement>>,
+    retained_hints: Option<mpsc::Receiver<FlowExpiryHint>>,
+) -> RetirementWorker {
+    let (remove_tx, remove_rx) = mpsc::channel(1024);
+    udp_pool.set_remove_sink(remove_tx);
     tokio::spawn(async move {
         let mut exit = super::runtime::CriticalTaskExit {
             name: "flow_retirement_worker",
             fatal_tx: fatal_tx.clone(),
             expected: false,
         };
-        let hints = match retained_hints {
-            Some(receiver) => Some(receiver),
-            None => ebpf.write().await.take_expiry_hints(),
+        let hints = match (retained_hints, kernel.as_ref()) {
+            (Some(receiver), _) => Some(receiver),
+            (None, Some((tc, _))) => match tc.take_expiry_hints().await {
+                Ok(hints) => hints,
+                Err(error) => {
+                    let _ = fatal_tx.send(error.context("TC retirement capability unavailable"));
+                    None
+                }
+            },
+            (None, None) => None,
         };
         let mut ingress = Ingress {
             udp: Some(remove_rx),
-            tcp: Some(tcp_rx),
+            tcp,
             hints,
             fatal: fatal_tx.clone(),
         };
@@ -264,38 +302,43 @@ pub(in crate::control) fn spawn_retirement_worker(
                     let _ = fatal_tx.send(error);
                 }
             }
-            let mut backend = ebpf.write().await;
-            // Both local and native pins leave under W before checking any
-            // external owner; adoption retains both under continuous backendR.
-            for slot in &mut slots {
-                if let Err(error) = slot.job.release_pins() {
-                    slot.ok = false;
-                    let _ = fatal_tx.send(error.context("TCP retirement pin release failed"));
-                }
-            }
-            let hint_time = if slots
-                .iter()
-                .any(|slot| matches!(slot.job, Retirement::Hint(_)))
-            {
-                match super::janitor::monotonic_now_ns() {
-                    Ok(now) => Some(now),
-                    Err(error) => {
-                        let _ =
-                            fatal_tx.send(error.context("reading flow retirement expiry clock"));
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            for slot in &mut slots {
-                if slot.ok {
-                    slot.request = slot.job.request(&tcp_flow_pins, hint_time);
-                }
-            }
-            requests.extend(slots.iter().filter_map(|slot| slot.request));
-            let batch_ok = requests.is_empty()
-                || match backend.retire_batch(&requests, &mut outcomes[..requests.len()]) {
+            let batch_ok = if let Some((tc, pins)) = &kernel {
+                match tc
+                    .retire_flows(&mut requests, &mut outcomes, |requests| {
+                        // Both local and native pins leave under W before checking any
+                        // external owner; adoption retains both under continuous backendR.
+                        for slot in slots.iter_mut() {
+                            if let Err(error) = slot.job.release_pins() {
+                                slot.ok = false;
+                                let _ = fatal_tx
+                                    .send(error.context("TCP retirement pin release failed"));
+                            }
+                        }
+                        let hint_time = if slots
+                            .iter()
+                            .any(|slot| matches!(slot.job, Retirement::Hint(_)))
+                        {
+                            match super::janitor::monotonic_now_ns() {
+                                Ok(now) => Some(now),
+                                Err(error) => {
+                                    let _ = fatal_tx.send(
+                                        error.context("reading flow retirement expiry clock"),
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        for slot in slots.iter_mut() {
+                            if slot.ok {
+                                slot.request = slot.job.request(pins, hint_time);
+                            }
+                        }
+                        requests.extend(slots.iter().filter_map(|slot| slot.request));
+                    })
+                    .await
+                {
                     Ok(_) => true,
                     Err(error) => {
                         let _ = fatal_tx.send(
@@ -303,8 +346,20 @@ pub(in crate::control) fn spawn_retirement_worker(
                         );
                         false
                     }
-                };
-            drop(backend);
+                }
+            } else {
+                for slot in &mut slots {
+                    if slot.ok
+                        && !matches!(&slot.job, Retirement::Udp(removal) if !removal.owner.has_kernel_capture())
+                    {
+                        slot.ok = false;
+                        let _ = fatal_tx.send(anyhow::anyhow!(
+                            "packet retirement received kernel-owned work"
+                        ));
+                    }
+                }
+                true
+            };
             for (slot, &outcome) in slots
                 .iter_mut()
                 .filter(|slot| slot.request.is_some())
@@ -343,6 +398,91 @@ mod tests {
     use crate::ebpf::{TcpPin, mock::MockEbpfBackend};
     use honk_ebpf_common::conn::{ConnState, TcpState};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn packet_retirement_cannot_delete_a_coincident_kernel_flow() {
+        use crate::ebpf::UdpFlowOwner;
+        use honk_datapath::ScopeId;
+        let client: SocketAddr = "192.0.2.1:50000".parse().unwrap();
+        let dst: SocketAddr = "198.51.100.1:443".parse().unwrap();
+        let key =
+            connection::build_tuples_key(dst.ip(), dst.port(), client.ip(), client.port(), 17);
+        let mut backend = MockEbpfBackend::new();
+        let state = ConnState {
+            decision_token: 71,
+            incarnation: 99,
+            state: honk_ebpf_common::UdpDecisionState::Proxy as u8,
+            ..Default::default()
+        };
+        backend.udp_conn_state_store(&key, &state).unwrap();
+        let captured = backend.udp_flow_owner(71, Some(state)).unwrap();
+        let mut packet = UdpFlowOwner::packet();
+        packet.token = captured.token;
+        packet.incarnation = captured.incarnation;
+        assert!(backend.verify_udp_admission(&key, packet).is_err());
+        let pins = TcpFlowPins::default();
+        let foreign = ScopeId::allocate().unwrap();
+        for (scope, owner, allowed) in [
+            (ScopeId::HOST, packet, false),
+            (foreign, packet, false),
+            (foreign, captured, false),
+            (ScopeId::HOST, captured, true),
+        ] {
+            let job = Retirement::Udp(EndpointRemoval {
+                scope,
+                packet_lineage: None,
+                client,
+                dst,
+                owner,
+                generation: 1,
+                conn_id: None,
+                reason: RemovalReason::UserspaceEndpointRetired,
+            });
+            let request = job.request(&pins, None);
+            assert_eq!(request.is_some(), allowed);
+            if let Some(request) = request {
+                let mut outcome = [RetireOutcome::NotRun];
+                backend.retire_batch(&[request], &mut outcome).unwrap();
+                assert_eq!(outcome[0], RetireOutcome::ConnRetired);
+            }
+            assert_eq!(backend.conn_state_lookup(&key).unwrap().is_some(), !allowed);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn packet_worker_rejects_kernel_owned_udp_removal() {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let (fatal, mut errors) = mpsc::unbounded_channel();
+        let worker = spawn_packet_retirement_worker(
+            Arc::clone(&pool),
+            Arc::new(ConnectionTracker::new()),
+            fatal,
+        );
+        // This TC fixture reserves a kernel-owned token-zero flow.
+        let EndpointReservation::Initializing(lease) = pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            "192.0.2.1:50000".parse().unwrap(),
+            "198.51.100.1:443".parse().unwrap(),
+            b"first datagram",
+            Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap(),
+            &StatsManager::new(),
+        ) else {
+            panic!("expected an initializing lease");
+        };
+        drop(lease);
+        let fatal = tokio::time::timeout(Duration::from_secs(1), errors.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fatal.to_string(),
+            "packet retirement received kernel-owned work"
+        );
+        assert!(!pool.shutdown().await.joined);
+        assert!(worker.await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn ingress_reports_closed_hints_until_real_producers_drain() {
@@ -406,7 +546,8 @@ mod tests {
                 ..ConnState::default()
             },
         )?;
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+        let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+            Arc::new(RwLock::new(Box::new(mock)));
         let pool = Arc::new(UdpEndpointPool::new());
         let pins = Arc::new(TcpFlowPins::default());
         let tracker = Arc::new(ConnectionTracker::new());
@@ -429,9 +570,9 @@ mod tests {
         };
         let close = CloseRequest::Pending(signal);
         flow.track(ConnectionEntry {
-            id: "admitted-cancellation".to_string(),
-            source: client.to_string(),
-            destination: destination.to_string(),
+            id: uuid::Uuid::new_v4(),
+            source: client,
+            destination,
             proxy: "direct".to_string(),
             #[cfg(feature = "native-api")]
             routed_outbound: None,
@@ -444,15 +585,17 @@ mod tests {
             download: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             start_time: std::time::Instant::now(),
             domain: None,
-            network: "tcp".to_string(),
+            network: "tcp",
             process: None,
             process_path: None,
         });
-        let locked = backend.read().await;
+        let locked = tokio::sync::RwLockReadGuard::map(backend.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
         let worker = spawn_retirement_worker(
             Arc::clone(&pool),
-            Arc::clone(&backend),
+            crate::control::TcKernelController::for_test(Arc::clone(&backend)),
             Arc::clone(&tracker),
             fatal_tx,
             Arc::clone(&pins),
@@ -500,7 +643,15 @@ mod tests {
         })?;
         assert_eq!(hints.try_recv()?.incarnation, 71);
         assert_eq!(confirmation.await, CloseOutcome::Closed);
-        assert!(backend.read().await.conn_state_lookup(&key)?.is_none());
+        assert!(
+            backend
+                .read()
+                .await
+                .tc()
+                .unwrap()
+                .conn_state_lookup(&key)?
+                .is_none()
+        );
         assert!(!pins.contains(&key));
         assert!(tracker.snapshot().is_empty());
         assert_eq!(
@@ -538,7 +689,7 @@ mod tests {
             50001,
             6,
         );
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+        let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
             Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
         let pool = Arc::new(UdpEndpointPool::new());
         let pins = Arc::new(TcpFlowPins::default());
@@ -557,7 +708,7 @@ mod tests {
         let (fatal_tx, _fatal_rx) = mpsc::unbounded_channel();
         let worker = spawn_retirement_worker(
             Arc::clone(&pool),
-            Arc::clone(&backend),
+            crate::control::TcKernelController::for_test(Arc::clone(&backend)),
             Arc::new(ConnectionTracker::new()),
             fatal_tx,
             pins,

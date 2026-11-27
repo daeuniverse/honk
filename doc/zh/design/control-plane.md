@@ -6,7 +6,7 @@
 
 控制面负责透明代理入口、内核交接、用户态路由、嗅探、出站选择、中继、资源 admission 和运行时发布。内核怎么把流量交给用户态，见[数据路径设计](./datapath.md)。代理组策略和健康状态怎么驱动选择，见[代理组设计](./groups.md)；DNS 运行时行为见 [DNS 设计](./dns.md)。
 
-主要实现在 `crates/honk-core/src/control/`。控制面读取 `EbpfBackend` 状态，并把 TCP 流或 `PacketTransport` UDP 契约交给 `honk-outbound`。
+主要实现在 `crates/honk-core/src/control/`。控制平面共享同一个 `PolicyBackend` 发布 cell，并把 TCP 流或 `PacketTransport` UDP 契约交给 `honk-outbound`。TC 专属操作从该 cell 借用 `EbpfBackend` 能力，始终保留原 backend guard。
 
 模块分工：
 
@@ -31,7 +31,7 @@
 
 配置诊断在初始化 tracing 之前就收集。加载或配置校验提前失败时，先往标准错误输出已有的非终止诊断，每条只输出一次，然后由二进制程序返回一次脱敏后的终止错误。加载成功时，诊断会等到配置指定的 tracing 订阅器就绪后再输出。之后运行时的致命错误仍按原有方式写入日志文件。
 
-启动时保持内核 admission 关闭，直到用户态能够接收每个重定向流：
+以下启动顺序描述 TC；配置 XDP/TUN 则使用下述 packet supervisor 与各自[捕获 setup](./datapath.md)。TUN 在无 `ebpf` feature 时同样取得真实 instance lock。所选消费端能够接收全部捕获流量前，准入保持关闭：
 
 1. 真实模式取得 `/run/honk-core.lock`，最多等待 240 秒让前一个实例退出，并把进程 PID 发布到已锁文件；`honk-core reload` 读取该 PID 并发送 `SIGHUP`。未取得锁的后继实例在读取配置和打开状态数据库之前退出。Mock 模式不取得进程全局锁。
 2. 加载并校验配置、选择 `global.data_dir`，在任何网络 I/O 前初始化进程 bypass mark，提升 `RLIMIT_NOFILE`，并取得一次不可变的描述符预算快照。
@@ -46,6 +46,22 @@
     `DATAPATH_STATE_MAP[0]` 设为 ready。之后 TCP accept loop 在控制面 supervisor
     里运行。
 
+编译路由、已学习域名、连通性、模式标志、准入与清理共用接口。软件 backend 以 `Unsupported` 拒绝 TC 能力；共享策略发布本身不授予 HostFacts。TUN owner 可在真实来源就绪后提供经认证的应用 socket 事实。
+
+配置为 XDP 和 TUN 的 daemon 共用 packet supervisor、mode/flags coordinator、订阅 authorization 及完整 control-command dispatch。软件 flags 在 scope 准入前以禁用 NFQUEUE 的状态初始化，保持恢复后的 mode；发布失败进入 joined startup cleanup。这两条路径不创建 TC listener 或 NFQUEUE helper；原 `PacketEndpoints::new()` 嵌入生命周期保持不变。
+
+TUN 和启用 Host 的 XDP 在捕获前准备 DNS bind 地址，并将候选交给 `start_driven`；未启用 Host 的 XDP 无需预备地址。两个设备 runtime 在等待 `owner.poll_ready` 或失败启动清理时都持续服务唯一 `PacketDriver`。Supervisor ready 不等于 capture ready：只有真实设备/拓扑提交后调用 `capture_ready()`，才允许 lifecycle Running。TUN 的 setup/FD owner 与[保留 guard 的停止顺序](./datapath.md#停止与失败保留)不属于共享 policy backend。
+
+启动拒绝外来的物理 XDP，不接管旧对象或 reader；物理 link 由 FD 持有。Host 出口使用 FD 持有的 TCX link，每个绑定有独立的私有 TUN；持久 setup 收据属于独立 TUN 后端。
+
+物理 XDP Endpoint 策略重载先准备候选，逐成员替换 link，再发布软件 Router/config。已保留的流保持原 owner，重载面向新流；跨设备及与软件发布之间并非原子。策略更新期间同一新 tuple 的并发首包可能分别进入内核和 Endpoint；回滚不撤销窗口中建立的 hold 或 CT。UDP 没有 CT（包括 NOTRACK 或 CT 尚未确认）时，即使没有重载，DSCP/MAC 或策略变化也可能改变执行者。hold 收集器最后重读一个空闲、未保留条目后，XDP 可能命中并刷新，收集器仍将其删除：该新流首包进入 Endpoint，后续包可能进入内核。RX owner 或 worker 在 Endpoint 建立保留前停顿约 29 秒也可能丢失 hold。这些是已接受的窗口。
+
+TUN 的有效进程 mark 是 required：初始化存储一致的 `(mark, required)`，用真实 TCP/UDP socket 回读，并传播后续 mark 失败。独立 DNS 及两个管理 API listener 均在 bind/listen 前设置并回读 M，让握手期间的 accepted child 就已继承；TC 透明 accepted socket 清 mark 的规则不适用于这些普通 TUN 服务 socket。Clash bind/mark 失败报告 API unavailable，native API 失败拒绝启动；授权不变。`/configs.tun` 投影已接受的 backend/device/MTU/stack 及由 address6 决定的 IPv6，不证明 runtime 健康；native datapath summary 仍为 unknown，无内核可见性。
+
+XDP 的可选轮询资源由进程启动点持有，与不可变的 `ResourceBudget` 尺寸值分开。唯一不可克隆的 publisher 派生共享 participant 句柄，普通 embedding 构造器不创建配额。reload、owner 替换或所有句柄被释放都不能重新初始化进程槽。有限 mutex 账本在整个进程最多允许一个同步 Busy 区间，持锁期间不访问设备/策略、不跨 await。按完整 BOOTTIME 时长计费，包括有用工作和调度停顿；结算未知时禁用 Busy，而不是退款。未结算活动区间跨过的补充边界作废，债务保留。
+
+轮询参数随现有本地配置提交发布。唯一 publisher 必须先按旧/已经暂存的策略把空闲账本推进至发布时间，**之后**才暂存新 W/B；保留推进所得的未来边界，不赠送 reload 配额。活动区间不会因发布而推进或补充。participant 的已知不匹配可在提交前拒绝；若准备后 publisher 发生竞争更新，participant 的本地提交仍被接受，但实际状态只能为 Event/mismatch，不能修改账本。预留和每个有限 Busy 段都重检本地 revision、独立的进程 revision 和 publisher 关闭状态。这些版本只控制可选调度，不构成 scoped flow/fact 权威。参数发布清空资格，不迁移 flow、不重启 TCP。
+
 `RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实的 NFQUEUE 集
 成。`MockEbpfBackend` 在没有特权内核资源时，提供同样的控制面接口。请求的 NFQUEUE
 路径如果过不了锁交接后的固定队列前置检查，或者过不了随后 admission 之前的队列、
@@ -56,6 +72,8 @@
 对象 admission 会在进程名 probe 和任何 Aya loader 之前，拒绝隐式的 `ByName` map pinning。外部对象必须声明未 pin 的 map；包括持久分配器在内，所有 pin 路径都由 core 显式提供，免得 loader 造出的别名逃出启动回滚。
 
 真实 backend 在 pin map 之后启动失败时，启动 guard 只删除本次成功创建的临时 pin；没能替换的已有 pin，以及无关的已有 pin，都不归本次所有。`UDP_DECISION_SEQUENCE` 和 `ROUTING_GENERATION_SEQUENCE` 在启动失败和普通清理之后都会保留；启动成功时，临时 pin 的所有权转给 backend 清理。
+
+关闭时在资源消失前逆序释放所有权：fence NFQUEUE、关闭数据路径准入、拒绝新的用户态工作、取消并排空持有的 verdict 和 UDP initializer、停止 UDP driver 和 removal 处理、停止接口 watcher（等待进行中的批次完成）、卸载 TC backend 的 BPF hook，按[业务连接宽限等待](../reference/global.md#关闭)规则执行可选等待，再关闭剩余连接、退役出站运行时、停止 NFQUEUE、停止 DNS controller 和 persistence，并清理 generation 持有的 BPF 状态。普通 TC backend 清理保留固定分配器。随后 listener 和 `daens`/link-pair 所有权离开作用域。
 
 关闭时在资源消失之前逆序释放所有权。顺序是：fence NFQUEUE；关闭数据路径 admission；拒绝新的用户态工作；取消并排空持有的 verdict 和 UDP initializer；停止 UDP driver 和 removal 处理；停止接口 watcher，并等进行中的批次结束；卸载 BPF hook；按[业务连接宽限等待](../reference/global.md#关闭)规则执行可选等待；关闭剩余连接；退役出站运行时；停止 NFQUEUE；停止 DNS controller 和 persistence；最后清理 generation 持有的 BPF 状态。普通清理保留固定分配器。之后 listener 和 `daens`/link-pair 的所有权离开作用域。
 
@@ -331,6 +349,7 @@ Selector 和 UDP warm 的所有权仍绑定 generation，见[预热所有权](./
 | 区域 | 需要重启的字段 |
 | --- | --- |
 | listener/数据路径 | `global.tproxy_port`、`global.tproxy_mark`、`global.tproxy_port_protect`、`global.pprof_port`、`global.so_mark_from_dae`、`global.lan_interface`、`global.wan_interface`、`global.auto_config_kernel_parameter` |
+| 捕获设备 | backend、Direct profile、完整规范 TUN setup（全部 `tun` 值）、XDP interface/zone 与有效 XSK mode；轮询策略/校准仍按独立合同可重载 |
 | 进程状态 | `global.log_level`、`global.data_dir`、`global.store_subscribe` |
 | DNS listener | `dns.bind` endpoint 或 transport 的语义变更 |
 | Clash API | `experimental.clash_api.external_controller`、`external_ui`、`secret`、`default_mode`；生效的 `assets.ui.url` 和 `assets.ui.route` |
@@ -340,6 +359,8 @@ Selector 和 UDP warm 的所有权仍绑定 generation，见[预热所有权](./
 | 健康检查与 TLS | `global.check_interval`、生效的第一个 `global.tcp_check_url`、启用 HTTP 检查时的 `global.tcp_check_http_method`、选中的 `global.udp_check_dns` 目标，或原生 TLS/uTLS 模式切换（参见[健康检查 reload 语义](../reference/global.md#reload-健康检查与-tls-模式)） |
 
 UI 和 geodata 的生效设置里，包含从 `assets.route` 继承来的值。如果这个默认出口的变更影响到启动阶段持有的任一下载出口，就需要重启。`assets.subscription` 的默认值和订阅条目设置交给订阅协调处理。
+
+TUN startup、SIGHUP 和 native offline/save 共用 runtime-policy validator。`same_device_setup` 比较整个规范 `TunConfig`（含 `host_facts`）、backend 与 Direct profile；有效变化需重启。省略与显式 false 等价，MTU 省略与 1500 也等价。策略更新保留 FD 与 scope；拒绝候选保留活动 generation。`dns.bind` 语义变化仍需重启。
 
 旧值和新值都能解析时，`dns.bind` 的语义比较用的是解析后的 bind endpoint，所以只是拼写不同、实际描述同一个 endpoint 的变更不会强制重启。
 
@@ -403,6 +424,10 @@ Accepted 源在真实 no-op 或 commit 时随原有 config 发布屏障更新，
 
 Selector 写入由同一 `control/reload` owner 序列化，TCP/UDP 分开保存，both 原子发布；Clash 写 both、读 TCP 投影。精确连接关闭绑定 TCP UUID 或 UDP token/generation/source view，等待实际 transport 与 backend/driver 退役，而非只删除 tracker 记录。同一 owner 的重复关闭共用完成结果与失败，不存在或已被替换的 owner 才是 Gone。组中断按捕获的组路径与网络关闭旧 owner，在同步 guard 外等待。组 PATCH 使用 parser span 和原源码协调器，写前及 reload lock 下都检查 accepted revision，独立检查 hash 与依赖。Provider 并发发布可使已写文件不能激活，必须保留 written/committed 区分。自动策略的分网络 pin/clear 已开放，pin 成员只属于当前 GroupManager。
 
+Selector 在 reload guard 内捕获发布 revision、选择结果和精确连接 owner，随后先
+释放该 guard，再等待 transport/driver 关闭完成。control command 仍保持串行并
+报告其捕获结果；不能让 CQ 持有的关闭等待同时占住退出所需的发布锁。
+
 主文件创建/删除复用相同协调器、parser span、revision fence 与 reload reply，但等真实激活后才返回 201/200。订阅 supervisor 持有绑定身份的初次拉取延迟，所有离线 admission 都携带这些排除项和有效运行时数据目录。Geodata 先暂存并验证所有资产，再经 FD 相对替换；临时不可变 `SourceUpdate.geo_sources` 同时进入 reload 的两条路径，发布后不再由 accepted 源元数据保留。Router/DnsRouter 保留实际加载字节的元数据，观测按 router-before-config 锁序且不重读磁盘；部分文件替换与提交后 degraded 如实报告，不承诺回滚。
 
 暂存 writer 返回保留的 installed-file FD 及耐久结果。Geodata 从待替换文件转为 installed guard，不再重新打开文件重建所有权。路径、inode 与字节复查仍拒绝外部编辑；可见但未确认耐久的替换仍明确报告。
@@ -426,6 +451,8 @@ Native cold/warm HTTP probe 与 URLTest 共用 dial/TLS/ALPN 和 H1/H2 exchange�
 `control/lifecycle/teardown.rs` 的共用网络清理在有无 listener epoch 时都适用，涵盖部分启动。独立 DNS supervisor 保留已回收 child 的失败，并经 joined teardown 传播；主动关闭导致的取消是中性的，但 owner panic 会使清理失败。
 
 网络维护任务属于 `RuntimeEpoch`。延迟缓存 writer 属于进程，仅在终止关闭时 join。
+
+TUN 在原 packet supervisor 返回真实 joined plane/result 前保留 FD、driver、watcher 与 blackhole containment；abort/drain 前先撤销 capture route。正常确认 stop 先删除 P+4，再清其余自有路由资源与 receipt；失败或清理不明时保留 guard/rule/receipt 并报告失败。Driver Drop 仅归还驱动权，不确认 join 或 netlink 删除；取消后仍须保留原 runtime 执行清理。见 [TUN 停止与失败保留](./datapath.md#停止与失败保留)。
 
 已开始的阻塞工作无法靠取消 async waiter 停止，持有它的 owner 必须等待实际 join。通用清理/join 阶段使用十秒 `STAGE_TIMEOUT`，超时的 async task 会被 abort，teardown 报告失败。`control/cache.rs::StateTick` 是例外：十秒后记录 warning 并继续 join 实际维护任务及在途阻塞 SQLite 写入，不 abort。取消这次等待时，handle 仍留在 owner 中，可再次等待；owner 被 Drop 时只发出停止信号，外层 task 继续持有阻塞写入。因此总关闭时间没有严格十秒上限。TCP 连接任务 panic 时记录日志并回收，不停止引擎。关闭时可选的[业务连接宽限等待](../reference/global.md#关闭)在 joined teardown 之前执行。
 

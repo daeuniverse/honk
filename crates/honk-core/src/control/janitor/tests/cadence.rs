@@ -27,8 +27,12 @@ async fn auxiliary_occupancy_drives_real_ticks_and_drains_backlog() -> anyhow::R
                     .insert(*key, RoutingHandoffEntry::default());
             }
         }
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
-        let mut janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
+        let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+            Arc::new(RwLock::new(Box::new(model)));
+        let mut janitor = BpfJanitor::new(
+            crate::control::TcKernelController::for_test(Arc::clone(&backend)),
+            Arc::new(TcpFlowPins::default()),
+        );
         // `max_ticks` assumes full candidate batches; the mock's collect-and-sort
         // of the pressured map can outlast the wall-clock scan budget.
         janitor.unbounded_scan_time = true;
@@ -54,7 +58,7 @@ async fn auxiliary_occupancy_drives_real_ticks_and_drains_backlog() -> anyhow::R
             if tick == 1 {
                 assert_eq!(state.pressure.active, pressured);
             }
-            let (redirect, handoffs) = backend.read().await.aux_occupancy()?;
+            let (redirect, handoffs) = backend.read().await.tc().unwrap().aux_occupancy()?;
             let remaining = if handoff { handoffs } else { redirect };
             assert!(previous - remaining <= JANITOR_MAX_CANDIDATES as u64);
             if !pressured && tick == 1 {

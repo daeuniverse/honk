@@ -1,16 +1,16 @@
 //! Build script for honk-core.
 //!
-//! Embeds the release tag or Git description for the CLI and Clash API.
+//! Embeds the release tag or Git description for the CLI and Clash API, and
+//! the full source commit that TUN setup receipts record.
 //!
-//! When the `ebpf` feature is enabled, this script ensures the eBPF object
-//! file is available and copies it into `OUT_DIR` so `lib.rs` can embed it
-//! via `include_bytes!`.  If the object does not exist yet, it is built
-//! automatically using the nightly toolchain.
+//! For packet and legacy builds, this script ensures the selected eBPF objects
+//! are available and copies them into `OUT_DIR` for `include_bytes!`.
+//! Missing or stale objects are built together using the nightly toolchain.
 
 fn main() {
     emit_version();
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "packet-ebpf")]
     embed_ebpf_object();
 
     #[cfg(feature = "native-ui")]
@@ -56,8 +56,29 @@ fn emit_version() {
     // The commit and target triple identify a build precisely when the version is a tag.
     let revision = git_output(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_default();
     println!("cargo:rustc-env=HONK_REVISION={revision}");
+    // A source archive has no Git metadata; its packager names the commit explicitly.
+    println!("cargo:rerun-if-env-changed=HONK_SOURCE_SHA");
+    let source_sha = match std::env::var_os("HONK_SOURCE_SHA") {
+        Some(explicit) => {
+            let explicit = explicit.to_str().filter(|sha| is_full_sha(sha));
+            explicit
+                .expect("HONK_SOURCE_SHA must be a full 40-character lowercase hexadecimal commit")
+                .to_string()
+        }
+        None => git_output(&["rev-parse", "--verify", "HEAD^{commit}"])
+            .filter(|sha| is_full_sha(sha))
+            .unwrap_or_default(),
+    };
+    println!("cargo:rustc-env=HONK_SOURCE_SHA={source_sha}");
     let target = std::env::var("TARGET").unwrap_or_default();
     println!("cargo:rustc-env=HONK_TARGET={target}");
+}
+
+fn is_full_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 #[cfg(feature = "native-ui")]
@@ -239,194 +260,23 @@ fn encode(file: &std::path::Path) -> anyhow::Result<Option<Compressed>> {
     Ok((br.len().max(gzip.len()) < len).then_some(Compressed { br, gzip, len }))
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "packet-ebpf")]
 fn embed_ebpf_object() {
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
-
-    // A shared target can reuse a build-script binary compiled in another checkout.
-    let manifest_dir = PathBuf::from(
-        std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo must provide CARGO_MANIFEST_DIR"),
-    );
-    let ebpf_crate = manifest_dir.join("../honk-ebpf");
-    let ebpf_common_crate = manifest_dir.join("../honk-ebpf-common");
-    let ebpf_target = ebpf_crate.join("target/bpfel-unknown-none/release/honk-ebpf");
-    let toolchain_file = ebpf_crate.join("rust-toolchain.toml");
-    println!("cargo:rerun-if-changed={}", toolchain_file.display());
-    let toolchain =
-        std::fs::read_to_string(&toolchain_file).expect("failed to read eBPF rust-toolchain.toml");
-    let channel = toolchain
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .find(|(key, _)| key.trim() == "channel")
-        .and_then(|(_, value)| value.trim().strip_prefix('"')?.strip_suffix('"'))
-        .filter(|channel| !channel.is_empty())
-        .expect("eBPF rust-toolchain.toml must contain a quoted channel");
-
-    /// aya refuses objects without a `.BTF` section ("no BTF parsed for
-    /// object"). Cheap guard: section names live verbatim in the section
-    /// header string table, so a byte search for the NUL-terminated name is
-    /// sufficient.
-    fn object_has_btf(path: &Path) -> bool {
-        std::fs::read(path)
-            .map(|data| {
-                data.windows(5).any(|w| w == b".BTF\0") || data.windows(5).any(|w| w == b".BTF.")
-            })
-            .unwrap_or(false)
-    }
-
-    /// Newest mtime under `dir` (recursive). The eBPF object is built by a
-    /// separate cargo invocation, so cargo's own change tracking never
-    /// rebuilds it — without this check a stale object from hours ago gets
-    /// embedded while the sources have moved on (observed twice: missing maps
-    /// at runtime while the build looks green).
-    fn newest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
-        if dir.is_file() {
-            return dir.metadata().ok()?.modified().ok();
-        }
-        let mut newest = None;
-        let mut stack = vec![dir.to_path_buf()];
-        while let Some(d) = stack.pop() {
-            for entry in std::fs::read_dir(&d).ok()?.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if let Ok(meta) = path.metadata()
-                    && let Ok(mtime) = meta.modified()
-                    && newest.is_none_or(|n| mtime > n)
-                {
-                    newest = Some(mtime);
-                }
-            }
-        }
-        newest
-    }
-
-    fn object_stale(obj: &Path, src_dirs: &[&Path]) -> bool {
-        let Ok(obj_mtime) = obj.metadata().and_then(|m| m.modified()) else {
-            return true;
-        };
-        src_dirs
-            .iter()
-            .filter_map(|d| newest_mtime(d))
-            .any(|src_mtime| src_mtime > obj_mtime)
-    }
-
-    let candidates = [
-        ebpf_target.clone(),
-        manifest_dir.join("../../target/honk-core.o"),
-    ];
-
-    let obj = candidates.iter().find(|p| p.exists()).cloned();
-    let src_dirs = [
-        ebpf_crate.join("src"),
-        ebpf_common_crate.join("src"),
-        toolchain_file,
-    ];
-
-    let obj = match obj {
-        Some(p)
-            if object_has_btf(&p)
-                // A restored object may have a newer mtime than the changed pin.
-                && std::fs::read_to_string(p.with_extension("toolchain"))
-                    .is_ok_and(|built_channel| built_channel == channel)
-                && !object_stale(
-                    &p.with_extension("toolchain"),
-                    &[manifest_dir.join("build.rs").as_path()],
-                )
-                && !object_stale(
-                    &p,
-                    &src_dirs.iter().map(|d| d.as_path()).collect::<Vec<_>>(),
-                ) =>
-        {
-            println!("cargo:rerun-if-changed={}", p.display());
-            p
-        }
-        stale => {
-            if let Some(p) = &stale
-                && p.exists()
-                && object_has_btf(p)
-            {
-                println!(
-                    "cargo:warning=eBPF object at {} has stale sources or toolchain — rebuilding with {channel}",
-                    p.display()
-                );
-            }
-            // Missing, or stale without .BTF (e.g. built while an environment
-            // RUSTFLAGS overrode crates/honk-ebpf/.cargo/config.toml): (re)build.
-            println!("cargo:warning=Building eBPF object with {channel}...");
-            let status = {
-                let mut command = Command::new("cargo");
-                for (key, _) in std::env::vars_os() {
-                    if key.as_encoded_bytes().starts_with(b"CARGO_PROFILE_") {
-                        command.env_remove(key);
-                    }
-                }
-                command
-            }
-            .arg(format!("+{channel}"))
-            .args([
-                "build",
-                "--release",
-                "-Zbuild-std=core",
-                "--target",
-                "bpfel-unknown-none",
-            ])
-            // Cargo exports its absolute host rustc path to build scripts.
-            // Let the selected nightly resolve its own compiler and sysroot.
-            .env_remove("RUSTC")
-            // An inherited RUSTFLAGS would override the crate's
-            // .cargo/config.toml rustflags (--btf, debuginfo) and silently
-            // produce a BTF-less object again.
-            .env_remove("RUSTFLAGS")
-            .env_remove("CARGO_ENCODED_RUSTFLAGS")
-            // Parent workspace analysis must not turn this separate build into clippy.
-            .env_remove("RUSTC_WORKSPACE_WRAPPER")
-            .env_remove("CLIPPY_ARGS")
-            .env("CARGO_TARGET_DIR", ebpf_crate.join("target"))
-            .current_dir(&ebpf_crate)
-            .status()
-            .expect("failed to build eBPF object");
-
-            if !status.success() {
-                panic!(
-                    "eBPF build failed. Build manually:\n  \
-                     cd crates/honk-ebpf && cargo +{channel} build --release \
-                     -Zbuild-std=core --target bpfel-unknown-none"
-                );
-            }
-            if !object_has_btf(&ebpf_target) {
-                panic!(
-                    "eBPF object at {} has no .BTF section — aya cannot load it. \
-                     Rebuild manually:\n  \
-                     cd crates/honk-ebpf && cargo +{channel} build --release \
-                     -Zbuild-std=core --target bpfel-unknown-none",
-                    ebpf_target.display()
-                );
-            }
-            std::fs::write(ebpf_target.with_extension("toolchain"), channel)
-                .expect("failed to record eBPF object toolchain");
-            println!("cargo:rerun-if-changed={}", ebpf_target.display());
-            ebpf_target
-        }
-    };
-
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let dest = out_dir.join("honk-ebpf.o");
-    std::fs::copy(&obj, &dest)
-        .unwrap_or_else(|e| panic!("copy {} -> {}: {}", obj.display(), dest.display(), e));
-
-    println!(
-        "cargo:rerun-if-changed={}",
-        ebpf_crate.join("src").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        ebpf_common_crate.join("src").display()
-    );
-    println!("cargo:rustc-env=HONK_EBPF_OBJECT={}", dest.display());
-    println!(
-        "cargo:warning=eBPF object embedded ({} bytes)",
-        obj.metadata().map(|m| m.len()).unwrap_or(0)
-    );
+    use std::{env, path::PathBuf, process::Command};
+    let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../..");
+    println!("cargo:rerun-if-env-changed=HONK_EBPF_PREBUILT_DIR");
+    let status = Command::new("sh")
+        .arg(root.join("ci/ebpf-objects.sh"))
+        .args([
+            "embed",
+            if cfg!(feature = "legacy-tc") {
+                "legacy-tc"
+            } else {
+                "packet-ebpf"
+            },
+        ])
+        .arg(env::var_os("OUT_DIR").unwrap())
+        .status()
+        .expect("prepare eBPF objects");
+    assert!(status.success(), "eBPF object preparation failed: {status}");
 }

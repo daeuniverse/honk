@@ -1,6 +1,307 @@
-# eBPF 内核数据路径
+# Linux 捕获数据路径
 
-内核数据路径负责流量拦截；用户态路径见[控制面](./control-plane.md)，持有首包的 UDP 路径见 [NFQUEUE](./nfqueue.md)。
+Linux capture 向共享用户态策略和出站路径交付流量。用户态路径见[控制平面](./control-plane.md)，TC 持有首包的 UDP 路径见 [NFQUEUE](./nfqueue.md)。
+
+## Linux TUN Endpoint
+
+`backend: tun; direct: endpoint` 选择 daemon-owned Linux TUN 路径。
+[全局参考](../reference/global.md#linux-tun-endpoint)列出完整语法、必填资源值、
+准入及精确五条 RPDB rule。TUN 通过真实 FD 消费已有 scoped Stack、canonical
+Router、DNS projector 与出站流初始化器，不创建 TC hook、NFQUEUE、`dae0` 或
+`daens`。仅 `host_facts: true` 要求 `ebpf` feature；拒绝 `--mock-ebpf`。
+
+每个队列独占一个非持久化 `TunDevice` FD，以 `O_RDWR|O_NONBLOCK|O_CLOEXEC` 打开。
+单队列用 `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR|IFF_TUN_EXCL` 创建。配置 2–8 个队列时，
+首个 FD 增加 `IFF_MULTI_QUEUE`，其余 FD 保留该位、去掉 `IFF_TUN_EXCL` 并附加到同一链路。
+所有 FD 都须核对网络命名空间、名称、ifindex、附加标志及 10 字节小端 vnet 格式。
+Netlink 必须回读到配置的队列数且禁用队列为零。仅启用 `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`。
+HostFacts 与辅助私有 TUN 保持单队列。honk 拒绝不支持的设置，只使用自己新建的设备和 FD。
+
+### Setup 与就绪
+
+1. 完成静态/runtime 准入，取得真实 instance lock，初始化 required 精确旁路
+   mark M。`prepare_dns_bind(&Config)` 解析并保留启用 bind endpoint 的实际
+   `SocketAddr` 候选；关闭监听时返回 `None`。先计费 runtime/RX 与 plain scope；
+   true 额外准备独立 Host scope 和 source owner，均共用 384 MiB 预算。
+2. 用真实 TCP/UDP socket 验证 required mark，先订阅 rtnetlink 再 snapshot。
+   拒绝已占用的名称/表/五个优先级及不支持的 RPDB/main/default 拓扑。先创建
+   私有 setup receipt，持久化 create intent，再执行 exclusive TUN ioctl；
+   立即记录实际 netns cookie、ifindex 与 attachment
+   incarnation。设置 MTU、明确地址、自有 link sysctl 与 UP，逐项记录 ACK/回读。
+   UP ACK 后，先等精确自有 link、永久 host address 与 local host route 回读完成，
+   再安装任何 guard/rule。IPv6 NODAD 仍会排队执行 local-route 工作；仅缺失其
+   `/128` route 时按通知等待，所有回读共用一个两秒截止时间，不延长。冲突、
+   外部非法拓扑或损坏观察立即拒绝，失败发生在改路之前。
+3. 每项变更前先写 intent，安装 capture prefix 的 static blackhole（metric
+   32760）和五条 rule；此时不安装 unicast capture，Endpoint 未 ready 期间所选
+   prefix 由 guard 拒绝，不能原生漏过。
+4. 将已计费 scope 与原 owner 交给 driven packet supervisor，传入保留的 DNS
+   bind 候选和明确的 plain 独立 DNS scope。就绪和失败清理期间服务所有 driver；
+   DNS、软件 flags 与订阅 authorization 均须 ready。true 模式在捕获激活前将
+   source owner 绑定到真实 FD 与 attachment。
+   多队列模式等待全部队列工作任务就绪，并完成最终 FD 和队列回读，才发布捕获路由。
+5. 回读 link/address/rule，安装并回读 metric-1024 capture route；保留旧
+   watch 的同时建立最终 `Topology::admit_tun` 订阅及完整 snapshot。全部准入成功
+   后才开共享 gate，调用 `capture_ready()`，报告 `TUN datapath ready`、lifecycle
+   Running 和 sd_notify READY。close 不能在此竞争中被绕过。
+
+Receipt 位于 `<data_dir>/state/tun-<netns_cookie>-<instance_nonce>.json`，
+create-new、mode 0600、拒绝 symlink。它记录完整源码 SHA、PID/starttime、实际
+netns/link/attachment identity，以及精确 address/route/rule key 的
+Intent/Acknowledged/Removed 状态，每次转换都持久化并 fsync。多队列收据区分独占创建
+和后续附加，并记录预期与回读队列数。仅删除已确认仍属本实例的对象。归属不明时保留
+对象和收据。收据不授予自动重放或接管的权限。
+
+两个地址族的 active capture route 使用 metric 1024，static blackhole guard
+仍为 32760。Linux 会规范化 IPv6 metric 0，IPv4 route delete 的 metric 0
+则表示通配，因此 1024 是相对初始 metric-0 设计的明确表示调整。Exclusive
+create、回读及 exact delete 都包含 table、family、prefix、output interface
+和 metric，移除 active route 时不能选中 guard。
+
+操作者保持 main/WAN/LAN 路由、源地址、forwarding、NAT、防火墙稳定。每个启用
+地址族都须有非 TUN 的有效 main uplink 与源地址；main/default 不得通过 unicast、
+multipath、nexthop、VRF 或 lwt 路径引用 TUN。额外早期/local rule、VRF/l3mdev、
+未知 selector/action 均拒绝，不近似解释。route/address/link/rule 变化、ENOBUFS、
+dump 中断/未知解析或 ifindex 替换都会 sticky invalidation 并关闭捕获。订阅不是
+抵御任意并发 root 改路的原子栅栏，保留 guard 也不是完整宿主防火墙 kill switch。
+
+### FD 报文管线
+
+FD read 接收 kernel egress；FD write 注入**新的 interface ingress 包**，不能恢复
+原始 skb。plain 记录进入原 plain scope；`host_facts: true` 时，真实 read 的
+经认证应用 socket 事实选择 Host scope，见证过但无归属的记录仍为 plain。来源
+错误不能变成 plain。两条路径均使用解码 vnet metadata、canonical Router、真实
+outbound 和同一 FD 的生成 output lease。Direct 新建 dial；scope/tuple/mark 或
+生成回复不提供原 operation 或 pre-NAT/TTL 等价。
+
+每个队列复用一个已计费的 65,586 字节 buffer（10 字节 vnet + 65,575 字节普通 IPv6
+以及一个字节 sentinel），一轮共用同一个入口时间戳。读满 buffer 可能截断，直接拒绝；
+在组合 metadata/source/admission 路径之前，必须验证精确 IP 长度以及 vnet
+flag/type/family/header/checksum 范围。TCPv4/TCPv6 GSO 以一个连续 run 接收；
+普通 UDP partial checksum 无需 USO。IPv4 头、ICMP 和重组完成包仍验证校验和，
+Endpoint/WireGuard 信任规则不变。借用 UDP 在下一次 read 前经 funded ingress
+接纳/复制。source callback 仅检查该 scope/attachment 的真实 reverse consumer
+存活，不写 FD、不阻塞、不重入 scope mutex。
+
+多队列模式下，一个协调任务管理每队列各一个 Tokio 工作任务和 PacketDriver。
+非分片报文若已在规范归属队列上，就直接从 RX buffer 处理。其他队列通过启动前已计费的
+有界 FIFO 传递自有报文。队列 0 负责 IP 重组，以 `RxMeta::VERIFY` 和重组完成入站时间
+将完整报文交给规范归属者。普通报文保留原 RX 元数据和入站时间。FIFO 满时计数并丢包。
+每个归属者用自己的 FD 写回，Linux 据此可将已建立的流导向该队列。
+
+TX 为 CPU frame 单独计费 65,535 字节容量，不放大逻辑 MTU、MSS/PMTU 或普通
+UDP MTU。所有输出均带 10 字节 vnet 头，包括普通 ACK/UDP/control；一次 writev
+提交该头与不可变 lease 字节，由内核分段 TSO 并完成 partial checksum。
+
+Owner 在有界 RX 前后服务所有 driver。RX 每轮最多 32 次 syscall 尝试/包、1 MiB
+或 1 ms。TX 轮转 scope/class 组并保留 pending lease，共用有界 syscall/byte/time
+输出预算。EINTR 计数；这些是调度限额，不是可抢占 syscall 的硬期限。
+多队列模式下，各工作任务在有界轮次内服务自己的 driver。
+
+| TUN write 结果 | 所有权 |
+| --- | --- |
+| 完整 vnet+IP record 长度 | 内核接受这一个 record，锁外释放 lease；不代表远端交付或 TCP ACK。 |
+| EAGAIN/EWOULDBLOCK | 原 lease、metadata、bytes、scope、FlowId 保持在该类别队首，注册 writable 后重试该记录。 |
+| EINTR | 保留同一 lease、metadata 和 bytes，在有限 syscall 预算内重试/让出。 |
+| 零或短写 | 致命 packet-boundary violation，禁止写 suffix 或重发整包；保留已报告的部分结果，明确处置本地所有权。 |
+| 其他错误 | 致命 owner I/O failure，不回退后端或由其他 executor 重放；模糊提交结果保持模糊。 |
+
+仅 EAGAIN 才清 readiness。空闲前注册 readable，仅 blocked pending 注册 writable，
+并注册 topology/driver/close/supervisor waker 与最早真实 driver deadline，再重查。
+无 flow/deadline/pending 时没有周期数据面 timer；TUN 没有 XSK CQ/FILL 后备轮询。
+任何 scope/config/Router/projection 锁均不跨 await。
+
+### 停止与失败保留
+
+正常 operator stop 先关 admission、移除 metric-1024 capture route，让 prefix 命中
+guard，再停止 FD RX，同时保留 setup/watcher/FD/driver。`endpoints.close()` 先关
+协议准入，再停止 DNS/command 准入。不再发送新协议输出；pending/closing lease
+锁外明确处置，同时继续 driver service 和 `owner.poll_join_plane`，直到 TCP/UDP
+initializer、source/receiver、retirement、DNS 与原 scope owner 真正 join。
+`shutdown_wait_connections` 不提供自然结束宽限。
+
+Supervisor 返回后，等待全部队列工作任务退出并关闭所有队列 FD。启用来源捕获时，在必需资源
+仍存活时排空单读者 source owner。确认自有链路消失后，只删除收据记录且仍可证明归属的对象。
+全部业务清理成功后先删除 P+4，
+再清 guard/table、bypass/return rule，最后删除 receipt。这个显式 stop 恢复普通
+main 路由；之后进行软件 policy cleanup 和已有 API/订阅 shutdown。
+
+任一工作任务或 FD 遭遇致命故障时，整个设备关闭准入。运行失败、崩溃或清理未经确认时，保留 blackhole、规则和收据，并返回错误。
+先停源并核对精确归属再由操作者清理，不按名称/表盲删后重启。Drop 只同步关闭
+本地 admission/endpoint、处置本地 lease、归还驱动权并关闭 FD，不做 rtnetlink
+清理或成功 ack。原 supervisor 在原 Tokio runtime 上继续持有 joined cleanup，
+嵌入方必须保持该 runtime 存活。不自动重开 FD、接管资源或回退 TC/XDP。
+
+第一阶段的原生测试覆盖归属、启动与回滚。Linux 真实多队列行为及 1/2/4/8 队列扩展性须通过第二阶段的最低和近期内核一次性 VM 验证。
+
+## Full-XDP 启动
+
+未配置 `datapath` 时仍默认使用 TC。Full-XDP 是显式选择的真实 daemon 后端，不是 XSK fixture，也不会回退到 TC/NFQUEUE/TUN：
+
+```dae
+global {
+    dial_mode: ip
+    nfqueue_enable: false
+    so_mark_from_dae: 0x100
+}
+datapath {
+    backend: xdp
+    direct: core
+    interface {
+        dut0: lan
+        dut1: wan
+    }
+}
+routing {
+    fallback: direct
+}
+```
+
+`direct: endpoint` 通过现有 packet Endpoint 终止 Direct TCP/UDP，再使用 outbound relay；`direct: core` 则通过 Core forwarding owner 与带输入上下文的内核 FIB 保留 transit 语义。`lan`/`wan`（模型中的 `Lan`/`Wan`）是物理接口角色，不是执行模式。选择 XDP 必须指定 `backend: xdp` 与显式 Direct profile；无效配置在内核挂载前拒绝。不要同时使用 TC 的 `global.lan_interface`/`wan_interface`。所有选中物理接口的全部 RX 队列均打开，每队列一个 ring owner，跨端口/队列共享一个 routing-domain owner。后端、profile 与设备变化要求重启；firewall/NAT 规则通过事务式 generation 发布，拒绝更新时保留原有效策略。
+
+每个 Port 为 retained RX slot 预留 `R * 1024` 字节，其中 `R = min(rx_frames, ring_size)`。这些内存与 UMEM 及其他 capture 资源共用 384 MiB `CAPTURE_MEMORY` 预算（见 `honk-xsk/src/port.rs::RetainedRxSlots::{layout,new}` 与 `honk-core/src/xdp.rs::prepare`）。
+
+借用 RX 不占用 retained slot。Port 校验并取得整包的全部帧后才调用回调，在批末发布 RX consumer 并补充 FILL。后缀有误只提交已接纳的前缀；回调 panic 时关闭 Port，不发布该批，也不回收被中断包的帧。关闭后再次调用接收接口不能改变这个结果。即使先完成的 TX 帧已被复用，原包的 owner 槽也要等最后一个描述符完成后才归还空闲链表。
+
+Endpoint 启动时检查所有路由表中已安装的默认路由，包括 multipath 和 nexthop，拒绝任何可能经捕获端口及其下层出口的路由。运行时不监测这一条件，操作者须自行保持。捕获的以太网和 bond 接口允许有地址；Core 有自己的输入上下文 FIB 要求。物理入口没有经认证的进程身份；未启用 Host 时路由器本机发起的连接留在内核。
+
+Endpoint 的本机地址集合包含命名空间所有有效地址，包括 deprecated 但仍有效的 IPv6 地址。可分类的本机 TCP/UDP 目的地址交给内核，端口 53 例外，仍须经过策略。后续分片使用首片判定；后片先到时会丢弃。未连接 UDP 以及带 options、扩展头或分片的回复也依赖这一行为；如需本机 DNS listener 接收 53 流量，请按顺序配置静态 `direct(must)` 规则。
+
+TUN 使用独立 watcher：无关 link/address/route/rule 变化触发依赖复查，不关闭 TUN；自有 link、地址、路由或规则变化以及畸形或丢失通知仍为致命错误。
+
+Endpoint 回复身份以逻辑 scope 和源 IP 为键，共用 4096 项表。只有不再被协议状态、
+TIME_WAIT、initializer/source receiver、DNS 工作及排队/已导出输出持有的条目才可
+回收。冲突的 MAC/VLAN 声明不能替换活跃 owner，陌生 RST 不能学习或毒化 peer；
+静默条目的冲突仍保留 60 秒，表满也不能绕过。若全表均被持有则拒绝新 peer，不抢占
+回复路径。完整 VLAN TCI 随输出导出并保留到 TX credit 等待之后。需要不可用原始
+MAC/process 来源事实的 firewall/NAT 谓词在捕获准入前拒绝。
+
+所有捕获逻辑域的 MTU 都必须至少为 1280，包括可能 handoff 给 Endpoint 的 Core
+profile；不兼容逻辑域在挂载前拒绝。捕获入口在挂载前选择两种合同之一：已验证关闭
+RX VLAN stripping、且不需要恢复标签的物理设备使用 wire-only 解码，由自有 XSK
+提供设备/队列权威，并从实际字节解析 inline L2；不读取或伪造 metadata 前缀。
+需要 metadata 的路径保留 32 字节 v2 producer 记录，通过真实 device-bound
+`bpf_xdp_metadata_rx_vlan_tag` kfunc 获取标签，函数 ID 由内核 BTF 解析。
+veth 必须使用该路径，因为本地关闭 RX stripping 不能限制对端 TX 插入标签。
+恢复的一层加 inline 标签最多两层；缺失或畸形 metadata 不会触发 wire-only 回退。
+最小帧填充上限仅按每层 **inline** VLAN 增加四字节。
+
+就绪前会重新核对设备事实与 topology 订阅。内核没有通用 `data_meta` 能力通告；
+必须的 metadata 调整失败时丢包，并与 capture 分开计数。runtime 至多每秒采样一次，
+观察到失败后关闭捕获，不承诺一秒硬上限，也不把它称为任意驱动的启动前能力证明。
+device-bound 程序必须以真实入站验证，不能使用 `BPF_PROG_TEST_RUN`。
+
+L2 group 地址不能让单播 IP 获得原生 socket 豁免。原生 ARP/ND 和 IP 特殊地址
+处理保留；定向广播取自最多 64 条精确的本地表 `RTN_BROADCAST` 路由，不猜后缀。
+
+物理捕获默认强制 ZeroCopy；`xsk_mode: copy` 指定 Copy，`xsk_mode: auto` 根据每个成员的能力与所需 segment 数选择模式。Auto 选择 ZeroCopy 后 bind 失败不会重试 Copy。每次 bind 均回读验证；模式变更需重启。Host 不使用 AF_XDP 队列。
+
+只读启动准入最多汇总 256 条问题，额外问题计入 omitted，前置条件失败导致无法检查的项目标为 `NOT_CHECKED`。检查包含捕获布局、队列、设备能力、外来 XDP、拓扑、内存，以及 Endpoint 的 zone-0 CT 和上联条件。通过后才准备 VLAN feature、加载程序、创建 FD 持有的 link 并绑定队列；supervisor 就绪和拓扑验证之后激活。后续队列失败也会撤销已创建 link。物理 Endpoint/Core link 和程序不 pin；外来 XDP 会被拒绝。进程退出或 SIGKILL 关闭 link FD，内核恢复转发，但已有代理会话可能需要重连。Host 出口独立使用 FD 持有的 TCX 绑定。
+
+物理协调器在 RTNL 就绪时排空通知。Core 若可能从 RX 队列 0 直接转发缓存命中的流量，仍在消费这批输入前做完整检查。链路静默时，协调器会在一秒后读回每个自有 link FD 的身份，不依赖 Core 策略读锁。该检查能发现自有链接脱离或所挂程序变化，不查询其他 XDP 模式，也不代表全量拓扑快照。每个存活的 RTNL watcher 都独立计费 64 KiB 接收缓冲，包括最终启动准入时新旧实例短暂重叠的时段。
+
+Linux 以 `NLM_F_DUMP_INTR` 标记拓扑转储时，honk 丢弃本次不完整的快照，在同一网络命名空间新开 dump socket，从头读取。XDP 和 TUN 的拓扑读取在同一个两秒截止时间内最多尝试八次。若各次转储都被中断，准入失败。非法拓扑和监听通知丢失沿用各自的失败处理。
+
+停止时，honk 先禁止物理 worker 开始新的收发，再撤销 XSK 映射。从进入抓包关闭流程起，撤销策略发布、等待物理 TX 完成和第二个 worker 确认共用 100 ms 等待预算。只有尚有未完成描述符的 TX 才可请求唤醒。超时或设备报错仍会尝试拆除 link，并将关停记为失败，不当作完成。拆除后，物理队列只回收真实 CQ 条目。该预算不限制已经进入内核的调用，也不保证从 SIGTERM 到内核恢复转发的实际耗时。
+
+没有 VLAN upper 时，honk 关闭它所修改的两个 RX VLAN stripping feature，并在正常停止或启动失败时恢复。SIGKILL 后这两位保持关闭，内核软件处理 VLAN。设备身份失权时不再恢复，以免写入已替换的设备。veth 仍需 VLAN metadata。
+
+本机非 53 流量先交内核，本机目的端口 53 仍须走策略。Endpoint hold 优先于 zone-0 conntrack。DNS 原生 pending 命中 CT 后由 CT 接管；没有 CT 时，重复 SYN 或完整 UDP 数据报仍须重新取得许可，pending 本身不授权转发。没有 hold 或 CT 时，TCP 仅纯 SYN 进入 D1，非 SYN miss 交内核。真正需要重组的 UDP 首片不能建立或续签 DNS 原生归属。非 TCP/UDP 通常交内核；ICMP 错误检查引用的流。无法分类的传输层头丢弃。后片在 30 秒内沿用缓存的首片判定，无判定则丢弃。见[网关 DNS 路由](../reference/global.md#xdp-endpoint-dns-投影)。
+
+仅支持 zone 0。启动拒绝非零或无法证明安全的 nft 和 legacy zone。运行期不安全的 nft zone 或 CT 查询合同错误仍是致命错误。legacy raw 表的周期采样可以关闭 DNS 原生转发，但不是完整的运行期 legacy zone 准入；修改 legacy zone 前应停止 honk，修改后重启。
+
+准入的 802.3ad bond 是一个逻辑 realm，XDP 挂在物理以太网或 veth 成员上；其他 bond 模式或不支持的哈希策略被拒绝。同 realm 的 peer 可以换成员，已导出输出保持原成员。多成员 realm 使用 CPU 输出而不使用 generated output，有性能代价；单成员 bond 可以使用 generated output。realm worker 数受成员中最小队列数限制。捕获身份变化、新成员加入 bond、ENOBUFS 或 `Desynchronized` 为致命错误；carrier、LACP 状态、统计及其他设备变化忽略。地址更新刷新本机集合；成功重同步前保持已发布 map，重同步失败为致命错误。FIB dump 中断在三轮同步内重试。
+
+内核 map/program 内存与 UMEM 一同计入共享 384 MiB 捕获预算；重载期间新旧 generation 同时计费。见[重载限制](./control-plane.md#reload-与运行时-generation)。
+
+[辅助 L3 LAN](../reference/global.md#辅助-l3-lan) 从 TCX ingress 进入同一策略，不提供 MAC 事实。原生判定继续执行内核链；选中 Endpoint 的包重定向到该绑定独占、无地址的 TUN。TCX 使用独立的 per-CPU scratch 和 skb conntrack 查询；解析同时受 IP 声明长度和 skb 线性区长度约束，只有必需首部不在线性区时才拉取。已知归属 Endpoint 的 ICMP 错误交给 Stack 核查引用；未知传输流的引用不会建立新归属。
+
+读写内部 TUN 和驱动 packet scope 的任务在共享运行时执行，不占物理 AF_XDP 队列循环。两个方向均检查本次绑定的设备对；ifindex 数字被复用不构成重定向许可。即使 FD 托管的回向程序先关闭，内 TUN 随设备持有的终态丢弃仍生效。更换绑定时先注销旧 TUN 并退役其在途业务和 DNS 许可，再准入新绑定；`writev` 成功不能证明内核旧队列已空。重载按顺序替换物理和在役辅助 link，失败按逆序回滚；Linux 不提供所有 link 在同一包边界同时切换的保证。
+
+SG/multi-buffer 能力通告和 bind 成功都不等于 jumbo 实测。手动 veth smoke
+在 Copy 模式覆盖 MTU 1500 和 9000：每次 UDP 回复必须是单个完整数据报，
+jumbo 用例还要求在客户端接口的收发两个方向观察到大于 4096 字节、完整且
+未分片的 IP 包。物理 NIC zero-copy、jumbo 性能与 DMA 释放仍需各自证据。
+
+仅符合条件的单成员 realm 且经检查的 `14 + 4 * vlan_count + logical_mtu.max(1280)` 不超过 `FRAME_SIZE` 时，Endpoint 才直接在已预留 UMEM frame 内生成输出。多成员、jumbo 和其他不符合条件的 realm 继续使用 CPU 输出和整链 SG，包括控制包。应用 UDP 首包/首分片、未分片和零长度数据报及控制器 DNS 回复仍为计费的 CPU 输出；后续直接分片不能越过更早 CPU 前缀。
+
+`Port::transmit_generated(class, max_length, generate)` 先预留真实单帧/ring/sidecar 容量，再调用同步 generator；scope credit 也早于 Stack emitter 预留。私有 guard 在无输出、错误或 panic 时取消未发布预留。原始 FlowId 持有先在 scope mutex 内安装，随后在锁外完成精确 peer/header，中间不 await 或服务 RX。只按实际长度补零到以太网最小帧，并以未偏移的 frame base 发布；后续错误不释放已发布 owner，仍须真实 CQ。CPU 与直接 Endpoint owner 共用按精确 scope 混合归还的 CQ batch。既有每 realm 每类别 32 个候选输出、64 个 CQ descriptor 的上限、相互独立的 ACK/重传/CQ 生命周期、E3.1 handoff 及进程生命周期 UMEM 计费不变。符合资格的 driver 轮次只跳过 CPU 拉取，在直接输出后完成 timer/event/close/deadline 收尾，不增加 busy polling。只移除一次中间 Endpoint CPU-IP-frame 到 UMEM 的复制，TCP payload/校验和与 relay 复制仍存在；这不是通用 UDP zero-copy、常驻内存减少或已测收益。
+
+XDP 通过 userspace backend 拥有规范 routing、domain 与 health 发布。native API 报告 datapath kind `userspace`，不声称拥有硬件计数器或 program/attachment 清单。TC listener/token 及 kernel witness API 仍不支持。
+
+固定聚合计数区分队列/credit/容量拒绝、native-ID 历史精度下降及成功 peer 回收。
+只有实际拒绝 episode 会告警，持续压力以 debug 汇总，不逐包写日志。
+同一 owner sampler 在 DEBUG 过滤外读取六项内核 socket 计数与原始 ring 索引，
+只在既有 owner turn 中至多每秒一次；DEBUG 复用样本并报告 port 计数。
+就绪时取一次初始样本，正常关闭在 socket 拆除前另取最终样本，不增加空闲采样 timer。
+`StatsManager` 仅共享最新有界观测，供 native `/api/v1/datapath` 的
+`x-honk.xdp` 与 Clash `/stats` 的 `xdp` 使用；GET 不读取内核、不改变 polling。
+按实际准入队列数分配共享存储，构造前计费，最后一个诊断读者释放后才退还预算；
+诊断不保留 Port、FD 或包 lease。身份采用真实 namespace/attachment/ifindex/queue，
+并保留实际 bind 模式与容量、采样时间/序列、不可用/错误/恢复，以及
+starting/active/closing/closed/failed-retained 生命周期。各 ring/队列顺序读取，
+不是原子快照。空 FILL 事件和 wakeup 错误不能相加当成丢包；当前 FILL 有内容
+不能否定历史饥饿。详见 [API 语义](../reference/api.md#连接关闭模式与数据面生命周期)。
+
+### Event 与有限 adaptive 服务
+
+`datapath.poll_mode` 选择 Event 或 adaptive 策略，两者都从 Event 开始。Adaptive 要求精确匹配可执行文件、计数位置、设备/offload 和参数的校准，RX 或 TX 独立在至少两个完整非重叠窗口内持续高 PPS，真实可轮询设备义务以及共享进程配额。未知 source receipt、异步 SYN/Initializing/DNS 准入、队列拒绝、descriptor、CQ 和空探测都不计资格。TX 按完整 producer publication 计包，包括 generated 与 SG，不按发送函数的成功返回或 descriptor 数。边界与 candidate/qualified 记录见[全局参考](../reference/global.md)。
+
+同一 capture Runtime 服务 driver、timer、completion/FILL、control、有限 RX/TX 和 close；真实策略 reader 的 Pending 获取保持 pinned，并与这些服务复用，blocked-ready 本身不持续 spin。每个活动区间都结算并执行 Event 重评估/协作 yield。只有真实 owner 边界观察到时间经过时才补充配额，不设空闲配额/采样 timer；真实设备可见性与 completion 义务所需的 Event 后备 deadline 仍保留。
+
+每个选中设备（包括 metadata/veth）都持有冷路径计费的 ethtool FD 和有界查询缓冲。每个有限 Busy 探测轮前读取真实 active bit，查询/比较成本计入活动区间；轮内变化在下次扫描发现，不宣称原子排除。MONOTONIC-before/BOOTTIME/MONOTONIC-after 形成的 offset 区间逐次求交：普通重叠不确定性允许累积资格，分离/错误/倒退/长间隔则清空资格。报告的分辨率及非原子读取不确定性不能证明更短 suspend 不存在。协议 Instant 与 scoped 最终发布/权威检查保持原义。
+
+Event 启动即使无校准，也输出可复现的 executable/context/counting 身份；完整数值块还输出参数摘要。因此 candidate 可在测量前绑定预登记实验 manifest，但只有显式实验 CLI 参数才准入该记录。Qualified 仍是特权操作员经外部评审的证据声明，不是 runtime 科学认证。不据此宣称未经测量的吞吐或节能收益；未合格平台继续 Event。
+
+被忽略的 `xdp::tests::driven_kernel::adaptive` 入口
+`actual_owner_clock_budget_fairness_and_live_features`（Copy）与
+`actual_zerocopy_owner_clock_budget_fairness_and_live_features`（ZeroCopy）
+运行同一完整 fixture。一个 Core owner 与独立 Endpoint owner 在同一进程中
+共用账本，Endpoint 的每次重建也沿用该账本。唯一的 45 秒绝对 deadline 在
+初始化前开始，包含流量、clock/publication 间隔、真实 socket 应用数据/重传/
+timer/close、所有队列进展、Core 两个设备的 egress、同线程公平性、配额/债务、
+独立发布、真实 feature 修改/恢复、保留查询的 `ENODEV` 及 joined 清理。
+ZeroCopy 入口要求实际 `igb` driver 身份、精确队列 `[0, 1]`，以及每个绑定
+port 的实际 ZeroCopy 回读，包括每次重建。
+
+独立 recent-kernel igb rig 要求六块 igb NIC、三个封闭 hub、两个 KVM vCPU、
+1536 MiB、只读 host root 和一个私有可写 export，不使用 host TAP、bridge
+或 socket 网络后端。每个 capture 设备必须回读两个 combined 队列、UDP IPv4
+哈希字段 `sdfn` 及双队列 RSS indirection table（`ethtool -N DEV rx-flow-hash
+udp4 sdfn` 与 `ethtool -X DEV equal 2`）。producer 变化 64 个 UDP 源端口；
+只有真实逐队列 RX 增长才满足队列证据。`HONK_XDP_ARTIFACT_ROOT` 下的
+`adaptive-runtime.bindings.jsonl` 与对应 `adaptive-runtime.binding ` stdout
+记录保留五次启动：A 一次、B 四次。每条记录包含实际 capture incarnation
+（`startup_id`）、namespace/inode、driver、device/ifindex、配置模式及每个队列
+的实际 bind 模式。只有真实 peer、scope/CQ、socket、worker 与 OS thread
+完成 join 且自有 link 已 detach 后，才写 `adaptive-runtime.joined`。这些源码覆盖仍须 rig 实际通过才能接受某次运行；
+不构成 virtio 等价、物理 NIC 性能或 DMA 释放结论。既有 Copy 与 virtio Event
+profile 仍作为独立结果。
+
+### Host 来源托管
+
+Host TCX egress 位于原路由选择与 POSTROUTING 之后。转发包和恰好携带 honk bypass mark 的包原样继续。豁免本机服务回包需要**此 skb** 已跟踪的回复标识及同一个 zone 0 conntrack 对象；仅查到反向元组或 ORIGINAL 条目都不能豁免。非适配帧、非 TCP/UDP、DHCP、特殊地址及本机非 53 流量沿用内核路径。
+
+新流按有序网关策略分类。五个 FD 持有的 cgroup hook 将第一次取得的 argv0（不可用时取线程名）存入不随 clone 复制的 socket storage。只有 TCP 使用第二张 socket storage 保存本次连接的决策；断开后在同一 socket 上重连是新决策。UDP 始终按元组分流。Endpoint 的执行、回复和待释放工作都归最初出口及其绑定代。新流的进程信息需与 hold 核对，不是逐包来源凭据，也不恢复原系统调用。`backend: tun` 的 HostFacts 保持独立。 共享 UDP 接收者保留绑定和地址，不继承首个目标的进程事实；物理回复路径与经认证的 TUN 来源不因此被清除。
+
+已证明的 Direct 走原生路径。只有 hold 表确实已满时，**当前策略已经明确判为 Direct** 的新 UDP 包可以不记归属而放行；下一包重新判决。同键争用、未知结果或 Endpoint 容量不足均不能变为 Direct。8,192 行进程元数据表不限制 Direct；LAN 的 8,192 个 native-pending 名额另算。 原生 TCP 另有 8,192 个可按元组查询的归属槽，为没有完整 socket 的控制包保留依据。65,536 行 Host UDP/Endpoint 表满不挤占 TCP Direct 或物理、辅助 LAN 的 hold；TCP 专用表也满时拒绝新 SYN，不作无记录的 TCP 放行。
+
+每个出口单独使用一个私有单队列 TUN。连接空闲后新发的包不算迟到包；已重定向的包到达 TUN 驱动时若已滞留**超过 30 秒**，在进入私有 FIFO 前丢弃，内部时间戳不改 IP 负载。空闲回收要等内核读者通过 grace、唯一读者处理完此前可能已入队的记录，并核实协议、应用和输出都不再保留原归属。定时器触发或一次 TUN 写成功不算排空。不会改投其他出口或重放。
+
+外口 TCX link 由 FD 持有；回复从原活动出口 ingress 注入，以太网使用核验后的本机 MAC。重绑先撤回双向重定向并排空原工作；接口下线或 ifindex 复用不能接收旧回复。终态保护只随自建私有 TUN 存在，不创建 Host XSK、持久外口 pin 或 Host 收据，也不回退到 TC/NFQUEUE。内核防火墙、路由、NAT 与严格反向路径检查仍决定是否交付，不能仅凭它们存在就声称回包成功或失败。
+
+已关闭的 Host 绑定依次退役。队首删除自己的 gate 和设备映射时，不占捕获注册表或绑定锁。删除失败会保留原设备对及其预算；该出口的旧归属清理完毕前不得重绑。
+
+### 物理捕获与 smoke
+
+物理 UDP 包若在 Endpoint 关闭准入前刚通过校验，校验得到的源信息仍然有效。若队列因准入已关闭而拒收该包，它不算被接管，也不计入有效 RX；这次拒收不会导致设备 owner 失败。
+
+物理 link FD 在正常停止或进程退出时 detach。非法 CQ/completion 是致命错误，不算成功排空；未归还 buffer 和 owner 保留到进程退出。启动拒绝外来 XDP，无须手工移除物理 guard 或程序 pin。
+
+`.github/ci/xdp-daemon-smoke.sh` 属于使用匹配预构建 daemon 和测试程序的 floor/recent disposable VM gate。D3 合同检查进程退出或 SIGKILL 后 link detach 和内核转发恢复，以及后续队列启动失败时全部 link 的撤销。保留独立 Host custody 与 TC/NFQUEUE 选择。虚拟覆盖不等于物理 NIC 性能或 DMA 释放认证。
+
+smoke 将 daemon 状态保存在私有 `/run` tmpfs，关闭后再归档。guest cgroup2
+挂载放在 `/sys` 之外，避免 `ip netns exec` 为 TC 回归重挂 sysfs 时隐藏该层级。
 
 ## 网络命名空间与 hook 架构
 
@@ -325,6 +626,83 @@ Removal worker 每批最多处理 1,024 项 TCP/UDP/过期请求，使用 [NFQUE
 Backend API 使用 `TuplesKey`/`ConnState`、有界 map 扫描和条件退役。旧 `ConnTuple` CRUD、字符串 IP/域名路由、参数缓存 setter 与 backend 统计适配器已删除；加载时配置的 `DaeParam` global、带 generation fence 的 IP/规则位投影、`StatsManager` 和 pinned `OUTBOUND_STATS` 仍是正式路径。
 
 `just test-netns` 包含生产 TC 报文回归：完整反向 tuple 的 RX 计数、缓存路由的健康/就绪政策，以及 LAN 与 WAN egress 的本机 ICMPv6 Redirect 抑制。L2 使用 `BPF_PROG_TEST_RUN`；L3 使用隔离网络命名空间内的真实 TUN 接口，并验证转发报文与卸载 hook 后的对照行为。
+
+## Core 转发防火墙与 IPv4 NAT
+
+可选的[强类型防火墙/NAT 配置](../reference/routing.md#core-转发防火墙与-ipv4-nat)
+扩展现有 CoreForward owner，不是第二套执行器，也不反向解析 nftables。
+阶段顺序是捕获域/接口身份、已有原始/回复 binding、原始事实防火墙与 DNAT、
+真实输入 FIB、转换后事实转发防火墙、SNAT，然后复用 TTL/MTU/校验和及设备
+输出路径。条件沿用规范流量编译器与 matcher，allow/drop/reject 与转换动作
+则保留独立的强类型语义。
+
+一个有界表按精确逻辑入口身份保留原始与 DNAT alias；不同 LAN/VLAN 接口可
+并存相同私网元组。完整转换后的反向 alias 与公网地址/端口分配器仍在
+namespace/scope 域内共享。各方向绑定真实 ifindex 与 attachment incarnation，
+错误接口不能借用许可。TCP 由 SYN 开始准入，必须观察匹配序号及
+确认号的 SYN-ACK 和最终 ACK 才进入 established。已建立 owner 保留实际观察到的
+握手证明，允许匹配的 SYN/SYN-ACK 重传（包括既有 SYN 数据与同时打开），但新
+SYN 序号不能接管元组。UDP 反向所有权限定精确对端，不把公网端口作为通配许可。
+首包接收时间隔离更早的排队输入；空闲新鲜度同样依据接收事件，而当前处理时间
+驱动超时与容量清理。IPv6 使用同一防火墙 owner，但不做地址转换。IPv4 NAT
+地址必须满足 transit 单播校验，除回环、多播和有限广播外，也拒绝
+`0.0.0.0/8` 与 `240.0.0.0/4`。
+
+已建立 TCP binding 的空闲期限为 7440 秒，UDP 为 120 秒；握手/关闭证明状态保留
+30 秒期限。没有接收窗口权威时，FIN/RST 标志本身不能缩短 established 保护。
+当前 traffic Block 先于可变 lookup：被拒包既不续期 binding，也不分配转换 ID。
+
+表存储与每个 binding 的 Arc 元数据在分配前计费；改包使用 Core 已计费的
+原始缓冲区。端口搜索跳过依赖候选端口的自身 alias 冲突；冲突或端口池耗尽
+不发布任何部分 alias。超时、策略撤销及 MASQUERADE
+地址移除立即关闭准入，但输出 lease 在真实资源归还前继续保留 binding、端口
+与费用。仅修改流量路由不改变安全 epoch；防火墙/NAT 或相关捕获 GeoIP 变化
+在发布前推进 epoch，移除再启用也不会将其重置。失败候选保留原编译 sidecar。
+路由刷新不会迁移 owner。runtime 慢表为 1024 项（纯 API 最多允许 4096 项），
+使用线性查询/分配；这不构成 fast-path、卸载或性能验证声明。
+
+NAT 为转换后的 DF-clear IPv4 数据报分配不同 ID，包括只会在下游分片的包；
+DF-set atomic 流量不需要这项分配。全局计费身份目录最多保留
+`min(binding_capacity × 64, 65536)` 个数据报（daemon 为 65536），输出及 CQ
+owner 保留 binding/quote 权威。观察到最后一个 owner 归还后，还要隔离 120 秒
+才能复用。这采用 RFC 6864 的惯例最大数据报寿命，不保证任意更长的远端分片
+队列或网络延迟。耗尽只拒绝当前包，不复用活跃 ID；保守的全局池即使不计额外
+持有时间，也可能把持续 DF-clear 转换限制在约 546 个数据报/秒，不能宣称高吞吐 NAT。
+
+Core 在尚未启用 firewall/NAT 策略时就记录不授予权限的原生 IPv4 ID 历史，覆盖
+普通包先于 NAT、NAT 先于普通包两种顺序。未改写 ID 被记住，只有与保留转换输出
+碰撞的普通包才重映射 ID。输出/quote lease 不代表 conntrack grant，并跨 CQ、
+策略变更及首次启用 NAT 保留。授权始终使用收到的 wire facts；原生 quote 的 ID
+只在最终转发前恢复，不在 lookup 或邻居等待前修复。ICMP echo 标识仍参与匹配。
+
+精确原生历史另有 `min(capacity × 64, 65536)` 项上限，不占用 managed-ID 池；
+重复原始 ID 复用历史。目录或预算耗尽时，预先计费的逐 ID 计数器仅把未知 ID
+保守地在全域保留，不丢普通转发，也不把转换数据报的速率上限强加给普通流量。
+overflow 等待最后 owner 归还，再等待 120 秒加 Core 有界重组期限（当前 30 秒）；
+完成的 quote 在任何过期或排队前取得独立保留。这只在饱和时降低域区分精度；
+确实需要转换但没有可证明安全 ID 的包仍被拒绝，不复用活跃身份。
+
+历史与实际 conntrack/managed-ID 存储分别计费，后者按需分配。overflow owner
+包含 65536 项原子引用计数/退休时刻及有界 bitmap，保留至最后输出/quote guard
+归还。动态身份记录持有独立 reservation，table 丢弃也不会提前退还导出 lease
+仍占用的内存。这些是逻辑内存边界，不是进程 RSS 或高吞吐 NAT 认证。
+
+分片复用现有重组器，不新建 NAT 重组器，也不虚构非首片端口。存活/正在完成的
+重组及导出的 timeout quote 只保留其可能关联的 scoped 地址/协议域；tombstone
+和不相关分片不能重置全表身份退休时钟。仅在完整包及校验和验证后转换，
+之后的分片仍由 CoreForward 处理。
+已准入 IPv4 ICMP 错误引用会还原内层地址、端口、原 ID 及实际存在的校验和字段；
+仅含八字节 TCP 首部的引用不会读取不存在的校验和。非首片引用使用保留的 ID
+权威，绝不把载荷当作端口。IPv4 UDP 零校验和保持零；未知/截断引用及不支持
+的引用扩展布局 fail-closed，IPv6 related 错误不代表支持 IPv6 NAT。
+
+必要的非特权回归位于 `honk-datapath::firewall::tests`、
+`honk-core::routing::firewall::tests` 和 `honk-config/tests/firewall.rs`。
+集成 owner 生成测试产物后，无需重新构建的 smoke 入口为：直接运行现有
+datapath 测试可执行文件并传入 `firewall::tests`，运行 core 测试可执行文件并
+传入 `routing::firewall::tests`，以及直接运行 config 的 `firewall` 集成测试
+可执行文件。无需操作主机接口、加载 BPF 或创建网络命名空间。源码实现及这些
+报文测试不证明设备/硬件、真实内核或性能已验证；完整跨后端验证矩阵仍属独立阶段。
 
 ## 相关文档
 

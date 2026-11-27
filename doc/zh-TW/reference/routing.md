@@ -88,6 +88,8 @@ routing {
 
 執行時沒有 BTF 偏移，或沒有 verifier 允許的核心 argv 存取方式時，cgroup hook 同步改用呼叫執行緒的 `comm`。只匹配 honk 所在主機上的行程，不匹配 LAN 用戶端上的應用。
 
+TUN 中使用 `pname` 或其否定形式，須同時設定 `host_facts: true` 與 `queues: 1`。行程事實來自確有該資訊的已驗證應用程式 socket Host 紀錄。純封包與缺少該項事實的紀錄只符合否定條件。純封包可包含本機發起或轉送的流量。請參閱 [Linux TUN Endpoint](./global.md#linux-tun-endpoint)。
+
 ```dae
 routing {
     pname(NetworkManager, systemd-resolved) && l4proto(udp) && dport(53) -> direct(must)

@@ -1,6 +1,6 @@
 # 架构概览
 
-`honk` 是 Linux eBPF 透明代理引擎，代理网关转发的流量和本机发起的流量。项目处于实验性 alpha 阶段，使用 `GPL-3.0-only` 许可证，仓库为 `daeuniverse/honk`。
+`honk` 是面向网关与本机流量的 Linux 透明代理引擎，默认 TC/eBPF capture，也可显式选择 XDP 或 TUN packet 后端。本页说明其架构及关键运行时规则。项目当前为实验性 alpha，采用 `GPL-3.0-only` 许可证，仓库为 `daeuniverse/honk`。
 
 `honk` 的配置语法和 TC 数据路径来自 dae，在文档声明的范围内与 dae 兼容。出站 handler、代理组和 Clash API 采用 sing-box 风格的设计。它是独立实现，与两者都有明显差异。
 
@@ -20,13 +20,16 @@
 
 ## Crate 分工
 
-根 workspace 包含六个 crate。`honk-ebpf` 的目标是 `bpfel-unknown-none`，因此不在 workspace 内，单独作为一个 Cargo 项目并维护自己的 `Cargo.lock`。
+根 workspace 包含九个 crate。`honk-ebpf` 因面向 `bpfel-unknown-none` 而作为独立 Cargo 项目：它被排除在 workspace 外，并维护自己的 `Cargo.lock`。
 
 | Crate | Workspace | 职责 |
 | --- | --- | --- |
 | `honk-config` | 成员 | 共享配置模型、dae 语法解析器、include 处理、分享链接解析和订阅解码。 |
 | `honk-ebpf-common` | 成员 | 内核程序与用户态 map 写入端共享的 `no_std`、`#[repr(C)]` 常量和 ABI 类型。 |
 | `honk-nfqueue` | 成员 | raw `NETLINK_NETFILTER` 队列 `320`、verdict 所有权和自有 nftables 事务。 |
+| `honk-netstack` | 成员 | sans-I/O IPv4/IPv6 TCP/UDP 栈，用于 WireGuard 及 scoped packet Endpoint，包括配置 XDP/TUN；只依赖 `blake3` 与 `thiserror`。见[用户态网络栈](./netstack.md)。 |
+| `honk-datapath` | 成员 | scoped frame 所有权、纯 Core 转发与状态防火墙/NAT；规范策略及平台 FIB 权威仍由 core/adapter 持有。 |
+| `honk-xsk` | 成员 | 已配置 daemon 与显式实验消费端共用的 Linux XDP/AF_XDP 原语；不代表延迟 DMA 释放栅栏或硬件验收通过。 |
 | `honk-outbound` | 成员 | 协议 handler、逐节点 runtime、出站组、健康状态、URLTest 探测和始终编译的 Score 评分器。 |
 | `honk-core` | 成员 | 引擎库与二进制：eBPF/NFQUEUE runtime、控制面、DNS、路由、中继和 Clash API。 |
 | `honk-tool` | 成员 | 用于订阅/节点探测、数据路径诊断、已固定 map 检查和 geo 资源查询的 CLI 工具箱。 |
@@ -40,6 +43,7 @@ flowchart LR
   COMMON --> OUT
   COMMON --> EBPF[honk-ebpf]
   CORE --> OUT
+  OUT --> NS[honk-netstack]
   CORE -->|optional ebpf feature| NFQ[honk-nfqueue]
   CORE -->|build.rs embeds object| EBPF
   TOOL[honk-tool] --> CFG
@@ -70,7 +74,11 @@ flowchart LR
 - `src/experimental.rs`：`ExperimentalConfig` 持有 `clash_api: ClashApiConfig`、`cache_file: CacheFileConfig` 和 `native_api`。原生设置严格校验、独立启用，而且都需要重启。`native-api` 要显式编译，可用 `--features native-api` 或 `native-ui` 构建，full 与 `-native-api` 发布产物都包含它。它提供用户态观测、有界历史、由源文件管理的组 PATCH 和主文件条目管理，以及已验证 geodata 的激活。listener 仍默认关闭。`.dae` 仍是唯一的配置权威。原文披露与写入权限各自独立。带凭据的来源只读。接口返回正文时会遮蔽 listener secret 的值，而不是省略整段正文。按网络的自动策略 pin/clear 已启用；pin 归属于当前 `GroupManager`，激活后失效。原生 mode 与完整内核透明仍未开放。`native-ui` 默认关闭，打包时通过 `ci/fetch-doona.sh` 和 `.github/ci/pins.env` 获取带许可及版本记录的 doona 发行资产。`build.rs` 读取绝对路径 `HONK_DOONA_DIR`，运行时不会获取资产或构建前端。dae 解析器目前显式允许 `clash_api` 和 `cache_file` 这两个嵌套节。旧的 `udp_nfqueue` 只作为迁移输入：解析时发出 warning，且只在没有配置 `global.nfqueue_enable` 时，把 `enabled` 复制到 `GlobalConfig::nfqueue_enable`。
 - `src/subscription.rs`、`src/types.rs`、`src/error.rs`。`src/types.rs` 里 `NodeProtocol` 的 `Direct` 和 `Block` 留给内置节点，`Chain` 用于链式节点。`DialMode` 为 `ip`、`domain`、`domain+` 或 `domain++`。该文件还定义 `SubscriptionType`、`DnsProtocol` 以及共享的 `default_true`/`parse_duration_secs` helper。`src/error.rs` 定义 `ConfigError`。
 
+`src/node/wireguard.rs` 负责单 peer WireGuard 配置、身份材料与准入。
+
 ## 高层数据路径
+
+下图及报文路径描述默认 TC。显式 [TUN Endpoint](./datapath.md#linux-tun-endpoint) 使用 daemon 自有唯一 FD、scoped Stack、canonical Router 与真实 outbound。可选 socket HostFacts 支持进程路由；Direct 新建 dial，不具备原 socket operation 或 pre-NAT/TTL 等价性。XDP 保持独立 device/Core 合同。
 
 ```mermaid
 flowchart TB
@@ -105,7 +113,7 @@ flowchart TB
 
 ## 运行时不变量
 
-- bypass mark 纪律：拨号、探测、DNS 上游、HTTP 下载、QUIC endpoint 和透明 listener 都会携带进程配置的 bypass mark。非零直连规则 mark 会替换 bypass mark 的低 30 位，并携带 `CLASSIFIED_MARK`；策略路由必须使用 `0x3fffffff` 掩码。accept 之后的 TCP socket 会清除 listener 标记；普通 host-netns `dns.bind` 入口 socket 则有意保持无标记。
+- **旁路标记纪律：** dial、probe、DNS 上游、HTTP 下载、QUIC endpoint 与 TC 透明 listener 携带进程 mark。TC 非零直连规则使用 `CLASSIFIED_MARK` 和带掩码策略路由，accepted TC TCP 清 listener mark。TC/XDP 独立 `dns.bind` 无 mark。TUN 要求 physical egress 使用精确有效 M，DNS/管理 socket 在 bind/listen 前严格设置并回读 M，accepted service child 保留该值；权限错误拒绝 TUN，不能冒路由回环风险。
 - Anyfrom UDP 回包：代理 UDP 和透明 53 端口的 DNS 回包，使用在 `daens` 中创建并绑定到流量原始目的地址的透明 socket。直接从 TPROXY listener 回包会暴露 `dae0` 源地址，并在返回路径上失败。来自其他 full-cone 来源的回复通过仅含客户端的 `CLIENT_REPLY_TRACK` 帧信息返回，不经过主机转发。数据路径也不会因此为客户端随后发往该来源的包学到原生反向方向。
 - DNS 来源边界：透明入口和 `dns.bind` adapter 从 socket peer 得到逻辑客户端来源；流关联查询使用已通过 admission 的流的来源。缓存只有在路由选出与来源无关的 scope 之后才复用。每个 policy generation 的域名谓词投影仍是全局的，不区分来源。
 - UDP source 边界：来源共享协议的复用按以下四项区分：复用的 runtime、规范化后的 client、协议与 UDP path，以及 actual-peer 或 original-destination 的 reply projection。完整五元组 endpoint map 仍持有 route、token/generation 与逐 flow Score；source association 持有唯一的 receiver 和 transport health。关闭 `rprx` 时，除 VLESS 外各协议的 source ownership 仍可用。
@@ -121,6 +129,7 @@ flowchart TB
 - Score 按需反馈：setup／首响应与有界的分方向进展可以在终态前发布，不会增加 Beta 完成次数。业务、配置健康和预热三种来源承担不同作用；任意手动 delay 测量都不会变成业务可靠性或配置基线。Score 的 TCP 建立失败可以在原 deadline 内通过另一个合格叶节点恢复一次，不打开新的 final、不绕过 Selector、也不重放负载。
 - 条件性验证接口：Score 代理组会发布聚合的临时／可用状态、新鲜的成对挑战者响应关系、证据问题与等待原因，这些内容与同一次只读选择出的成员一致。不存在全组范围的比较结论。`/stats` 增加固定的组／网络验证以及预算／成本字段，还有经嵌套去重的根业务计数；观察到的试用失败不会被计为额外的因果失败。两者都不导出原始目标 key 或最优概率。详见 [API 验证](../reference/api.md#score-验证信息)。
 - 内部与特殊流量：honk 的内部链路地址范围 `169.254.0.0/16` 和 `fd00:686f:6e6b::/64` 永不代理。L2 广播/组播、IPv4 广播/组播/未指定目的地址以及 IPv6 组播会在路由或 conntrack 之前直通。
+- **TUN 所有权：** daemon 独占新建 nonpersistent link、明确地址、专用 capture table、五条 RPDB rule、blackhole guard 与 setup receipt。操作者保持 main/WAN/LAN/NAT/firewall/forwarding 拓扑稳定。Watcher 失效关闭 capture，但不是 root 改路的原子栅栏。正常 joined stop 最后撤销自有 containment，失败保留 guard/rule/receipt 供精确核对清理。
 
 ## 构建 feature 与 mock 模式
 
@@ -135,7 +144,7 @@ flowchart TB
 | `jemalloc` | 是 | 引入 `tikv-jemallocator`，把 jemalloc 安装为 `honk-core` 二进制的 allocator；该 crate 从 C 源码构建 jemalloc。在 Linux 上，程序会在启动 Tokio 之前对当前进程禁用透明大页。运行期选项使用 `_RJEM_MALLOC_CONF`，不用 `MALLOC_CONF`：crate 以 `_rjem_` 前缀构建 jemalloc，环境变量名也被加上该前缀。 |
 | `rprx` | 是 | 启用 `honk-outbound/rprx`，注册 VLESS 与 VMess handler，包括受支持的 VLESS Encryption 和 `xtls-rprx-vision` 路径。 |
 
-`mock-ebpf` 不是 Cargo feature。不带 `ebpf` 的构建使用 `MockEbpfBackend`，`--mock-ebpf` 则显式选择无特权开发路径。若请求 `global.nfqueue_enable = true`，启动会记录 warning，仅在本进程关闭 NFQUEUE 暂存，配置文件保持不变。
+`mock-ebpf` 不是 Cargo feature。默认 TC 无 `ebpf` 时使用 `MockEbpfBackend`，`--mock-ebpf` 选择无特权开发并在进程内禁用所请求的 NFQUEUE。XDP/TUN 使用共享 userspace policy backend；TUN `host_facts: true` 要求 `ebpf`，false 不要求。TUN 要求 `/dev/net/tun`、设备/路由及 socket mark 权限，拒绝 mock，必须设 `nfqueue_enable: false`，不回退 TC/NFQUEUE。
 
 嵌入 eBPF 时，`build.rs` 使用内核 crate 固定的编译器和独立的 release 策略重建，不继承 host 的 `RUSTFLAGS`、`CARGO_ENCODED_RUSTFLAGS` 或 `CARGO_PROFILE_*` 性能分析覆盖。编译器 sidecar 不能早于嵌入构建脚本，所以修改嵌入策略会使既有对象失效。显式 `--bpf-object` 资产和手动内核构建仍由调用方负责。
 

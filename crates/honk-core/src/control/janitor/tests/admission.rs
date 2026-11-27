@@ -11,8 +11,12 @@ async fn tick_publishes_conn_pressure_without_using_auxiliary_pressure() -> anyh
         )?;
     }
     let pressure = Arc::clone(&model.admission_pressure);
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
-    let janitor = BpfJanitor::new(backend, Arc::new(TcpFlowPins::default()));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(model)));
+    let janitor = BpfJanitor::new(
+        crate::control::TcKernelController::for_test(backend),
+        Arc::new(TcpFlowPins::default()),
+    );
     let start = tokio::time::Instant::now();
     let mut state = tick::TickState::new(start);
     let enter = (u64::from(MAX_CONN_STATE_NUM) * 7).div_ceil(10);

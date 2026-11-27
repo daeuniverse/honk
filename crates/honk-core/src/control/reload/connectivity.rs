@@ -368,7 +368,7 @@ fn connectivity_snapshot<G: Copy>(
 }
 
 pub(super) fn installed_group_connectivity(
-    ebpf: &dyn EbpfBackend,
+    ebpf: &dyn crate::ebpf::PolicyBackend,
     group_count: usize,
 ) -> anyhow::Result<Vec<GroupConnectivity>> {
     let mut snapshot = Vec::with_capacity(group_count * 6);
@@ -381,7 +381,7 @@ pub(super) fn installed_group_connectivity(
 }
 
 pub(crate) fn publish_group_connectivity(
-    ebpf: &mut dyn EbpfBackend,
+    ebpf: &mut dyn crate::ebpf::PolicyBackend,
     snapshot: &[GroupConnectivity],
 ) -> anyhow::Result<()> {
     for &(outbound, domain, ipver, alive) in snapshot {
@@ -391,7 +391,7 @@ pub(crate) fn publish_group_connectivity(
 }
 
 pub(crate) fn open_group_connectivity(
-    ebpf: &mut dyn EbpfBackend,
+    ebpf: &mut dyn crate::ebpf::PolicyBackend,
     group_count: usize,
 ) -> anyhow::Result<()> {
     visit_group_connectivity_slots(group_count, |outbound, domain, ipver| {

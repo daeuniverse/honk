@@ -98,6 +98,8 @@ pub(crate) enum CloseAction {
     Tcp,
     Udp {
         pool: std::sync::Weak<crate::control::udp_endpoint::UdpEndpointPool>,
+        scope: honk_datapath::ScopeId,
+        packet_lineage: Option<std::num::NonZeroU64>,
         client: SocketAddr,
         destination: SocketAddr,
         token: u32,
@@ -117,7 +119,7 @@ struct TrackedConnection {
 }
 
 pub(crate) struct SelectedConnection {
-    id: String,
+    id: uuid::Uuid,
     owner: Option<Arc<ConnectionOwner>>,
 }
 
@@ -201,9 +203,9 @@ pub struct ConnectionSnapshot {
 
 /// Live per-connection entry, updated concurrently from the relay task.
 pub struct ConnectionEntry {
-    pub id: String,
-    pub source: String,
-    pub destination: String,
+    pub id: uuid::Uuid,
+    pub source: SocketAddr,
+    pub destination: SocketAddr,
     pub proxy: String,
     #[cfg(feature = "native-api")]
     pub routed_outbound: Option<String>,
@@ -218,7 +220,7 @@ pub struct ConnectionEntry {
     pub download: Arc<AtomicU64>,
     pub start_time: Instant,
     pub domain: Option<String>,
-    pub network: String,
+    pub network: &'static str,
     /// Originating process name for locally-generated flows (cgroup cookie
     /// attribution); None for LAN-forwarded traffic.
     pub process: Option<String>,
@@ -231,9 +233,9 @@ impl ConnectionEntry {
     /// Create a read-only snapshot of the current entry state.
     pub fn snapshot(&self) -> ConnectionSnapshot {
         ConnectionSnapshot {
-            id: self.id.clone(),
-            source: self.source.clone(),
-            destination: self.destination.clone(),
+            id: self.id.to_string(),
+            source: self.source.to_string(),
+            destination: self.destination.to_string(),
             proxy: self.proxy.clone(),
             rule: self.rule.clone(),
             rule_payload: self.rule_payload.clone(),
@@ -242,7 +244,7 @@ impl ConnectionEntry {
             download: self.download.load(Ordering::Relaxed),
             start_time: self.start_time,
             domain: self.domain.clone(),
-            network: self.network.clone(),
+            network: self.network.to_owned(),
             process: self.process.clone(),
             process_path: self.process_path.clone(),
         }
@@ -253,7 +255,7 @@ impl ConnectionEntry {
 ///
 /// Thread-safe by construction via [`DashMap`] — no external locks needed.
 pub struct ConnectionTracker {
-    entries: DashMap<String, TrackedConnection>,
+    entries: DashMap<uuid::Uuid, TrackedConnection>,
     consumers: AtomicU8,
     consumer_transition: parking_lot::Mutex<()>,
 }
@@ -334,17 +336,21 @@ impl ConnectionTracker {
     }
 
     /// Register a new connection and return its unique ID (UUID v4).
-    pub fn register(&self, entry: ConnectionEntry) -> String {
-        let id = entry.id.clone();
+    pub fn register(&self, entry: ConnectionEntry) -> uuid::Uuid {
+        let id = entry.id;
         self.entries
-            .insert(id.clone(), TrackedConnection { entry, owner: None });
+            .insert(id, TrackedConnection { entry, owner: None });
         id
     }
 
-    pub(crate) fn register_owned(&self, entry: ConnectionEntry, owner: ConnectionOwner) -> String {
-        let id = entry.id.clone();
+    pub(crate) fn register_owned(
+        &self,
+        entry: ConnectionEntry,
+        owner: ConnectionOwner,
+    ) -> uuid::Uuid {
+        let id = entry.id;
         self.entries.insert(
-            id.clone(),
+            id,
             TrackedConnection {
                 entry,
                 owner: Some(Arc::new(owner)),
@@ -364,13 +370,7 @@ impl ConnectionTracker {
         for tracked in &self.entries {
             let entry = &tracked.entry;
             if network.is_some_and(|network| entry.network != network)
-                || source.is_some_and(|source| {
-                    entry
-                        .source
-                        .parse::<SocketAddr>()
-                        .ok()
-                        .is_none_or(|addr| normalize_ip(addr.ip()) != source)
-                })
+                || source.is_some_and(|source| normalize_ip(entry.source.ip()) != source)
             {
                 continue;
             }
@@ -378,7 +378,7 @@ impl ConnectionTracker {
                 return Err(());
             }
             selected.push(SelectedConnection {
-                id: entry.id.clone(),
+                id: entry.id,
                 owner: tracked.owner.clone(),
             });
         }
@@ -423,7 +423,7 @@ impl ConnectionTracker {
                 (network.is_none_or(|network| tracked.entry.network == network)
                     && owner.groups.iter().any(|id| id == group))
                 .then(|| SelectedConnection {
-                    id: tracked.entry.id.clone(),
+                    id: tracked.entry.id,
                     owner: Some(Arc::clone(owner)),
                 })
             })
@@ -432,8 +432,18 @@ impl ConnectionTracker {
 
     #[cfg(any(test, feature = "native-api", feature = "clash-api"))]
     pub(crate) async fn close_id(&self, id: &str) -> CloseOutcome {
-        let selected = self.entries.get(id).map(|tracked| SelectedConnection {
-            id: id.to_owned(),
+        let Ok(key) = uuid::Uuid::parse_str(id) else {
+            return CloseOutcome::Gone;
+        };
+        if key
+            .as_hyphenated()
+            .encode_lower(&mut uuid::Uuid::encode_buffer())
+            != id
+        {
+            return CloseOutcome::Gone;
+        }
+        let selected = self.entries.get(&key).map(|tracked| SelectedConnection {
+            id: key,
             owner: tracked.owner.clone(),
         });
         match selected {
@@ -469,6 +479,8 @@ impl ConnectionTracker {
         let owner = selected.owner.expect("claimed transport owner");
         if let CloseAction::Udp {
             pool,
+            scope,
+            packet_lineage,
             client,
             destination,
             token,
@@ -479,7 +491,14 @@ impl ConnectionTracker {
                 owner.signal.finish(false);
                 return CloseRequest::Pending(Arc::clone(&owner.signal));
             };
-            if !pool.close_exact(*client, *destination, *token, *generation) {
+            if !pool.close_exact(
+                *scope,
+                *client,
+                *destination,
+                *token,
+                *generation,
+                *packet_lineage,
+            ) {
                 owner.signal.finish(false);
             }
         }
@@ -490,7 +509,7 @@ impl ConnectionTracker {
     ///
     /// If the connection is no longer in the map, the update is silently
     /// dropped (the relay task may have raced with a close).
-    pub fn update_bytes(&self, id: &str, upload_delta: u64, download_delta: u64) {
+    pub fn update_bytes(&self, id: &uuid::Uuid, upload_delta: u64, download_delta: u64) {
         if let Some(entry) = self.entries.get(id) {
             entry
                 .entry
@@ -505,14 +524,14 @@ impl ConnectionTracker {
 
     /// Attach process metadata after registration. A missing entry means the
     /// flow closed before the blocking `/proc` lookup completed.
-    pub fn update_process_path(&self, id: &str, process_path: String) {
+    pub fn update_process_path(&self, id: &uuid::Uuid, process_path: String) {
         if let Some(mut entry) = self.entries.get_mut(id) {
             entry.entry.process_path = Some(process_path);
         }
     }
 
     /// Remove a connection from the tracker.
-    pub fn remove(&self, id: &str) {
+    pub fn remove(&self, id: &uuid::Uuid) {
         self.entries.remove(id);
     }
 
@@ -569,9 +588,9 @@ mod tests {
         use super::*;
         fn entry(id: &str) -> ConnectionEntry {
             ConnectionEntry {
-                id: id.into(),
-                source: "127.0.0.1:1".into(),
-                destination: "127.0.0.1:2".into(),
+                id: id.parse().unwrap(),
+                source: "127.0.0.1:1".parse().unwrap(),
+                destination: "127.0.0.1:2".parse().unwrap(),
                 proxy: "direct".into(),
                 routed_outbound: Some("direct".into()),
                 native_flow_id: None,
@@ -582,15 +601,18 @@ mod tests {
                 download: Arc::new(AtomicU64::new(0)),
                 start_time: Instant::now(),
                 domain: None,
-                network: "tcp".into(),
+                network: "tcp",
                 process: None,
                 process_path: None,
             }
         }
         let tracker = Arc::new(ConnectionTracker::new());
         tracker.enable();
-        tracker.register(entry("old"));
-        let old = tracker.entries.get("old").unwrap();
+        tracker.register(entry("00000000-0000-0000-0000-000000000004"));
+        let old = tracker
+            .entries
+            .get(&uuid::uuid!("00000000-0000-0000-0000-000000000004"))
+            .unwrap();
         let disabling = Arc::clone(&tracker);
         let disabled = std::thread::spawn(move || disabling.disable_api());
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
@@ -602,7 +624,7 @@ mod tests {
         let enabling = Arc::clone(&tracker);
         let enabled = std::thread::spawn(move || {
             enabling.enable_native();
-            enabling.register(entry("new"));
+            enabling.register(entry("00000000-0000-0000-0000-000000000006"));
         });
         drop(old);
         disabled.join().unwrap();
@@ -614,7 +636,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.id.as_str())
                 .collect::<Vec<_>>(),
-            ["new"]
+            ["00000000-0000-0000-0000-000000000006"]
         );
     }
 }

@@ -30,7 +30,8 @@ async fn exact_ids_follow_incarnations_not_keys_or_cache_instances() {
             300,
             None,
         )
-        .unwrap();
+        .unwrap()
+        .revision;
     let first = service.entry_id(&key).unwrap();
     assert_eq!(
         service.entry_id_for_revision(&key, revision).as_deref(),

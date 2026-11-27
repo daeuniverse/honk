@@ -24,7 +24,7 @@ use aya_obj::generated::{
 };
 
 use super::routing::Target;
-use super::syscall::bpf_syscall;
+use crate::ebpf::common::syscall::bpf_syscall;
 use crate::ebpf::interface::{
     ApplyReport, Binding, BindingCommit, BindingSnapshot, Direction, InterfacePlan, TcProgram,
     Topology,

@@ -226,8 +226,7 @@ impl Tally {
         let progress = RelayProgress {
             upload: Arc::new(AtomicU64::new(sniffed_upload)),
             download: Arc::default(),
-            outbound_upload: None,
-            outbound_download: None,
+            outbound: None,
             first_response: Some(Arc::new({
                 let responses = responses.clone();
                 move || {

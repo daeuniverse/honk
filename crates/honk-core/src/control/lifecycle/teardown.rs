@@ -9,7 +9,7 @@ impl ControlPlane {
     ) -> anyhow::Result<()> {
         let mut error = None;
         if let Some(epoch) = epoch.as_mut() {
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             if let Some(queue) = epoch.queue.as_mut() {
                 retain_error(
                     &mut error,
@@ -69,7 +69,19 @@ impl ControlPlane {
     // Runs after `quiesce_udp_epoch`.
     pub(super) async fn stop_network_epoch(
         &mut self,
+        epoch: Option<&mut RuntimeEpoch>,
+    ) -> anyhow::Result<()> {
+        self.stop_network_epoch_with_backend(epoch, true).await
+    }
+
+    pub(in crate::control) async fn stop_packet_epoch(&mut self) -> anyhow::Result<()> {
+        self.stop_network_epoch_with_backend(None, false).await
+    }
+
+    async fn stop_network_epoch_with_backend(
+        &mut self,
         mut epoch: Option<&mut RuntimeEpoch>,
+        owns_backend: bool,
     ) -> anyhow::Result<()> {
         let mut error = None;
         if let Some(epoch) = epoch.as_mut() {
@@ -84,13 +96,22 @@ impl ControlPlane {
             retain_error(&mut error, epoch.maintenance.abort_and_join().await);
         }
         // The tracker covers published UUIDs; the epoch also owns pre-ID TCP work.
-        if let Ok(summary) = self
+        match self
             .connection_tracker
             .close_matching(Some("tcp"), None, usize::MAX)
             .await
-            && summary.failed
         {
-            error.get_or_insert_with(|| anyhow::anyhow!("TCP retirement could not be confirmed"));
+            Ok(summary) if summary.failed => {
+                error.get_or_insert_with(|| {
+                    anyhow::anyhow!("TCP retirement could not be confirmed")
+                });
+            }
+            Err(close_error) => {
+                error.get_or_insert_with(|| {
+                    anyhow::anyhow!("TCP retirement failed: {close_error:?}")
+                });
+            }
+            _ => {}
         }
         if let Some(epoch) = epoch.as_mut() {
             epoch.tcp.abort_all();
@@ -118,7 +139,7 @@ impl ControlPlane {
                 retain_error(&mut error, updates.stop().await);
             }
             epoch.health_updates.take();
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             if let Some(queue) = epoch.queue.as_mut() {
                 // Not stage-bounded: see `shutdown_service`.
                 retain_error(&mut error, queue.shutdown_service().await);
@@ -132,7 +153,7 @@ impl ControlPlane {
                 queue.abort_tasks().await;
                 self.pending_udp_verdicts = None;
             }
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             {
                 epoch.queue.take();
             }
@@ -143,15 +164,26 @@ impl ControlPlane {
                 error.get_or_insert(fatal);
             }
         }
-        retain_error(&mut error, self.ebpf.write().await.clear_listener_sockets());
-        retain_error(
-            &mut error,
-            cleanup_stage(async {
-                registry.shutdown().await;
-                Ok(())
-            })
-            .await,
-        );
+        if owns_backend {
+            let cleared = match TcKernelController::require(&self.tc_kernel) {
+                Ok(tc) => tc.clear_listeners().await,
+                Err(error) => Err(error),
+            };
+            retain_error(&mut error, cleared);
+            retain_error(
+                &mut error,
+                cleanup_stage(async {
+                    registry.shutdown().await;
+                    Ok(())
+                })
+                .await,
+            );
+        } else {
+            registry.shutdown().await;
+            if registry.tasks_failed() {
+                error.get_or_insert_with(|| anyhow::anyhow!("outbound runtime cleanup failed"));
+            }
+        }
         self.connection_pool.clear();
         for runtime in registry.values() {
             for reason in [
@@ -205,12 +237,14 @@ impl ControlPlane {
             &mut fatal,
             self.quiesce_udp_epoch(epoch.as_deref_mut()).await,
         );
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some(watcher) = self.iface_watcher.take() {
             watcher.shutdown(STAGE_TIMEOUT).await;
         }
         // No watcher can reattach after this terminal boundary.
-        retain_error(&mut fatal, self.ebpf.write().await.detach_hooks());
+        if let Some(tc) = &self.tc_kernel {
+            retain_error(&mut fatal, tc.detach_hooks().await);
+        }
         if self.health_task.is_some() {
             retain_error(
                 &mut fatal,
@@ -253,6 +287,18 @@ impl ControlPlane {
             }
         }
         retain_error(&mut fatal, self.stop_network_epoch(epoch).await);
+        // Terminal only: tunnels are shared by the plane's generations, so a candidate-epoch
+        // cleanup must not end the running generation's. Every runtime is closed by now; this
+        // joins the owner tasks of this plane's tunnels and leaves any other plane's alone.
+        let registry = self.runtime_registry.read().clone();
+        retain_error(
+            &mut fatal,
+            cleanup_stage(async {
+                registry.shutdown_wireguard_tunnels().await;
+                Ok(())
+            })
+            .await,
+        );
         if let Some(flags) = &self.datapath_flags {
             retain_error(&mut fatal, flags.disable().await);
         }
@@ -309,7 +355,7 @@ mod tests {
                 removal_errors: mpsc::unbounded_channel().1,
                 critical_errors: mpsc::unbounded_channel().1,
                 health_updates: None,
-                #[cfg(feature = "ebpf")]
+                #[cfg(feature = "legacy-tc")]
                 queue: None,
             };
             let guard = ConnectionGuard::new(plane.drain_tracker.clone());

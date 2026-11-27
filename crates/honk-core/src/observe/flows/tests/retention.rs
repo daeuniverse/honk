@@ -137,7 +137,7 @@ fn snapshot_capacity_is_explicit_and_recording_disable_releases_every_owner() {
     assert_eq!(page["flows"], json!([]));
     assert_eq!(page["coverage"]["userspace_tcp"], "none");
     let inner = store.inner.lock();
-    assert_eq!(inner.records.capacity(), 0);
+    assert_eq!(inner.records.overhead(), 0);
     assert_eq!(inner.snapshots.capacity(), 0);
     assert_eq!(inner.tombstones.capacity(), 0);
     assert_eq!(inner.record_bytes + inner.snapshot_bytes, 0);
@@ -211,15 +211,15 @@ fn room_making_eviction_is_reported_once_per_interval() {
 fn step_overflow_updates_the_record_without_a_gap() {
     let (store, hub) = store_with_hub();
     let flow = begin(&store, crate::observe::vocab::Network::Tcp);
-    while store.inner.lock().records[0].steps.len() < MAX_STEPS {
+    while store.inner.lock().records.at(0).steps.len() < MAX_STEPS {
         flow.step(Some(1), dial_mode());
     }
     let updates = count(&hub, "flow.updated");
-    let revision = store.inner.lock().records[0].summary.revision;
+    let revision = store.inner.lock().records.at(0).summary.revision;
     flow.step(Some(1), dial_mode());
     let inner = store.inner.lock();
-    assert!(inner.records[0].overflow);
-    assert_eq!(inner.records[0].summary.revision, revision + 1);
+    assert!(inner.records.at(0).overflow);
+    assert_eq!(inner.records.at(0).summary.revision, revision + 1);
     drop(inner);
     assert_eq!(count(&hub, "flow.updated"), updates + 1);
     assert_eq!(count(&hub, "flow.gap"), 0);
@@ -238,7 +238,7 @@ fn revision_exhaustion_joins_the_interval_notice() {
             .inner
             .lock()
             .records
-            .back_mut()
+            .get_mut(&flow.key)
             .unwrap()
             .summary
             .revision = MAX_SAFE_UINT;
@@ -406,7 +406,7 @@ fn a_step_survives_pruning_an_expired_record_behind_it() {
         "relay_finished",
     );
     store.inner.lock().max_records = 1;
-    assert!(store.record_step(live.id(), Some(1), dial_mode()));
+    assert!(store.record_step(&live.key, Some(1), dial_mode()));
     assert_eq!(store.inner.lock().records.len(), 1);
 }
 
@@ -433,6 +433,85 @@ fn room_making_evicts_ended_records_before_the_oldest_live_one() {
 }
 
 #[test]
+fn index_storage_can_evict_a_live_record_at_the_shared_byte_limit() {
+    const N: usize = 256;
+    let store = store();
+    let flows: Vec<_> = (0..N).map(|_| begin(&store, Network::Tcp)).collect();
+    // Leave room for all occupied slots and the order, but only half the
+    // UUID index. The old record-only budget would still admit the oldest flow.
+    let target = MAX_BYTES
+        - SNAPSHOT_BYTES
+        - OWNER_BYTES
+        - N * (size_of::<Option<Record>>() - size_of::<Record>()
+            + size_of::<usize>()
+            + size_of::<(Uuid, usize)>() / 2);
+    for flow in flows.iter().skip(1) {
+        let inner = store.inner.lock();
+        if inner.dropped != 0 || inner.record_bytes >= target {
+            break;
+        }
+        let capacity = (target - inner.record_bytes).min(MAX_STEP_BYTES / 2);
+        drop(inner);
+        let mut evaluation = String::with_capacity(capacity);
+        evaluation.push('a');
+        flow.step(
+            None,
+            StepData::Reroute {
+                performed: false,
+                reason: "not_required",
+                from_evaluation_id: Some(evaluation),
+                to_evaluation_id: None,
+            },
+        );
+    }
+    assert_eq!(store.get(flows[0].id()), Err(FlowMissing::Expired));
+    assert!(store.get(flows.last().unwrap().id()).is_ok());
+    let page = store.page(filters("all", "all", true, 1), None).unwrap();
+    assert!(page["next_cursor"].is_string());
+    assert!(store.inner.lock().bytes() <= MAX_BYTES);
+}
+
+#[test]
+fn reused_middle_slot_preserves_live_ids_page_order_and_accounted_storage() {
+    let store = store();
+    store.set_limits(3, 3600);
+    let first = begin(&store, Network::Tcp);
+    let middle = begin(&store, Network::Tcp);
+    let last = begin(&store, Network::Tcp);
+    middle.finish(ConnectionState::Closed, "relay_finished");
+    let fourth = begin(&store, Network::Udp);
+    first.finish(ConnectionState::Closed, "relay_finished");
+    let fifth = begin(&store, Network::Udp);
+    assert_eq!(store.get(middle.id()), Err(FlowMissing::Expired));
+    assert!(!store.record_step(&middle.key, Some(1), dial_mode()));
+    assert!(store.record_step(&last.key, Some(1), dial_mode()));
+    let page = store.page(filters("all", "all", true, 10), None).unwrap();
+    let ids: Vec<_> = page["flows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [fifth.id(), fourth.id(), last.id()]);
+    let inner = store.inner.lock();
+    for r in inner.records.iter() {
+        assert_eq!(
+            r.step_bytes,
+            r.steps.iter().map(Step::heap_bytes).sum::<usize>()
+        );
+    }
+    assert!(inner.records.overhead() > 0);
+    assert_eq!(
+        inner.bytes(),
+        OWNER_BYTES + inner.record_bytes + inner.records.overhead() + inner.snapshot_bytes
+    );
+    assert!(inner.bytes() <= MAX_BYTES);
+    drop(inner);
+    store.set_recording(false);
+    assert_eq!(store.inner.lock().records.overhead(), 0);
+}
+
+#[test]
 fn detached_begin_records_nothing_without_locking() {
     let owner =
         crate::native_api::observation::NativeObservation::new(&honk_config::Config::default());
@@ -440,6 +519,6 @@ fn detached_begin_records_nothing_without_locking() {
     let inner = owner.core.flows.inner.lock();
     assert!(try_begin(&owner.core.flows, Network::Tcp).is_none());
     assert!(inner.records.is_empty());
-    assert_eq!(inner.records.capacity(), 0);
+    assert_eq!(inner.records.overhead(), 0);
     assert_eq!(inner.record_bytes, 0);
 }

@@ -1,11 +1,16 @@
 use super::*;
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "keep admitted source ownership inline without another allocation"
+)]
 pub(in crate::control) enum SourcePreparation {
     Reused(SourceAttachment),
     Fresh {
         scope: SourceScope,
         prepared: PreparedSourceTransport,
         source_permit: OwnedSemaphorePermit,
+        packet_source: Option<SourceWork>,
         runtime: Arc<NodeRuntime>,
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
         stats: Arc<StatsManager>,
@@ -41,7 +46,9 @@ impl SourcePreparation {
     ) -> anyhow::Result<SourceAttachment> {
         match self {
             Self::Reused(attachment) => {
-                if attachment.owner.is_ready() {
+                if attachment.owner.is_ready()
+                    && packet_binding_active(attachment.owner.packet_source.as_ref())
+                {
                     attachment.owner.transport.observe_reuse();
                     Ok(attachment)
                 } else {
@@ -52,6 +59,7 @@ impl SourcePreparation {
                 scope,
                 prepared,
                 source_permit,
+                packet_source,
                 runtime,
                 alive_set,
                 stats,
@@ -63,7 +71,9 @@ impl SourcePreparation {
                 let mut prepared = Some(prepared);
                 let mut transport = None;
                 loop {
-                    if pool.terminal.load(Ordering::Acquire) {
+                    if pool.terminal.load(Ordering::Acquire)
+                        || !packet_binding_active(packet_source.as_ref())
+                    {
                         return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
                     }
                     let changed = pool.source_changed.notified();
@@ -72,6 +82,15 @@ impl SourcePreparation {
                         .get(&scope)
                         .map(|entry| Arc::clone(entry.value()))
                     {
+                        if owner.packet_source.as_ref().map(SourceWork::identity)
+                            != packet_source.as_ref().map(SourceWork::identity)
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "shared UDP source execution owner mismatch",
+                            )
+                            .into());
+                        }
                         if let Some(attachment) = owner.attach() {
                             owner.transport.observe_reuse();
                             return Ok(attachment);
@@ -86,7 +105,7 @@ impl SourcePreparation {
 
                     {
                         let mut tasks = pool.source_tasks.lock();
-                        while let Some(result) = tasks.tasks.try_join_next() {
+                        while let Some(result) = tasks.try_join_next() {
                             if let Err(error) = result {
                                 debug!("UDP source receiver join failed: {}", error);
                             }
@@ -94,7 +113,11 @@ impl SourcePreparation {
                         if tasks.closed || pool.terminal.load(Ordering::Acquire) {
                             return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
                         }
-                        match pool.sources.entry(scope.clone()) {
+                        let entry = pool.sources.entry(scope.clone());
+                        if !packet_binding_active(packet_source.as_ref()) {
+                            return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
+                        }
+                        match entry {
                             dashmap::mapref::entry::Entry::Occupied(entry) => {
                                 let owner = Arc::clone(entry.get());
                                 drop(entry);
@@ -120,13 +143,19 @@ impl SourcePreparation {
                                     ),
                                     stats,
                                     source_permit,
+                                    packet_source,
                                     evidence,
+                                )?;
+                                let receiver =
+                                    run_source_receiver(Arc::clone(pool), Arc::clone(&owner));
+                                drop(
+                                    tasks
+                                        .spawn(receiver, super::super::budget::RECEIVE_BYTES)
+                                        .map_err(|_| {
+                                            honk_outbound::proxy::PacketRejection::Capacity
+                                        })?,
                                 );
                                 entry.insert(Arc::clone(&owner));
-                                drop(tasks.tasks.spawn(run_source_receiver(
-                                    Arc::clone(pool),
-                                    Arc::clone(&owner),
-                                )));
                                 drop(tasks);
                                 return Ok(SourceAttachment {
                                     owner,

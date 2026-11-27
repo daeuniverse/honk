@@ -1,14 +1,6 @@
-use super::btf::Btf;
+use crate::ebpf::common::{PnameCaptureMode, btf::Btf, load_pair};
 use aya::EbpfLoader;
-use aya::programs::{CgroupSock, CgroupSockAddr};
 use honk_ebpf_common::DaeParam;
-use std::convert::TryInto;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PnameCaptureMode {
-    Argv0,
-    Comm,
-}
 
 /// Select a mode by loading the actual cgroup programs, not by trusting a
 /// helper probe. Some kernels recognize helpers globally but reject them for
@@ -55,22 +47,7 @@ fn probe_pair(
         Ok(bpf) => bpf,
         Err(_) => return false,
     };
-    let sock_ok = bpf
-        .program_mut(sock_name)
-        .and_then(|program| {
-            let program: &mut CgroupSock = program.try_into().ok()?;
-            program.load().ok()
-        })
-        .is_some();
-    if !sock_ok {
-        return false;
-    }
-    bpf.program_mut(sock_addr_name)
-        .and_then(|program| {
-            let program: &mut CgroupSockAddr = program.try_into().ok()?;
-            program.load().ok()
-        })
-        .is_some()
+    load_pair(&mut bpf, sock_name, sock_addr_name)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +67,7 @@ pub(super) fn detect(data: &[u8]) -> Option<ProcessNameOffsets> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ebpf::real::btf::BTF_HEADER_LEN;
+    use crate::ebpf::common::btf::BTF_HEADER_LEN;
 
     #[test]
     fn finds_process_argv_offsets() {

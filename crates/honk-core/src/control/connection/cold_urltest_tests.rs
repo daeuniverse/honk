@@ -143,7 +143,6 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
     handle
         .connection_pool
         .deposit_ready(
-            generation.generation(),
             &key,
             crate::proxy::ProxyStream {
                 stream: Box::new(tcp),

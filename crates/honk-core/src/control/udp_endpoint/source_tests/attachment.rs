@@ -14,12 +14,16 @@ async fn pending_attachment_survives_last_binding_retirement() {
     let target_b = raw_b.local_addr().unwrap();
     let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
         2,
-        Arc::new(SourceReplySocketFactory::new([raw_a, raw_b])),
+        Arc::new(SourceReplySocketFactory::new(
+            [ScopeId::HOST],
+            [raw_a, raw_b],
+        )),
     ));
     let stats = Arc::new(StatsManager::new());
     let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
     let attach = async |target| {
         pool.prepare_source(
+            honk_datapath::ScopeId::HOST,
             &honk_outbound::proxy::ProxyRegistry::new(),
             Arc::clone(&generation),
             Arc::clone(&runtime),
@@ -33,6 +37,7 @@ async fn pending_attachment_survives_last_binding_retirement() {
             Arc::clone(&stats),
             honk_outbound::alive::IpVersion::V4,
             false,
+            None,
         )
         .await
         .unwrap()
@@ -51,7 +56,7 @@ async fn pending_attachment_survives_last_binding_retirement() {
     );
     let lease_b = reserve_source(&pool, &stats, client_addr, target_b, node.id);
     let pending = attach(target_b).await;
-    pool.remove(client_addr, target_a);
+    pool.remove(honk_datapath::ScopeId::HOST, client_addr, target_a);
     drop(endpoint_a);
     let endpoint_b = install_source(&pool, lease_b, pending, target_b, &stats, node.id);
     endpoint_b
@@ -71,13 +76,15 @@ async fn pending_attachment_survives_last_binding_retirement() {
     );
 
     let cancelled = attach(target_a).await;
-    pool.remove(client_addr, target_b);
+    pool.remove(honk_datapath::ScopeId::HOST, client_addr, target_b);
     drop(endpoint_b);
     drop(cancelled);
     let scope = SourceScope::new(
+        honk_datapath::ScopeId::HOST,
         &runtime,
         client_addr,
         SourcePath::Vless(VlessUdpPath::Xudp),
+        None,
         None,
     );
     wait_source_removed(&pool, &scope).await;

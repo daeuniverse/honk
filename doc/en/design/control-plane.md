@@ -6,7 +6,7 @@ The `honk-core` userspace engine connects the kernel datapath to the outbound st
 
 The control plane owns transparent ingress, kernel handoff consumption, userspace routing, sniffing, outbound selection, relay, resource admission, and runtime publication. [Datapath design](./datapath.md) describes kernel flow delivery, [Group design](./groups.md) describes group policy and health-driven selection, and [DNS design](./dns.md) describes DNS runtime behavior.
 
-The main implementation is `crates/honk-core/src/control/`. It consumes `EbpfBackend` state and hands TCP streams or the `PacketTransport` UDP contract to `honk-outbound`.
+The main implementation is `crates/honk-core/src/control/`. It shares one `PolicyBackend` publication cell and hands TCP streams or the `PacketTransport` UDP contract to `honk-outbound`. TC-specific operations borrow an `EbpfBackend` capability from that same cell while retaining the original backend guard.
 
 Module map:
 
@@ -31,7 +31,7 @@ Module map:
 
 honk collects configuration diagnostics before it sets up tracing. If loading or operator validation fails early, honk writes the diagnostics collected before the failure to stderr once, then returns the redacted terminal cause. Successful loading defers diagnostics to the configured tracing subscriber. Later runtime fatal errors keep their existing log-file mirror.
 
-Startup keeps kernel admission closed until userspace can receive every redirected flow:
+The following startup sequence describes TC. Configured XDP/TUN instead use the packet supervisor below and their [capture setup](./datapath.md); TUN also takes the real instance lock without the `ebpf` feature. Startup keeps admission closed until the selected consumer can receive every captured flow:
 
 1. Real mode takes `/run/honk-core.lock`, waiting up to 240 seconds for a previous instance to exit, and publishes the process PID in the locked file; `honk-core reload` reads that PID and sends `SIGHUP`. A successor that cannot take the lock exits before it reads the configuration or opens the state db. Mock mode does not take the process-global lock.
 2. Load and validate the configuration, select `global.data_dir`, initialize the process bypass mark before any network I/O, raise `RLIMIT_NOFILE`, and take one immutable descriptor-budget snapshot.
@@ -46,11 +46,27 @@ Startup keeps kernel admission closed until userspace can receive every redirect
 
 `RealEbpfBackend` owns aya programs, maps, links, persistent allocator handling, and real NFQUEUE integration. `MockEbpfBackend` provides the same control-plane interface without privileged kernel resources. A requested NFQUEUE path that cannot pass the post-lock fixed-queue preflight or later pre-admission queue/rules/health checks is disabled with a warning; that startup downgrade remains effective across reloads ([global reference](../reference/global.md)). Persistent token-generation recovery failures and failures after the service is admitted remain fatal.
 
+Compiled routing, learned-domain maps, connectivity, mode flags, admission and cleanup use the common interface. The software backend rejects TC capability with `Unsupported`; shared policy publication grants no HostFacts. The TUN owner optionally supplies authenticated application-socket facts, only after real source readiness.
+
+The configured XDP and TUN daemons share the packet supervisor, mode/flags coordinator, subscription authorizations and complete control-command dispatch. Software flags initialize with NFQUEUE disabled before scope admission; restored mode is preserved, and publication failure enters joined startup cleanup. These paths create no TC listeners or NFQUEUE helpers. The original `PacketEndpoints::new()` embedding lifecycle remains unchanged.
+
+TUN and XDP with Host prepare configured DNS bind candidates before capture. XDP without Host needs no prepared bind address. Both device runtimes keep the unique `PacketDriver` servicing while `owner.poll_ready` or failed-startup cleanup is pending. Supervisor readiness alone is not capture readiness: `capture_ready()` follows the real device/topology commit and only then permits lifecycle Running. TUN's setup/FD owner and [guarded stop ordering](./datapath.md#stop-and-failure-custody) remain outside the shared policy backend.
+
+Startup refuses foreign physical XDP and does not adopt old objects or readers; physical links are owned by FDs. Host egress uses FD-owned TCX links and a private TUN per live binding; persistent setup receipts belong to the standalone TUN backend.
+
+Physical XDP Endpoint policy reload prepares candidates and replaces each member link before software Router/config publication. Existing retained flows keep their owners, and reload targets new flows; publication is not atomic across devices or with software. Concurrent first packets of one new tuple during policy update can split between kernel and Endpoint. Rollback does not undo holds or CT created in the window. UDP without CT (including NOTRACK or unconfirmed CT) can change executor as DSCP/MAC or policy changes even without reload. The hold collector can also reread an idle unretained entry, race with a new XDP hit, then delete it: that new flow's first packet enters Endpoint and later packets may go to the kernel. An RX owner or worker stalled for about 29 seconds before Endpoint retention can likewise lose a hold. These are accepted limits.
+
+For TUN, the effective process mark is required: initialization stores one consistent `(mark, required)` pair, probes actual TCP/UDP mark readback, and propagates later mark failures. Standalone DNS and both management API listeners set/read back M before bind/listen, so handshake-time accepted children inherit it; transparent TC accepted-socket mark clearing does not apply to these ordinary TUN service sockets. Clash bind/mark failure reports API unavailable; native API failure rejects startup. Authorization is unchanged. `/configs.tun` projects the accepted backend/device/MTU/stack and address6-derived IPv6 flag, not runtime health; native datapath summary remains unknown with no kernel visibility.
+
+XDP optional polling has a distinct process-start resource beside immutable `ResourceBudget` sizing. Its one non-Clone publisher derives shared participant handles; public embedding constructors create no quota. The process slot cannot be reinitialized by reload, owner replacement or dropping every handle. The finite mutex ledger permits one outstanding synchronous Busy interval across the process; no lock spans device/policy work or await. Whole BOOTTIME elapsed is charged, including useful work and stalls; unknown settlement disables Busy rather than refunding it. Crossed active refill frontiers are forfeited, while debt remains.
+
+Polling publication follows the existing local configuration commit. The sole publisher advances an idle ledger through publication time under its old/already-staged policy **before** staging new W/B; it preserves the resulting future frontier and never grants a reload bonus. An active interval is not advanced/refilled by publication. A participant known to mismatch may reject before commit; if a publisher races after preparation, the participant's local commit remains accepted but actual state is Event/mismatch, without ledger mutation. Local revision, independent process revision and publisher closure are rechecked at reserve and every bounded Busy segment. These revisions govern optional scheduling, not scoped flow/fact authority. Parameter publication clears qualification without migrating flows or restarting TCP.
+
 Object admission rejects implicit `ByName` map pinning before the process-name probe or any Aya loader runs. External objects must declare unpinned maps; core supplies all pin paths explicitly, including the persistent allocators, so no loader-created alias can escape startup rollback.
 
 If real-backend startup fails after pinning maps, a startup guard removes only the transient pins this attempt successfully created. Pins it could not replace and unrelated pre-existing pins are not claimed. `UDP_DECISION_SEQUENCE` and `ROUTING_GENERATION_SEQUENCE` survive failed startup as well as ordinary cleanup; a successful start transfers the transient pin ownership to backend cleanup.
 
-Shutdown releases ownership in reverse order before resources disappear: fence NFQUEUE, close datapath admission, reject new userspace work, cancel and drain held verdicts and UDP initializers, stop UDP drivers and removal processing, stop and join the interface watcher (including any in-flight blocking batch), and detach BPF hooks. It then applies the optional [business-connection grace](../reference/global.md#shutdown), closes remaining connections, retires the outbound runtime, stops NFQUEUE, stops the DNS controller and persistence, and cleans up generation-owned BPF state. Ordinary cleanup preserves the pinned allocator. Listener and `daens`/link-pair ownership then falls out of scope.
+Shutdown reverses ownership before resources disappear: fence NFQUEUE, close datapath admission, reject new userspace work, cancel and drain held verdicts and UDP initializers, stop UDP drivers and removal processing, stop and join the interface watcher (including any in-flight blocking batch), detach TC-backend BPF hooks, apply the optional [business-connection grace](../reference/global.md#shutdown), close remaining connections, retire the outbound runtime, stop NFQUEUE, stop the DNS controller and persistence, and clean up generation-owned BPF state. Ordinary TC-backend cleanup preserves the pinned allocator. Listener and `daens`/link-pair ownership then falls out of scope.
 
 When UDP receive-priority ancillary metadata is unavailable, the real backend owns the receive-trace fallback's links and maps. Each family requires its complete enter/exit pair: failure detaches that pair without disabling the other family. Both require the shared hook on `__skb_recv_udp`; failure there disables both. Registration checks the socket family, so a listener without its pair reports unavailable instead of silently registering without evidence. The fallback is attempted once per backend, including failed or partial attachment. Listener reload re-evaluates native ancillary support and registrations but does not retry attachment. Restart honk after changing kernel or BTF support. Missing tracing affects recorded kernel route evidence, not routing or UDP delivery. `cleanup()` detaches ingress hooks, joins its ring consumers and drops `receive_trace` before dropping the BPF object, even if the backend itself stays alive; ordinary cleanup still preserves both persistent sequence pins.
 
@@ -315,6 +331,7 @@ The current process-scoped consumers reject a SIGHUP reload when any of these va
 | Area | Restart-required fields |
 | --- | --- |
 | Listener/datapath | `global.tproxy_port`, `global.tproxy_mark`, `global.tproxy_port_protect`, `global.pprof_port`, `global.so_mark_from_dae`, `global.lan_interface`, `global.wan_interface`, `global.auto_config_kernel_parameter` |
+| Capture device | Backend, Direct profile, canonical TUN setup (all `tun` values), XDP interface/zone setup and effective XSK mode; polling policy/calibration retain their separate reloadable contract |
 | Process state | `global.log_level`, `global.data_dir`, `global.store_subscribe` |
 | DNS listener | Semantic `dns.bind` endpoint or transport change |
 | Clash API | `experimental.clash_api.external_controller`, `external_ui`, `secret`, `default_mode`; effective `assets.ui.url` and `assets.ui.route` |
@@ -324,6 +341,8 @@ The current process-scoped consumers reject a SIGHUP reload when any of these va
 | Health probes and TLS | `global.check_interval`, the effective first `global.tcp_check_url`, `global.tcp_check_http_method` when HTTP probing is enabled, the selected `global.udp_check_dns` target, or a native TLS/uTLS mode change ([health-check reload semantics](../reference/global.md#reloading-health-checks-and-tls-mode)) |
 
 The effective UI and geodata settings include the fallback from `assets.route`; changing that fallback requires restart when it changes either startup-owned download route. `assets.subscription` defaults and individual subscription options are handled by subscription reconciliation.
+
+TUN startup, SIGHUP and native offline/save use the same runtime-policy validator. `same_device_setup` compares the whole canonical `TunConfig`, including `host_facts`, backend and Direct profile; effective changes require restart. Omitted and explicit false are equal, as are omitted MTU and 1500. Policy updates retain the FD and scopes; rejected candidates preserve the active generation. Semantic `dns.bind` changes remain restart-required.
 
 Semantic comparison of `dns.bind` uses the parsed bind endpoint when both old and new values parse, so spelling-only changes that describe the same endpoint do not force a restart.
 
@@ -369,6 +388,11 @@ For a captured `.dae` startup, `configuration/accepted.rs` owns the accepted sou
 
 `native_api/config/http.rs` owns the source HTTP adapters. Database recording stays with the coordinator through an awaited blocking promotion, including HTTP cancellation and shutdown; pending accepted sources are not falsely labeled as the old durable revision.
 
+Selector publication captures its revision, selection and exact connection owners
+under the reload guard, then releases that guard before awaiting transport/driver
+close completion. The control command remains serialized and reports its captured
+outcome; a CQ-held close must not retain a publication lock needed by shutdown.
+
 Main-source create/delete uses the same coordinator, parser spans, revision fence and reload reply, but waits for actual activation before returning 201/200. The subscription supervisor owns identity-bound initial deferrals, and all offline admission carries those exclusions plus the effective runtime data directory. Geodata work stages and validates all assets before FD-relative replacement; a transient immutable `SourceUpdate.geo_sources` feeds both reload paths and is dropped from accepted source metadata afterward. Retained Router/DnsRouter metadata describes actual loaded bytes; observation takes router before config and never rereads disk. Partial file replacement and committed degradation remain explicit, not rollback.
 
 The staged writer returns the retained installed-file descriptor and its durability outcome. Geodata advances from pending staged files to installed guards without reopening files to reconstruct ownership; namespace, inode and content rechecks still fence external edits, and a visible but undurable replacement remains explicitly reported.
@@ -390,6 +414,8 @@ Native cold/warm HTTP probes share dial/TLS/ALPN and H1/H2 exchanges with URLTes
 `control/lifecycle/teardown.rs` owns shared network cleanup with or without a listener epoch, including partial startup. Standalone DNS supervisors retain failures from already-reaped children and propagate them through joined teardown; intentional shutdown cancellation is neutral, but an owner panic fails teardown.
 
 Network maintenance belongs to `RuntimeEpoch`. The cache delay writer is process-owned and is joined only at terminal shutdown.
+
+TUN retains the FD, driver, watcher and blackhole containment until its original packet supervisor returns the real joined plane/result. It withdraws capture routes before abort/drain; ordinary confirmed stop removes P+4, then remaining owned routing resources and receipt. Failure or ambiguous cleanup preserves guards/rules/receipt and reports failure. Driver Drop only returns driving rights, never acknowledges join or netlink deletion; cancellation must keep the original runtime alive for cleanup. See [TUN stop and failure custody](./datapath.md#stop-and-failure-custody).
 
 Shutdown's optional [business-connection grace](../reference/global.md#shutdown) precedes joined teardown. Cleanup/fence ambiguity is fatal. Generic cleanup/join stages use the 10-second `STAGE_TIMEOUT`; timed-out joined async tasks are aborted and teardown reports failure. `control/cache.rs::StateTick` is an exception: after ten seconds it warns and continues joining the actual maintenance task, including its in-flight blocking SQLite write, without aborting it. A cancelled join leaves the handle with the owner for another wait; dropping the owner signals stop while the outer task retains its blocking write. Total shutdown can therefore exceed ten seconds. A panicking TCP connection task is logged and reaped; it does not stop the engine. Mock operation success does not establish real-kernel forwarding correctness.
 

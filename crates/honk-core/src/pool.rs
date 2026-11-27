@@ -13,11 +13,8 @@
 //!   server-side state than a bare TCP connection and servers reap idle
 //!   tunnels sooner.
 //!
-//! Ready keys are namespaced (`ready|<generation>|<node-id>|<target>`) so they
-//! can never collide with bare `"host:port"` keys (`|` cannot appear in a
-//! host:port pair). The key binds the proxy generation and node identity as
-//! well as the target because the completed handshake committed the stream
-//! to that exact credential/configuration.
+//! Bare connections use the proxy address. Ready streams bind a runtime generation,
+//! node identity, and the destination actually sent by the handshake.
 //!
 //! Budgets beyond the per-key cap: an explicit global FD capacity (bounded by
 //! [`MAX_TOTAL_ENTRIES`]), a per-identity-per-generation ready-target
@@ -35,8 +32,7 @@
 //! unlocking, so socket teardown cannot extend the critical section.
 //! Retiring a generation removes its ready namespace, target budget, warm
 //! claims and hotness under that same lock; the successor starts empty and
-//! late writes for the retired generation are refused. The retired-generation
-//! set grows by one entry per retired generation and is never reclaimed.
+//! the pool refuses later work at or below its retirement watermark.
 //! Hotness is bounded to 4,096 keys; saturation within one live generation is
 //! unchanged, and warm claims remain one per in-flight dial without a separate
 //! cardinality cap.
@@ -76,8 +72,25 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const READY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_AGE: Duration = Duration::from_secs(300);
 
-/// A pooled connection. Each key's list holds exactly one kind: the key
-/// namespaces (`"host:port"` vs `ready|...`) make mixing impossible.
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub(crate) struct ReadyKey {
+    generation: u64,
+    node: Uuid,
+    target: ReadyTarget,
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+enum ReadyTarget {
+    Address(SocketAddr),
+    Domain(Arc<str>, u16),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PoolKey<'a> {
+    Bare(&'a str),
+    Ready(&'a ReadyKey),
+}
+
 enum PooledStream {
     /// Pre-handshake TCP to the proxy server; reused via `dial_with_tcp`.
     Bare(TcpStream),
@@ -124,39 +137,56 @@ pub struct ConnectionPool {
 
 #[derive(Default)]
 struct PoolState {
-    entries: HashMap<String, Vec<TimedStream>>,
+    bare: HashMap<String, Vec<TimedStream>>,
+    ready: HashMap<ReadyKey, Vec<TimedStream>>,
     total: u64,
-    ready_targets: HashMap<String, u32>,
-    warm_dials: HashSet<String>,
-    hot: HashMap<String, (u32, Instant)>,
-    retired: HashSet<u64>,
+    ready_targets: HashMap<(u64, Uuid), u32>,
+    warm_dials: HashSet<ReadyKey>,
+    hot: HashMap<ReadyKey, (u32, Instant)>,
+    retired_up_to: Option<u64>,
 }
 
 impl PoolState {
-    fn decrement_ready_target(targets: &mut HashMap<String, u32>, key: &str) {
-        if key.starts_with("ready|") {
-            let node = ConnectionPool::ready_node(key);
-            let count = targets.get_mut(node).expect("present ready target");
-            *count -= 1;
-            if *count == 0 {
-                targets.remove(node);
+    fn retired(&self, generation: u64) -> bool {
+        self.retired_up_to.is_some_and(|last| generation <= last)
+    }
+
+    fn list_mut(&mut self, key: PoolKey<'_>) -> Option<&mut Vec<TimedStream>> {
+        match key {
+            PoolKey::Bare(addr) => self.bare.get_mut(addr),
+            PoolKey::Ready(key) => self.ready.get_mut(key),
+        }
+    }
+
+    fn decrement_ready_target(targets: &mut HashMap<(u64, Uuid), u32>, key: &ReadyKey) {
+        let node = (key.generation, key.node);
+        let count = targets.get_mut(&node).expect("present ready target");
+        *count -= 1;
+        if *count == 0 {
+            targets.remove(&node);
+        }
+    }
+
+    fn remove_empty_key(&mut self, key: PoolKey<'_>) {
+        if self.list_mut(key).is_some_and(|list| list.is_empty()) {
+            match key {
+                PoolKey::Bare(addr) => {
+                    self.bare.remove(addr);
+                }
+                PoolKey::Ready(key) => {
+                    self.ready.remove(key);
+                    Self::decrement_ready_target(&mut self.ready_targets, key);
+                }
             }
         }
     }
 
-    fn remove_empty_key(&mut self, key: &str) {
-        if self.entries.get(key).is_some_and(Vec::is_empty) {
-            self.entries.remove(key);
-            Self::decrement_ready_target(&mut self.ready_targets, key);
-        }
-    }
-
-    fn remove_matching(
+    fn remove_ready(
         &mut self,
-        mut matches: impl FnMut(&str) -> bool,
+        mut matches: impl FnMut(&ReadyKey) -> bool,
         removed: &mut Vec<TimedStream>,
     ) {
-        for (key, mut list) in self.entries.extract_if(|key, _| matches(key)) {
+        for (key, mut list) in self.ready.extract_if(|key, _| matches(key)) {
             self.total -= list.len() as u64;
             Self::decrement_ready_target(&mut self.ready_targets, &key);
             removed.append(&mut list);
@@ -166,7 +196,7 @@ impl PoolState {
 
 pub(crate) struct WarmDialGuard<'a> {
     pool: &'a ConnectionPool,
-    key: String,
+    key: ReadyKey,
 }
 
 impl Drop for WarmDialGuard<'_> {
@@ -245,14 +275,14 @@ impl ConnectionPool {
         }
     }
 
-    /// Record one flow to `key` (a `ready|…` key) for `generation` and report
+    /// Record one flow to this ready destination and report
     /// whether the target is hot enough to justify a speculative ready deposit
     /// ([`HOT_THRESHOLD`] flows within [`HOT_WINDOW`]). Retired generations
     /// cannot acquire new hotness.
-    pub(crate) fn note_target(&self, generation: u64, key: &str) -> bool {
+    pub(crate) fn note_target(&self, key: &ReadyKey) -> bool {
         const MAX_HOT_TARGETS: u64 = 4096;
         let mut state = self.state.lock();
-        if state.retired.contains(&generation) {
+        if state.retired(key.generation) {
             return false;
         }
         if let Some(value) = state.hot.get_mut(key) {
@@ -271,9 +301,9 @@ impl ConnectionPool {
 
     /// Claim one background warming dial for this ready key. The returned
     /// guard clears the claim on drop, including cancellation and failures.
-    pub(crate) fn try_begin_warm(&self, generation: u64, key: &str) -> Option<WarmDialGuard<'_>> {
+    pub(crate) fn try_begin_warm(&self, key: &ReadyKey) -> Option<WarmDialGuard<'_>> {
         let mut state = self.state.lock();
-        if state.retired.contains(&generation) || state.warm_dials.contains(key) {
+        if state.retired(key.generation) || state.warm_dials.contains(key) {
             return None;
         }
         state.warm_dials.insert(key.to_owned());
@@ -307,15 +337,19 @@ impl ConnectionPool {
         node_id: Uuid,
         target: SocketAddr,
         target_domain: Option<&str>,
-    ) -> String {
-        match target_domain {
-            Some(domain) => format!("ready|{generation}|{node_id}|{domain}:{}", target.port()),
-            None => format!("ready|{generation}|{node_id}|{target}"),
+    ) -> ReadyKey {
+        ReadyKey {
+            generation,
+            node: node_id,
+            target: match target_domain {
+                Some(domain) => ReadyTarget::Domain(Arc::from(domain), target.port()),
+                None => ReadyTarget::Address(target),
+            },
         }
     }
 
     pub(crate) async fn acquire_tcp(&self, addr: &str) -> Option<TcpStream> {
-        match self.acquire_entry(addr, false).await {
+        match self.acquire_entry(PoolKey::Bare(addr)).await {
             Some(PooledStream::Bare(tcp)) => Some(tcp),
             _ => None,
         }
@@ -324,8 +358,8 @@ impl ConnectionPool {
     /// Take a Ready stream for `key`, if one is pooled, unexpired, and
     /// alive. The entry is removed from the pool: a ready stream serves
     /// exactly one connection and is never returned after use.
-    pub(crate) async fn acquire_ready(&self, key: &str) -> Option<ProxyStream> {
-        match self.acquire_entry(key, true).await {
+    pub(crate) async fn acquire_ready(&self, key: &ReadyKey) -> Option<ProxyStream> {
+        match self.acquire_entry(PoolKey::Ready(key)).await {
             Some(PooledStream::Ready(stream)) => {
                 self.ready_hits.fetch_add(1, Ordering::Relaxed);
                 Some(stream)
@@ -337,7 +371,7 @@ impl ConnectionPool {
         }
     }
 
-    async fn acquire_entry(&self, addr: &str, want_ready: bool) -> Option<PooledStream> {
+    async fn acquire_entry(&self, key: PoolKey<'_>) -> Option<PooledStream> {
         #[cfg(test)]
         {
             self.pause_at("checkout_after_clone");
@@ -345,21 +379,14 @@ impl ConnectionPool {
         }
         let mut removed = Vec::new();
         let mut state = self.state.lock();
-        let list = state.entries.get_mut(addr)?;
+        let list = state.list_mut(key)?;
         let now = Instant::now();
-        let found = list.iter().rposition(|entry| {
-            Self::entry_matches(entry, want_ready)
-                && !self.entry_expired(entry, now)
-                && Self::is_entry_alive(entry)
-        });
+        let found = list
+            .iter()
+            .rposition(|entry| !self.entry_expired(entry, now) && Self::is_entry_alive(entry));
         let acquired = if let Some(index) = found {
             let entry = list.swap_remove(index);
-            trace!(
-                "Pool hit ({}): {} ({} idle remaining)",
-                if want_ready { "ready" } else { "bare" },
-                addr,
-                list.len()
-            );
+            trace!("Pool hit: {:?} ({} idle remaining)", key, list.len());
             state.total -= 1;
             Some(entry.stream)
         } else {
@@ -369,7 +396,7 @@ impl ConnectionPool {
             state.total -= removed.len() as u64;
             None
         };
-        state.remove_empty_key(addr);
+        state.remove_empty_key(key);
         drop(state);
         drop(removed);
         acquired
@@ -383,7 +410,7 @@ impl ConnectionPool {
         if !is_bare_tcp_stream_usable(&stream) {
             return false;
         }
-        self.deposit_entry(addr, PooledStream::Bare(stream), None)
+        self.deposit_entry(PoolKey::Bare(addr), PooledStream::Bare(stream))
             .await;
         true
     }
@@ -396,7 +423,7 @@ impl ConnectionPool {
         let mut removed = Vec::new();
         let mut state = self.state.lock();
         let now = Instant::now();
-        let Some(entries) = state.entries.get_mut(addr) else {
+        let Some(entries) = state.bare.get_mut(addr) else {
             return false;
         };
         removed.extend(entries.extract_if(.., |entry| {
@@ -407,7 +434,7 @@ impl ConnectionPool {
             .iter()
             .any(|entry| matches!(entry.stream, PooledStream::Bare(_)));
         state.total -= removed.len() as u64;
-        state.remove_empty_key(addr);
+        state.remove_empty_key(PoolKey::Bare(addr));
         drop(state);
         drop(removed);
         live
@@ -417,51 +444,38 @@ impl ConnectionPool {
     /// The stream must come straight out of `TcpOutbound::dial()` with no
     /// application reads performed, so its userspace TLS buffer (if any)
     /// is empty and the fd-level liveness probe stays accurate.
-    pub(crate) async fn deposit_ready(&self, generation: u64, key: &str, stream: ProxyStream) {
-        self.deposit_entry(key, PooledStream::Ready(stream), Some(generation))
+    pub(crate) async fn deposit_ready(&self, key: &ReadyKey, stream: ProxyStream) {
+        self.deposit_entry(PoolKey::Ready(key), PooledStream::Ready(stream))
             .await;
     }
 
-    async fn deposit_entry(&self, addr: &str, stream: PooledStream, generation: Option<u64>) {
+    async fn deposit_entry(&self, key: PoolKey<'_>, stream: PooledStream) {
         #[cfg(test)]
         self.pause_at("deposit_before_lock");
         let mut state = self.state.lock();
-        if let Some(generation) = generation
-            && state.retired.contains(&generation)
+        if let PoolKey::Ready(ready) = key
+            && state.retired(ready.generation)
         {
-            debug!(
-                "Pool generation {} retired; dropping ready deposit for {}",
-                generation, addr
-            );
-            drop(state);
             return;
         }
-        if state.total >= self.capacity_limit {
-            debug!(
-                "Pool global cap reached ({}); dropping deposit for {}",
-                self.capacity_limit, addr
-            );
-            drop(state);
+        if state.total >= self.capacity_limit
+            || state
+                .list_mut(key)
+                .is_some_and(|list| list.len() >= MAX_PER_HOST)
+        {
             return;
         }
-        let list = state.entries.get(addr);
-        if list.is_some_and(|list| list.len() >= MAX_PER_HOST) {
-            debug!("Pool cap reached for {} (max={})", addr, MAX_PER_HOST);
-            drop(state);
-            return;
-        }
-        if list.is_none() && matches!(stream, PooledStream::Ready(_)) {
-            let node = Self::ready_node(addr);
-            let count = state.ready_targets.get(node).copied().unwrap_or(0);
-            if count >= MAX_READY_TARGETS_PER_NODE as u32 {
-                debug!(
-                    "Ready target cardinality cap reached for {} (max={}); dropping deposit",
-                    node, MAX_READY_TARGETS_PER_NODE
-                );
-                drop(state);
+        if let PoolKey::Ready(ready) = key
+            && !state.ready.contains_key(ready)
+        {
+            let count = state
+                .ready_targets
+                .entry((ready.generation, ready.node))
+                .or_default();
+            if *count >= MAX_READY_TARGETS_PER_NODE as u32 {
                 return;
             }
-            state.ready_targets.insert(node.to_owned(), count + 1);
+            *count += 1;
         }
         let now = Instant::now();
         let entry = TimedStream {
@@ -469,36 +483,27 @@ impl ConnectionPool {
             created: now,
             last_used: now,
         };
-        if let Some(list) = state.entries.get_mut(addr) {
+        if let Some(list) = state.list_mut(key) {
             list.push(entry);
         } else {
-            state.entries.insert(addr.to_owned(), vec![entry]);
+            match key {
+                PoolKey::Bare(addr) => {
+                    state.bare.insert(addr.to_owned(), vec![entry]);
+                }
+                PoolKey::Ready(key) => {
+                    state.ready.insert(key.clone(), vec![entry]);
+                }
+            }
         }
         state.total += 1;
-        debug!("Pool deposit: {} ({} total pooled)", addr, state.total);
-    }
-
-    #[cfg(test)]
-    fn ready_generation(key: &str) -> Option<u64> {
-        key.strip_prefix("ready|")?.split_once('|')?.0.parse().ok()
-    }
-
-    fn ready_node(key: &str) -> &str {
-        let after = key.strip_prefix("ready|").unwrap_or_default();
-        let Some((generation, after_node)) = after.split_once('|') else {
-            return "";
-        };
-        let Some((node_id, _target)) = after_node.split_once('|') else {
-            return "";
-        };
-        &after[..generation.len() + 1 + node_id.len()]
+        debug!(?key, total = state.total, "Pool deposit");
     }
 
     /// Drop only the bare preconnect for a node. Ready streams may belong to
     /// active traffic policy and are not selector warm ownership.
     pub(crate) fn purge_bare(&self, node_addr: &str) {
         let mut state = self.state.lock();
-        let removed = state.entries.remove(node_addr);
+        let removed = state.bare.remove(node_addr);
         if let Some(entries) = &removed {
             state.total -= entries.len() as u64;
             debug!(
@@ -515,11 +520,13 @@ impl ConnectionPool {
     /// plus its bare preconnect when the current config supplies the address.
     /// Called when the node flips alive→dead.
     pub(crate) fn purge_node(&self, node_addr: Option<&str>, generation: u64, node_id: Uuid) {
-        let ready_prefix = format!("ready|{generation}|{node_id}|");
-        let mut removed = Vec::new();
         let mut state = self.state.lock();
-        state.remove_matching(
-            |key| node_addr.is_some_and(|addr| key == addr) || key.starts_with(&ready_prefix),
+        let mut removed = node_addr
+            .and_then(|addr| state.bare.remove(addr))
+            .unwrap_or_default();
+        state.total -= removed.len() as u64;
+        state.remove_ready(
+            |key| key.generation == generation && key.node == node_id,
             &mut removed,
         );
         drop(state);
@@ -534,15 +541,15 @@ impl ConnectionPool {
     /// Retire all ready-pool state for a generation. Ready streams are
     /// collected and destroyed after releasing the state lock.
     pub(crate) fn retire_generation(&self, generation: u64) {
-        let ready_prefix = format!("ready|{generation}|");
         let mut removed = Vec::new();
         let mut state = self.state.lock();
-        state.retired.insert(generation);
-        state.remove_matching(|key| key.starts_with(&ready_prefix), &mut removed);
-        state
-            .warm_dials
-            .retain(|key| !key.starts_with(&ready_prefix));
-        state.hot.retain(|key, _| !key.starts_with(&ready_prefix));
+        if state.retired(generation) {
+            return;
+        }
+        state.retired_up_to = Some(generation);
+        state.remove_ready(|key| key.generation <= generation, &mut removed);
+        state.warm_dials.retain(|key| key.generation > generation);
+        state.hot.retain(|key, _| key.generation > generation);
         drop(state);
         debug!(
             "Retired generation {generation}, dropping {} ready connections",
@@ -553,7 +560,10 @@ impl ConnectionPool {
 
     pub(crate) fn clear(&self) {
         let mut state = self.state.lock();
-        let removed = std::mem::take(&mut state.entries);
+        let removed = (
+            std::mem::take(&mut state.bare),
+            std::mem::take(&mut state.ready),
+        );
         state.total = 0;
         state.ready_targets.clear();
         state.warm_dials.clear();
@@ -568,25 +578,27 @@ impl ConnectionPool {
         let mut removed = Vec::new();
         let mut state = self.state.lock();
         let now = Instant::now();
-        let PoolState {
-            entries,
-            total,
-            ready_targets,
-            ..
-        } = &mut *state;
-        entries.retain(|key, list| {
-            let before = removed.len();
+        let mut keep = |list: &mut Vec<TimedStream>| {
             removed.extend(list.extract_if(.., |entry| {
                 self.entry_expired(entry, now) || !Self::is_entry_alive(entry)
             }));
-            *total -= (removed.len() - before) as u64;
-            if list.is_empty() {
+            !list.is_empty()
+        };
+        state.bare.retain(|_, list| keep(list));
+        let PoolState {
+            ready,
+            ready_targets,
+            ..
+        } = &mut *state;
+        ready.retain(|key, list| {
+            if keep(list) {
+                true
+            } else {
                 PoolState::decrement_ready_target(ready_targets, key);
                 false
-            } else {
-                true
             }
         });
+        state.total -= removed.len() as u64;
         let remaining = state.total;
         drop(state);
         let count = removed.len();
@@ -609,6 +621,7 @@ impl ConnectionPool {
         })
     }
 
+    #[cfg(test)]
     fn entry_matches(entry: &TimedStream, want_ready: bool) -> bool {
         matches!(
             (&entry.stream, want_ready),
@@ -682,23 +695,17 @@ impl ConnectionPool {
         assert!(state.total <= self.capacity_limit);
         let mut sum = 0;
         let mut targets = HashMap::new();
-        for (key, list) in &state.entries {
-            assert!(!list.is_empty(), "empty pool key {key}");
-            assert!(list.len() <= MAX_PER_HOST);
+        for list in state.bare.values() {
+            assert!(!list.is_empty() && list.len() <= MAX_PER_HOST);
+            assert!(list.iter().all(|entry| Self::entry_matches(entry, false)));
             sum += list.len() as u64;
-            let ready = key.starts_with("ready|");
-            assert!(list.iter().all(|entry| Self::entry_matches(entry, ready)));
-            if ready {
-                let generation =
-                    Self::ready_generation(key).expect("ready entry key has a generation");
-                assert!(
-                    !state.retired.contains(&generation),
-                    "retired generation has ready entry: {key}"
-                );
-                *targets
-                    .entry(Self::ready_node(key).to_owned())
-                    .or_insert(0u32) += 1;
-            }
+        }
+        for (key, list) in &state.ready {
+            assert!(!list.is_empty() && list.len() <= MAX_PER_HOST);
+            assert!(list.iter().all(|entry| Self::entry_matches(entry, true)));
+            assert!(!state.retired(key.generation));
+            *targets.entry((key.generation, key.node)).or_insert(0u32) += 1;
+            sum += list.len() as u64;
         }
         assert_eq!(state.total, sum, "pool total disagrees with entry vectors");
         assert_eq!(state.ready_targets, targets);
@@ -709,12 +716,10 @@ impl ConnectionPool {
         );
         assert!(state.hot.len() <= 4096);
         for key in state.warm_dials.iter().chain(state.hot.keys()) {
-            if let Some(generation) = Self::ready_generation(key) {
-                assert!(
-                    !state.retired.contains(&generation),
-                    "retired generation has auxiliary state: {key}"
-                );
-            }
+            assert!(
+                !state.retired(key.generation),
+                "retired generation has auxiliary state: {key:?}"
+            );
         }
     }
 }
@@ -1092,15 +1097,12 @@ mod tests {
         let node_id = Uuid::from_u128(1);
         let key =
             ConnectionPool::ready_key(generation, node_id, "1.2.3.4:443".parse().unwrap(), None);
-        assert!(!pool.note_target(generation, &key), "first flow is cold");
-        assert!(
-            pool.note_target(generation, &key),
-            "second flow within window is hot"
-        );
-        assert!(pool.note_target(generation, &key), "stays hot");
+        assert!(!pool.note_target(&key), "first flow is cold");
+        assert!(pool.note_target(&key), "second flow within window is hot");
+        assert!(pool.note_target(&key), "stays hot");
         let other =
             ConnectionPool::ready_key(generation, node_id, "5.6.7.8:443".parse().unwrap(), None);
-        assert!(!pool.note_target(generation, &other));
+        assert!(!pool.note_target(&other));
     }
 
     /// Phase 5: ready deposits stop at the per-node target cardinality.
@@ -1116,14 +1118,14 @@ mod tests {
                 SocketAddr::new(std::net::Ipv4Addr::new(10, 0, 0, i as u8 + 1).into(), 443);
             let key = ConnectionPool::ready_key(generation, node_id, key_target, None);
             let tcp = TcpStream::connect(addr).await.unwrap();
-            pool.deposit_ready(generation, &key, make_ready_stream(tcp, target))
+            pool.deposit_ready(&key, make_ready_stream(tcp, target))
                 .await;
         }
         // One more distinct target for the same identity: refused.
         let key_target = SocketAddr::new(std::net::Ipv4Addr::new(10, 9, 9, 9).into(), 443);
         let key = ConnectionPool::ready_key(generation, node_id, key_target, None);
         let tcp = TcpStream::connect(addr).await.unwrap();
-        pool.deposit_ready(generation, &key, make_ready_stream(tcp, target))
+        pool.deposit_ready(&key, make_ready_stream(tcp, target))
             .await;
         assert!(pool.acquire_ready(&key).await.is_none());
         // The ready metrics reflect one hit attempt (the refused acquire).
@@ -1161,7 +1163,7 @@ mod tests {
         assert!(pool.acquire_ready(&key).await.is_none());
 
         let tcp = TcpStream::connect(server_addr).await.unwrap();
-        pool.deposit_ready(generation, &key, make_ready_stream(tcp, target))
+        pool.deposit_ready(&key, make_ready_stream(tcp, target))
             .await;
 
         let ready = pool.acquire_ready(&key).await.expect("ready entry");
@@ -1183,8 +1185,10 @@ mod tests {
         let k3 = ConnectionPool::ready_key(generation, other_node_id, target, None);
         assert_ne!(k1, k2);
         assert_ne!(k1, k3);
-        assert_ne!(k1, "proxy.example:1080");
-        assert!(k1.contains('|'));
+        assert_ne!(
+            k1,
+            ConnectionPool::ready_key(generation, node_id, target, Some("93.184.216.34"))
+        );
     }
 
     #[tokio::test]
@@ -1199,7 +1203,7 @@ mod tests {
         let node_id = Uuid::from_u128(1);
         let key = ConnectionPool::ready_key(generation, node_id, target, None);
         let tcp = TcpStream::connect(server_addr).await.unwrap();
-        pool.deposit_ready(generation, &key, make_ready_stream(tcp, target))
+        pool.deposit_ready(&key, make_ready_stream(tcp, target))
             .await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(pool.acquire_ready(&key).await.is_none());
@@ -1239,7 +1243,7 @@ mod tests {
 
         // A dead ready entry must not be handed out.
         let key = ConnectionPool::ready_key(1, Uuid::from_u128(1), target, None);
-        pool.deposit_ready(1, &key, stream).await;
+        pool.deposit_ready(&key, stream).await;
         assert!(pool.acquire_ready(&key).await.is_none());
     }
 
@@ -1283,7 +1287,7 @@ mod tests {
         let ready_fd = ready.as_raw_fd();
         let target = "192.0.2.1:443".parse().unwrap();
         let key = ConnectionPool::ready_key(1, Uuid::from_u128(1), target, None);
-        pool.deposit_ready(1, &key, make_ready_stream(ready, target))
+        pool.deposit_ready(&key, make_ready_stream(ready, target))
             .await;
         ready_server.write_all(b"READY").await.unwrap();
         wait_for_queued_byte(ready_fd).await;
@@ -1340,7 +1344,7 @@ mod tests {
         let pool = ConnectionPool::new();
         let generation = 1;
         let key = ConnectionPool::ready_key(generation, node.id, target, None);
-        pool.deposit_ready(generation, &key, stream).await;
+        pool.deposit_ready(&key, stream).await;
 
         // Raw application bytes on checkout must receive the authenticated
         // fixture response, not a second SOCKS5 handshake.
@@ -1374,7 +1378,7 @@ mod tests {
             pool.deposit_tcp(addr, tcp).await;
             let key = ConnectionPool::ready_key(generation, node_id, target, None);
             let tcp = TcpStream::connect(server).await.unwrap();
-            pool.deposit_ready(generation, &key, make_ready_stream(tcp, target))
+            pool.deposit_ready(&key, make_ready_stream(tcp, target))
                 .await;
         }
         pool.purge_node(Some(dead_addr), generation, dead_id);
@@ -1429,7 +1433,7 @@ mod tests {
                 let key_target: SocketAddr = format!("198.51.100.{i}:443").parse().unwrap();
                 let key = ConnectionPool::ready_key(generation, node_id, key_target, None);
                 let tcp = TcpStream::connect(server).await.unwrap();
-                pool.deposit_ready(generation, &key, make_ready_stream(tcp, target))
+                pool.deposit_ready(&key, make_ready_stream(tcp, target))
                     .await;
             });
         }
@@ -1447,7 +1451,7 @@ mod tests {
         let key_target: SocketAddr = "198.51.100.1:443".parse().unwrap();
         let key = ConnectionPool::ready_key(generation, node_id, key_target, None);
         let tcp = TcpStream::connect(server).await.unwrap();
-        pool.deposit_ready(generation, &key, make_ready_stream(tcp, target))
+        pool.deposit_ready(&key, make_ready_stream(tcp, target))
             .await;
         pool.check_invariants();
         assert!(pool.acquire_ready(&key).await.is_some());
@@ -1487,16 +1491,14 @@ mod tests {
         let node_id = Uuid::from_u128(1);
         let target: SocketAddr = "198.51.100.1:443".parse().unwrap();
         let key = ConnectionPool::ready_key(generation, node_id, target, None);
-        let guard = pool
-            .try_begin_warm(generation, &key)
-            .expect("first warmer owns key");
+        let guard = pool.try_begin_warm(&key).expect("first warmer owns key");
         assert!(
-            pool.try_begin_warm(generation, &key).is_none(),
+            pool.try_begin_warm(&key).is_none(),
             "follower must not duplicate warm dial"
         );
         drop(guard);
         assert!(
-            pool.try_begin_warm(generation, &key).is_some(),
+            pool.try_begin_warm(&key).is_some(),
             "cancelled/failed owner must release key"
         );
     }
@@ -1512,18 +1514,18 @@ mod tests {
                 443,
             );
             let key = ConnectionPool::ready_key(generation, node_id, target, None);
-            assert!(!pool.note_target(generation, &key));
+            assert!(!pool.note_target(&key));
             pool.check_invariants();
         }
         let new_target: SocketAddr = "203.0.113.1:443".parse().unwrap();
         let new_key = ConnectionPool::ready_key(generation, node_id, new_target, None);
-        assert!(!pool.note_target(generation, &new_key));
+        assert!(!pool.note_target(&new_key));
         pool.check_invariants();
-        assert!(!pool.note_target(generation, &new_key));
+        assert!(!pool.note_target(&new_key));
         pool.check_invariants();
         let first_target: SocketAddr = "192.0.0.0:443".parse().unwrap();
         let first_key = ConnectionPool::ready_key(generation, node_id, first_target, None);
-        assert!(pool.note_target(generation, &first_key));
+        assert!(pool.note_target(&first_key));
         pool.check_invariants();
     }
 
@@ -1696,7 +1698,7 @@ mod tests {
         .await
         .expect("SOCKS5 A dial timed out")
         .unwrap();
-        pool.deposit_ready(generation, &key_a, stream_a).await;
+        pool.deposit_ready(&key_a, stream_a).await;
         pool.check_invariants();
 
         // Distinct identity keys force B's physical dial when no B stream is pooled.
@@ -1750,7 +1752,7 @@ mod tests {
         let key_a = ConnectionPool::ready_key(1, node_a.id, target, None);
         let key_b = ConnectionPool::ready_key(1, node_b.id, target, None);
         let tcp = TcpStream::connect(server).await.unwrap();
-        pool.deposit_ready(1, &key_a, make_ready_stream(tcp, target))
+        pool.deposit_ready(&key_a, make_ready_stream(tcp, target))
             .await;
 
         assert!(
@@ -1770,7 +1772,7 @@ mod tests {
         let key_generation_two = ConnectionPool::ready_key(2, node.id, target, None);
 
         let tcp = TcpStream::connect(server).await.unwrap();
-        pool.deposit_ready(1, &key_generation_one, make_ready_stream(tcp, target))
+        pool.deposit_ready(&key_generation_one, make_ready_stream(tcp, target))
             .await;
         pool.check_invariants();
 
@@ -1796,11 +1798,11 @@ mod tests {
         let key_b = ConnectionPool::ready_key(generation, node_b.id, target_b, None);
 
         let tcp_a = TcpStream::connect(server).await.unwrap();
-        pool.deposit_ready(generation, &key_a, make_ready_stream(tcp_a, target_a))
+        pool.deposit_ready(&key_a, make_ready_stream(tcp_a, target_a))
             .await;
         pool.check_invariants();
         let tcp_b = TcpStream::connect(server).await.unwrap();
-        pool.deposit_ready(generation, &key_b, make_ready_stream(tcp_b, target_b))
+        pool.deposit_ready(&key_b, make_ready_stream(tcp_b, target_b))
             .await;
         pool.check_invariants();
 
@@ -1830,7 +1832,7 @@ mod tests {
             let target = SocketAddr::new(std::net::Ipv4Addr::new(192, 0, 2, index).into(), 443);
             let key = ConnectionPool::ready_key(1, node_a.id, target, None);
             let tcp = TcpStream::connect(server).await.unwrap();
-            pool.deposit_ready(1, &key, make_ready_stream(tcp, target))
+            pool.deposit_ready(&key, make_ready_stream(tcp, target))
                 .await;
             pool.check_invariants();
         }
@@ -1838,7 +1840,7 @@ mod tests {
             let target = SocketAddr::new(std::net::Ipv4Addr::new(198, 51, 100, index).into(), 443);
             let key = ConnectionPool::ready_key(1, node_b.id, target, None);
             let tcp = TcpStream::connect(server).await.unwrap();
-            pool.deposit_ready(1, &key, make_ready_stream(tcp, target))
+            pool.deposit_ready(&key, make_ready_stream(tcp, target))
                 .await;
             pool.check_invariants();
         }
@@ -1872,19 +1874,19 @@ mod tests {
         let node_id = Uuid::from_u128(1);
         let old = ConnectionPool::ready_key(1, node_id, target, None);
         let next = ConnectionPool::ready_key(2, node_id, target, None);
-        for (generation, key) in [(1, &old), (2, &next)] {
+        for key in [&old, &next] {
             let tcp = TcpStream::connect(server).await.unwrap();
-            pool.deposit_ready(generation, key, make_ready_stream(tcp, target))
+            pool.deposit_ready(key, make_ready_stream(tcp, target))
                 .await;
             pool.check_invariants();
-            assert!(!pool.note_target(generation, key));
+            assert!(!pool.note_target(key));
             pool.check_invariants();
-            assert!(pool.note_target(generation, key));
+            assert!(pool.note_target(key));
             pool.check_invariants();
         }
-        let old_guard = pool.try_begin_warm(1, &old).unwrap();
+        let old_guard = pool.try_begin_warm(&old).unwrap();
         pool.check_invariants();
-        let next_guard = pool.try_begin_warm(2, &next).unwrap();
+        let next_guard = pool.try_begin_warm(&next).unwrap();
         pool.check_invariants();
         pool.retire_generation(1);
         pool.check_invariants();
@@ -1892,14 +1894,14 @@ mod tests {
         pool.check_invariants();
         {
             let state = pool.state.lock();
-            assert!(state.retired.contains(&1));
-            assert!(!state.retired.contains(&2));
+            assert!(state.retired(1));
+            assert!(!state.retired(2));
             assert!(!state.hot.contains_key(&old));
             assert!(!state.warm_dials.contains(&old));
             assert!(
                 !state
                     .ready_targets
-                    .contains_key(ConnectionPool::ready_node(&old))
+                    .contains_key(&(old.generation, old.node))
             );
             assert!(state.hot.contains_key(&next));
             assert!(state.warm_dials.contains(&next));
@@ -1908,11 +1910,11 @@ mod tests {
         pool.check_invariants();
         drop(old_guard);
         pool.check_invariants();
-        assert!(pool.try_begin_warm(2, &next).is_none());
+        assert!(pool.try_begin_warm(&next).is_none());
         pool.check_invariants();
         drop(next_guard);
         pool.check_invariants();
-        assert!(pool.try_begin_warm(2, &next).is_some());
+        assert!(pool.try_begin_warm(&next).is_some());
         pool.check_invariants();
     }
 
@@ -1926,7 +1928,7 @@ mod tests {
         pool.retire_generation(generation);
         pool.check_invariants();
         let tcp = TcpStream::connect(server).await.unwrap();
-        pool.deposit_ready(generation, &key, make_ready_stream(tcp, target))
+        pool.deposit_ready(&key, make_ready_stream(tcp, target))
             .await;
         pool.check_invariants();
         assert!(pool.acquire_ready(&key).await.is_none());
@@ -1941,9 +1943,9 @@ mod tests {
         let key = ConnectionPool::ready_key(generation, Uuid::from_u128(1), target, None);
         pool.retire_generation(generation);
         pool.check_invariants();
-        assert!(!pool.note_target(generation, &key));
+        assert!(!pool.note_target(&key));
         pool.check_invariants();
-        assert!(!pool.note_target(generation, &key));
+        assert!(!pool.note_target(&key));
         pool.check_invariants();
         assert!(!pool.state.lock().hot.contains_key(&key));
     }
@@ -1956,9 +1958,33 @@ mod tests {
         let key = ConnectionPool::ready_key(generation, Uuid::from_u128(1), target, None);
         pool.retire_generation(generation);
         pool.check_invariants();
-        assert!(pool.try_begin_warm(generation, &key).is_none());
+        assert!(pool.try_begin_warm(&key).is_none());
         pool.check_invariants();
     }
+    #[tokio::test]
+    async fn retired_watermark_fences_skipped_generations_and_preserves_newer_claims() {
+        let pool = ConnectionPool::new();
+        let server = spawn_hold_open_listener().await;
+        let target = "192.0.2.1:443".parse().unwrap();
+        let node = Uuid::new_v4();
+        let skipped = ConnectionPool::ready_key(7, node, target, None);
+        let live = ConnectionPool::ready_key(20, node, target, None);
+        let guard = pool.try_begin_warm(&live).unwrap();
+        pool.retire_generation(12);
+        pool.retire_generation(3);
+        assert!(pool.try_begin_warm(&skipped).is_none());
+        assert!(!pool.note_target(&skipped));
+        assert!(!pool.note_target(&skipped));
+        let tcp = TcpStream::connect(server).await.unwrap();
+        pool.deposit_ready(&skipped, make_ready_stream(tcp, target))
+            .await;
+        assert!(pool.acquire_ready(&skipped).await.is_none());
+        assert!(pool.try_begin_warm(&live).is_none());
+        drop(guard);
+        assert!(pool.try_begin_warm(&live).is_some());
+        pool.check_invariants();
+    }
+
     #[test]
     fn ready_retirement_reclaims_hotness_across_seventy_generations() {
         let pool = ConnectionPool::new();
@@ -1967,10 +1993,10 @@ mod tests {
             for port in 1..=64 {
                 let target = SocketAddr::from(([192, 0, 2, 1], port));
                 let key = ConnectionPool::ready_key(generation, node_id, target, None);
-                assert!(!pool.note_target(generation, &key));
+                assert!(!pool.note_target(&key));
                 pool.check_invariants();
                 assert!(
-                    pool.note_target(generation, &key),
+                    pool.note_target(&key),
                     "generation {generation} must become hot"
                 );
                 pool.check_invariants();
@@ -1999,7 +2025,7 @@ mod tests {
             assert!(!matches!(stream.stream.read(&mut byte).await, Ok(n) if n > 0));
             let pool = ConnectionPool::new();
             let key = ConnectionPool::ready_key(1, node.id, target, None);
-            pool.deposit_ready(1, &key, stream).await;
+            pool.deposit_ready(&key, stream).await;
             assert!(pool.acquire_ready(&key).await.is_none());
         })
         .await

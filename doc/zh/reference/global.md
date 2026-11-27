@@ -326,15 +326,22 @@ HTTP 探测把 `200–499` 的任何最终状态码视为成功，因此重定�
 
 ## 关闭
 
-`shutdown_wait_connections: true` 让 honk 在退出时给已接受的连接最多五秒自然结束，然后关闭并 join 剩余连接。这个宽限只在关闭过程正常、数据路径健康、且存在活动的 runtime epoch 时生效。其他情况跳过等待，不分长短连接。
+TC 后端仅在设为 `shutdown_wait_connections: true`，且正常关闭、数据路径健康并存在活动 runtime epoch 时，才给已接受连接最多五秒自然结束，再关闭并 join 剩余连接。其他情况跳过宽限等待，不区分长短连接。
 
 关闭使用最近接受的配置；reload 被拒绝时保留旧值。这个开关不影响 reload 退役、DNS/状态持久化、NFQUEUE/eBPF 清理，也不影响原生 API 独立的[五秒 HTTP 宽限期](./api.md#原生-api)。
+
+
+XDP 后端先关闭抓包准入并 detach 物理 link，再等待 packet endpoint 输出/CQ 拆卸完成。此开关不为 XDP packet TCP 连接提供自然结束宽限期。
+
+TUN 先关闭准入、移除活动 capture route，再 join Endpoint 清理，整个排空期间
+保留 blackhole guard。正常确认停止后才移除自有策略资源；失败时保留 guard 与
+setup receipt。该开关不为 TUN packet 连接提供自然结束宽限。
 
 这不是优雅重启，也不限制总退出时间：[已持有的清理和阻塞工作](../design/control-plane.md#终止所有权)仍须完成。
 
 ## socket mark
 
-`so_mark_from_dae: 0` 或省略该项时，保留历史上的实际 mark `0x100`。非零值替换 `0x100`，不会和它按位 OR。honk 在 connect/send 之前原样应用该 mark，作用于代理 carrier、bootstrap/DNS、健康检查、订阅和 UI 下载。数据路径按配置值做精确旁路匹配，仅仅带有 `0x100` 这一位并不能免于拦截。透明 listener socket 使用同一个 mark 供内核识别；accept 得到的 TCP 客户端 socket 会清除这个 mark。独立 `dns.bind` 入口仍是普通的无 mark 本地服务。
+`so_mark_from_dae: 0` 或省略该项时，保留历史上的实际 mark `0x100`。非零值替换 `0x100`，不会和它按位 OR。honk 在 connect/send 之前原样应用该 mark，作用于代理 carrier、bootstrap/DNS、健康检查、订阅和 UI 下载。数据路径按配置值做精确旁路匹配，仅仅带有 `0x100` 这一位并不能免于拦截。 TC 清除透明监听接受的 TCP socket 上的继承 mark。TUN 和启用 Host 的 XDP 在绑定 DNS、Clash 和原生 API 监听前设置并核验旁路 mark，服务端接受的 socket 保留该值。必须设置 mark 的物理出站 socket 会传播权限拒绝等错误。
 
 dae 全局标量沿用 honk 既有的十六进制优先规则：`10` 和 `0x10` 都表示 16。格式错误或溢出的文本会产生诊断，并回退到原始值 `0`，实际生效的是 `0x100`，建议显式写 `0x`。这与[直连规则 mark](./routing.md#策略路由-mark) 不同：后者无前缀时按十进制解析，错误值直接拒绝配置。
 
@@ -360,14 +367,14 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 
 ## 流量入口与拦截
 
-honk 通过所配置网卡上的 eBPF TC hook 接收流量，不提供供客户端连接的代理端口。
+默认由 TC 拦截流量。可通过 datapath 配置显式选择 [Linux TUN Endpoint](#linux-tun-endpoint)。
 
 - `lan_interface` 上的 hook 拦截 LAN 客户端经本机转发的流量，例如把本机设为网关的客户端。
 - `wan_interface` 上的 hook 拦截本机发起的 TCP/UDP。
 - 需要用户态处理的流量由数据路径经 `dae0` 送进 `daens` 命名空间，再由 `sk_lookup` 交给 `tproxy_port` 上的透明代理 TCP 或 UDP listener。有歧义的 LAN 转发 UDP 则由 NFQUEUE 暂存（`nfqueue_enable`）。
-- 拦截需要真实 eBPF 后端；mock 后端不拦截任何流量。
+- mock 后端不拦截任何流量。
 
-honk 没有 TUN 入站，也没有 `mixed-port`、`redir-port` 或 HTTP/SOCKS 入站。Clash API 的 `GET /configs` 把 `port`、`socks-port` 和 `mixed-port` 报告为 `0`，把 `tun.enable` 报告为 `false`。除透明代理 listener 外，honk 只监听可选的 [`dns.bind`](./dns.md#独立-listenerbind) 地址，以及 [`experimental`](./experimental.md) 中配置的 API listener。流量经过各个 hook 的过程见[报文路径](../design/overview.md#报文路径)。
+honk 不提供 `mixed-port`、`redir-port`、HTTP 或 SOCKS 代理监听。Clash API 的 `GET /configs` 将 `port`、`socks-port` 和 `mixed-port` 报告为 `0`。`tun` 对象报告已接受的 TUN 配置（包括 `enable`）。就绪状态单独报告。除透明代理监听外，honk 只监听可选的 [DNS 地址](./dns.md#独立-listenerbind)和 [experimental](./experimental.md) 中配置的 API 地址。参见 [TC 报文路径](../design/overview.md#报文路径)。
 
 ## 网卡语义
 
@@ -441,6 +448,296 @@ IP6GRE 如果只有单播 remote、没有显式 local 地址，可能不带 `IFF
 ## 预热与拨号预算
 
 `preconnect_node_count`、`udp_warm_node_count` 和 `max_concurrent_dials` 取非负整数，例如 `4`；`preconnect_node_count` 还接受不区分大小写的 `auto`。其他值以 `invalid-config-value` 拒绝配置。这三个字段与代理组的交互见[组设计](../design/groups.md)。
+
+## 捕获后端选择
+
+省略 `datapath` 会保持现有 TC 后端。XDP 是 Linux 上的显式选择：
+
+```dae
+global {
+    nfqueue_enable: false
+    dial_mode: ip
+}
+datapath {
+    backend: xdp
+    direct: core
+    interface {
+        lan0: lan
+        wan0: wan
+    }
+}
+```
+
+`direct` 必须显式选择 `core`（最终 Direct 数据包由 CoreForward 转发）或
+`endpoint`（Direct TCP 终止后中继）。防火墙/NAT 仍仅限 `direct: core`。
+
+接口角色是可信的 LAN/WAN 入站分区，不是执行方式；必须绑定发现的全部 RX 队列。
+XDP 不可同时配置
+`global.lan_interface` 或 `global.wan_interface`。
+后端、Direct 方式、有效 AF_XDP 绑定模式及接口/分区变更需要重启；受支持的
+防火墙/NAT 规则沿用事务式发布。未知字段及不支持的非零标记续送请求会被拒绝，
+不会被静默忽略。
+物理接口声明为 `名称: lan` 或 `名称: wan`。XDP Endpoint 还可用 `名称: l3_lan`
+声明[辅助 IP 接口](#辅助-l3-lan)。接口条目不接受子块，包括空子块。
+
+物理捕获的 `datapath.xsk_mode` 接受 `copy`、`zerocopy` 或 `auto`。省略仍强制 ZeroCopy；Auto 按每个成员的能力与所需 segment 选择。每次 bind 均回读验证，选定模式失败不会重试其他模式。省略与显式 `zerocopy` 在重载时等价，模式变更需重启。TC 和 TUN 拒绝显式模式；Host 不使用 AF_XDP 队列。
+
+`datapath.workers` 是仅限 XDP 的整数，只接受 `1`（默认）或 `2`，修改需要重启。
+双 worker 要求至少两个真实物理队列 owner，且有效 cpuset 至少有两个 CPU。
+每个 worker 在 OS 线程上独占其队列和 Stack 分片；Host 与 Core 协调仍在
+worker 0。逻辑 realm、DNS/UDP source 所有权及内存/流总上限不会翻倍。
+两个 worker 共享原有单个可选 Busy grant；校准包含双方队列/CPU context，
+旧单 owner 的校准证据不能使新配置获得资格。
+
+**从原 Copy 默认值迁移：**已有 XDP 配置若省略 `xsk_mode`，现在要求全部选中
+队列实际支持 ZeroCopy。若要保留 Copy 行为，请在升级前向原有 `datapath` 块加入
+`xsk_mode: copy`。否则，不支持 ZeroCopy 会拒绝启动，不会静默降级。省略
+`datapath` 的配置仍使用 TC，不受影响。
+
+Core Direct 要求 `dial_mode: ip`；域名谓词使用 packet 入口 scope 内学到的事实。物理入口提供源 MAC，但没有经认证的进程事实。未启用 Host 时 pname 使用 Missing 语义，并通过现有 `pname_routing` 报告降级；路由器本机发起的流留在内核。Endpoint 接受带地址的以太网和 bond 接口，启动时检查所有默认路由不能从捕获口输出；运行期由操作者保持。物理 link 由 FD 持有，进程退出时 detach；honk 修改的 VLAN RX stripping 位在正常停止或启动失败时恢复，SIGKILL 后保持关闭。参阅[完整 XDP 启动与限制](../design/datapath.md)。
+
+Core 的输入上下文 FIB 契约拒绝非零 IPv6 flow label 及无法保持语义的路由器扩展头/options；Endpoint 支持 IPv6 不证明 Core 对这些组合具有等价授权。
+
+### 辅助 L3 LAN
+
+```dae
+datapath {
+    backend: xdp
+    direct: endpoint
+    interface {
+        eth1: lan
+        wg0: l3_lan
+    }
+}
+```
+
+至少配置一个物理 XDP `lan` 或 `wan` 后，可额外声明最多八个名称不同的
+`l3_lan`。辅助口不算物理 worker 或 RX 队列。按实际链路判断：只接收裸 IP
+设备（`ARPHRD_NONE`），MTU 至少 1280，且不得作为默认路由的出口。以太网、
+PPP、GRE 不会因接口名而获准。TC、TUN 和 Core Direct 不能与该角色组合。Host 出口必须与该接口分开。物理口 XDP 准入失败不会降级成 TCX。
+
+尚不存在的辅助口可进入 `waiting_link`；启动时已存在却不合规的接口会拒绝
+启动。在役绑定使用 TCX ingress 与专有、无地址、非持久的 `honk-l3-<n>` TUN。
+不要把这些生成名用作配置的接口名。honk 不为内口添加地址、路由或策略规则，
+也不删除既有入向过滤器：若 Endpoint 重定向会跳过传统 ingress 分类器，则不
+绑定该口。若 WireGuard 服务在**被物理捕获的接口**上监听 UDP 53，须为该监听
+显式配置静态 `direct(must)` 流量规则；端口 53 不享受本机服务豁免。
+
+### XDP Endpoint DNS 投影
+
+`datapath.dns_projection` 是可选布尔值，仅适用于 `backend: xdp`、
+`direct: endpoint` 且至少有一个 `lan`、`l3_lan` 或 Host 出口的配置。省略或显式写
+`true` 都会启用 DNS 投影，写 `false` 可关闭。有效值变更需要重启。TC、
+TUN、XDP Core 和没有合格接口的 XDP Endpoint 必须省略该字段，显式写任一
+布尔值均会被拒绝。跨合并分段或 include 重复声明，以及结构化输入中的显式
+`null` 也会被拒绝。
+
+只有在同一逻辑 LAN realm 接受的透明 DNS 应答才能提供事实。bond 成员共用 bond 的 realm；每个 VLAN 使用自己的 realm 并继承配置根接口的角色。每个辅助 LAN 的 scope 独立，绑定失效时撤回该域的事实。WAN、Host 和独立 `dns.bind` 均不为 LAN 提供事实。
+
+对于目的端口非 53 的纯 TCP SYN 或完整 UDP 数据报，有序策略选中无 mark 的 `direct(must)`，或在 `dial_mode: ip` 且为 Rule 模式时选中普通无 mark 的 `direct`，才可交内核路由。事实缺失、过期或冲突不能授权新的原生流；既有静态 D1（含 `:53 direct(must)`）不变。
+
+UDP 数据报可以是零长度 payload，也可以带无需重组的 IPv6 atomic fragment 头。真正需要重组的第一片不能建立或续签 DNS 原生归属：新流走 Endpoint；已有原生 pending 且未命中 conntrack 时，只丢当前包。后续片没有端口，只沿用既有分片判定，不另查 DNS。静态 Direct 和已确认的 conntrack 匹配保持原行为。
+
+TCP 与 UDP 共享 8,192 个等待对应 conntrack 证据的 DNS 原生名额。满额时新流改为争取 Endpoint 归属。conntrack 接管之前，重复 SYN 或同流后续 UDP 报文仍须满足当下的策略；许可撤回就丢当前包，不拆分同一条流。同键竞争且有界复查仍无法确定归属时，也只丢当前包。命中同键 conntrack 或满足 30 秒空闲回收条件可退役 pending 记录；30 秒不是删除期限。
+
+一旦观测到 `notrack`，honk 会告警，并在本次 capture 的剩余时间关闭 DNS 许可。静态 D1 和 Endpoint 继续工作。运行期 legacy raw 表是周期抽查，不能与并发防火墙更改构成原子屏障。采样计数和回退原因见 [XDP 诊断](./api.md)。
+
+### XDP Host Endpoint
+
+使用启用了 `ebpf` 的构建，可在指定出口对本机发起的 TCP/UDP 分流：
+
+```dae
+global { nfqueue_enable: false }
+datapath {
+    backend: xdp
+    direct: endpoint
+    host { interface { eth0 } }
+}
+```
+
+配置 1–4 个不同接口名。不接受 `lo`、`auto`、与物理捕获口（包括 bond 成员与 VLAN）或辅助 LAN 重叠的接口，也不再接受 `host.xsk_mode`。见[迁移说明](../../migration/zh/gateway-host.md)。纯 Host 配置不需要物理队列；`workers: 2` 仍需两个实际物理队列 owner。更改出口列表需重启。
+
+支持的以太网、VLAN、网桥或裸 IP 出口（例如 WireGuard）要求 MTU 至少为 1280，不支持 PPP 和 GRE。尚未出现的接口可等待上线；不合规的设备不能挂载。每个活动出口独占一个无地址、非持久的 `honk-host-<n>` TUN。不要给这些私有设备添加地址、路由或改写报文的程序。honk 不修改主路由，也不要求清空防火墙。
+
+已证明的 Direct 保留原 socket，Endpoint 流固定在原出口，回复从该出口注入 Linux。进程名称来自 socket，不能证明每次 `sendmsg` 的调用者。honk 自发 socket、管理和 DNS 监听必须使用有效 bypass mark。容量与延迟包见 [Host 来源托管](../design/datapath.md#host-来源托管)。`backend: tun` 的 `host_facts` 契约独立。
+
+### Linux TUN Endpoint
+
+通过 `backend: tun` 和 `direct: endpoint` 显式选择 TUN。honk 新建并独占一个
+非持久化 Linux TUN。下列资源由操作者选择。
+
+```dae
+global {
+    nfqueue_enable: false
+    so_mark_from_dae: 0x100
+    dial_mode: ip
+}
+datapath {
+    backend: tun
+    direct: endpoint
+    tun {
+        name: honk0
+        mtu: 1500
+        queues: 1
+        host_facts: true
+        address4: 198.18.0.1/32
+        address6: fd00:686f:6e6b:100::1/128
+        table: 202
+        rule_priority: 10000
+        capture {
+            0.0.0.0/0
+            ::/0
+        }
+    }
+}
+routing {
+    fallback: direct
+}
+```
+
+| `tun` 字段 | 必需值与准入 |
+| --- | --- |
+| `name` | 必填；1–15 个 ASCII 字节，仅限 `[A-Za-z0-9_.-]`，拒绝 `lo` 和 `auto`。该 netns 内必须尚无同名链路，绝不接管或替换已有链路。 |
+| `mtu` | 可省略，默认 `1500`；整数 `1280..=65535`。 |
+| `queues` | 可省略，默认 `1`。接受 1 到 8 的整数，包括非 2 的幂。大于 1 时要求 `host_facts: false`。变更需重启。 |
+| `address4` / `address6` | 至少配置一个，严格使用 `/32`、`/128` 主机前缀。拒绝 unspecified、multicast、broadcast、mapped IPv6、link-local 及重复的本地地址。 |
+| `table` | 必填；`1..=0xfffffffe`，排除 `253..=255`。任何现存 route/rule 都不得使用此专用表。 |
+| `rule_priority` | 必填，首优先级 P；`P >= 1` 且 checked `P+4 < 32766`。五个优先级 `[P,P+4]` 必须全部空闲。 |
+| `host_facts` | 可选严格布尔值，默认 `false`。`true` 要求 `queues: 1`、`ebpf` 构建与真实来源捕获。变更需重启。 |
+| `capture { ... }` | 必填，1–64 条已配置地址族内的规范 CIDR 网络。拒绝 host bits 及互相包含的冗余前缀；排序并去重。仅接受裸前缀，不接受键值条目或嵌套块。 |
+
+TUN 必须恰有一个 `tun` 块；TC/XDP 拒绝该块。TUN 拒绝 `interface`、
+`xsk_mode`、显式 `poll_mode`、`dns_projection`、`busy_poll`、`firewall`、
+非空 `nat` 及 `direct: core`。未知字段以及
+合并 sections/includes 后重复的标量/块均拒绝；结构化输入使用同一校验。
+这是新增的显式选择，既有配置不改变含义，无须 TUN 迁移。
+
+要求 Linux、`/dev/net/tun`、创建/配置 TUN 和应用 `SO_MARK` 的权限，不能传
+`--mock-ebpf`。必须显式关闭 NFQUEUE，并保持 `global.lan_interface`/
+`wan_interface` 为空。拒绝非零 traffic rule/default mark、MAC 谓词及其否定；
+进程名谓词要求单队列 HostFacts。既有四种 dial mode 均可使用。参见 [pname](./routing.md#pname)。
+
+对每个已启用地址族，honk 验证系统 priority-0 local rule，并安装恰好五条自有
+RPDB rule；M 为有效 `global.so_mark_from_dae`，T 为 `tun.table`，P 为
+`tun.rule_priority`：
+
+| 优先级 | 精确匹配 | 动作 |
+| --- | --- | --- |
+| P | `fwmark M/0xffffffff` | `lookup main` |
+| P+1 | `fwmark M/0xffffffff` | `prohibit` |
+| P+2 | `iif <tun.name>` | `lookup main` |
+| P+3 | `iif <tun.name>` | `prohibit` |
+| P+4 | 全部流量 | `lookup T` |
+
+系统 local rule 先执行，32766/32767 的普通 main/default rule 保留。T 中每条
+capture prefix 先安装 metric 32760 的 static blackhole guard，Endpoint 启动后
+才加入经 TUN 的 metric-1024 unicast route。不复制 main 表，不合成私网豁免。
+daemon socket 经 P/P+1 旁路；写入 TUN 的回复作为新 interface ingress 进入
+内核，经 P+2/P+3 回程。main 缺路由时终止，不重新进入 TUN。
+
+两个地址族的 active capture 都使用 metric 1024：Linux 会规范化 IPv6 的
+metric 0，而 IPv4 删除时 metric 0 表示通配。这是相对初始 metric-0 设计的
+明确 Linux 表示调整。Exclusive create、回读与删除均使用完整 route key：
+table、地址族、prefix、output interface 和 metric。Blackhole guard 保持 32760。
+
+操作者持有 main/default 路由、WAN/LAN 地址、NAT、防火墙及 forwarding 开关，
+并须保持拓扑稳定。每个已启用族都须有可用源地址和非 TUN 的 main uplink；拒绝
+main/default 中经 TUN 的路径、额外 local rule、P 之前的其他 rule、VRF/l3mdev、
+未知 selector/action 及其他对 T 的引用。capture/reply 腿必须保持实际 L3 策略
+输入，不宣称外部 NAT 等价。拓扑变化或通知丢失关闭捕获；watcher 不是抵御并发
+特权路由修改的原子栅栏。仅自有 TUN 设置 `rp_filter=0`，IPv6 关闭自动地址生成/
+RA，明确配置 NODAD 地址。
+
+启用 IPv4 时，TUN 启动会在创建任何资源前读取
+`net.ipv4.conf.all.rp_filter`。接受 `0` 和 `2`；严格模式（`1`）、未知值或
+读取失败均拒绝启动。请在启动 honk 前将其设为 `0` 或 `2`。Linux 验证本地
+交付回复的源地址时，使用 `iif=lo` 和数据包的 mark（未标记的物理承载回复为
+`0`）进行反向查路由。在 TUN capture RPDB 下，该查询命中经 TUN 的捕获路由，
+与真实入站接口不符，因此严格模式会丢弃代理/Direct 承载回复。有效设置取
+`max(all, interface)`，自有 TUN 的 `0` 无法降低全局 `1`。honk 从不写入全局值，
+也不修改 WAN/LAN 的 `rp_filter`。操作者在启动后改为严格模式不会被运行时检测。
+仅 IPv6 的 TUN 不读取也不因该 IPv4 设置而拒绝启动；IPv6 没有对应的
+`rp_filter` 设置。
+
+Setup 以 create-new、拒绝符号链接、mode 0600 创建
+`<data_dir>/state/tun-<netns_cookie>-<instance_nonce>.json` receipt，记录完整源码
+SHA、PID/starttime、netns cookie、link/attachment identity 及精确 address/route/
+rule key。每次外部变更前先持久化 Intent；ACK 与 Removed 状态均持久化并 fsync。
+它只供操作者精确核对清理，不授权重放 setup、接管资源或删除归属不明对象。
+详见 [TUN setup 与拆卸](../design/datapath.md#linux-tun-endpoint)。
+
+Direct TCP/UDP 明确使用 Endpoint relay：真实 TUN FD read → scoped Stack →
+canonical Router → 新建 direct/proxy outbound → 生成回复 → 所属分片的 FD。启用
+`host_facts: true` 时，经认证的应用 socket 记录携带原始来源事实进入独立 Host
+scope；见证过但无归属的记录仍走 plain，不代表已证明 Transit。进程名仅在经认证
+Host 来源且存在时可用；Missing 不匹配正向谓词，但匹配其否定。两个 scope 共用
+384 MiB capture 预算。独立 DNS 只在 plain scope 学习，透明 DNS 使用对应 packet
+scope；均不借用 HOST DNS 事实。来源准入要求真实支持，来源错误不能回退 plain；
+读取延迟不刷新原始来源有效期。生成回复不提供原 operation 或 pre-NAT/TTL 等价。
+
+整个规范 TUN setup（含 `queues` 与 `host_facts`）、backend 与 Direct profile 变更均需重启。
+省略时分别等同于 MTU 1500、`queues: 1` 与 `host_facts: false`。
+policy/group/DNS/订阅/mode 更新沿用既有 FD 与 scope。`dns.bind` 语义变化仍需重启。正常 joined stop 先撤销 capture，等待真实 owner
+退出，再移除自有 rule/guard 与 receipt，恢复 main 路由。失败或未确认清理时保留
+blackhole、rule 与 receipt，供停源后核对并精确清理；不自动重开、接管或回退后端。
+
+`/configs.tun` 报告已接受配置（`enable`、`device`、`mtu`、`stack: "honk"`），
+IPv6 投影由 `address6` 决定；这些字段不是就绪证明。就绪由 `capture_ready()`
+后的 lifecycle Running、`TUN datapath ready` 与 sd_notify 表达；native datapath
+可见性仍为 unknown。
+
+### 有界自适应轮询
+
+XDP 的 `datapath.poll_mode` 接受 `event` 或 `adaptive`。省略表示选择 adaptive **策略**，
+不是立即进入 Busy：owner 从 Event 开始。显式 `event` 禁止主动轮询，但允许保留
+完全相同的调参与校准块，用于 Event/adaptive 对照。TC/TUN 拒绝任何显式模式（包括
+`event`）及任何 `busy_poll` 块。轮询与校准可重载而不重建设备；变更清除本地
+资格累计，但不重置进程配额或债务。
+
+`datapath.busy_poll` 是可选单例块；出现时下列九个整数全部必填，不提供已校准的
+PPS 默认值。值采用无符号十进制整数，不接受 duration 字符串或浮点数。
+
+| 字段 | 类型 | 接受的安全/表示边界 |
+| --- | --- | --- |
+| `pps_enter` | `u32` | `1..=4294967295` |
+| `pps_exit` | `u32` | `0 <= pps_exit < pps_enter` |
+| `observation_window_us` | `u32` | `1..=60000000` 微秒 |
+| `enter_windows` | `u16` | `2..=65535` 个连续完整窗口 |
+| `exit_windows` | `u16` | `1..=65535` 个连续完整窗口 |
+| `max_busy_us` | `u32` | `1..=1000` 微秒且 `<= budget_us` |
+| `empty_rounds` | `u16` | `1..=65535` 个完整空设备轮次 |
+| `budget_window_us` | `u32` | `1..=60000000` 微秒（W） |
+| `budget_us` | `u32` | `0 < budget_us < budget_window_us`（B） |
+
+唯一可选子块是单例 `datapath.busy_poll.calibration`。出现时全部字段必填：正整数
+`schema: u16`、正整数 `counting_revision: u32`、`executable_sha256`、
+`context_sha256`、`parameter_sha256`、`status: candidate | qualified` 和
+`evidence_manifest_sha256`。四个摘要各为恰好 64 个小写十六进制字符。消费方要求
+schema 1/counting revision 1；格式正确的其他版本保持 Event 并报告不匹配原因，
+不会假定其兼容。
+
+`candidate` 的 `evidence_manifest_sha256` 绑定**已预注册的实验清单**，不是未来
+补交结果的空承诺。候选资格还要求进程启动时显式选择校准实验模式，不能靠配置
+重载开启。`qualified` 的摘要绑定经过评审的已完成资格证据清单。两种状态都必须
+精确匹配可执行文件、实际设备/上下文及参数。摘要/状态不是签名、下载的测量结果
+或收益证明；配置不提供清单路径或 URL。
+
+未知键/块、重复字段/块（包括合并 section/include）、不完整块、正负号、小数、
+溢出及非法边界均拒绝准入。类型化适配器沿用相同准入规则；新增可选字段的显式
+`null` 被拒绝，原有类型化适配器的 `xsk_mode: null` 行为不变。不提供 global/顶层
+calibration 别名或逐接口配额。
+
+缺少调参/校准、证据不匹配、必要上下文不可用或无法证明共享进程记账时，仍可
+使用正常 Event 网络处理，并保留资格原因。Busy 还要求独立 RX 或 TX PPS 持续
+达标、具体可轮询设备义务及进程额度。RX 统计已证明准入的结果而非源地址收据；
+TX 统计完整 producer 发布而非描述符/CQ 事件。进程账本同时至多允许一个 Busy
+区间，初始额度为零，按完整 BOOTTIME 流逝时间（含停顿）收费，跨重载保留债务，
+并放弃未结算区间跨越的补充额度。Busy 到达边界/截止时间后退出并让出执行，再
+重新评估；仅有配额不会唤醒空闲 owner。Event 不是对有效业务或总 CPU 的限额。
+
+这些是协作式安全边界，不是实测阈值或硬实时保证。时钟连续性观察不能排除低于
+保留的非原子读取/分辨率不确定性的 suspend。未经与精确绑定上下文一致的完整
+证据和评审，不宣称吞吐、延迟、CPU 或能耗收益。
 
 ## 相关文档
 

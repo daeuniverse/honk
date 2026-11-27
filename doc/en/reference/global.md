@@ -326,15 +326,23 @@ HTTP probes count any final status `200–499` as success, so a redirect or `404
 
 ## Shutdown
 
-Setting `shutdown_wait_connections: true` gives accepted connections up to five seconds to finish on an ordinary, healthy shutdown with an active runtime epoch. honk then closes and joins the remaining connections. Other cases skip this grace, which does not distinguish short and long connections.
+On the TC backend, setting `shutdown_wait_connections: true` gives accepted connections up to five seconds to finish on ordinary, healthy shutdown with an active runtime epoch; remaining connections are then closed and joined. Other cases skip this grace. It does not distinguish short and long connections.
 
 Shutdown uses the latest accepted configuration; rejected reloads preserve the previous value. The flag does not change reload retirement, DNS/state persistence, NFQUEUE/eBPF cleanup or the native API's independent [five-second HTTP grace](./api.md#native-api).
+
+
+The XDP backend closes capture admission and detaches its physical links before joining packet endpoint output/CQ teardown. This flag does not provide natural-completion grace for XDP packet TCP connections.
+
+TUN closes admission and removes its active capture routes before joined Endpoint
+cleanup, retaining blackhole guards throughout the drain. Normal confirmed stop
+then removes owned policy resources; failure keeps guards and the setup receipt.
+This flag supplies no natural-completion grace for TUN packet connections.
 
 This is neither a graceful restart nor a total exit deadline: [owned cleanup and blocking work](../design/control-plane.md#runtime-teardown) still have to finish.
 
 ## Socket marks
 
-`so_mark_from_dae: 0` (or omission) retains the historical effective mark `0x100`. A nonzero value replaces `0x100` instead of OR-ing with it. honk applies the mark exactly before connect/send, including proxy carriers, bootstrap/DNS traffic, health checks, subscriptions and UI downloads. The datapath bypass compares this exact configured value: merely containing bit `0x100` is not an exemption. Transparent listeners use the same mark for socket recognition; accepted TCP client sockets have it cleared. Standalone `dns.bind` ingress stays an ordinary unmarked local service.
+`so_mark_from_dae: 0` (or omission) retains the historical effective mark `0x100`. A nonzero value replaces `0x100` instead of OR-ing with it. honk applies the mark exactly before connect/send, including proxy carriers, bootstrap/DNS traffic, health checks, subscriptions and UI downloads. The datapath bypass compares this exact configured value: merely containing bit `0x100` is not an exemption. TC clears the inherited mark on accepted transparent TCP sockets. TUN and XDP Host set and verify the bypass mark on DNS, Clash and native API listeners before binding; accepted service sockets keep it. Required physical egress sockets propagate mark failures, including permission errors.
 
 The dae global scalar keeps honk's hexadecimal-first lexical parsing: `10` and `0x10` both mean 16. Malformed or overflowing text produces a diagnostic and falls back to raw `0`, hence effective `0x100`. Prefer explicit `0x` notation. This differs from [direct rule marks](./routing.md#policy-routing-marks), where unprefixed values are decimal and malformed values reject the configuration.
 
@@ -360,14 +368,14 @@ honk starts UDP DNS target initialization at startup, within the health-check ti
 
 ## Traffic entry and interception
 
-honk receives traffic through eBPF TC hooks on the configured interfaces, not through a proxy port that clients connect to.
+TC is the default interception backend. Opt in to [Linux TUN Endpoint](#linux-tun-endpoint) through datapath configuration.
 
 - `lan_interface` hooks intercept traffic that LAN clients send through the host, for example clients that use it as their gateway.
 - `wan_interface` hooks intercept TCP and UDP that the host itself originates.
 - The datapath sends flows that need userspace handling through `dae0` into the `daens` namespace. There, `sk_lookup` assigns them to the transparent TCP or UDP listener on `tproxy_port`. NFQUEUE staging (`nfqueue_enable`) holds ambiguous LAN-forwarded UDP instead.
-- Interception requires the real eBPF backend; the mock backend intercepts nothing.
+- The mock backend intercepts nothing.
 
-honk has no TUN inbound, no `mixed-port`, no `redir-port`, and no HTTP or SOCKS inbound. The Clash API's `GET /configs` reports `port`, `socks-port` and `mixed-port` as `0` and `tun.enable` as `false`. Besides the transparent listeners, honk listens only on the optional [`dns.bind`](./dns.md#standalone-listener-bind) address and on the API listeners configured in [`experimental`](./experimental.md). The [packet walk](../design/overview.md#packet-walk) follows a flow through the hooks.
+honk provides no `mixed-port`, `redir-port`, HTTP or SOCKS proxy listeners. The Clash API's `GET /configs` reports `port`, `socks-port` and `mixed-port` as `0`. Its `tun` object reports the accepted TUN configuration, including `enable`. Readiness is reported separately. Besides transparent listeners, honk listens only on the optional [DNS listener](./dns.md#standalone-listener-bind) and the API listeners configured in [experimental](./experimental.md). See the [TC packet walk](../design/overview.md#packet-walk).
 
 ## Interface semantics
 
@@ -441,6 +449,333 @@ Other relative runtime paths preserve legacy installations as follows. Except fo
 ## Warm-up and dial budget
 
 `preconnect_node_count`, `udp_warm_node_count` and `max_concurrent_dials` take nonnegative integers such as `4`; `preconnect_node_count` also takes `auto` in any letter case. Anything else rejects the configuration with `invalid-config-value`. The three keys follow [Group design](../design/groups.md) for their group interaction.
+
+## Capture backend selection
+
+Omitting `datapath` preserves the existing TC backend. XDP is an explicit Linux
+selection:
+
+```dae
+global {
+    nfqueue_enable: false
+    dial_mode: ip
+}
+datapath {
+    backend: xdp
+    direct: core
+    interface {
+        lan0: lan
+        wan0: wan
+    }
+}
+```
+
+`direct` must be `core` (final Direct packets use CoreForward) or `endpoint`
+(Direct TCP terminates and relays). Firewall/NAT remain exclusive to `direct: core`.
+
+Interface roles are trusted ingress LAN/WAN zones, not execution dispositions;
+every discovered RX queue is required.
+Do not also set `global.lan_interface` or `global.wan_interface` for XDP.
+The backend, Direct profile, effective AF_XDP binding mode, and interface/zone setup
+require restart. Supported firewall/NAT rules use transactional policy publication.
+Unknown settings and unsupported marked continuation requests are rejected, not ignored.
+Use `name: lan` or `name: wan` for physical capture. XDP Endpoint also accepts
+`name: l3_lan` for an [auxiliary IP interface](#auxiliary-l3-lan). Interface
+declarations with a nested body, even an empty one, are rejected.
+
+`datapath.xsk_mode` accepts `copy`, `zerocopy`, or `auto` for physical capture. Omission remains forced ZeroCopy; Auto selects per member from its capabilities and required segments. Every bind is read back; a failed selected bind does not retry another mode. Omitted and explicit `zerocopy` are equivalent for reload; changing mode requires restart. TC and TUN reject an explicit mode. Host uses no AF_XDP queue.
+
+`datapath.workers` is an XDP-only integer, either `1` (default) or `2`; changing it
+requires restart. Two workers require at least two actual physical queue owners
+and two CPUs in the effective cpuset. Each owns its queues and Stack shards on an
+OS thread; Host and Core coordination remain on worker 0. The logical realm,
+DNS/UDP source ownership and aggregate memory/flow limits do not multiply.
+Both workers share the existing single optional Busy grant. Calibration includes
+both queue/CPU contexts, so old single-owner evidence does not qualify the new setup.
+
+**Migration from the previous Copy default:** existing XDP configurations that
+omit `xsk_mode` now require working ZeroCopy on every selected queue. To preserve
+Copy behavior, add `xsk_mode: copy` to the existing `datapath` block before
+upgrading. Without it, unsupported ZeroCopy rejects startup rather than silently
+falling back. Configurations that omit `datapath` keep TC unchanged.
+
+Core Direct requires `dial_mode: ip`; domain predicates use facts learned in the packet ingress scope. Physical ingress supplies the source MAC but no authenticated process fact. Without Host capture, pname uses Missing semantics and reports the existing `pname_routing` degradation; router-originated flows remain in the kernel. Endpoint permits numbered Ethernet and bond interfaces and checks all default routes for captured outputs at startup; the operator must maintain that condition at runtime. Physical FD-owned links detach on process exit; VLAN RX stripping bits changed by honk are restored on normal stop or startup failure, but remain off after SIGKILL. See [Full-XDP startup and limitations](../design/datapath.md).
+
+Core's input-context FIB contract rejects nonzero IPv6 flow labels and router-specific extension/options execution it cannot preserve; Endpoint IPv6 support does not establish equivalent Core authority.
+
+### Auxiliary L3 LAN
+
+```dae
+datapath {
+    backend: xdp
+    direct: endpoint
+    interface {
+        eth1: lan
+        wg0: l3_lan
+    }
+}
+```
+
+`l3_lan` adds a raw-IP ingress beside at least one physical XDP `lan` or `wan`.
+Configure up to eight distinct auxiliary names. They do not count as physical
+workers or RX queues. The interface must actually carry bare IP (`ARPHRD_NONE`),
+have an MTU of at least 1280, and not be used by a default route. An Ethernet,
+PPP or GRE device is not admitted merely because of its name. The role is not
+available with TC, TUN or Core Direct. Host egress interfaces must be distinct. A physical
+interface that fails XDP admission never falls back to TCX.
+
+An absent auxiliary interface can start in `waiting_link`. A present but
+incompatible interface rejects startup. An active binding uses TCX ingress
+and its own unnumbered, nonpersistent `honk-l3-<n>` TUN. Do not use those
+generated names for configured interfaces. honk creates no routes, policy
+rules or addresses for the internal TUN. It does not remove existing ingress
+filters: if Endpoint redirection would skip an existing legacy classifier,
+the auxiliary cannot bind. A WireGuard server listening on UDP port 53 on a
+*physical capture interface* needs an explicit static `direct(must)` traffic
+rule for that listener; the local-service exemption does not include port 53.
+
+### XDP Endpoint DNS projection
+
+`datapath.dns_projection` is an optional boolean for `backend: xdp` with
+`direct: endpoint` and at least one `lan`, `l3_lan` or Host interface. Omission
+and `true` both enable DNS projection. Set `false` to turn it off. A
+change to the effective value requires a restart. TC, TUN, XDP Core and XDP
+Endpoint without an eligible interface require omission. Either explicit boolean is
+rejected in those configurations. Duplicate declarations across merged sections
+or includes and explicit null in structured input are also rejected.
+
+Only transparent DNS answers accepted on the same logical LAN realm supply facts. A bond's members share its realm; each VLAN has its own realm and inherits its configured root's role. Each auxiliary LAN has its own scope; losing the binding withdraws its facts. Neither WAN, Host nor standalone `dns.bind` supplies LAN facts.
+
+A pure TCP SYN or complete UDP datagram to a port other than 53 can take the kernel route when the ordered policy selects unmarked `direct(must)`, or ordinary unmarked `direct` in `dial_mode: ip` and Rule mode. Missing, expired or conflicting facts do not authorize a new native flow; static D1 rules, including `:53 direct(must)`, are unchanged.
+
+A complete UDP datagram may have an empty payload or an IPv6 atomic fragment header. A first fragment that actually needs reassembly cannot acquire or renew DNS-native ownership: a new flow takes the Endpoint path, and an existing native-pending flow without a conntrack match drops that packet. Later fragments have no ports and follow the existing fragment verdict, not a new DNS decision. Static Direct and confirmed conntrack matches keep their original behavior.
+
+TCP and UDP share at most 8,192 DNS-native flows awaiting matching conntrack evidence. At capacity, a fresh flow competes for Endpoint ownership instead. Until conntrack takes over, a repeated SYN or subsequent datagram must still qualify under the current policy; loss of permission drops that packet rather than splitting a flow. If bounded checks cannot determine the owner during a same-flow race, only that packet is dropped. A matching conntrack entry or collection after 30 seconds of inactivity can retire a pending record; 30 seconds is not a guaranteed deletion time.
+
+If honk observes `notrack`, it closes DNS permission for the rest of this capture and warns. Static D1 and Endpoint remain available. Runtime legacy raw-table checks are periodic, not an atomic fence against concurrent firewall edits. See [XDP diagnostics](./api.md) for the sampled counters and fallback reason.
+
+### XDP Host Endpoint
+
+Use an `ebpf` build to classify locally originated TCP/UDP on explicit egress interfaces:
+
+```dae
+global { nfqueue_enable: false }
+datapath {
+    backend: xdp
+    direct: endpoint
+    host { interface { eth0 } }
+}
+```
+
+Configure 1–4 distinct names. `lo`, `auto`, overlap with physical capture (including bond members and VLANs) or with an auxiliary LAN, and the former `host.xsk_mode` are rejected. See the [migration note](../../migration/en/gateway-host.md). A Host-only configuration needs no physical queue; `workers: 2` still requires two physical queue owners. Changing the interface list requires a restart.
+
+A supported Ethernet, VLAN, bridge or raw-IP egress (for example WireGuard) needs MTU 1280 or larger. PPP and GRE are not supported. A missing device waits for a link; an incompatible device cannot acquire a hook. Each active egress owns one unnumbered, nonpersistent `honk-host-<n>` TUN. Do not add addresses, routes or packet-rewriting programs to these private devices. honk does not change main routes or require the host firewall to be empty.
+
+Packets already proved Direct continue on the original socket. Endpoint traffic stays on its original binding; replies enter Linux on that egress. Process names are socket observations, not evidence of the caller of every `sendmsg`. In Host mode honk requires its effective bypass mark on originated sockets and management/DNS listeners. See [capture and ownership](../design/datapath.md#host-source-custody) for capacity and delayed packets. `backend: tun` has its own independent `host_facts` contract.
+
+### Linux TUN Endpoint
+
+Select TUN explicitly with `backend: tun` and `direct: endpoint`. honk creates and
+owns a new, nonpersistent Linux TUN. The resources below are chosen by the operator.
+
+```dae
+global {
+    nfqueue_enable: false
+    so_mark_from_dae: 0x100
+    dial_mode: ip
+}
+datapath {
+    backend: tun
+    direct: endpoint
+    tun {
+        name: honk0
+        mtu: 1500
+        queues: 1
+        host_facts: true
+        address4: 198.18.0.1/32
+        address6: fd00:686f:6e6b:100::1/128
+        table: 202
+        rule_priority: 10000
+        capture {
+            0.0.0.0/0
+            ::/0
+        }
+    }
+}
+routing {
+    fallback: direct
+}
+```
+
+| `tun` field | Required value and admission |
+| --- | --- |
+| `name` | Required; 1–15 ASCII bytes from `[A-Za-z0-9_.-]`. `lo` and `auto` are rejected. The name must be unused in this network namespace; existing links are never adopted or replaced. |
+| `mtu` | Optional, default `1500`; integer `1280..=65535`. |
+| `queues` | Optional integer from 1 through 8, including non-powers of two. Defaults to 1. Counts above 1 require `host_facts: false`. Changes require restart. |
+| `address4` / `address6` | At least one required; exact host prefixes `/32` and `/128`. Unspecified, multicast, broadcast, mapped IPv6, link-local and duplicate local addresses are rejected. |
+| `table` | Required; `1..=0xfffffffe`, excluding `253..=255`. No existing route or rule may use this dedicated table. |
+| `rule_priority` | Required first priority P; `P >= 1` and checked `P+4 < 32766`. All five priorities `[P,P+4]` must be unused. |
+| `host_facts` | Optional strict boolean, default `false`. `true` requires `queues: 1`, an `ebpf` build and real source capture. Changes require restart. |
+| `capture { ... }` | Required, 1–64 canonical CIDR networks in configured address families. Host bits and mutually containing redundant prefixes are rejected; entries are sorted and deduplicated. Only bare prefixes are accepted, without keyed entries or nested blocks. |
+
+TUN requires exactly one `tun` block; TC/XDP reject that block. TUN rejects
+`interface`, `xsk_mode`, explicit `poll_mode`, `dns_projection`, `busy_poll`,
+`firewall`, nonempty `nat`, and `direct: core`.
+Unknown fields and duplicate scalars/blocks reject across merged sections and
+includes. Structured input uses the same validation. This is an opt-in addition;
+existing configurations do not change meaning and need no TUN migration.
+
+Run on Linux with `/dev/net/tun`, permission to create/configure TUN and apply
+`SO_MARK`, and no `--mock-ebpf`. Explicitly disable NFQUEUE and leave
+`global.lan_interface`/`wan_interface` empty. Nonzero traffic-rule/default marks
+and MAC predicates (including negations) are unsupported. Process-name predicates
+require single-queue HostFacts. All four dial modes remain available. See [pname](./routing.md#pname).
+
+For every enabled address family honk validates the standard priority-0 local
+rule and installs exactly five owned RPDB rules, where M is the effective
+`global.so_mark_from_dae`, T is `tun.table`, and P is `tun.rule_priority`:
+
+| Priority | Exact match | Action |
+| --- | --- | --- |
+| P | `fwmark M/0xffffffff` | `lookup main` |
+| P+1 | `fwmark M/0xffffffff` | `prohibit` |
+| P+2 | `iif <tun.name>` | `lookup main` |
+| P+3 | `iif <tun.name>` | `prohibit` |
+| P+4 | All traffic | `lookup T` |
+
+The system local rule runs first; ordinary system main/default rules at
+32766/32767 remain. Each capture prefix gets a static blackhole guard in T with
+metric 32760, then a metric-1024 unicast route through TUN only after Endpoint startup.
+No main-table copy or private-subnet exemption is synthesized. Daemon sockets
+escape through P/P+1; replies written to TUN enter the kernel as new interface
+ingress and use P+2/P+3. Missing main routes terminate instead of looping.
+
+Active capture uses metric 1024 for both families because Linux normalizes IPv6
+metric 0 and treats IPv4 delete metric 0 as a wildcard. This is a deliberate
+Linux representation adjustment from the initial metric-0 design. Exclusive
+creation, readback and deletion use the full route key: table, address family,
+prefix, output interface and metric. Blackhole guards remain metric 32760.
+
+The operator owns main/default routes, WAN/LAN addresses, NAT, firewall and
+forwarding switches, and must keep that topology stable. Each enabled family
+needs a usable source and non-TUN main uplink; main/default paths through TUN,
+extra local rules, rules before P, VRF/l3mdev, unknown selectors/actions and other
+references to T are rejected. Capture/reply legs must preserve the L3 policy
+input; external NAT equivalence is not established. Topology changes or lost
+notifications close capture; the watcher is not an atomic fence against a
+concurrent privileged route writer. Only the owned TUN gets `rp_filter=0` and
+explicit IPv6 NODAD addresses with automatic address generation/RA disabled.
+
+When IPv4 is enabled, TUN startup reads `net.ipv4.conf.all.rp_filter` before
+creating any resources. Values `0` and `2` are accepted; strict mode (`1`),
+unknown values and read failures reject startup. Set it to `0` or `2` before
+starting honk. Linux validates the source of locally delivered replies with a
+reverse lookup using `iif=lo` and the packet's mark (`0` for unmarked physical
+carrier replies). Under the TUN capture RPDB, that lookup reaches the capture
+route through TUN instead of the real ingress, so strict mode drops proxy/direct
+carrier replies. The effective setting is `max(all, interface)`, so the owned
+TUN's `0` cannot lower global `1`. honk never writes the global value or changes
+WAN/LAN `rp_filter` values. A later operator change to strict mode is not detected
+at runtime. IPv6-only TUN neither reads nor rejects this IPv4 setting; IPv6 has
+no equivalent `rp_filter` setting.
+
+Setup writes a create-new, nonsymlink, mode-0600 receipt at
+`<data_dir>/state/tun-<netns_cookie>-<instance_nonce>.json`. It records full source
+SHA, PID/starttime, namespace cookie, link/attachment identity and exact
+address/route/rule keys. Intent is persisted before each external mutation;
+ACK and Removed states are persisted and fsynced. It is evidence for exact
+operator cleanup, never authority to replay setup, adopt resources or delete an
+ambiguous object. See [TUN setup and teardown](../design/datapath.md#linux-tun-endpoint).
+
+Direct TCP/UDP is an explicit Endpoint relay: real TUN FD read → scoped Stack →
+canonical Router → new direct/proxy outbound → generated reply → the owning shard's FD.
+With `host_facts: true`, authenticated application-socket records carry their
+original source facts into a separate Host scope; witnessed unattributed records
+remain plain, not proven Transit. Process names are available only for authenticated
+Host sources when present: Missing does not match a positive predicate but matches
+its negation. Both scopes share one 384 MiB capture budget. Standalone DNS learns
+only in the plain scope; transparent DNS learns in its packet's own scope. Neither
+scope borrows HOST DNS facts. Source admission requires real support and fails closed;
+it does not fall back to plain on source errors. The original source expiry is not
+refreshed by read delay. Generated replies provide no original operation or
+pre-NAT/TTL equivalence.
+
+The entire canonical TUN setup, including `queues` and `host_facts`, the backend and the
+Direct profile require a restart when changed. Omission is equivalent to MTU 1500,
+`queues: 1` and `host_facts: false`. Policy/group/DNS/subscription/mode updates retain
+the FDs and scopes. Semantic `dns.bind` changes still require restart. Normal joined stop
+removes capture first, drains actual owners, then removes owned rules/guards and
+the receipt to restore main routing. Failure or unconfirmed cleanup retains
+blackholes, rules and receipt for stop-source inspection and exact cleanup;
+there is no automatic reopen, adoption or backend fallback.
+
+`/configs.tun` reports accepted configuration (`enable`, `device`, `mtu`,
+`stack: "honk"`); its IPv6 projection follows `address6`. These fields do not
+prove readiness. Readiness follows `capture_ready()`, lifecycle Running,
+`TUN datapath ready` and sd_notify; native datapath visibility remains unknown.
+
+### Bounded adaptive polling
+
+For XDP, `datapath.poll_mode` accepts `event` or `adaptive`. Omission selects the adaptive
+**policy**, not Busy operation: the owner starts in Event. Explicit `event` forbids
+active polling and can retain the identical complete tuning/calibration block for
+an Event-versus-adaptive comparison. TC/TUN reject either explicit mode (even `event`)
+and any `busy_poll` block. Polling and calibration changes are reloadable without
+changing device setup; they reset local qualification, not process quota or debt.
+
+`datapath.busy_poll` is an optional singleton block. When present, all nine integers
+below are required; there are no calibrated PPS defaults. Values use unsigned
+decimal integers, not duration strings or floating-point values.
+
+| Field | Type | Accepted safety/representation bounds |
+| --- | --- | --- |
+| `pps_enter` | `u32` | `1..=4294967295` |
+| `pps_exit` | `u32` | `0 <= pps_exit < pps_enter` |
+| `observation_window_us` | `u32` | `1..=60000000` microseconds |
+| `enter_windows` | `u16` | `2..=65535` consecutive complete windows |
+| `exit_windows` | `u16` | `1..=65535` consecutive complete windows |
+| `max_busy_us` | `u32` | `1..=1000` microseconds and `<= budget_us` |
+| `empty_rounds` | `u16` | `1..=65535` complete empty device rounds |
+| `budget_window_us` | `u32` | `1..=60000000` microseconds (W) |
+| `budget_us` | `u32` | `0 < budget_us < budget_window_us` (B) |
+
+The only optional child is `datapath.busy_poll.calibration`, also a singleton. All
+its fields are required when present: positive `schema: u16`, positive
+`counting_revision: u32`, `executable_sha256`, `context_sha256`, `parameter_sha256`,
+`status: candidate | qualified`, and `evidence_manifest_sha256`. Each of the four
+digests is exactly 64 lowercase hexadecimal characters. The consumer expects schema
+1/counting revision 1; well-formed other revisions remain Event with a mismatch
+reason, rather than being assumed compatible.
+
+For `candidate`, `evidence_manifest_sha256` binds the **already preregistered
+experiment manifest**, not a future empty promise of results. Candidate eligibility
+also requires the explicit process-start calibration-experiment opt-in; configuration
+reload cannot enable it. For `qualified`, the digest binds the reviewed completed
+qualification evidence manifest. Both statuses require exact executable, actual
+device/context and parameter binding. A digest/status is not a signature, fetched
+measurement, or proof of benefit; configuration supplies no manifest path or URL.
+
+Unknown keys/blocks, duplicate fields/blocks (including merged sections/includes),
+partial blocks, signs, fractions, overflow and invalid bounds reject admission.
+Typed adapters use the same admission rules. Explicit `null` for the new optional
+fields is rejected; the existing `xsk_mode: null` typed-adapter behavior is unchanged.
+There is no global/top-level calibration alias or per-interface quota.
+
+Missing tuning/calibration, mismatched evidence, unavailable required context or
+unproven shared process accounting leave normal Event networking available with an
+eligibility reason. Busy additionally requires sustained separately measured RX or
+TX PPS, concrete pollable device obligations and process credit. RX counts proven
+admitted outcomes, not source receipts; TX counts complete producer publications,
+not descriptors/CQ events. One process ledger permits at most one Busy interval,
+starts with zero credit, charges full BOOTTIME elapsed (including stalls), retains
+debt across reloads and forfeits refill grants crossed by an outstanding interval.
+Busy ends at its bounds/deadlines and yields before reevaluation; quota alone never
+wakes an idle owner. Event processing is not a cap on useful work or total CPU.
+
+These are cooperative safety bounds, not measured thresholds or hard realtime
+guarantees. Clock continuity observations cannot exclude suspend below the retained
+non-atomic-read/resolution uncertainty. No throughput, latency, CPU or energy benefit
+is claimed without completed, reviewed evidence for the exact bound context.
 
 ## Related docs
 

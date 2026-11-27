@@ -7,6 +7,7 @@ honk 使用 dae 配置语法的方言，与 dae 的已知差异见[方言参考]
 | 配置段 | 用途 | 参考 |
 | --- | --- | --- |
 | `global` | 选择接口、拨号行为、健康检查与运行时路径。 | [Global 参考](./reference/global.md) |
+| `datapath` | 显式选择 Linux XDP 捕获与 Direct 执行方式，可选 Core 防火墙/NAT；省略时保留 TC。 | [捕获后端选择](./reference/global.md#捕获后端选择)、[防火墙/NAT](./reference/routing.md#core-转发防火墙与-ipv4-nat) |
 | `node` | 用分享链接声明静态代理节点。 | [节点参考](./reference/nodes.md) |
 | `group` | 在节点与嵌套代理组之间选择。 | [代理组参考](./reference/groups.md) |
 | `routing` | 应用有序流量规则与默认出站。 | [路由参考](./reference/routing.md) |
@@ -31,7 +32,7 @@ honk 使用 dae 配置语法的方言，与 dae 的已知差异见[方言参考]
 - `check_tolerance` 这类毫秒配置项接受裸毫秒数、带 `ms` 的整数或带 `s` 的秒数，`1.5s` 就是 1500 ms。不足 1 ms 的小数部分会舍去；`1.5ms` 和 `m`、`h` 后缀无效。无效值会产生 warning 并保留默认值。
 - 引号外、词法单元开头的 `#` 开始注释；值内部的 `#` 按数据保留。链接的结束引号或订阅 `(UA)` 后缀后面紧贴的 `#` 也算注释，但会产生 `legacy-glued-hash` warning，所以注释前要留空白。词法单元开头的注释里，花括号不会闭合配置块。
 - 成对单引号或双引号内的花括号按数据处理。多余的右花括号 `}` 会被忽略，并报告一条诊断；有未闭合的块时，整个文档都会被拒绝。解析器能定位时，诊断会附上物理行号；错误文本不会回显任意输入内容。
-- 解析器遇到未知的标量 key 会报告诊断并忽略。未知嵌套块整棵子树跳过，不会把里面的内容当成父块内容读取；只有文档列出的 `node` 和 `subscription` 包装块保留兼容遍历。以下情况都是错误：未知的 `experimental` 外层设置、`experimental.native_api` 里的未知内容、旧版 NFQUEUE 中不支持的内容，以及用 `tolerance` 这类组标量命名的块。见[方言参考](./reference/dialect.md#配置段与-include)。
+- 宽松配置段中的未知标量键产生诊断并被忽略，未知嵌套块按完整的已闭合子树跳过，不会将内容摊平到父块。只有文档列出的 `node` 和 `subscription` 包装块保留兼容遍历。未知的 `experimental` 外层设置及旧版 NFQUEUE 中不支持的内容都是错误。`datapath` 扩展采用严格规则：未知设置/块、重复设置/子块、无效值以及不支持的防火墙/NAT 组合会导致配置被拒绝，不会被忽略。见[方言参考](./reference/dialect.md#配置段与-include)。
 
 ### 使用 `include {}` 拆分配置
 
@@ -52,6 +53,28 @@ include {
 所有相对 include 都相对传给 `--config` 的入口配置所在目录解析，嵌套 include 文件里的也一样。加载器会规范化入口目录和每个匹配项的路径；指向该目录之外的绝对路径或符号链接会被拒绝。同一个规范路径的文件，不管是直接重复加载还是循环加载，都会被拒绝。
 
 入口文件自身的配置段始终最先合并，不受 `include` 块位置影响；之后依次合并每个被包含文件及其后代。后出现的标量 key 覆盖先前的值。节点、订阅、组、DNS 上游、固定 TTL 和路由规则这类集合条目，按合并顺序追加。
+
+严格的 `datapath` 配置段不采用标量覆盖合并。每个配置项或子块（包括 `dns_projection`）在所有合并分段和被包含文件中最多声明一次。
+
+XDP Endpoint 网关配置逻辑 LAN 接口（允许带地址的以太网接口或 bond），也可为每个成员选择 Auto：
+
+```dae
+global { nfqueue_enable: false }
+datapath {
+    backend: xdp
+    direct: endpoint
+    xsk_mode: auto
+    interface { bond0: lan }
+}
+routing {
+    dip(10.10.10.1) && dport(53) -> direct(must)
+    fallback: direct
+}
+```
+
+只有该地址的本机 listener 应接收 53 流量时才需要 DNS 规则，并须放在域名规则之前。见[网关准入与限制](./design/datapath.md#full-xdp-启动)。
+
+XDP Endpoint LAN 默认可用本 LAN 学到的 DNS 应答，将符合条件的 TCP SYN 或完整 UDP 数据报交给内核路由。需要重组的 IP 分片不能建立 DNS 原生 UDP 流。除物理捕获口外，还可声明 `wg0: l3_lan` 作为独立的[辅助 LAN](./reference/global.md#辅助-l3-lan)。设置 `datapath.dns_projection: false` 并重启可对两个协议关闭 [DNS 派生路由](./reference/global.md#xdp-endpoint-dns-投影)。 可另配[本机出口](./reference/global.md#xdp-host-endpoint)，共用独立的 Host DNS 域；它不授予 LAN DNS 事实。
 
 ## 运行时数据目录
 

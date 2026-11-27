@@ -70,6 +70,7 @@ async fn serve_stale_with_configured_reply_ttl_updates_wire_and_outcome() {
     assert_eq!(stale.provenance(), Provenance::Stale);
     assert_eq!(extract_min_ttl(stale.rendered()), 7);
     assert_eq!(stale.expiry().ttl(), Duration::from_secs(7));
+    assert!(stale.projection_lifetime().is_none());
 }
 
 #[tokio::test]

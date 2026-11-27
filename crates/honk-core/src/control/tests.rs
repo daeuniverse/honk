@@ -5,8 +5,8 @@ use crate::control::udp_endpoint::UdpEndpoint;
 use crate::dns::query::{IngressProfile, is_exact_dns_query, validate_exact_dns_query};
 #[cfg(feature = "native-api")]
 pub(super) mod reload_harness;
-pub(super) mod support;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+pub(crate) mod support;
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 use support::KernelUdpReplySocketFactory;
 use support::{
     FailingUdpTestReplySocketFactory, UdpTestHandler, UdpTestMode, addr, assert_udp_outbound,
@@ -16,22 +16,64 @@ use support::{
 };
 
 mod admission;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 mod bond_binding;
 mod diagnostics;
 mod dns_tcp_ownership;
 mod dns_udp_ownership;
 mod health;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 mod nfqueue_retirement;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 mod tcp_binding;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 mod tcp_tuple_reuse;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 mod udp_fullcone;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 mod vlan_frames;
+
+#[tokio::test]
+async fn shutdown_intent_wakes_all_waiters_before_a_blocked_command_send() {
+    let plane = control_plane(Config::default());
+    let signal = plane.shutdown_intent();
+    let commands = plane.command_sender();
+    let _reserved = commands
+        .reserve_many(commands.max_capacity())
+        .await
+        .unwrap();
+    let (ready, mut registered) = tokio::sync::mpsc::channel(2);
+    let mut waiters = tokio::task::JoinSet::new();
+    for _ in 0..2 {
+        let signal = Arc::clone(&signal);
+        let ready = ready.clone();
+        waiters.spawn(async move {
+            let notified = signal.wait();
+            tokio::pin!(notified);
+            assert!(futures::poll!(&mut notified).is_pending());
+            ready.send(()).await.unwrap();
+            notified.await;
+        });
+    }
+    for _ in 0..2 {
+        registered.recv().await.unwrap();
+    }
+    let request = async {
+        signal.request();
+        commands.send(ControlCommand::Shutdown).await.unwrap();
+    };
+    tokio::pin!(request);
+    assert!(futures::poll!(&mut request).is_pending());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        for _ in 0..2 {
+            waiters.join_next().await.unwrap().unwrap();
+        }
+        signal.wait().await;
+    })
+    .await
+    .expect("all current and late shutdown waiters progress while command admission is blocked");
+    assert!(futures::poll!(&mut request).is_pending());
+}
 
 #[tokio::test]
 async fn health_push_re_resolves_after_reload_writer() {
@@ -72,7 +114,7 @@ async fn health_push_re_resolves_after_reload_writer() {
     };
     let routing_plan = Arc::new(parking_lot::RwLock::new(compile(&old_config, 1)));
     let alive_set = Arc::new(AliveDialerSet::new());
-    let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
+    let ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> = Arc::new(RwLock::new(Box::new(
         crate::ebpf::mock::MockEbpfBackend::new(),
     )));
     let health_publisher = Arc::new(runtime::OutboundHealthPublisher::new(
@@ -105,7 +147,7 @@ async fn health_push_re_resolves_after_reload_writer() {
     assert!(backend.get_outbound_alive(3, 1, 0).unwrap());
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[test]
 fn nfqueue_actor_queue_bounds_small_and_max_payloads() {
     let stats = Arc::new(StatsManager::new());
@@ -140,7 +182,7 @@ fn nfqueue_actor_queue_bounds_small_and_max_payloads() {
     assert_eq!(empty.actor_oldest_age_nanos, 0);
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[tokio::test]
 async fn nfqueue_startup_degradation_clears_config_and_effective_flag() {
     use honk_ebpf_common::{DATAPATH_FLAG_NFQ_ENABLED, DATAPATH_FLAG_NFQ_READY};
@@ -209,7 +251,7 @@ async fn nfqueue_startup_degradation_clears_config_and_effective_flag() {
     );
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[test]
 fn nfqueue_actor_acquires_slow_permits_only_at_dequeue() {
     let limit = Arc::new(tokio::sync::Semaphore::new(1));
@@ -226,7 +268,7 @@ fn nfqueue_actor_acquires_slow_permits_only_at_dequeue() {
     assert!(queue.dequeue(0, true).is_some());
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[test]
 fn nfqueue_token_retry_backoff_caps_at_thirty_seconds() {
     let mut backoff = NfqueueTokenRetryBackoff::default();
@@ -618,7 +660,14 @@ async fn ready_udp_endpoint(
     let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()
         .unwrap();
-    let mut lease = match pool.reserve_or_enqueue(client, dst, b"bootstrap", slow_permit, stats) {
+    let mut lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"bootstrap",
+        slow_permit,
+        stats,
+    ) {
         crate::control::udp_endpoint::EndpointReservation::Initializing(lease) => lease,
         _ => panic!("test endpoint must reserve a fresh lease"),
     };
@@ -626,6 +675,7 @@ async fn ready_udp_endpoint(
     let queue_rx = lease.take_queue_receiver().unwrap();
     let reply_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         lease.generation(),
@@ -669,7 +719,10 @@ async fn routing_reload_retires_direct_udp_sockets_but_unrelated_reload_preserve
         .unwrap()
         .unwrap();
     assert_eq!(&packet[..len], b"first");
-    let first = plane.udp_pool.get(client, target).unwrap();
+    let first = plane
+        .udp_pool
+        .get(honk_datapath::ScopeId::HOST, client, target)
+        .unwrap();
     assert!(
         plane
             .reload_runtime_config(config.clone(), Default::default())
@@ -701,14 +754,19 @@ async fn routing_reload_retires_direct_udp_sockets_but_unrelated_reload_preserve
             outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
             priority: 0,
             must: false,
-            mark: 0x321,
+            mark: Some(0x321),
         });
     assert!(
         plane
             .reload_runtime_config(config, Default::default())
             .await
     );
-    assert!(plane.udp_pool.get(client, target).is_none());
+    assert!(
+        plane
+            .udp_pool
+            .get(honk_datapath::ScopeId::HOST, client, target)
+            .is_none()
+    );
     serve_test_udp_to(&handle, client, target, b"new mark")
         .await
         .unwrap();
@@ -719,7 +777,10 @@ async fn routing_reload_retires_direct_udp_sockets_but_unrelated_reload_preserve
     assert_eq!(&packet[..len], b"new mark");
     assert!(!Arc::ptr_eq(
         &first,
-        &plane.udp_pool.get(client, target).unwrap()
+        &plane
+            .udp_pool
+            .get(honk_datapath::ScopeId::HOST, client, target)
+            .unwrap()
     ));
     assert!(plane.udp_pool.shutdown().await.joined);
 }
@@ -1225,10 +1286,10 @@ fn dae0_internal_addr_covers_real_dae0_addresses() {
     // addresses assigned by the netns setup; this pins the crate-root
     // DAENS_* strings to the DAE0_* constants in honk-ebpf-common.
     for s in [
-        crate::daens::DAENS_HOST_IPV6,
-        crate::daens::DAENS_PEER_IPV6,
-        crate::daens::DAENS_HOST_IP,
-        crate::daens::DAENS_PEER_IP,
+        crate::dae0_addresses::DAENS_HOST_IPV6,
+        crate::dae0_addresses::DAENS_PEER_IPV6,
+        crate::dae0_addresses::DAENS_HOST_IP,
+        crate::dae0_addresses::DAENS_PEER_IP,
     ] {
         let ip: std::net::IpAddr = s.parse().unwrap();
         assert!(
@@ -1460,14 +1521,20 @@ pub(in crate::control) async fn store_active_tcp_flow(
         client_addr.port(),
         6,
     );
-    handle.ebpf.write().await.tcp_conn_state_store(
-        &tuples,
-        &honk_ebpf_common::conn::ConnState {
-            state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
-            last_seen_ns: 1,
-            ..Default::default()
-        },
-    )?;
+    handle
+        .ebpf
+        .write()
+        .await
+        .tc_mut()
+        .unwrap()
+        .tcp_conn_state_store(
+            &tuples,
+            &honk_ebpf_common::conn::ConnState {
+                state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
+                last_seen_ns: 1,
+                ..Default::default()
+            },
+        )?;
     Ok(())
 }
 
@@ -1574,7 +1641,9 @@ async fn udp_domain_reality_uses_client_source() -> anyhow::Result<()> {
         .next()
         .expect("ready UDP endpoint must be tracked");
     assert_eq!(tracked.domain.as_deref(), Some("source.test"));
-    handle.udp_pool.remove(client, original_dst);
+    handle
+        .udp_pool
+        .remove(honk_datapath::ScopeId::HOST, client, original_dst);
     Ok(())
 }
 
@@ -1610,7 +1679,9 @@ async fn udp_domain_plus_passes_sniffed_proxy_target_without_rerouting() -> anyh
         .expect("UDP transport dial was captured");
     assert_eq!(target, original_dst);
     assert_eq!(domain.as_deref(), Some("source.test"));
-    handle.udp_pool.remove(client, original_dst);
+    handle
+        .udp_pool
+        .remove(honk_datapath::ScopeId::HOST, client, original_dst);
     Ok(())
 }
 
@@ -1965,7 +2036,9 @@ async fn native_tcp_accounting_updates_before_close() -> anyhow::Result<()> {
         assert_eq!(body["udp"][0]["download_bytes"], "6");
         let totals = handle.stats.snapshot();
         assert_eq!((totals["G"].tx_bytes, totals["G"].rx_bytes), (12, 14));
-        handle.udp_pool.remove(source, target);
+        handle
+            .udp_pool
+            .remove(honk_datapath::ScopeId::HOST, source, target);
         native.shutdown().await;
     }
     retirement.join(&handle).await?;
@@ -2049,7 +2122,10 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
     .await?;
 
     let synthetic_now = TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS + stale_timestamp + 1;
-    let janitor = BpfJanitor::new(handle.ebpf.clone(), handle.tcp_flow_pins.clone());
+    let janitor = BpfJanitor::new(
+        handle.tc_kernel.clone().unwrap(),
+        handle.tcp_flow_pins.clone(),
+    );
     assert_eq!(
         janitor.cleanup_conn_state_for_test(synthetic_now).await,
         (0, 1)
@@ -2059,7 +2135,9 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
         (0, 1)
     );
     {
-        let backend = handle.ebpf.read().await;
+        let backend = tokio::sync::RwLockReadGuard::map(handle.ebpf.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         assert!(backend.conn_state_lookup(&tuples)?.is_some());
         assert!(backend.redirect_track_lookup(&redirect_key)?.is_some());
     }
@@ -2090,7 +2168,9 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
     handler_result??;
 
     {
-        let backend = handle.ebpf.read().await;
+        let backend = tokio::sync::RwLockReadGuard::map(handle.ebpf.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         assert!(backend.conn_state_lookup(&tuples)?.is_none());
     }
     assert!(handle.tcp_flow_pins.snapshot().is_empty());
@@ -2383,14 +2463,20 @@ async fn tcp_tracker_keeps_the_dial_selection_snapshot() -> anyhow::Result<()> {
         client_addr.port(),
         6,
     );
-    handle.ebpf.write().await.tcp_conn_state_store(
-        &tuples,
-        &honk_ebpf_common::conn::ConnState {
-            state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
-            last_seen_ns: 1,
-            ..Default::default()
-        },
-    )?;
+    handle
+        .ebpf
+        .write()
+        .await
+        .tc_mut()
+        .unwrap()
+        .tcp_conn_state_store(
+            &tuples,
+            &honk_ebpf_common::conn::ConnState {
+                state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
+                last_seen_ns: 1,
+                ..Default::default()
+            },
+        )?;
     let task_handle = handle.clone();
     let mut task =
         tokio::spawn(async move { task_handle.serve_connection(accepted, client_addr).await });
@@ -2543,9 +2629,11 @@ async fn udp_tracker_uses_the_udp_selection_snapshot() -> anyhow::Result<()> {
         .expect("ready UDP endpoint must be tracked");
     assert_eq!(tracked.proxy, "udp-node");
     assert_eq!(tracked.chains, vec!["udp-node", "traffic"]);
-    handle
-        .udp_pool
-        .remove(addr("10.0.0.2:53000"), addr("203.0.113.2:443"));
+    handle.udp_pool.remove(
+        honk_datapath::ScopeId::HOST,
+        addr("10.0.0.2:53000"),
+        addr("203.0.113.2:443"),
+    );
     Ok(())
 }
 
@@ -3428,8 +3516,15 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
             validated,
             ..
         } => {
-            dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated, None)
-                .await;
+            dns.handle_udp_dns_admitted(
+                &admission,
+                &data,
+                (client, dst),
+                validated,
+                super::dns_control::DnsUdpReply::Kernel,
+                None,
+            )
+            .await;
         }
         _ => panic!("strict DNS must not enter the Ready endpoint queue"),
     }
@@ -3459,7 +3554,14 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
     let init_permit = Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()
         .unwrap();
-    let lease = match pool.reserve_or_enqueue(client, dst, b"bootstrap", init_permit, &stats) {
+    let lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"bootstrap",
+        init_permit,
+        &stats,
+    ) {
         crate::control::udp_endpoint::EndpointReservation::Initializing(lease) => lease,
         _ => panic!("DNS+Initializing fixture must reserve"),
     };
@@ -3493,8 +3595,15 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
             validated,
             ..
         } => {
-            dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated, None)
-                .await;
+            dns.handle_udp_dns_admitted(
+                &admission,
+                &data,
+                (client, dst),
+                validated,
+                super::dns_control::DnsUdpReply::Kernel,
+                None,
+            )
+            .await;
         }
         _ => panic!("strict DNS must not enter the Initializing endpoint queue"),
     }
@@ -3521,7 +3630,14 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
     let init_permit = Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()
         .unwrap();
-    let lease = match pool.reserve_or_enqueue(client, dst, b"first", init_permit, &stats) {
+    let lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        init_permit,
+        &stats,
+    ) {
         crate::control::udp_endpoint::EndpointReservation::Initializing(lease) => lease,
         _ => panic!("follower fixture must initialize"),
     };
@@ -3555,7 +3671,7 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
         super::UdpSlowPathWork::Dns { .. } | super::UdpSlowPathWork::DnsRefused { .. } => {
             panic!("non-DNS follower must not take the DNS branch")
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         super::UdpSlowPathWork::QueuedDatagram { .. } => {
             panic!("socket follower must not defer queue publication")
         }
@@ -4503,7 +4619,7 @@ fn link_lifecycle_cp(backend: crate::ebpf::mock::MockEbpfBackend) -> ControlPlan
     .unwrap()
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[tokio::test]
 async fn exhausted_udp_tokens_wait_for_a_rollback_safe_generation() {
     use honk_ebpf_common::conn::{ConnState, UdpDecisionState};
@@ -4539,6 +4655,8 @@ async fn exhausted_udp_tokens_wait_for_a_rollback_safe_generation() {
             .ebpf
             .read()
             .await
+            .tc()
+            .unwrap()
             .udp_decision_sequence_status()
             .unwrap()
             .exhausted()
@@ -4546,7 +4664,10 @@ async fn exhausted_udp_tokens_wait_for_a_rollback_safe_generation() {
 
     for index in [2, 3] {
         {
-            let mut backend = control.ebpf.write().await;
+            let mut backend =
+                tokio::sync::RwLockWriteGuard::map(control.ebpf.write().await, |backend| {
+                    backend.tc_mut().unwrap()
+                });
             let expected = backend.conn_state_lookup(&keys[index]).unwrap().unwrap();
             backend
                 .retire_batch(
@@ -4572,6 +4693,8 @@ async fn exhausted_udp_tokens_wait_for_a_rollback_safe_generation() {
             .ebpf
             .read()
             .await
+            .tc()
+            .unwrap()
             .udp_decision_sequence_status()
             .unwrap(),
         crate::ebpf::UdpDecisionSequenceStatus {
@@ -4667,14 +4790,15 @@ async fn retirement_worker_retires_legacy_token_zero_conn_state() {
         },
     )
     .unwrap();
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(mock)));
     let pool = Arc::new(UdpEndpointPool::new());
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
     let pins = Arc::new(connection::handoff::TcpFlowPins::default());
     let port = Arc::new(RetirementPort::default());
     let removal_task = spawn_retirement_worker(
         Arc::clone(&pool),
-        Arc::clone(&backend),
+        crate::control::TcKernelController::for_test(Arc::clone(&backend)),
         Arc::new(ConnectionTracker::new()),
         fatal_tx,
         Arc::clone(&pins),
@@ -4684,6 +4808,7 @@ async fn retirement_worker_retires_legacy_token_zero_conn_state() {
         .try_acquire_owned()
         .unwrap();
     let lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         b"legacy first datagram",
@@ -4701,6 +4826,8 @@ async fn retirement_worker_retires_legacy_token_zero_conn_state() {
         backend
             .read()
             .await
+            .tc()
+            .unwrap()
             .conn_state_lookup(&key)
             .unwrap()
             .is_none()
@@ -4729,20 +4856,22 @@ async fn retirement_worker_acknowledges_superseding_token() {
         },
     )
     .unwrap();
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(mock)));
     let pool = Arc::new(UdpEndpointPool::new());
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
     let pins = Arc::new(connection::handoff::TcpFlowPins::default());
     let port = Arc::new(RetirementPort::default());
     let removal_task = spawn_retirement_worker(
         Arc::clone(&pool),
-        Arc::clone(&backend),
+        crate::control::TcKernelController::for_test(Arc::clone(&backend)),
         Arc::new(ConnectionTracker::new()),
         fatal_tx,
         Arc::clone(&pins),
         Arc::clone(&port),
     );
     let lease = match pool.reserve_owned_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         Bytes::from_static(b"held datagram"),
@@ -4764,6 +4893,8 @@ async fn retirement_worker_acknowledges_superseding_token() {
         backend
             .read()
             .await
+            .tc()
+            .unwrap()
             .conn_state_lookup(&key)
             .unwrap()
             .unwrap()
@@ -4802,20 +4933,22 @@ async fn retirement_worker_escalates_auxiliary_token_mismatch() {
         },
     )
     .unwrap();
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(mock)));
     let pool = Arc::new(UdpEndpointPool::new());
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
     let pins = Arc::new(connection::handoff::TcpFlowPins::default());
     let port = Arc::new(RetirementPort::default());
     let removal_task = spawn_retirement_worker(
         Arc::clone(&pool),
-        Arc::clone(&backend),
+        crate::control::TcKernelController::for_test(Arc::clone(&backend)),
         Arc::new(ConnectionTracker::new()),
         fatal_tx,
         Arc::clone(&pins),
         Arc::clone(&port),
     );
     let lease = match pool.reserve_owned_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         client,
         dst,
         Bytes::from_static(b"held datagram"),
@@ -4841,6 +4974,8 @@ async fn retirement_worker_escalates_auxiliary_token_mismatch() {
         backend
             .read()
             .await
+            .tc()
+            .unwrap()
             .conn_state_lookup(&key)
             .unwrap()
             .unwrap()
@@ -4852,7 +4987,7 @@ async fn retirement_worker_escalates_auxiliary_token_mismatch() {
     removal_task.await.unwrap();
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 fn fresh_test_netns() -> std::os::fd::OwnedFd {
     std::thread::spawn(|| {
         nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).expect("unshare test netns");
@@ -4864,7 +4999,7 @@ fn fresh_test_netns() -> std::os::fd::OwnedFd {
     .expect("create test netns")
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 fn in_test_netns<T>(netns: &std::os::fd::OwnedFd, f: impl FnOnce() -> T) -> T {
     let current = std::fs::File::open("/proc/thread-self/ns/net").expect("open current netns");
     nix::sched::setns(netns, nix::sched::CloneFlags::CLONE_NEWNET).expect("enter test netns");
@@ -4876,10 +5011,10 @@ fn in_test_netns<T>(netns: &std::os::fd::OwnedFd, f: impl FnOnce() -> T) -> T {
     }
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 const NETNS_TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 fn wait_for_test_address(address: std::net::IpAddr) {
     let std::net::IpAddr::V6(address) = address else {
         return;
@@ -4908,7 +5043,7 @@ fn wait_for_test_address(address: std::net::IpAddr) {
     }
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 fn configure_test_edge(
     netns: &std::os::fd::OwnedFd,
     interface: &str,
@@ -4985,7 +5120,7 @@ fn configure_test_edge(
     })
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 #[test]
 #[ignore = "requires root, bpffs, nftables, and eBPF TC support"]
 fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
@@ -5103,7 +5238,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                     ),
                     priority: 0,
                     must: false,
-                    mark: 0,
+                    mark: None,
                 });
             config
                 .routing
@@ -5119,7 +5254,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                     ),
                     priority: 0,
                     must: false,
-                    mark: 0,
+                    mark: None,
                 });
             let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
             let mut control = ControlPlane::new(
@@ -5173,7 +5308,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             let (removal_fatal_tx, mut removal_fatal_rx) = mpsc::unbounded_channel();
             let removal_task = spawn_retirement_worker(
                 Arc::clone(&control.udp_pool),
-                Arc::clone(&control.ebpf),
+                control.tc_kernel.clone().unwrap(),
                 Arc::clone(&control.connection_tracker),
                 removal_fatal_tx,
                 Arc::clone(&control.tcp_flow_pins),
@@ -5374,15 +5509,15 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
     .map_err(|_| anyhow::anyhow!("NFQUEUE network test thread panicked"))?
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 struct NfqueueRuntimeFixture {
     runtime: NfqueueRuntime,
     listener_fatal_tx: tokio::sync::oneshot::Sender<honk_nfqueue::FatalError>,
     pending: Arc<nfqueue::PendingUdpVerdicts>,
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 fn stop_waiting_task(stop: &tokio::sync::watch::Sender<bool>) -> tokio::task::JoinHandle<()> {
     let mut rx = stop.subscribe();
     tokio::spawn(async move {
@@ -5390,7 +5525,7 @@ fn stop_waiting_task(stop: &tokio::sync::watch::Sender<bool>) -> tokio::task::Jo
     })
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 fn nfqueue_runtime_fixture(
     watchdog: tokio::task::JoinHandle<()>,
     ingest_worker: tokio::task::JoinHandle<()>,
@@ -5398,7 +5533,7 @@ fn nfqueue_runtime_fixture(
     stop: tokio::sync::watch::Sender<bool>,
 ) -> NfqueueRuntimeFixture {
     let stats = Arc::new(StatsManager::new());
-    let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
+    let ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> = Arc::new(RwLock::new(Box::new(
         crate::ebpf::mock::MockEbpfBackend::new(),
     )));
     let (pending, pending_fatal) = nfqueue::PendingUdpVerdicts::new(
@@ -5433,7 +5568,7 @@ fn nfqueue_runtime_fixture(
     }
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[tokio::test]
 async fn nfqueue_watchdog_exit_completes_shutdown_without_double_join() {
     let (stop, _) = tokio::sync::watch::channel(false);
@@ -5461,7 +5596,7 @@ async fn nfqueue_watchdog_exit_completes_shutdown_without_double_join() {
     assert!(!fixture.listener_fatal_tx.is_closed());
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[tokio::test]
 async fn nfqueue_ingest_actor_exit_completes_shutdown_without_double_join() {
     let (stop, _) = tokio::sync::watch::channel(false);
@@ -5489,7 +5624,7 @@ async fn nfqueue_ingest_actor_exit_completes_shutdown_without_double_join() {
     assert!(!fixture.listener_fatal_tx.is_closed());
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[tokio::test]
 async fn nfqueue_stats_sampler_exit_completes_shutdown_without_double_join() {
     let (stop, _) = tokio::sync::watch::channel(false);

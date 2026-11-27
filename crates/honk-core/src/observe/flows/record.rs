@@ -140,7 +140,7 @@ pub(crate) struct RouteInput {
 }
 
 impl RouteInput {
-    fn heap_bytes(&self) -> usize {
+    pub(crate) fn heap_bytes(&self) -> usize {
         optional_bytes([&self.domain, &self.pname, &self.src_mac])
             + self.domain_rule_ids.as_ref().map_or(0, |ids| {
                 ids.capacity() * size_of::<String>()
@@ -159,7 +159,7 @@ impl From<&crate::routing::ConnectionInfo> for RouteInput {
             dst_port: input.dst_port,
             domain: input.domain.clone(),
             pname: input.process_name.clone(),
-            src_mac: input.mac.clone(),
+            src_mac: input.mac.map(crate::routing::mac_string),
             dscp: input.dscp,
             mark: (),
             ingress: None,
@@ -350,6 +350,7 @@ pub(crate) enum StepData {
         rules: Vec<RuleEvaluation>,
         outbound: Option<String>,
         must: Option<bool>,
+        mark_kind: Option<u32>,
         mark: Option<u32>,
         input: Option<EvaluationInput>,
         dns_action: Option<&'static str>,

@@ -1,15 +1,15 @@
 //! Process-scoped standalone DNS listener for `dns.bind`.
 //!
-//! These sockets are ordinary host-netns listeners. They deliberately do not
-//! carry proxy marks and never enter `daens`; only the transparent port-53
-//! listeners use that machinery.
+//! Required bypass marks follow the packet backend's listener setup.
 
 use super::ConnectionGuard;
 use crate::control::dns_control::DnsController;
 use crate::control::drain::DrainTracker;
+use crate::dns::projection::QueryScope;
 use crate::dns::query::{DnsRequestMeta, validate_exact_dns_query};
 use crate::stats::StatsManager;
 use honk_config::dns::DnsBindEndpoint;
+use honk_datapath::ScopeId;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
@@ -57,6 +57,17 @@ fn udp_response_source(meta: &super::sockets::UdpRecvMeta) -> Option<(IpAddr, u3
         .or_else(|| (!meta.local_addr.ip().is_unspecified()).then_some((meta.local_addr.ip(), 0)))
 }
 
+fn peer_query_scope(
+    peer: SocketAddr,
+    (standalone, host): (Option<QueryScope>, Option<QueryScope>),
+) -> Option<QueryScope> {
+    if host.is_some() && peer.ip().to_canonical().is_loopback() {
+        host
+    } else {
+        standalone
+    }
+}
+
 async fn send_bound_udp_response(
     socket: &UdpSocket,
     response: &[u8],
@@ -80,6 +91,21 @@ enum ListenerPhase {
     Abort,
 }
 
+pub(crate) struct PreparedDnsBind {
+    pub(super) endpoint: DnsBindEndpoint,
+    candidates: Vec<SocketAddr>,
+}
+
+impl PreparedDnsBind {
+    pub(super) fn new(endpoint: DnsBindEndpoint) -> io::Result<Self> {
+        let candidates = resolve_bind_addresses(&endpoint)?;
+        Ok(Self {
+            endpoint,
+            candidates,
+        })
+    }
+}
+
 /// Synchronously bound sockets. Keeping binding separate from spawning makes
 /// dual-transport startup atomic: no supervisor exists until every selected
 /// socket has successfully bound.
@@ -91,11 +117,18 @@ pub(super) struct BoundDnsListener {
 }
 
 impl BoundDnsListener {
-    pub(super) fn bind(endpoint: &DnsBindEndpoint) -> io::Result<Self> {
-        let candidates = resolve_bind_addresses(endpoint)?;
+    pub(super) fn bind(endpoint: &DnsBindEndpoint, egress_mark: Option<u32>) -> io::Result<Self> {
+        Self::bind_prepared(&PreparedDnsBind::new(endpoint.clone())?, egress_mark)
+    }
+
+    pub(super) fn bind_prepared(
+        prepared: &PreparedDnsBind,
+        egress_mark: Option<u32>,
+    ) -> io::Result<Self> {
+        let endpoint = &prepared.endpoint;
         let mut last_error = None;
 
-        for candidate in candidates {
+        for &candidate in &prepared.candidates {
             let attempts =
                 if candidate.port() == 0 && endpoint.tcp_enabled() && endpoint.udp_enabled() {
                     EPHEMERAL_BIND_ATTEMPTS
@@ -103,7 +136,12 @@ impl BoundDnsListener {
                     1
                 };
             for _ in 0..attempts {
-                match bind_selected(candidate, endpoint.tcp_enabled(), endpoint.udp_enabled()) {
+                match bind_selected(
+                    candidate,
+                    endpoint.tcp_enabled(),
+                    endpoint.udp_enabled(),
+                    egress_mark,
+                ) {
                     Ok(bound) => return Ok(bound),
                     Err(error) => last_error = Some(error),
                 }
@@ -118,6 +156,7 @@ impl BoundDnsListener {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn(
         self,
         controller: Arc<DnsController>,
@@ -126,6 +165,7 @@ impl BoundDnsListener {
         drain: Arc<DrainTracker>,
         native: Option<Arc<crate::observe::Observation>>,
         diagnostics: crate::config_diagnostics::SharedDiagnostics,
+        fact_scope: ScopeId,
     ) -> io::Result<DnsListener> {
         let Self { tcp, udp, .. } = self;
         let address = match (&tcp, &udp) {
@@ -166,6 +206,7 @@ impl BoundDnsListener {
                     phase_rx.clone(),
                     native.clone(),
                     diagnostics.clone(),
+                    fact_scope,
                 ));
             }
         }
@@ -181,6 +222,7 @@ impl BoundDnsListener {
                 native,
                 #[cfg(feature = "native-api")]
                 diagnostics,
+                fact_scope,
             ));
         }
 
@@ -279,13 +321,33 @@ fn resolve_bind_addresses(endpoint: &DnsBindEndpoint) -> io::Result<Vec<SocketAd
     Ok(addresses)
 }
 
-fn bind_tcp_listener(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
+fn set_listener_mark(socket: &socket2::Socket, egress_mark: Option<u32>) -> io::Result<()> {
+    if let Some(mark) = egress_mark {
+        #[cfg(target_os = "linux")]
+        honk_outbound::util::set_mark_verified(socket, mark)?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (socket, mark);
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TUN requires Linux",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn bind_tcp_listener(
+    addr: SocketAddr,
+    egress_mark: Option<u32>,
+) -> io::Result<std::net::TcpListener> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    set_listener_mark(&socket, egress_mark)?;
     if addr.is_ipv6() && addr.ip().is_unspecified() {
         socket.set_only_v6(false)?;
     }
@@ -299,13 +361,17 @@ fn bind_tcp_listener(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
     Ok(socket.into())
 }
 
-fn bind_udp_listener(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+fn bind_udp_listener(
+    addr: SocketAddr,
+    egress_mark: Option<u32>,
+) -> io::Result<std::net::UdpSocket> {
     let domain = if addr.is_ipv4() {
         socket2::Domain::IPV4
     } else {
         socket2::Domain::IPV6
     };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    set_listener_mark(&socket, egress_mark)?;
     if addr.is_ipv6() && addr.ip().is_unspecified() {
         socket.set_only_v6(false)?;
     }
@@ -321,6 +387,7 @@ fn bind_selected(
     addr: SocketAddr,
     tcp_enabled: bool,
     udp_enabled: bool,
+    egress_mark: Option<u32>,
 ) -> io::Result<BoundDnsListener> {
     debug_assert!(tcp_enabled || udp_enabled);
 
@@ -328,7 +395,7 @@ fn bind_selected(
     // selected port. A cross-protocol collision drops both sockets and the
     // caller retries with another kernel-selected port.
     let udp = if udp_enabled {
-        let socket = bind_udp_listener(addr)?;
+        let socket = bind_udp_listener(addr, egress_mark)?;
         Some(socket)
     } else {
         None
@@ -339,7 +406,7 @@ fn bind_selected(
         _ => addr,
     };
     let tcp = if tcp_enabled {
-        let listener = bind_tcp_listener(selected_addr)?;
+        let listener = bind_tcp_listener(selected_addr, egress_mark)?;
         Some(listener)
     } else {
         None
@@ -359,6 +426,7 @@ fn bind_selected(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_udp_supervisor(
     socket: Arc<UdpSocket>,
     controller: Arc<DnsController>,
@@ -367,6 +435,7 @@ async fn run_udp_supervisor(
     mut phase: watch::Receiver<ListenerPhase>,
     native: Option<Arc<crate::observe::Observation>>,
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
+    fact_scope: ScopeId,
 ) -> anyhow::Result<()> {
     let mut batch = super::sockets::UdpRecvBatch::new()?;
     let mut children = JoinSet::new();
@@ -402,6 +471,8 @@ async fn run_udp_supervisor(
                     continue;
                 }
                 let received = batch.len();
+                // Pin the receive's Host activity before any reply in it can yield.
+                let batch_scopes = controller.listener_query_scopes(fact_scope);
                 for index in 0..received {
                     let (query, client_addr, meta) = match batch.packet(index) {
                         Ok(packet) => packet,
@@ -449,7 +520,8 @@ async fn run_udp_supervisor(
                         continue;
                     }
 
-                    let admission = match controller.try_admit_query(true) {
+                    let query_scope = peer_query_scope(client_addr, batch_scopes);
+                    let admission = match controller.try_admit_bound_query(true, query_scope) {
                         Ok(admission) => {
                             stats.record_udp_slow_permit_accepted();
                             admission
@@ -646,6 +718,7 @@ async fn run_tcp_supervisor(
     mut phase: watch::Receiver<ListenerPhase>,
     #[cfg(feature = "native-api")] native: Option<Arc<crate::observe::Observation>>,
     #[cfg(feature = "native-api")] diagnostics: crate::config_diagnostics::SharedDiagnostics,
+    fact_scope: ScopeId,
 ) -> anyhow::Result<()> {
     let mut children = JoinSet::new();
     let mut failure = None;
@@ -681,6 +754,8 @@ async fn run_tcp_supervisor(
                 if *phase.borrow() != ListenerPhase::Running || drain.should_reject() {
                     continue;
                 }
+                let scopes = controller.listener_query_scopes(fact_scope);
+                let Some(connection_scope) = peer_query_scope(client_addr, scopes) else { continue };
                 let standalone_permit = match Arc::clone(&standalone_tcp_limit).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
@@ -710,7 +785,7 @@ async fn run_tcp_supervisor(
                     let _permit = permit;
                     let _standalone_permit = standalone_permit;
                     let _guard = guard;
-                    let operation = child_controller.serve_bound_tcp_dns(&mut stream, client_addr);
+                    let operation = child_controller.serve_bound_tcp_dns(&mut stream, client_addr, connection_scope);
                     #[cfg(feature = "native-api")]
                     let result = match observer {
                         Some(observer) => observer.scope(operation).await,

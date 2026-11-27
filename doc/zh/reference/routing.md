@@ -2,6 +2,12 @@
 
 `routing { ... }` 按顺序匹配流量，再把命中的流量交给指定的出站。
 
+## XDP Endpoint 网关
+
+D1 遵循配置的规则顺序。静态放行要求终态 Direct：普通 Direct 需要 Rule mode、目的端口非 53 且 direct finality 成立；可静态决定的 `direct(must)` 也可覆盖 53。不能越过更早命中的 block/proxy。遇到实际可达的 domain/geosite 条件时，静态求值停止；此后只有[源自同一 LAN 的 DNS 投影](./global.md#xdp-endpoint-dns-投影)可授权纯 TCP SYN 或完整 UDP 数据报走内核路由，绝不授权目的端口 53。源 MAC、IP、端口、协议及 DSCP 可用；LAN pname 为 Missing，正向不匹配、否定匹配。未启用 Host 时 pname 规则通过 `pname_routing` 报告降级，本机发起的流留在内核。mode 在运行时读取。
+
+本机 DNS listener 需要接收流量时，可在域名规则前配置合适的静态规则，例如 `dip(10.10.10.1) && dport(53) -> direct(must)`；honk 不自动生成此规则。
+
 ## 完整示例
 
 ```dae
@@ -87,6 +93,8 @@ routing {
 `pname(...)` 把子串模式按 15 字节规范化，再匹配 `argv[0]` 里可执行文件的 basename。
 
 运行时没有 BTF 偏移，或没有 verifier 允许的内核 argv 访问方式时，cgroup hook 同步改用调用线程的 `comm`。只匹配 honk 所在主机上的进程，不匹配 LAN 客户端上的应用。
+
+TUN 中使用 `pname` 或其否定形式，要求同时配置 `host_facts: true` 与 `queues: 1`。进程事实来自确有该信息的已认证应用 socket Host 记录。plain 或单条记录缺失时只匹配否定谓词。plain 可以包含两种流量，即本机发起和转发流量。参见 [Linux TUN Endpoint](./global.md#linux-tun-endpoint)。
 
 ```dae
 routing {
@@ -174,11 +182,27 @@ honk 只嗅探数据路径交给控制面的流量；TC hook 留在 Linux 原生
 
 ## 策略路由 mark
 
-`direct(mark: 512)` 与 `direct(mark: 0x200)` 选择相同的直连 mark。无前缀数字按十进制解析，包括前导零；`0x`/`0X` 前缀表示十六进制。范围为 `0..=0x3fffffff`；`0xc0000000` 位属于数据路径，不供用户策略使用。二进制/八进制前缀、下划线、正负号、溢出、未知选项以及重复的 `mark`/`must` 选项均拒绝配置；与全局 mark 标量不同，格式错误的直连 mark 不会静默变为零。mark 只支持 `direct`，不支持代理目标和组目标。
+`direct(mark: 512)` 与 `direct(mark: 0x200)` 选择相同的直连 mark。
+无前缀数字按十进制解析（包括前导零），`0x`/`0X` 前缀表示十六进制。
+解析保留完整 `u32` 范围，并区分省略 mark（`Keep`）与显式 `mark: 0`（`Set(0)`）。
+实际 backend 仍拒绝不支持的动作：TC 保留 `0xc0000000`，packet Endpoint/Core
+保持原有非零 mark 限制。二进制/八进制前缀、下划线、正负号、溢出、未知选项
+以及重复的 `mark`/`must` 选项均拒绝配置；格式错误的直连 mark 不会静默变为零。
+mark 只支持 `direct`，不支持代理/组目标。
 
-`direct(mark: 0x200, must)` 与 `direct(must, mark: 0x200)` 等价，直连选项列表内部允许空白。`fallback:` 及其别名 `default:` 接受相同形式。合并 include 后，最后出现的 fallback 会替换整个回退动作，普通 `direct` 不保留 mark 与 `must`。fallback 只在全部普通规则之后生效，即使源文件里有些规则声明在它后面。
+`direct(mark: 0x200, must)` 与 `direct(must, mark: 0x200)` 等价，
+直连选项列表内部允许空白。`fallback:` 及其别名 `default:` 接受相同形式。
+合并 include 后最后出现的 fallback 替换整个回退动作（普通 `direct` 会清除 mark 与 `must`），
+且只在全部普通规则之后生效，即使部分规则在该 fallback 后面声明。
 
-在 IPv4/IPv6 的 TCP 和 UDP 上，非零直连 mark 替换全局 socket mark 的策略有效位，**不与 `so_mark_from_dae` 或 `0x100` 按位 OR**。原生直连、NFQUEUE 批准的直连以及用户态直连 socket，会在低 30 位策略值之外额外保留 `CLASSIFIED_MARK`，这个位是 `0x40000000`。例如配置 `0x200` 时可观测到 `0x40000200`，Linux 策略路由规则必须用掩码排除保留位。`mark: 0` 表示未指定：用户态发起的直连 socket 使用全局 mark，原生直连不添加用户 mark。代理 carrier、bootstrap 和 DNS 控制器上游使用全局值，不继承被拦截流量规则的 mark。
+在既有 TC/NFQUEUE 和用户态直连套接字路径中，非零直连 mark 替换全局
+套接字 mark 的策略有效位，**不会与 `so_mark_from_dae` 或 `0x100` 按位 OR**。
+这些路径在低 30 位策略值之外保留 `CLASSIFIED_MARK`（`0x40000000`）。例如
+配置 `0x200` 时可观测到 `0x40000200`，Linux 策略路由规则必须用掩码排除保留位。
+仅在这个 legacy 执行边界，显式零与省略 mark 效果相同：用户态发起的直连
+套接字使用全局 mark，TC 直连不添加用户 mark。配置和 canonical 路由结果
+仍保留两者区别。
+代理承载连接、bootstrap 和 DNS 控制器上游使用全局值，不继承流量规则的 mark。
 
 例如，选择两个由用户配置的 WAN 路由表：
 
@@ -259,6 +283,78 @@ LAN 入站和 WAN 出站的 TCP、UDP 目的端口 `53` 豁免健康检查丢包
 - 添加 `dip(geoip: private) -> direct(must)`，让私有网络流量不依赖代理健康状态。这条规则也会绕过 LAN 私网 DNS，要保留接管就显式加上 `&& !dport(53)`。
 - 让 `fallback:` 指向至少包含两个节点的 [`fallback` 代理组](./groups.md)，而不是单个节点。
 - 至少保留一个走直连路径的 DNS 上游。
+
+`routing` 的 `direct` 目标使用
+[`datapath.direct`](./global.md#捕获后端选择) 选定的执行方式。
+
+## Core 转发防火墙与 IPv4 NAT
+
+这些是 `datapath` 的强类型动作，不是 `routing` 的出站名称。要求
+`backend: xdp`、`direct: core` 以及显式配置的 `lan`/`wan` 接口；不会改变
+现有 TC、Endpoint 中继或原生转发行为。
+
+```dae
+datapath {
+    backend: xdp
+    direct: core
+    interface { lan0: lan
+                wan0: wan }
+    firewall {
+        original {
+            lan: sip(10.0.0.0/24) && l4proto(tcp,udp) -> allow
+            default: drop
+        }
+        forward {
+            lan: ipversion(4,6) -> allow
+            default: drop
+        }
+    }
+    nat {
+        prerouting {
+            dip(198.51.100.1) && dport(8080) -> dnat(10.0.0.8:80)
+        }
+        postrouting {
+            sip(10.0.0.0/24) -> masquerade(40000-49999)
+        }
+    }
+}
+```
+
+`original` 匹配 DNAT 前的原始包；`forward` 与 `postrouting` 匹配 DNAT 后、
+SNAT 前的目标。规则按声明顺序复用普通路由条件。可选的 `lan:`/`wan:` 前缀
+匹配可信捕获接口角色，绝不通过源地址猜测区域；没有前缀表示有意匹配两类
+接口。本路径没有域名、进程、MAC 权威，因此这些条件及其否定形式均拒绝配置。
+结构化防火墙/NAT 条件同样拒绝未知字段，包括 `not` 内的字段：规范字段名为
+`source_ip`，不是 `source_ips`。即使其他匹配条件有效，拼写错误也会报错；
+传统流量路由对未知字段的容忍行为保持不变。
+防火墙/NAT 匹配器调用要求非空参数，逗号分隔的元素也不能为空；`sip()` 或
+`!pname()` 之类的空调用不会消失后扩大规则范围。规则链内的嵌套块会报错，
+不会仅警告后忽略。
+
+两个防火墙链默认都是 `drop`。`allow` 准入双向 owner，`drop` 静默丢弃；
+`reject` 请求限速的管理禁止 ICMP，对符合条件的 TCP 也采用 ICMP 而不是 RST。
+共享拒绝路径对 RST、ICMP 错误、组播及不合格分片抑制回应，并要求可信源地址
+与返回路由。管理拒绝要求有效 input-FIB 权威，包括实际 prohibit 结果；定向广播、
+LocalInput 或权威缺失不授予许可。转发邻居缺失不会抑制已有返回路径和权威的
+TTL/MTU 拒绝。DNAT 后拒绝引用原始元组，不泄露私网转换目标。单独 ACK 不证明已建立；
+UDP 回复必须命中已准入的精确对端与反向接口身份。已准入 owner 仅在未过期、
+且防火墙/NAT 撤销 epoch 仍有效时跳过新流规则。
+保留 owner 不能覆盖当前流量路由的 `block`，包括 mode 改变或安全 epoch 未变的
+纯路由 reload。
+被 Block 的包不分配新的转换 ID，也不续期已有 binding。
+
+`dnat(IPv4)` 保留目标端口，`dnat(IPv4:port)` 替换目标端口；`snat(IPv4)`
+保留源端口，发生冲突则失败；`snat(IPv4,first-last)` 分配唯一源端口。
+`masquerade()` 使用 1024–65535，`masquerade(first-last)` 限定端口池，且必须
+使用由内核为真实出接口选出的可信本地 IPv4 源地址。独立、限定出接口的源选择
+查询可为无地址捕获端口选择已配置的本地路由地址，但绝不替代真实输入 FIB。
+源地址/链路 incarnation 变化撤销 MASQUERADE，普通路由/邻居刷新不会撤销。
+组合 DNAT 与 SNAT 支持 hairpin。
+NAT 必须显式启用防火墙。IPv6 支持防火墙/路由，不支持地址转换；IPv6 包选中
+NAT 动作时 fail-closed。端口耗尽、出接口地址歧义或不支持的组合不会回退为
+Endpoint、原生转发或其他后端。
+
+详见[所有权、分片和证据边界](../design/datapath.md#core-转发防火墙与-ipv4-nat)。
 
 ## 相关文档
 

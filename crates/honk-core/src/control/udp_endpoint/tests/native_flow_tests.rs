@@ -1,5 +1,135 @@
 use super::*;
 use crate::control::tests::support::NativeFlowApi;
+use honk_netstack::MemoryBudget;
+
+#[tokio::test]
+async fn native_udp_observation_charge_follows_the_last_endpoint_owner() {
+    let budget = MemoryBudget::new(4 << 20);
+    let pool = Arc::new(
+        UdpEndpointPool::with_packet_reply_factory(
+            1,
+            Arc::new(SystemUdpReplySocketFactory),
+            Arc::clone(&budget),
+        )
+        .unwrap(),
+    );
+    let baseline = budget.used();
+    let api = NativeFlowApi::new().await;
+    let client = make_addr("127.0.0.1", 40000);
+    let dst = make_addr("127.0.0.1", 15353);
+    let EndpointReservation::Initializing(mut lease) = pool.reserve_or_enqueue(
+        ScopeId::HOST,
+        client,
+        dst,
+        b"first",
+        Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+        &StatsManager::new(),
+    ) else {
+        panic!("expected an initializing UDP endpoint")
+    };
+    let flow = Arc::new(
+        api.flows
+            .begin(crate::observe::vocab::Network::Udp, client, dst)
+            .unwrap(),
+    );
+    let id = flow.id().to_owned();
+    let observer = flow.observer(7, None, "dial_target").unwrap();
+    let terminal = lease.set_native_flow(Some(Arc::clone(&flow))).unwrap();
+    let mut initializer = terminal.initializer();
+    let mut endpoint =
+        UdpEndpoint::new(transport(test_reply_socket().await, dst), dst, TEST_NODE_ID);
+
+    let bytes = observation::ACTIVE_OBSERVATION_BYTES;
+    let before = budget.used();
+    let hold = budget.reserve(budget.limit() - before - bytes + 1).unwrap();
+    assert!(matches!(
+        EndpointObservation::reserve(&pool, true),
+        Err(error) if error.kind() == io::ErrorKind::OutOfMemory
+    ));
+    assert_eq!(
+        endpoint
+            .native
+            .set_flow(None, &pool, Some(Arc::clone(&terminal)))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::OutOfMemory
+    );
+    assert_eq!(
+        endpoint
+            .native
+            .set_observer(Some(observer.clone()), &pool)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::OutOfMemory
+    );
+    assert!(endpoint.native.flow().is_none());
+    assert!(endpoint.native.terminal().is_none());
+    assert!(endpoint.native.observer().is_none());
+    assert_eq!(budget.used(), before + hold.bytes());
+    drop(hold);
+
+    let hold = budget.reserve(budget.limit() - before - bytes).unwrap();
+    endpoint.native.set_observer(Some(observer), &pool).unwrap();
+    assert_eq!(budget.used(), budget.limit());
+    assert!(endpoint.native.flow().is_none());
+    assert!(endpoint.native.terminal().is_none());
+    endpoint
+        .native
+        .set_flow(None, &pool, Some(Arc::clone(&terminal)))
+        .unwrap();
+    assert!(endpoint.native.observer().is_some());
+    endpoint.native.reply_received();
+    assert!(!endpoint.native.received_reply());
+    endpoint
+        .native
+        .set_flow(Some(flow), &pool, Some(Arc::clone(&terminal)))
+        .unwrap();
+    endpoint.native.set_observer(None, &pool).unwrap();
+    assert!(endpoint.native.flow().is_some());
+    assert!(Arc::ptr_eq(endpoint.native.terminal().unwrap(), &terminal));
+    endpoint.native.reply_received();
+    endpoint
+        .native
+        .set_flow(None, &pool, Some(Arc::clone(&terminal)))
+        .unwrap();
+    assert!(endpoint.native.flow().is_none());
+    assert!(endpoint.native.received_reply());
+    assert_eq!(budget.used(), budget.limit());
+    drop(hold);
+
+    let endpoint = Arc::new(endpoint);
+    let last_owner = Arc::clone(&endpoint);
+    assert!(lease.commit_ready(Arc::clone(&endpoint)));
+    drop(lease);
+    pool.advance_initialization_epoch(true);
+    endpoint.native.finish(UdpTerminal::TransportError);
+    pool.remove(ScopeId::HOST, client, dst);
+    assert!(pool.is_empty());
+    assert_eq!(budget.used(), baseline + bytes);
+
+    assert!(api.flows.test_detail(&id)["ended_at"].is_null());
+    initializer.complete();
+    drop(initializer);
+    assert!(api.flows.test_detail(&id)["ended_at"].is_string());
+    terminal.cleaned(true);
+    terminal.outcome(UdpTerminal::DriverCancelled);
+    let detail = api.flows.test_detail(&id);
+    let outcomes: Vec<_> = detail["trace"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|step| step["data"]["milestone"] == "terminal")
+        .collect();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0]["data"]["reason"], "shutdown");
+
+    drop(endpoint);
+    drop(pool);
+    assert_eq!(budget.used(), bytes);
+    drop(last_owner);
+    assert_eq!(budget.used(), 0);
+    api.shutdown().await;
+}
 
 #[tokio::test]
 async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
@@ -28,7 +158,14 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
         );
         let id = flow.id().to_owned();
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-        let mut lease = match pool.reserve_or_enqueue(client, dst, b"first", permit, &stats) {
+        let mut lease = match pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            dst,
+            b"first",
+            permit,
+            &stats,
+        ) {
             EndpointReservation::Initializing(lease) => lease,
             _ => panic!("retired tuple must allow a new initializer"),
         };
@@ -52,7 +189,7 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
             },
         ));
         let mut endpoint = UdpEndpoint::new(transport, dst, TEST_NODE_ID);
-        endpoint.native.set_flow(Some(flow), &pool, None);
+        endpoint.native.set_flow(Some(flow), &pool, None).unwrap();
         let endpoint = Arc::new(endpoint);
         let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
         let death_called = Arc::new(AtomicBool::new(false));
@@ -73,6 +210,7 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
         }
         let queue = lease.take_queue_receiver().unwrap();
         let mut driver = pool.spawn_driver(
+            honk_datapath::ScopeId::HOST,
             client,
             dst,
             lease.generation(),
@@ -125,7 +263,7 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
                 recv_and_ack(&pool, &mut removed_rx).await.unwrap();
             }
             "intentional_retirement" => {
-                pool.remove(client, dst);
+                pool.remove(honk_datapath::ScopeId::HOST, client, dst);
                 recv_and_ack(&pool, &mut removed_rx).await.unwrap();
             }
             "shutdown" => {
@@ -175,6 +313,62 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
             usize::from(reply)
         );
     }
+    api.shutdown().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn auxiliary_pause_before_udp_ready_commit_preserves_retirement_reason() {
+    let api = NativeFlowApi::new().await;
+    let budget = honk_netstack::MemoryBudget::new(4 << 20);
+    let (scope, owner) = crate::control::netstack::auxiliary_scope(1500, &budget).unwrap();
+    let mut driver = owner.hand_off();
+    driver.resume_auxiliary(1500, || true).unwrap();
+    let pool = Arc::new(UdpEndpointPool::with_capacity_limit(1));
+    let client = make_addr("192.0.2.1", 40000);
+    let dst = make_addr("198.51.100.1", 443);
+    let source = scope.hold_udp_source(client).unwrap();
+    let EndpointReservation::Initializing(mut lease) = pool.reserve_payload_or_enqueue_at(
+        scope.scope(),
+        client,
+        dst,
+        DatagramPayload::Borrowed(b"first"),
+        None,
+        UdpFlowOwner::packet(),
+        pool.initialization_epoch(),
+        Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+        queue_now(),
+        &StatsManager::new(),
+        Some(source.clone()),
+    ) else {
+        panic!("expected an initializing auxiliary tuple")
+    };
+    let flow = Arc::new(
+        api.flows
+            .begin(crate::observe::vocab::Network::Udp, client, dst)
+            .unwrap(),
+    );
+    let id = flow.id().to_owned();
+    let terminal = lease.set_native_flow(Some(flow)).unwrap();
+    let initializer = terminal.initializer();
+    let mut endpoint =
+        UdpEndpoint::new(transport(test_reply_socket().await, dst), dst, TEST_NODE_ID);
+    endpoint.bind_packet_source(Some(source)).unwrap();
+    driver.begin_auxiliary_pause().unwrap();
+    assert!(lease.still_initializing());
+    assert!(!lease.commit_ready(Arc::new(endpoint)));
+    terminal.outcome(UdpTerminal::InitializerCancelled);
+    drop(initializer);
+    drop(lease);
+    let detail = api.detail(&id).await;
+    assert_eq!(detail["state"], "closed");
+    let steps = detail["trace"]["steps"].as_array().unwrap();
+    assert!(
+        steps
+            .iter()
+            .any(|step| step["data"]["milestone"] == "terminal"
+                && step["data"]["reason"] == "intentional_retirement")
+    );
     api.shutdown().await;
 }
 
@@ -273,6 +467,7 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
     );
     let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     let lease = match handle.udp_pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         client_addr,
         destination,
         &packet,
@@ -294,7 +489,10 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
                 .unwrap()
                 .unwrap();
         assert_eq!(&received[..length], packet.as_slice());
-        let endpoint = handle.udp_pool.get(client_addr, destination).unwrap();
+        let endpoint = handle
+            .udp_pool
+            .get(honk_datapath::ScopeId::HOST, client_addr, destination)
+            .unwrap();
         assert_eq!(
             endpoint.byte_counters().0.load(Ordering::Relaxed),
             packet.len() as u64
@@ -464,19 +662,26 @@ async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() 
         );
         let id = flow.id().to_owned();
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-        let mut lease =
-            match pool.reserve_or_enqueue(client, destination, b"request", permit, &stats) {
-                EndpointReservation::Initializing(lease) => lease,
-                _ => panic!("new loopback flow must be admitted"),
-            };
+        let mut lease = match pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            client,
+            destination,
+            b"request",
+            permit,
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("new loopback flow must be admitted"),
+        };
         let (removed_tx, mut removed_rx) = mpsc::channel(1);
         pool.set_remove_sink(removed_tx);
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let mut endpoint =
             UdpEndpoint::new(transport(socket, destination), destination, TEST_NODE_ID);
-        endpoint.native.set_flow(Some(flow), &pool, None);
+        endpoint.native.set_flow(Some(flow), &pool, None).unwrap();
         let endpoint = Arc::new(endpoint);
         let mut driver = pool.spawn_driver(
+            honk_datapath::ScopeId::HOST,
             client,
             destination,
             lease.generation(),
@@ -548,10 +753,12 @@ async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() 
         );
         if !cleanup_succeeded {
             assert!(pool.complete_removal(
+                removal.scope,
                 removal.client,
                 removal.dst,
                 removal.owner,
-                removal.generation
+                removal.generation,
+                removal.packet_lineage,
             ));
         }
         assert!(pool.shutdown().await.joined);
@@ -562,7 +769,7 @@ async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() 
 #[tokio::test]
 async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
     use crate::control::tests::support::{UdpTestReplySocketFactory, control_plane};
-    use crate::ebpf::{EbpfBackend, mock::MockEbpfBackend};
+    use crate::ebpf::{EbpfBackend, PolicyBackend, mock::MockEbpfBackend};
     use honk_ebpf_common::*;
     for recreated in [false, true] {
         let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

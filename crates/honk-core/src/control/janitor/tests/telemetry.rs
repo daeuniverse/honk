@@ -27,8 +27,12 @@ async fn failed_telemetry_reads_keep_last_samples_and_still_sweep() -> anyhow::R
         }
         let faults = Arc::clone(&model.telemetry_faults);
         let admission = Arc::clone(&model.admission_pressure);
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
-        let mut janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
+        let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+            Arc::new(RwLock::new(Box::new(model)));
+        let mut janitor = BpfJanitor::new(
+            crate::control::TcKernelController::for_test(Arc::clone(&backend)),
+            Arc::new(TcpFlowPins::default()),
+        );
         // The exact drain below counts pressure-sized candidate batches; the
         // mock's collect-and-sort of the 90% map can outlast the scan budget.
         janitor.unbounded_scan_time = true;
@@ -83,7 +87,7 @@ async fn failed_telemetry_reads_keep_last_samples_and_still_sweep() -> anyhow::R
         }
         *faults.lock() = MockTelemetryFaults::default();
         assert_eq!(
-            backend.read().await.aux_occupancy()?.0,
+            backend.read().await.tc().unwrap().aux_occupancy()?.0,
             count.saturating_sub(JANITOR_MAX_CANDIDATES * 4) as u64
         );
         for round in 5..=7 {
@@ -148,7 +152,7 @@ fn telemetry_read_warnings_are_throttled() {
     tracing::subscriber::with_default(subscriber, || {
         for _ in 0..2 {
             let result = Err(anyhow::anyhow!("injected read fault").context("BPF telemetry"));
-            let _ = tick::telemetry_sample::<u64>("test signal", result);
+            let _ = crate::control::tc_kernel::telemetry_sample::<u64>("test signal", result);
         }
     });
     let logs = String::from_utf8(sink.0.lock().clone()).unwrap();

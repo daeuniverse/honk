@@ -13,6 +13,8 @@ accounting. Generated code implements only `RoutingInput -> RoutingDecision`.
 No flow is sent to userspace merely because its policy is compiled. Existing
 native-direct and cached-flow paths remain native.
 
+Physical XDP Endpoint also emits D1 from the canonical ordered policy. On a hold/CT miss it evaluates only TCP pure SYN or UDP. A non-must Direct passes only in Rule mode, for non-53 traffic with direct finality; `direct(must)` may pass port 53 when its full predicates are statically decidable. Earlier block/proxy decisions and unresolved domain/geosite predicates form barriers; dynamic groups are not terminal Direct. Source MAC and other static facts are available, but LAN pname is Missing: positive pname fails and negation matches. Mode is read at runtime. See the [gateway reference](../reference/routing.md#xdp-endpoint-gateway).
+
 ## Rule semantics
 
 The canonical IR retains ordered rule IDs, display metadata, conditions, and an

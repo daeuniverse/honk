@@ -20,6 +20,10 @@ const TCP_FLOW_DESCRIPTOR_COST: usize = 6;
 const UDP_ENDPOINT_DESCRIPTOR_COST: usize = 2 + MAX_REPLY_SOCKETS_PER_ENDPOINT;
 // Keep half of the non-TCP budget available for bursty gateway DNS/UDP work.
 const ELASTIC_NON_TCP_RESERVE_DIVISOR: usize = 2;
+// The netstack's own default limit when RAM is unknown; otherwise 1/8 of RAM within bounds.
+const WIREGUARD_MEMORY_DEFAULT: u64 = 256 << 20;
+const WIREGUARD_MEMORY_MIN: u64 = 64 << 20;
+const WIREGUARD_MEMORY_MAX: u64 = 4 << 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResourceBudget {
@@ -33,6 +37,8 @@ pub(crate) struct ResourceBudget {
     pub udp_slow_path: usize,
     pub dns_sockets: usize,
     pub dns_udp_queries: usize,
+    /// Bytes every WireGuard tunnel's netstack may hold together (see `honk_outbound`).
+    pub wireguard_memory: u64,
 }
 
 impl ResourceBudget {
@@ -86,6 +92,7 @@ impl ResourceBudget {
             udp_slow_path: udp_endpoints.min(MAX_UDP_SLOW_PATH),
             dns_sockets,
             dns_udp_queries: MAX_UDP_CLIENT_QUERIES,
+            wireguard_memory: WIREGUARD_MEMORY_DEFAULT,
         }
     }
 
@@ -100,6 +107,7 @@ impl ResourceBudget {
         self.dns_udp_queries = self
             .dns_udp_queries
             .min(usize::try_from(dns_cap).unwrap_or(usize::MAX));
+        self.wireguard_memory = (total_bytes / 8).clamp(WIREGUARD_MEMORY_MIN, WIREGUARD_MEMORY_MAX);
         self
     }
 
@@ -196,7 +204,33 @@ mod tests {
             assert_eq!(budget.udp_slow_path, endpoints.min(MAX_UDP_SLOW_PATH));
         }
         let fd_bound = ResourceBudget::for_nofile(4_096);
-        assert_eq!(fd_bound.with_memory(16 * GIB), fd_bound);
+        let capped = fd_bound.with_memory(16 * GIB);
+        assert_eq!(
+            ResourceBudget {
+                wireguard_memory: fd_bound.wireguard_memory,
+                ..capped
+            },
+            fd_bound
+        );
+    }
+
+    #[test]
+    fn wireguard_memory_is_an_eighth_of_ram_within_bounds() {
+        const MIB: u64 = 1 << 20;
+        let unbounded = ResourceBudget::for_nofile(MAX_EFFECTIVE_NOFILE);
+        assert_eq!(
+            unbounded.wireguard_memory,
+            256 * MIB,
+            "default without MemTotal"
+        );
+        for (memory, share) in [
+            (128 * MIB, 64 * MIB),
+            (2048 * MIB, 256 * MIB),
+            (8192 * MIB, 1024 * MIB),
+            (1 << 40, 4096 * MIB),
+        ] {
+            assert_eq!(unbounded.with_memory(memory).wireguard_memory, share);
+        }
     }
 
     #[test]

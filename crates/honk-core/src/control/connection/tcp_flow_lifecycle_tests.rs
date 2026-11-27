@@ -28,12 +28,12 @@ fn reverse_tuple() -> TuplesKey {
     )
 }
 
-fn backend() -> Arc<RwLock<Box<dyn EbpfBackend>>> {
+fn backend() -> Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> {
     Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())))
 }
 
 fn removal_worker(
-    backend: &Arc<RwLock<Box<dyn EbpfBackend>>>,
+    backend: &Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     pins: &Arc<TcpFlowPins>,
     tracker: &Arc<ConnectionTracker>,
 ) -> (
@@ -47,7 +47,7 @@ fn removal_worker(
     let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
     let task = spawn_retirement_worker(
         Arc::clone(&pool),
-        Arc::clone(backend),
+        crate::control::TcKernelController::for_test(Arc::clone(backend)),
         Arc::clone(tracker),
         fatal_tx,
         Arc::clone(pins),
@@ -71,9 +71,9 @@ async fn stop_removals(
 
 fn tracked_entry(id: &str) -> ConnectionEntry {
     ConnectionEntry {
-        id: id.to_string(),
-        source: "192.0.2.1:50000".to_string(),
-        destination: "203.0.113.2:443".to_string(),
+        id: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, id.as_bytes()),
+        source: "192.0.2.1:50000".parse().unwrap(),
+        destination: "203.0.113.2:443".parse().unwrap(),
         proxy: "direct".to_string(),
         #[cfg(feature = "native-api")]
         routed_outbound: None,
@@ -86,7 +86,7 @@ fn tracked_entry(id: &str) -> ConnectionEntry {
         download: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         start_time: std::time::Instant::now(),
         domain: None,
-        network: "tcp".to_string(),
+        network: "tcp",
         process: None,
         process_path: None,
     }
@@ -170,15 +170,20 @@ async fn tcp_flow_guard_abort_releases_pin_tracker_and_socket() -> anyhow::Resul
 async fn tcp_retire_waits_for_final_owner() -> anyhow::Result<()> {
     let tuple = forward_tuple();
     let backend = backend();
-    backend.write().await.tcp_conn_state_store(
-        &tuple,
-        &ConnState {
-            state: TcpState::TcpStateActive as u8,
-            incarnation: 1,
-            last_seen_ns: 0,
-            ..Default::default()
-        },
-    )?;
+    backend
+        .write()
+        .await
+        .tc_mut()
+        .unwrap()
+        .tcp_conn_state_store(
+            &tuple,
+            &ConnState {
+                state: TcpState::TcpStateActive as u8,
+                incarnation: 1,
+                last_seen_ns: 0,
+                ..Default::default()
+            },
+        )?;
     let pins = Arc::new(TcpFlowPins::default());
     let tracker = Arc::new(ConnectionTracker::new());
     let (pool, port, worker, fatal) = removal_worker(&backend, &pins, &tracker);
@@ -204,11 +209,27 @@ async fn tcp_retire_waits_for_final_owner() -> anyhow::Result<()> {
     );
 
     assert!(first.retire(Default::default()).await);
-    assert!(backend.read().await.conn_state_lookup(&tuple)?.is_some());
+    assert!(
+        backend
+            .read()
+            .await
+            .tc()
+            .unwrap()
+            .conn_state_lookup(&tuple)?
+            .is_some()
+    );
     assert!(pins.snapshot().contains(&TcpFlowKey::from_tuples(&tuple)));
 
     assert!(second.retire(Default::default()).await);
-    assert!(backend.read().await.conn_state_lookup(&tuple)?.is_none());
+    assert!(
+        backend
+            .read()
+            .await
+            .tc()
+            .unwrap()
+            .conn_state_lookup(&tuple)?
+            .is_none()
+    );
     assert!(pins.snapshot().is_empty());
     stop_removals(pool, &port, worker, fatal).await?;
     Ok(())
@@ -226,7 +247,9 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
     };
     let backend = backend();
     {
-        let mut backend = backend.write().await;
+        let mut backend = tokio::sync::RwLockWriteGuard::map(backend.write().await, |backend| {
+            backend.tc_mut().unwrap()
+        });
         backend.tcp_conn_state_store(&tuple, &old)?;
         backend.tcp_conn_state_store(&reverse, &old)?;
     }
@@ -246,7 +269,9 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
     );
     flow.track(tracked_entry("replacement"));
 
-    let mut backend_guard = backend.write().await;
+    let mut backend_guard = tokio::sync::RwLockWriteGuard::map(backend.write().await, |backend| {
+        backend.tc_mut().unwrap()
+    });
     let retire = tokio::spawn(flow.retire(Default::default()));
     tokio::task::yield_now().await;
     assert_eq!(
@@ -265,7 +290,8 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
     drop(backend_guard);
     assert!(retire.await?);
 
-    let backend = backend.read().await;
+    let backend =
+        tokio::sync::RwLockReadGuard::map(backend.read().await, |backend| backend.tc().unwrap());
     assert_eq!(
         backend
             .conn_state_lookup(&tuple)?
@@ -291,7 +317,7 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
 async fn adoption_retries_a_child_proof_that_is_still_being_published() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let destination = listener.local_addr()?;
-    let retries = ControlPlaneHandle::CHILD_PROOF_RETRIES;
+    let retries = TcKernelController::CHILD_PROOF_RETRIES;
     for (pending, adopted) in [(retries, true), (retries + 1, false)] {
         let mock = MockEbpfBackend::default();
         mock.adopt_proof_pending
@@ -328,7 +354,7 @@ async fn adoption_retries_a_child_proof_that_is_still_being_published() -> anyho
             result.is_ok(),
             adopted,
             "{pending} pending refusals against {} retries",
-            ControlPlaneHandle::CHILD_PROOF_RETRIES
+            TcKernelController::CHILD_PROOF_RETRIES
         );
     }
     Ok(())

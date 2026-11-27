@@ -12,7 +12,7 @@ use honk_ebpf_common::receive_trace::{
     RECEIVE_TRACE_BATCH_SIZE, RECEIVE_TRACE_VALID, ReceiveTraceBatch, ReceiveTracePacket,
 };
 
-use super::btf::Btf as OffsetBtf;
+use crate::ebpf::common::btf::Btf as OffsetBtf;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ReceiveTraceOffsets {
@@ -98,7 +98,7 @@ fn attach_family(
 impl ReceiveTrace {
     #[cfg(test)]
     fn load_unattached_for_test() -> anyhow::Result<(Ebpf, Vec<u8>, Btf)> {
-        let (data, kernel_btf) = super::btf::load_kernel()?;
+        let (data, kernel_btf) = crate::ebpf::common::btf::load_kernel()?;
         let offsets = detect(&data)
             .ok_or_else(|| anyhow::anyhow!("receive trace BTF offsets unavailable"))?;
         let mut loader = EbpfLoader::new();

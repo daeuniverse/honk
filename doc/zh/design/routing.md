@@ -11,6 +11,8 @@ IR；受限编译器把同一份 IR 编译成原生 eBPF 比较代码。内核�
 `RoutingInput -> RoutingDecision`。采用编译策略不代表 honk 把每个首包都送到用户
 态；native-direct 和已有流缓存路径仍在内核执行。
 
+物理 XDP Endpoint 也从同一规范有序策略生成 D1。hold/CT miss 后仅对 TCP 纯 SYN 或 UDP 求值。非 must Direct 只在 Rule mode、非 53 且 direct finality 成立时放行；`direct(must)` 的全部谓词可静态决定时也可放行 53。更早的 block/proxy 决策及无法静态决定的 domain/geosite 条件构成屏障；动态 group 不是终局 Direct。源 MAC 等静态事实可用，但 LAN pname 为 Missing：正向不匹配，否定匹配。mode 在运行时读取。见[网关参考](../reference/routing.md#xdp-endpoint-网关)。
+
 ## 规则语义
 
 规范化的 IR 保存有序 RuleId、展示信息、条件和 outbound/mark/must 动作。priority

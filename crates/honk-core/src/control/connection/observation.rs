@@ -11,12 +11,14 @@ use honk_outbound::{
 };
 
 use super::{handoff::HandoffResult, routing::RoutingDecision};
+use crate::control::netstack::ProcessMeta;
 use crate::{
     observe::{
         Observation,
         catalog::CatalogIdentity,
         flows::{
             FlowGuard,
+            kernel::CapturedKernelRoute,
             record::{
                 EvaluationInput, FlowError, Input, InputValues, OutboundAttempt, RouteInput,
                 Selection, StepData,
@@ -29,6 +31,40 @@ use crate::{
     },
     routing::{ConnectionInfo, RouteMatch, Router},
 };
+
+#[derive(Debug)]
+pub(in crate::control) struct PacketRouteSlot {
+    pub(super) capture: Option<Box<CapturedKernelRoute>>,
+    pub(super) capture_gap: Option<&'static str>,
+}
+
+const _: () = assert!(size_of::<PacketRouteSlot>() <= 3 * size_of::<usize>());
+
+impl PacketRouteSlot {
+    pub(in crate::control) const ABSENT: Self = Self {
+        capture: None,
+        capture_gap: None,
+    };
+
+    pub(super) const fn failed(reason: &'static str) -> Self {
+        Self {
+            capture: None,
+            capture_gap: Some(reason),
+        }
+    }
+
+    pub(in crate::control) fn from_capture(
+        capture: Result<CapturedKernelRoute, &'static str>,
+    ) -> Self {
+        match capture {
+            Ok(mut route) => Self {
+                capture_gap: route.gap.take(),
+                capture: Some(Box::new(route)),
+            },
+            Err(reason) => Self::failed(reason),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct RouteObservation {
@@ -43,17 +79,39 @@ pub(super) struct RouteObservation {
 }
 
 impl RouteObservation {
-    pub(super) fn kernel() -> Self {
-        Self {
-            generation: None,
-            rule_id: None,
-            rule_expression: None,
-            evaluation_id: String::new(),
-            plane: Plane::Kernel,
-            input: None,
-            rules: Vec::new(),
-            truncated: false,
-        }
+    fn retained_bytes(&self) -> usize {
+        self.rule_id.as_ref().map_or(0, String::capacity)
+            + self.rule_expression.as_ref().map_or(0, String::capacity)
+            + self.evaluation_id.capacity()
+            + self.input.as_ref().map_or(0, RouteInput::heap_bytes)
+            + self.rules.capacity() * size_of::<RuleEvaluation>()
+            + self
+                .rules
+                .iter()
+                .map(RuleEvaluation::heap_bytes)
+                .sum::<usize>()
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct RouteTraceSlot(Option<Box<RouteObservation>>);
+
+const _: () = assert!(size_of::<RouteTraceSlot>() == size_of::<usize>());
+
+impl RouteTraceSlot {
+    pub(super) fn kernel(enabled: bool) -> Self {
+        Self(enabled.then(|| {
+            Box::new(RouteObservation {
+                generation: None,
+                rule_id: None,
+                rule_expression: None,
+                evaluation_id: String::new(),
+                plane: Plane::Kernel,
+                input: None,
+                rules: Vec::new(),
+                truncated: false,
+            })
+        }))
     }
 
     pub(super) fn userspace(
@@ -65,7 +123,7 @@ impl RouteObservation {
         rules: Vec<RuleEvaluation>,
         truncated: bool,
     ) -> Self {
-        Self {
+        Self(Some(Box::new(RouteObservation {
             generation: Some(generation),
             rule_id: Some(rule_id(
                 instance,
@@ -86,21 +144,44 @@ impl RouteObservation {
             input: Some(RouteInput::from(input)),
             rules,
             truncated,
-        }
+        })))
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.0.as_ref().map_or(0, |route| {
+            size_of::<RouteObservation>() + route.retained_bytes()
+        })
+    }
+
+    // The connection keeps the payload inline, releasing the snapshot's box.
+    fn take(&mut self) -> Option<RouteObservation> {
+        self.0.take().map(|route| *route)
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(in crate::control) struct ConnectionObservation {
-    recorded: Option<RecordedConnection>,
+    recorded: Option<Box<RecordedConnection>>,
+}
+
+const _: () = assert!(size_of::<ConnectionObservation>() == size_of::<usize>());
+
+pub(super) struct RecordedConnection {
+    facts: ConnectionFacts,
+    _memory: Option<honk_netstack::MemoryReservation>,
 }
 
 #[derive(Clone)]
-struct RecordedConnection {
+struct ConnectionFacts {
     flow: Arc<FlowGuard>,
     network: Network,
     source: SocketAddr,
     destination: SocketAddr,
+    packet_facts: Option<(ProcessMeta, u8, Option<u32>)>,
     kernel_evaluation: Option<String>,
     kernel_route: Option<RouteObservation>,
     evaluation: Option<String>,
@@ -127,14 +208,31 @@ impl ConnectionObservation {
         source: SocketAddr,
         destination: SocketAddr,
     ) -> Self {
-        Self {
-            recorded: native
-                .and_then(|native| native.flows.begin(network, source, destination))
-                .map(|flow| RecordedConnection {
+        Self::begin_in(native, network, source, destination, None).expect("unaccounted observation")
+    }
+
+    pub(in crate::control) fn begin_in(
+        native: Option<&Observation>,
+        network: Network,
+        source: SocketAddr,
+        destination: SocketAddr,
+        budget: Option<&Arc<honk_netstack::MemoryBudget>>,
+    ) -> std::io::Result<Self> {
+        let Some(flow) = native.and_then(|native| native.flows.begin(network, source, destination))
+        else {
+            return Ok(Self::default());
+        };
+        let memory = reserve_record(budget, size_of::<RecordedConnection>()).inspect_err(|_| {
+            flow.finish(ConnectionState::Failed, "packet_memory_capacity");
+        })?;
+        Ok(Self {
+            recorded: Some(Box::new(RecordedConnection {
+                facts: ConnectionFacts {
                     flow: Arc::new(flow),
                     network,
                     source,
                     destination,
+                    packet_facts: None,
                     kernel_evaluation: None,
                     kernel_route: None,
                     evaluation: None,
@@ -143,16 +241,26 @@ impl ConnectionObservation {
                     effective_outbound: None,
                     dial_mode_generation: None,
                     selection: None,
-                }),
-        }
+                },
+                _memory: memory,
+            })),
+        })
     }
 
-    pub(super) fn is_recording(&self) -> bool {
+    fn record(&self) -> Option<&ConnectionFacts> {
+        self.recorded.as_ref().map(|record| &record.facts)
+    }
+
+    fn record_mut(&mut self) -> Option<&mut ConnectionFacts> {
+        self.recorded.as_mut().map(|record| &mut record.facts)
+    }
+
+    pub(in crate::control) fn is_recording(&self) -> bool {
         self.recorded.is_some()
     }
 
     pub(in crate::control) fn flow(&self) -> Option<&Arc<FlowGuard>> {
-        self.recorded.as_ref().map(|record| &record.flow)
+        self.record().map(|record| &record.flow)
     }
 
     /// Reads `generation` only for a recorded connection.
@@ -165,7 +273,7 @@ impl ConnectionObservation {
     }
 
     pub(super) fn selection_observer(&self) -> Option<FlowObserver> {
-        let generation = self.recorded.as_ref()?.selection.as_ref()?.generation;
+        let generation = self.record()?.selection.as_ref()?.generation;
         self.observer(|| generation, "dial_target")
     }
 
@@ -182,7 +290,7 @@ impl ConnectionObservation {
         plan
     }
 
-    pub(super) fn routing_started(&self) {
+    pub(in crate::control) fn routing_started(&self) {
         if let Some(flow) = self.flow() {
             flow.transition(
                 ConnectionState::Routing,
@@ -198,7 +306,7 @@ impl ConnectionObservation {
         observation: Option<&Arc<honk_outbound::group::observation::SelectionObservation>>,
         family: IpVersion,
     ) {
-        let Some(record) = &mut self.recorded else {
+        let Some(record) = self.record_mut() else {
             return;
         };
         let Some(selection) = &mut record.selection else {
@@ -227,15 +335,66 @@ impl ConnectionObservation {
     }
 
     pub(super) fn take_flow(&mut self) -> Option<Arc<FlowGuard>> {
-        self.recorded.take().map(|record| record.flow)
+        self.recorded.take().map(|record| record.facts.flow)
     }
 
-    pub(super) fn shared(&self) -> Option<Arc<Self>> {
-        self.is_recording().then(|| Arc::new(self.clone()))
+    pub(super) fn shared(
+        &self,
+        budget: Option<&Arc<honk_netstack::MemoryBudget>>,
+    ) -> std::io::Result<Option<Arc<RecordedConnection>>> {
+        self.record()
+            .map(|facts| {
+                let bytes = size_of::<RecordedConnection>() + 2 * size_of::<usize>();
+                let memory = reserve_record(budget, bytes)?;
+                Ok(Arc::new(RecordedConnection {
+                    facts: facts.clone(),
+                    _memory: memory,
+                }))
+            })
+            .transpose()
     }
 
-    pub(super) fn handoff(&mut self, handoff: Option<&HandoffResult>, expected: bool) {
-        let Some(record) = &mut self.recorded else {
+    pub(in crate::control) fn packet_facts(
+        &mut self,
+        process: ProcessMeta,
+        dscp: u8,
+        mark: Option<u32>,
+    ) {
+        let Some(record) = self.record_mut() else {
+            return;
+        };
+        record.packet_facts = Some((process, dscp, mark));
+        let pname = process.name();
+        let pid = (process.pid != 0).then_some(process.pid);
+        record
+            .flow
+            .update_input(None, None, pname.as_deref(), pid, None, Some(dscp), mark);
+        record.flow.step(
+            None,
+            StepData::Input {
+                source: "packet",
+                values: InputValues {
+                    input: Input {
+                        src: record.source,
+                        dst: record.destination,
+                        domain: None,
+                        domain_source: None,
+                        pid,
+                        process_path: (),
+                        src_mac: None,
+                        ingress: (),
+                        domain_rule_ids: (),
+                        dscp: Some(dscp),
+                        mark,
+                    },
+                    pname,
+                },
+            },
+        );
+    }
+
+    pub(super) fn handoff(&mut self, handoff: Option<&mut HandoffResult>, expected: bool) {
+        let Some(record) = self.record_mut() else {
             return;
         };
         let Some(handoff) = handoff else {
@@ -244,7 +403,7 @@ impl ConnectionObservation {
             }
             return;
         };
-        if handoff.capture_gap == Some("kernel_handoff_ambiguous") {
+        if handoff.packet_route.capture_gap == Some("kernel_handoff_ambiguous") {
             record.flow.mark_gap(GapReason::NotInstrumented);
             return;
         }
@@ -263,7 +422,7 @@ impl ConnectionObservation {
                         domain_source: None,
                         pid: (handoff.pid != 0).then_some(handoff.pid),
                         process_path: (),
-                        src_mac: handoff.mac_address(),
+                        src_mac: handoff.mac_address().map(crate::routing::mac_string),
                         ingress: (),
                         domain_rule_ids: (),
                         dscp: (record.network == Network::Udp || handoff.dscp <= 63)
@@ -274,30 +433,29 @@ impl ConnectionObservation {
                 },
             },
         );
-        if let Some(capture) = &handoff.capture {
-            Self::record_kernel(record, capture.clone());
+        if let Some(capture) = handoff.packet_route.capture.take() {
+            Self::record_kernel(record, *capture, handoff.packet_route.capture_gap);
         } else {
             // Capture diagnostics stay specific; the record keeps only the missing flag.
             record.flow.mark_gap(GapReason::NotInstrumented);
         }
     }
 
-    pub(in crate::control) fn packet_route(
-        &mut self,
-        capture: Result<crate::observe::flows::kernel::CapturedKernelRoute, &'static str>,
-    ) {
-        let Some(record) = &mut self.recorded else {
+    pub(in crate::control) fn packet_route(&mut self, slot: PacketRouteSlot) {
+        let Some(record) = self.record_mut() else {
             return;
         };
-        match capture {
-            Ok(capture) => Self::record_kernel(record, capture),
-            Err(_) => record.flow.mark_gap(GapReason::NotInstrumented),
+        if let Some(capture) = slot.capture {
+            Self::record_kernel(record, *capture, slot.capture_gap);
+        } else if slot.capture_gap.is_some() {
+            record.flow.mark_gap(GapReason::NotInstrumented);
         }
     }
 
     fn record_kernel(
-        record: &mut RecordedConnection,
-        capture: crate::observe::flows::kernel::CapturedKernelRoute,
+        record: &mut ConnectionFacts,
+        capture: CapturedKernelRoute,
+        gap: Option<&'static str>,
     ) {
         if capture.truncated {
             record.flow.mark_overflow();
@@ -305,7 +463,7 @@ impl ConnectionObservation {
         if capture.ambiguous {
             record.flow.mark_gap(GapReason::StartedLate);
         }
-        if capture.gap.is_some() {
+        if gap.is_some() {
             record.flow.mark_gap(GapReason::NotInstrumented);
         }
         let rule_expression = capture.rule_id.as_ref().and_then(|id| {
@@ -333,7 +491,6 @@ impl ConnectionObservation {
         record.evaluation = record.kernel_evaluation.clone();
         record.routed_outbound = capture
             .effective_outbound
-            .clone()
             .or_else(|| capture.outbound.clone());
         record.flow.step(
             Some(capture.generation),
@@ -345,6 +502,7 @@ impl ConnectionObservation {
                 rules: capture.rules,
                 outbound: capture.outbound,
                 must: Some(capture.must),
+                mark_kind: Some(capture.mark_kind),
                 mark: Some(capture.mark),
                 input: Some(EvaluationInput::Traffic(input)),
                 dns_action: None,
@@ -370,13 +528,27 @@ impl ConnectionObservation {
         source: Option<DomainSource>,
         handoff: Option<&HandoffResult>,
     ) {
-        if let Some(flow) = self.flow() {
-            update_input(flow, domain, source, handoff);
+        if let Some(record) = self.record() {
+            if let Some((process, dscp, mark)) = record.packet_facts {
+                let pname = process.name();
+                let pid = (process.pid != 0).then_some(process.pid);
+                record.flow.update_input(
+                    domain,
+                    source,
+                    pname.as_deref(),
+                    pid,
+                    None,
+                    Some(dscp),
+                    mark,
+                );
+            } else {
+                update_input(&record.flow, domain, source, handoff);
+            }
         }
     }
 
-    pub(super) fn routed(&mut self, decision: &mut RoutingDecision) {
-        let Some(record) = &mut self.recorded else {
+    pub(in crate::control) fn routed(&mut self, decision: &mut RoutingDecision) {
+        let Some(record) = self.record_mut() else {
             return;
         };
         let mut route = decision.native_route.take();
@@ -408,11 +580,12 @@ impl ConnectionObservation {
                     rules: std::mem::take(&mut capture.rules),
                     outbound: Some(decision.outbound.clone()),
                     must: Some(decision.must),
-                    mark: Some(
-                        decision
-                            .mark
-                            .map_or(0, honk_outbound::proxy::DirectMark::get),
-                    ),
+                    mark_kind: Some(if decision.mark.is_some() {
+                        honk_ebpf_common::ROUTING_MARK_SET
+                    } else {
+                        honk_ebpf_common::ROUTING_MARK_KEEP
+                    }),
+                    mark: Some(decision.mark.unwrap_or(0)),
                     input: capture.input.take().map(EvaluationInput::Traffic),
                     dns_action: None,
                 },
@@ -440,7 +613,7 @@ impl ConnectionObservation {
     }
 
     pub(super) fn mode_applied(&mut self, outbound: &str) {
-        let Some(record) = &mut self.recorded else {
+        let Some(record) = self.record_mut() else {
             return;
         };
         record.effective_outbound = Some(outbound.to_owned());
@@ -462,7 +635,7 @@ impl ConnectionObservation {
     }
 
     pub(super) fn pin_dial_mode(&mut self, generation: Option<u64>) {
-        if let Some(record) = &mut self.recorded {
+        if let Some(record) = self.record_mut() {
             record.dial_mode_generation = generation;
         }
     }
@@ -473,7 +646,7 @@ impl ConnectionObservation {
         catalog: &Arc<CatalogIdentity>,
         config: &Arc<Config>,
     ) {
-        if let Some(record) = &mut self.recorded {
+        if let Some(record) = self.record_mut() {
             record.selection = Some(SelectionGeneration {
                 generation,
                 catalog: Arc::clone(catalog),
@@ -485,7 +658,7 @@ impl ConnectionObservation {
     }
 
     pub(super) fn release_selection(&mut self) {
-        if let Some(record) = &mut self.recorded {
+        if let Some(record) = self.record_mut() {
             record.selection = None;
         }
     }
@@ -498,7 +671,7 @@ impl ConnectionObservation {
         candidates: &[honk_outbound::group::OwnedTarget],
         domain: Option<&str>,
     ) {
-        let Some(record) = &self.recorded else { return };
+        let Some(record) = self.record() else { return };
         let Some(first) = candidates.first() else {
             record.flow.step(
                 record.dial_mode_generation,
@@ -547,7 +720,7 @@ impl ConnectionObservation {
         verification: &'static str,
         selected: Option<(&honk_outbound::group::OwnedTarget, Option<&str>)>,
     ) {
-        let Some(record) = &self.recorded else { return };
+        let Some(record) = self.record() else { return };
         let (generation, target, reason) = match selected {
             Some((outbound, target)) => (
                 record
@@ -581,7 +754,7 @@ impl ConnectionObservation {
     }
 
     pub(super) fn selected<'a>(&self, chain: &[String], dialed: impl Into<Dialed<'a>>) {
-        let Some(record) = &self.recorded else { return };
+        let Some(record) = self.record() else { return };
         let dialed = dialed.into();
         if matches!(
             dialed.protocol(),
@@ -612,7 +785,123 @@ impl ConnectionObservation {
         dialed: impl Into<Dialed<'a>>,
         domain: Option<&str>,
     ) -> Option<ConnectionAttempt> {
-        let record = self.recorded.as_ref()?;
+        self.recorded
+            .as_ref()
+            .map(|record| record.attempt(chain, dialed, domain))
+    }
+
+    pub(in crate::control) fn finish(&self, state: ConnectionState, reason: &'static str) {
+        if let Some(flow) = self.flow() {
+            flow.finish(state, reason);
+        }
+    }
+
+    pub(super) fn tcp_connected(
+        &self,
+        chain: &[String],
+        target: &honk_outbound::group::OwnedTarget,
+    ) {
+        self.selected(chain, target);
+        if let Some(flow) = self.flow() {
+            flow.transition(
+                ConnectionState::Active,
+                "dial_succeeded",
+                ConnectionMilestone::TransportReady,
+                None,
+            );
+        }
+    }
+
+    pub(super) fn tcp_deadline(&self) {
+        let Some(record) = self.record() else { return };
+        let generation = record
+            .selection
+            .as_ref()
+            .map(|selection| selection.generation)
+            .or(record.dial_mode_generation);
+        record.flow.step(
+            generation,
+            StepData::Connection {
+                state: ConnectionState::Dialing,
+                reason: "dial_deadline_exceeded",
+                milestone: ConnectionMilestone::Unknown,
+                attempt_id: None,
+                reply_received: None,
+                error: Some(FlowError::DialTimeout),
+                selections: Vec::new(),
+                lookup_id: None,
+                server_addr: None,
+            },
+        );
+    }
+
+    pub(super) fn first_response(
+        &self,
+        previous: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        let Some(flow) = self.flow() else {
+            return previous;
+        };
+        let flow = Arc::clone(flow);
+        Some(Arc::new(move || {
+            if let Some(callback) = &previous {
+                callback();
+            }
+            tcp_first_response(&flow);
+        }))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn tcp_first_response(&self) {
+        if let Some(flow) = self.flow() {
+            tcp_first_response(flow);
+        }
+    }
+
+    pub(super) fn udp_preparing(&self) {
+        if let Some(flow) = self.flow() {
+            flow.transition(
+                ConnectionState::Dialing,
+                "udp_prepare_started",
+                ConnectionMilestone::Unknown,
+                Some(false),
+            );
+        }
+    }
+}
+
+fn tcp_first_response(flow: &FlowGuard) {
+    if flow.first_reply() {
+        flow.transition(
+            ConnectionState::Active,
+            "response_received",
+            ConnectionMilestone::FirstReply,
+            Some(true),
+        );
+    }
+}
+
+fn reserve_record(
+    budget: Option<&Arc<honk_netstack::MemoryBudget>>,
+    bytes: usize,
+) -> std::io::Result<Option<honk_netstack::MemoryReservation>> {
+    budget
+        .map(|budget| {
+            budget
+                .reserve(bytes)
+                .ok_or_else(crate::control::task_registry::capacity_error)
+        })
+        .transpose()
+}
+
+impl RecordedConnection {
+    pub(super) fn attempt<'a>(
+        &self,
+        chain: &[String],
+        dialed: impl Into<Dialed<'a>>,
+        domain: Option<&str>,
+    ) -> ConnectionAttempt {
+        let record = &self.facts;
         let dialed = dialed.into();
         let node = dialed.node;
         let selection = record
@@ -663,7 +952,7 @@ impl ConnectionObservation {
                 ResolutionLocation::Unknown
             },
         };
-        Some(ConnectionAttempt::new(
+        ConnectionAttempt::new(
             Arc::clone(&record.flow),
             selection.generation,
             data,
@@ -672,86 +961,7 @@ impl ConnectionObservation {
             } else {
                 "proxy_server"
             },
-        ))
-    }
-
-    pub(in crate::control) fn finish(&self, state: ConnectionState, reason: &'static str) {
-        if let Some(flow) = self.flow() {
-            flow.finish(state, reason);
-        }
-    }
-
-    pub(super) fn tcp_connected(
-        &self,
-        chain: &[String],
-        target: &honk_outbound::group::OwnedTarget,
-    ) {
-        self.selected(chain, target);
-        if let Some(flow) = self.flow() {
-            flow.transition(
-                ConnectionState::Active,
-                "dial_succeeded",
-                ConnectionMilestone::TransportReady,
-                None,
-            );
-        }
-    }
-
-    pub(super) fn tcp_deadline(&self) {
-        let Some(record) = &self.recorded else { return };
-        let generation = record
-            .selection
-            .as_ref()
-            .map(|selection| selection.generation)
-            .or(record.dial_mode_generation);
-        record.flow.step(
-            generation,
-            StepData::Connection {
-                state: ConnectionState::Dialing,
-                reason: "dial_deadline_exceeded",
-                milestone: ConnectionMilestone::Unknown,
-                attempt_id: None,
-                reply_received: None,
-                error: Some(FlowError::DialTimeout),
-                selections: Vec::new(),
-                lookup_id: None,
-                server_addr: None,
-            },
-        );
-    }
-
-    pub(super) fn first_response(
-        &self,
-        previous: Option<Arc<dyn Fn() + Send + Sync>>,
-    ) -> Option<Arc<dyn Fn() + Send + Sync>> {
-        let Some(flow) = self.flow() else {
-            return previous;
-        };
-        let flow = Arc::clone(flow);
-        Some(Arc::new(move || {
-            if let Some(callback) = &previous {
-                callback();
-            }
-            if flow.first_reply() {
-                flow.transition(
-                    ConnectionState::Active,
-                    "response_received",
-                    ConnectionMilestone::FirstReply,
-                    Some(true),
-                );
-            }
-        }))
-    }
-
-    pub(super) fn udp_preparing(&self) {
-        if let Some(flow) = self.flow() {
-            flow.transition(
-                ConnectionState::Dialing,
-                "udp_prepare_started",
-                ConnectionMilestone::Unknown,
-                Some(false),
-            );
-        }
+        )
     }
 }
 
@@ -768,7 +978,9 @@ fn update_input(
             .and_then(|handoff| handoff.process_name())
             .as_deref(),
         handoff.and_then(|handoff| (handoff.pid != 0).then_some(handoff.pid)),
-        handoff.and_then(|handoff| handoff.mac_address()),
+        handoff
+            .and_then(HandoffResult::mac_address)
+            .map(crate::routing::mac_string),
         handoff.map(|handoff| handoff.dscp),
         handoff.map(|handoff| handoff.mark),
     );
@@ -996,6 +1208,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn absent_and_failed_packet_routes_project_different_evidence() {
+        let native = crate::native_api::observation::NativeObservation::new(&Config::default());
+        native.core.flows.set_recording(true);
+        let failure = PacketRouteSlot::from_capture(Err("receive_metadata_unavailable"));
+        assert_eq!(failure.capture_gap, Some("receive_metadata_unavailable"));
+        for (slot, missing) in [
+            (PacketRouteSlot::ABSENT, serde_json::json!([])),
+            (failure, serde_json::json!(["not_instrumented"])),
+        ] {
+            let mut observation = ConnectionObservation::begin(
+                Some(&native.core),
+                Network::Udp,
+                "192.0.2.1:53000".parse().unwrap(),
+                "198.51.100.1:53".parse().unwrap(),
+            );
+            observation.packet_route(slot);
+            let detail = native
+                .core
+                .flows
+                .test_detail(observation.flow().unwrap().id());
+            assert_eq!(detail["trace"]["missing"], missing);
+            assert!(
+                !detail["trace"]["steps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|step| step["stage"] == "route")
+            );
+        }
+    }
+
+    #[test]
+    fn captured_packet_and_handoff_routes_keep_partial_evidence() {
+        let native = crate::native_api::observation::NativeObservation::new(&Config::default());
+        native.core.flows.set_recording(true);
+        let source = "192.0.2.1:53000".parse().unwrap();
+        let destination = "198.51.100.1:53".parse().unwrap();
+        let input =
+            super::super::routing::build_connection_info(None, destination, source, "udp", None);
+        let gap = Some("kernel_trace_conn_incarnation_mismatch");
+        for from_handoff in [false, true] {
+            let mut observation =
+                ConnectionObservation::begin(Some(&native.core), Network::Udp, source, destination);
+            let capture = CapturedKernelRoute {
+                generation: 9,
+                evaluation_id: "kernel-evaluation".into(),
+                input: RouteInput::from(&input),
+                rules: vec![RuleEvaluation {
+                    rule_id: "rule-1".into(),
+                    expression: "fallback".into(),
+                    result: "matched",
+                    missing_inputs: Vec::new(),
+                    conditions: Vec::new(),
+                }],
+                rule_id: Some("rule-1".into()),
+                outbound: Some("direct".into()),
+                effective_outbound: None,
+                must: true,
+                mark_kind: honk_ebpf_common::ROUTING_MARK_SET,
+                mark: 42,
+                truncated: false,
+                ambiguous: true,
+                gap,
+                fact_state: 0,
+                domain_bitmap: [0; 8],
+            };
+            if from_handoff {
+                let mut handoff = HandoffResult::from(honk_ebpf_common::RoutingHandoffEntry {
+                    trace_id: 31,
+                    ..Default::default()
+                });
+                handoff.packet_route = PacketRouteSlot::from_capture(Ok(capture));
+                observation.handoff(Some(&mut handoff), true);
+                assert!(handoff.packet_route.capture.is_none());
+                assert_eq!(handoff.packet_route.capture_gap, gap);
+                assert_eq!(handoff.trace_id, 31);
+            } else {
+                observation.packet_route(PacketRouteSlot::from_capture(Ok(capture)));
+            }
+            let detail = native
+                .core
+                .flows
+                .test_detail(observation.flow().unwrap().id());
+            assert_eq!(
+                detail["trace"]["missing"],
+                serde_json::json!(["not_instrumented", "started_late"])
+            );
+            let route = detail["trace"]["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|step| step["stage"] == "route")
+                .unwrap();
+            assert_eq!(route["data"]["mark"], 42);
+            assert_eq!(route["data"]["outbound"], "direct");
+        }
+    }
+
+    #[test]
     fn detached_connection_begin_has_no_recorded_guard() {
         let native = crate::native_api::observation::NativeObservation::new(&Config::default());
         let observation = ConnectionObservation::begin(
@@ -1006,5 +1317,112 @@ mod tests {
         );
         assert!(!observation.is_recording());
         assert!(observation.flow().is_none());
+    }
+
+    #[test]
+    fn packet_recording_funds_only_admitted_payloads_and_their_shared_owner() {
+        let native = crate::native_api::observation::NativeObservation::new(&Config::default());
+        let begin = |budget| {
+            ConnectionObservation::begin_in(
+                Some(&native.core),
+                Network::Udp,
+                "192.0.2.1:41000".parse().unwrap(),
+                "198.51.100.9:53".parse().unwrap(),
+                Some(budget),
+            )
+        };
+        let bytes = size_of::<RecordedConnection>();
+        let short = honk_netstack::MemoryBudget::new(bytes - 1);
+        let unrecorded = begin(&short).unwrap();
+        assert!(!unrecorded.is_recording());
+        assert!(unrecorded.shared(Some(&short)).unwrap().is_none());
+        assert_eq!(short.used(), 0);
+        native.core.flows.set_recording(true);
+        assert!(begin(&short).is_err());
+        assert_eq!(short.used(), 0);
+        let budget = honk_netstack::MemoryBudget::new(bytes);
+        let record = begin(&budget).unwrap();
+        assert_eq!(budget.used(), bytes);
+        assert!(record.shared(Some(&budget)).is_err());
+        let shared_bytes = bytes + 2 * size_of::<usize>();
+        let shared_budget = honk_netstack::MemoryBudget::new(shared_bytes);
+        let shared = record.shared(Some(&shared_budget)).unwrap().unwrap();
+        drop(record);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(shared_budget.used(), shared_bytes);
+        drop(shared);
+        assert_eq!(shared_budget.used(), 0);
+    }
+
+    #[test]
+    fn captured_kernel_decision_charges_the_box_even_without_dynamic_rule_data() {
+        let trace = RouteTraceSlot::kernel(true);
+        assert_eq!(trace.retained_bytes(), size_of::<RouteObservation>());
+        assert_eq!(RouteTraceSlot::kernel(false).retained_bytes(), 0);
+    }
+
+    #[test]
+    fn gateway_process_survives_sniff_without_socket_mark_or_path() {
+        let native = crate::native_api::observation::NativeObservation::new(&Config::default());
+        native.core.flows.set_recording(true);
+        for (network, domain_source, name) in [
+            (Network::Tcp, DomainSource::HttpHost, "abcdefghijkl�猫"),
+            (Network::Udp, DomainSource::QuicSni, ""),
+        ] {
+            let mut observation = ConnectionObservation::begin(
+                Some(&native.core),
+                network,
+                "192.0.2.1:41000".parse().unwrap(),
+                "198.51.100.7:53".parse().unwrap(),
+            );
+            observation.packet_facts(ProcessMeta::test_gateway(417, name), 12, None);
+            observation.sniffed(Some("example.test"), Some(domain_source), None);
+            let detail = native
+                .core
+                .flows
+                .test_detail(observation.flow().unwrap().id());
+            assert_eq!(detail["input"]["pid"], 417);
+            assert_eq!(detail["pname"].as_str(), (!name.is_empty()).then_some(name));
+            assert!(detail["input"]["mark"].is_null());
+            assert!(detail["input"]["process_path"].is_null());
+        }
+    }
+
+    #[test]
+    fn userspace_route_evidence_distinguishes_keep_zero_and_full_marks() {
+        let native = crate::native_api::observation::NativeObservation::new(&Config::default());
+        native.core.flows.set_recording(true);
+        let source = "192.0.2.1:53000".parse().unwrap();
+        let destination = "198.51.100.1:443".parse().unwrap();
+        let input =
+            super::super::routing::build_connection_info(None, destination, source, "tcp", None);
+        for mark in [None, Some(0), Some(u32::MAX)] {
+            let mut observation =
+                ConnectionObservation::begin(Some(&native.core), Network::Tcp, source, destination);
+            let flow = Arc::clone(observation.flow().unwrap());
+            let mut routing = honk_config::routing::RoutingConfig::default();
+            routing.default_outbound = "direct".into();
+            routing.default_mark = mark;
+            let router = Router::from_config(&routing).unwrap();
+            let mut decision =
+                RoutingDecision::from_router(&router, &input, None, Some((&native.core, 1)));
+            observation.routed(&mut decision);
+            let detail = native.core.flows.test_detail(flow.id());
+            let route = detail["trace"]["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|step| step["stage"] == "route")
+                .unwrap();
+            assert_eq!(
+                route["data"]["mark_kind"],
+                if mark.is_some() {
+                    honk_ebpf_common::ROUTING_MARK_SET
+                } else {
+                    honk_ebpf_common::ROUTING_MARK_KEEP
+                }
+            );
+            assert_eq!(route["data"]["mark"], mark.unwrap_or(0));
+        }
     }
 }

@@ -11,20 +11,24 @@
 //! inside a scoped `setns` operates on that namespace, which is how the
 //! daens-internal setup works without `nsenter`.
 
+use honk_xsk::topology::{TunRoute, TunRouteKind, TunRule, TunRuleAction, TunRuleSelector};
 use std::io;
-use std::num::NonZeroU32;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::net::IpAddr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use nix::sys::socket::{
-    AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, recv, recvfrom,
-    send, setsockopt, socket, sockopt,
-};
+use nix::sys::socket::recvfrom;
+use nix::sys::socket::{MsgFlags, NetlinkAddr, bind, recv, send, setsockopt, sockopt};
 use nix::sys::time::TimeVal;
 
-#[cfg(feature = "ebpf")]
+pub(crate) mod fib;
+#[cfg(feature = "packet-ebpf")]
+mod links;
+#[cfg(feature = "legacy-tc")]
+pub(crate) use links::LinkSnapshot;
+#[cfg(feature = "legacy-tc")]
 mod netns_id;
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(crate) fn ipv6_socket_available() -> std::io::Result<bool> {
     match socket2::Socket::new(
         socket2::Domain::IPV6,
@@ -46,19 +50,24 @@ const NLM_F_REQUEST: u16 = 0x01;
 const NLM_F_ACK: u16 = 0x04;
 const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
+#[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
 const NLM_F_REPLACE: u16 = 0x100;
 const NLM_F_DUMP_INTR: u16 = 0x10;
+#[cfg(feature = "packet-ebpf")]
 const NLM_F_DUMP: u16 = 0x300;
 
 const NLMSG_ERROR: u16 = 2;
+#[cfg(feature = "packet-ebpf")]
 const NLMSG_DONE: u16 = 3;
 
 pub(crate) const RTM_NEWLINK: u16 = 16;
+#[cfg(feature = "packet-ebpf")]
 const RTM_GETLINK: u16 = 18;
 pub(crate) const RTM_DELLINK: u16 = 17;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
 const RTM_NEWROUTE: u16 = 24;
+const RTM_DELROUTE: u16 = 25;
 const RTM_DELRULE: u16 = 33;
 const RTM_NEWRULE: u16 = 32;
 const RTM_NEWNEIGH: u16 = 28;
@@ -67,23 +76,36 @@ const ARPHRD_ETHER: u16 = 1;
 const IFF_UP: u32 = 0x1;
 
 const IFLA_ADDRESS: u16 = 1;
+const IFLA_MTU: u16 = 4;
+#[cfg(feature = "packet-ebpf")]
 const IFLA_IFNAME: u16 = 3;
+#[cfg(feature = "packet-ebpf")]
 const IFLA_MASTER: u16 = 10;
 const IFLA_LINKINFO: u16 = 18;
+#[cfg(feature = "legacy-tc")]
 const IFLA_NET_NS_FD: u16 = 28;
 const IFLA_INFO_KIND: u16 = 1;
+#[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
 const IFLA_INFO_DATA: u16 = 2;
+#[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
 const VETH_INFO_PEER: u16 = 1;
+#[cfg(feature = "legacy-tc")]
 const IFLA_NETKIT_PEER_INFO: u16 = 1;
+#[cfg(feature = "legacy-tc")]
 const IFLA_NETKIT_MODE: u16 = 5;
+#[cfg(feature = "legacy-tc")]
 const NETKIT_L2: u32 = 0;
 
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
+const IFA_FLAGS: u16 = 8;
+const IFA_F_NOPREFIXROUTE: u32 = 0x200;
+const IFA_F_NODAD: u32 = 2;
 
 const RTA_DST: u16 = 1;
 const RTA_GATEWAY: u16 = 5;
 const RTA_OIF: u16 = 4;
+const RTA_PRIORITY: u16 = 6;
 const RTA_TABLE: u16 = 15;
 
 const NDA_DST: u16 = 1;
@@ -92,15 +114,21 @@ const NDA_LLADDR: u16 = 2;
 const FRA_FWMARK: u16 = 10;
 const FRA_TABLE: u16 = 15;
 const FRA_FWMASK: u16 = 16;
+const FRA_PRIORITY: u16 = 6;
+const FRA_IIFNAME: u16 = 3;
 
+#[cfg(feature = "legacy-tc")]
 const NUD_PERMANENT: u16 = 0x80;
 const RTN_UNICAST: u8 = 1;
 const RTN_LOCAL: u8 = 2;
 const RTPROT_STATIC: u8 = 4;
 const RT_SCOPE_LINK: u8 = 253;
 const RT_SCOPE_UNIVERSE: u8 = 0;
+#[cfg(feature = "legacy-tc")]
 const RT_SCOPE_HOST: u8 = 254;
 const FR_ACT_TO_TBL: u8 = 1;
+const RTN_BLACKHOLE: u8 = 6;
+const FR_ACT_PROHIBIT: u8 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -137,6 +165,7 @@ struct RtMsg {
     rtm_flags: u32,
 }
 
+#[cfg(feature = "legacy-tc")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NdMsg {
@@ -160,6 +189,7 @@ enum Attr {
     U32(u32),
     Bytes(Vec<u8>),
     Str(String),
+    #[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
     Nested(Vec<(u16, Attr)>),
 }
 
@@ -171,6 +201,7 @@ fn attr_payload(attr: &Attr, out: &mut Vec<u8>) {
             out.extend_from_slice(s.as_bytes());
             out.push(0);
         }
+        #[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
         Attr::Nested(children) => {
             for (ty, child) in children {
                 put_attr(out, *ty, child);
@@ -207,31 +238,211 @@ fn ifinfo(ifindex: i32, flags: u32, change: u32) -> IfInfoMsg {
     }
 }
 
+#[cfg(feature = "legacy-tc")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LinkPairKind {
     Netkit,
     Veth,
 }
 
+#[cfg(feature = "legacy-tc")]
 fn netkit_unavailable(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::EOPNOTSUPP)
 }
 
-/// One synchronous NETLINK_ROUTE connection.
-pub(crate) struct NlSock {
-    fd: OwnedFd,
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MutationError {
+    #[error("kernel mutation refused: {0}")]
+    Refused(#[source] io::Error),
+    #[error("kernel mutation outcome unconfirmed: {0}")]
+    Unconfirmed(#[source] io::Error),
+}
+
+#[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
+impl MutationError {
+    fn into_io(self) -> io::Error {
+        match self {
+            Self::Refused(error) | Self::Unconfirmed(error) => error,
+        }
+    }
+}
+
+fn encode_request(
     seq: u32,
+    kind: u16,
+    flags: u16,
+    header: &[u8],
+    attrs: &[(u16, Attr)],
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(256);
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(&kind.to_ne_bytes());
+    bytes.extend_from_slice(&flags.to_ne_bytes());
+    bytes.extend_from_slice(&seq.to_ne_bytes());
+    bytes.extend_from_slice(&0u32.to_ne_bytes());
+    bytes.extend_from_slice(header);
+    for (kind, value) in attrs {
+        put_attr(&mut bytes, *kind, value);
+    }
+    let length = bytes.len() as u32;
+    bytes[..4].copy_from_slice(&length.to_ne_bytes());
+    bytes
+}
+
+fn mutation_ack(bytes: &[u8], sequence: u32) -> Result<Option<()>, MutationError> {
+    let malformed = || {
+        MutationError::Unconfirmed(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed rtnetlink mutation acknowledgement",
+        ))
+    };
+    let mut offset: usize = 0;
+    while offset < bytes.len() {
+        let header = bytes.get(offset..offset + 16).ok_or_else(malformed)?;
+        let length = u32::from_ne_bytes(header[..4].try_into().unwrap()) as usize;
+        let message = bytes
+            .get(offset..offset.checked_add(length).ok_or_else(malformed)?)
+            .filter(|_| length >= 16)
+            .ok_or_else(malformed)?;
+        let kind = u16::from_ne_bytes(header[4..6].try_into().unwrap());
+        let seq = u32::from_ne_bytes(header[8..12].try_into().unwrap());
+        if seq == sequence && kind == NLMSG_ERROR {
+            let error = i32::from_ne_bytes(
+                message
+                    .get(16..20)
+                    .ok_or_else(malformed)?
+                    .try_into()
+                    .unwrap(),
+            );
+            return match error {
+                0 => Ok(Some(())),
+                i32::MIN..=-1 => Err(MutationError::Refused(io::Error::from_raw_os_error(
+                    error.checked_neg().ok_or_else(malformed)?,
+                ))),
+                _ => Err(malformed()),
+            };
+        }
+        offset = offset.checked_add(align(length)).ok_or_else(malformed)?;
+    }
+    Ok(None)
+}
+
+fn ip_bytes(address: IpAddr) -> Vec<u8> {
+    match address {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => ip.octets().to_vec(),
+    }
+}
+
+fn tun_address(ifindex: u32, address: IpAddr) -> (IfAddrMsg, Vec<(u16, Attr)>) {
+    let v6 = address.is_ipv6();
+    let flags = IFA_F_NOPREFIXROUTE | if v6 { IFA_F_NODAD } else { 0 };
+    let header = IfAddrMsg {
+        ifa_family: if v6 { AF_INET6 as u8 } else { AF_INET as u8 },
+        ifa_prefixlen: if v6 { 128 } else { 32 },
+        ifa_flags: flags as u8,
+        ifa_scope: RT_SCOPE_UNIVERSE,
+        ifa_index: ifindex,
+    };
+    (
+        header,
+        vec![
+            (IFA_LOCAL, Attr::Bytes(ip_bytes(address))),
+            (IFA_ADDRESS, Attr::Bytes(ip_bytes(address))),
+            (IFA_FLAGS, Attr::U32(flags)),
+        ],
+    )
+}
+
+fn tun_route_request(route: &TunRoute, add: bool) -> (u16, u16, RtMsg, Vec<(u16, Attr)>) {
+    let unicast = matches!(route.kind, TunRouteKind::Unicast { .. });
+    let header = RtMsg {
+        rtm_family: if route.destination.is_ipv6() {
+            AF_INET6 as u8
+        } else {
+            AF_INET as u8
+        },
+        rtm_dst_len: route.prefix_len,
+        rtm_src_len: 0,
+        rtm_tos: 0,
+        rtm_table: u8::try_from(route.table).unwrap_or(0),
+        rtm_protocol: RTPROT_STATIC,
+        rtm_scope: if unicast && route.destination.is_ipv4() {
+            RT_SCOPE_LINK
+        } else {
+            RT_SCOPE_UNIVERSE
+        },
+        rtm_type: if unicast { RTN_UNICAST } else { RTN_BLACKHOLE },
+        rtm_flags: 0,
+    };
+    let mut attrs = vec![
+        (RTA_TABLE, Attr::U32(route.table)),
+        (RTA_DST, Attr::Bytes(ip_bytes(route.destination))),
+        (RTA_PRIORITY, Attr::U32(route.metric)),
+    ];
+    if let TunRouteKind::Unicast { oif } = route.kind {
+        attrs.push((RTA_OIF, Attr::U32(oif)));
+    }
+    (
+        if add { RTM_NEWROUTE } else { RTM_DELROUTE },
+        NLM_F_REQUEST | NLM_F_ACK | if add { NLM_F_CREATE | NLM_F_EXCL } else { 0 },
+        header,
+        attrs,
+    )
+}
+
+fn tun_rule(rule: &TunRule, name: &str) -> ([u8; 12], Vec<(u16, Attr)>) {
+    let (table, action) = match rule.action {
+        TunRuleAction::Lookup(table) => (table, FR_ACT_TO_TBL),
+        TunRuleAction::Prohibit => (0, FR_ACT_PROHIBIT),
+    };
+    let mut header = [0; 12];
+    header[0] = if rule.ipv6 {
+        AF_INET6 as u8
+    } else {
+        AF_INET as u8
+    };
+    header[4] = u8::try_from(table).unwrap_or(0);
+    header[7] = action;
+    let mut attrs = vec![
+        (FRA_TABLE, Attr::U32(table)),
+        (FRA_PRIORITY, Attr::U32(rule.priority)),
+    ];
+    match rule.selector {
+        TunRuleSelector::Fwmark(mark) => {
+            attrs.push((FRA_FWMARK, Attr::U32(mark)));
+            attrs.push((FRA_FWMASK, Attr::U32(u32::MAX)));
+        }
+        TunRuleSelector::Iif => attrs.push((FRA_IIFNAME, Attr::Str(name.to_owned()))),
+        TunRuleSelector::All => {}
+    }
+    (header, attrs)
+}
+
+/// One synchronous namespace-bound netlink connection; route is the default.
+pub(crate) struct NlSock {
+    pub(crate) fd: OwnedFd,
+    pub(crate) seq: u32,
 }
 
 impl NlSock {
     pub(crate) fn new() -> io::Result<Self> {
-        let fd = socket(
-            AddressFamily::Netlink,
-            SockType::Raw,
-            SockFlag::SOCK_CLOEXEC,
-            SockProtocol::NetlinkRoute,
-        )
-        .map_err(io::Error::from)?;
+        Self::from_protocol(libc::NETLINK_ROUTE)
+    }
+
+    pub(crate) fn from_protocol(protocol: i32) -> io::Result<Self> {
+        // SAFETY: socket returns a new descriptor, adopted exactly once below.
+        let raw = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                protocol,
+            )
+        };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         setsockopt(&fd, sockopt::ReceiveTimeout, &TimeVal::new(2, 0)).map_err(io::Error::from)?;
         bind(fd.as_raw_fd(), &NetlinkAddr::new(0, 0)).map_err(io::Error::from)?;
         Ok(Self { fd, seq: 0 })
@@ -241,7 +452,7 @@ impl NlSock {
     /// before consuming: reading an oversize datagram straight away would
     /// silently drop its truncated remainder and make the next datagram
     /// look like the retry. EINTR is retried, oversize is a hard error.
-    fn recv_one(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
+    pub(crate) fn recv_one(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
         const MAX_BUF: usize = 1 << 20;
         loop {
             let needed = match recv(
@@ -274,7 +485,7 @@ impl NlSock {
         }
     }
 
-    fn send_datagram(&self, buf: &[u8]) -> io::Result<()> {
+    pub(crate) fn send_datagram(&self, buf: &[u8]) -> io::Result<()> {
         let sent = send(self.fd.as_raw_fd(), buf, MsgFlags::empty()).map_err(io::Error::from)?;
         if sent == buf.len() {
             Ok(())
@@ -286,8 +497,7 @@ impl NlSock {
         }
     }
 
-    /// Send one request and wait for the kernel ack (NLMSG_ERROR with
-    /// error 0).
+    #[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
     fn request(
         &mut self,
         msg_type: u16,
@@ -295,56 +505,136 @@ impl NlSock {
         header: &[u8],
         attrs: &[(u16, Attr)],
     ) -> io::Result<()> {
-        self.seq += 1;
-        let seq = self.seq;
-        let mut buf = Vec::with_capacity(256);
-        buf.extend_from_slice(&[0u8; 4]); // length, patched below
-        buf.extend_from_slice(&msg_type.to_ne_bytes());
-        buf.extend_from_slice(&flags.to_ne_bytes());
-        buf.extend_from_slice(&seq.to_ne_bytes());
-        buf.extend_from_slice(&0u32.to_ne_bytes()); // pid
-        buf.extend_from_slice(header);
-        for (ty, attr) in attrs {
-            put_attr(&mut buf, *ty, attr);
-        }
-        let len = buf.len() as u32;
-        buf[0..4].copy_from_slice(&len.to_ne_bytes());
+        self.request_owned(msg_type, flags, header, attrs)
+            .map_err(MutationError::into_io)
+    }
 
-        self.send_datagram(&buf)?;
-
-        let mut resp = vec![0u8; 4096];
+    fn request_owned(
+        &mut self,
+        msg_type: u16,
+        flags: u16,
+        header: &[u8],
+        attrs: &[(u16, Attr)],
+    ) -> Result<(), MutationError> {
+        self.seq = self.seq.checked_add(1).ok_or_else(|| {
+            MutationError::Refused(io::Error::other("rtnetlink sequence exhausted"))
+        })?;
+        let request = encode_request(self.seq, msg_type, flags, header, attrs);
+        self.send_datagram(&request).map_err(|error| {
+            if error.kind() == io::ErrorKind::WriteZero {
+                MutationError::Unconfirmed(error)
+            } else {
+                MutationError::Refused(error)
+            }
+        })?;
+        let mut response = vec![0; 4096];
         loop {
-            let n = self.recv_one(&mut resp)?;
-            let mut off = 0usize;
-            while off + 16 <= n {
-                // nlmsghdr: len(4) type(2) flags(2) seq(4) pid(4)
-                let hlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
-                let htype = u16::from_ne_bytes(resp[off + 4..off + 6].try_into().unwrap());
-                let hseq = u32::from_ne_bytes(resp[off + 8..off + 12].try_into().unwrap());
-                if hlen < 16 || off + hlen > n {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "malformed netlink message header",
-                    ));
-                }
-                if hseq == seq && htype == NLMSG_ERROR {
-                    if hlen < 20 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "short NLMSG_ERROR",
-                        ));
-                    }
-                    let err = i32::from_ne_bytes(resp[off + 16..off + 20].try_into().unwrap());
-                    if err == 0 {
-                        return Ok(());
-                    }
-                    return Err(io::Error::from_raw_os_error(-err));
-                }
-                off += align(hlen);
+            let length = self
+                .recv_one(&mut response)
+                .map_err(MutationError::Unconfirmed)?;
+            if mutation_ack(&response[..length], self.seq)?.is_some() {
+                return Ok(());
             }
         }
     }
 
+    pub(crate) fn set_link_mtu(&mut self, ifindex: u32, mtu: u32) -> Result<(), MutationError> {
+        self.request_owned(
+            RTM_NEWLINK,
+            NLM_F_REQUEST | NLM_F_ACK,
+            pod_bytes(&ifinfo(ifindex as i32, 0, 0)),
+            &[(IFLA_MTU, Attr::U32(mtu))],
+        )
+    }
+
+    #[cfg(feature = "packet-ebpf")]
+    pub(crate) fn set_host_tun_queue_len(
+        &mut self,
+        ifindex: u32,
+        slots: u32,
+    ) -> Result<(), MutationError> {
+        self.request_owned(
+            RTM_NEWLINK,
+            NLM_F_REQUEST | NLM_F_ACK,
+            pod_bytes(&ifinfo(ifindex as i32, 0, 0)),
+            &[(libc::IFLA_TXQLEN, Attr::U32(slots))],
+        )
+    }
+
+    #[cfg(feature = "packet-ebpf")]
+    pub(crate) fn add_host_tun_fifo(
+        &mut self,
+        ifindex: u32,
+        slots: u32,
+    ) -> Result<(), MutationError> {
+        // With an explicit major and no REPLACE flag, an existing foreign root returns EEXIST.
+        let mut header = [0u8; 20];
+        header[4..8].copy_from_slice(&ifindex.to_ne_bytes());
+        header[8..12].copy_from_slice(&0x0001_0000u32.to_ne_bytes());
+        header[12..16].copy_from_slice(&u32::MAX.to_ne_bytes());
+        self.request_owned(
+            libc::RTM_NEWQDISC,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+            &header,
+            &[
+                (libc::TCA_KIND, Attr::Str("pfifo".into())),
+                (libc::TCA_OPTIONS, Attr::U32(slots)),
+            ],
+        )
+    }
+
+    pub(crate) fn set_tun_link_up(&mut self, ifindex: u32) -> Result<(), MutationError> {
+        self.request_owned(
+            RTM_NEWLINK,
+            NLM_F_REQUEST | NLM_F_ACK,
+            pod_bytes(&ifinfo(ifindex as i32, IFF_UP, IFF_UP)),
+            &[],
+        )
+    }
+
+    pub(crate) fn add_tun_address(
+        &mut self,
+        ifindex: u32,
+        address: IpAddr,
+    ) -> Result<(), MutationError> {
+        let (header, attrs) = tun_address(ifindex, address);
+        self.request_owned(
+            RTM_NEWADDR,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+            pod_bytes(&header),
+            &attrs,
+        )
+    }
+
+    pub(crate) fn add_tun_route(&mut self, route: &TunRoute) -> Result<(), MutationError> {
+        self.tun_route(route, true)
+    }
+
+    pub(crate) fn del_tun_route(&mut self, route: &TunRoute) -> Result<(), MutationError> {
+        self.tun_route(route, false)
+    }
+
+    fn tun_route(&mut self, route: &TunRoute, add: bool) -> Result<(), MutationError> {
+        let (kind, flags, header, attrs) = tun_route_request(route, add);
+        self.request_owned(kind, flags, pod_bytes(&header), &attrs)
+    }
+
+    pub(crate) fn add_tun_rule(&mut self, rule: &TunRule, name: &str) -> Result<(), MutationError> {
+        self.tun_rule(rule, name, true)
+    }
+
+    pub(crate) fn del_tun_rule(&mut self, rule: &TunRule, name: &str) -> Result<(), MutationError> {
+        self.tun_rule(rule, name, false)
+    }
+
+    fn tun_rule(&mut self, rule: &TunRule, name: &str, add: bool) -> Result<(), MutationError> {
+        let (header, attrs) = tun_rule(rule, name);
+        let kind = if add { RTM_NEWRULE } else { RTM_DELRULE };
+        let flags = NLM_F_REQUEST | NLM_F_ACK | if add { NLM_F_CREATE | NLM_F_EXCL } else { 0 };
+        self.request_owned(kind, flags, &header, &attrs)
+    }
+
+    #[cfg(feature = "legacy-tc")]
     /// Create an L2 netkit pair when supported, otherwise a veth pair.
     pub(crate) fn add_link_pair(&mut self, name: &str, peer: &str) -> io::Result<LinkPairKind> {
         match self.add_netkit_pair(name, peer) {
@@ -357,6 +647,7 @@ impl NlSock {
         }
     }
 
+    #[cfg(feature = "legacy-tc")]
     fn add_netkit_pair(&mut self, name: &str, peer: &str) -> io::Result<()> {
         let header = ifinfo(0, 0, 0);
         let mut peer_payload = pod_bytes(&ifinfo(0, 0, 0)).to_vec();
@@ -386,6 +677,7 @@ impl NlSock {
         )
     }
 
+    #[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
     /// Create a veth pair (`name` ↔ `peer_name`).
     pub(crate) fn add_veth_pair(&mut self, name: &str, peer: &str) -> io::Result<()> {
         let header = ifinfo(0, 0, 0);
@@ -413,6 +705,7 @@ impl NlSock {
         )
     }
 
+    #[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
     /// Bring a link up (or down).
     pub(crate) fn set_link_up(&mut self, ifindex: u32, up: bool) -> io::Result<()> {
         let header = ifinfo(ifindex as i32, if up { IFF_UP } else { 0 }, IFF_UP);
@@ -424,6 +717,7 @@ impl NlSock {
         )
     }
 
+    #[cfg(feature = "legacy-tc")]
     /// Move a link into the namespace held by `ns_fd`.
     pub(crate) fn set_link_netns_fd(&mut self, ifindex: u32, ns_fd: &OwnedFd) -> io::Result<()> {
         let header = ifinfo(ifindex as i32, 0, 0);
@@ -439,6 +733,7 @@ impl NlSock {
         r
     }
 
+    #[cfg(feature = "legacy-tc")]
     /// Delete a link by index.
     pub(crate) fn del_link(&mut self, ifindex: u32) -> io::Result<()> {
         let header = ifinfo(ifindex as i32, 0, 0);
@@ -450,6 +745,7 @@ impl NlSock {
         )
     }
 
+    #[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
     /// Add (or remove) an address on an interface.
     pub(crate) fn addr_op(
         &mut self,
@@ -481,6 +777,7 @@ impl NlSock {
         self.request(ty, flags, pod_bytes(&header), &attrs)
     }
 
+    #[cfg(any(feature = "legacy-tc", all(test, feature = "packet-ebpf")))]
     /// Add a route. `dst` is (network, prefix) or None for default.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_route(
@@ -526,6 +823,7 @@ impl NlSock {
         )
     }
 
+    #[cfg(feature = "legacy-tc")]
     /// Add/delete a fwmark → table rule.
     fn rule_fwmark(
         &mut self,
@@ -566,6 +864,7 @@ impl NlSock {
         self.request(ty, flags, &header, &attrs)
     }
 
+    #[cfg(feature = "legacy-tc")]
     pub(crate) fn add_rule_fwmark(
         &mut self,
         family: u8,
@@ -576,6 +875,7 @@ impl NlSock {
         self.rule_fwmark(true, family, fwmark, fwmask, table)
     }
 
+    #[cfg(feature = "legacy-tc")]
     pub(crate) fn del_rule_fwmark(
         &mut self,
         family: u8,
@@ -586,6 +886,7 @@ impl NlSock {
         self.rule_fwmark(false, family, fwmark, fwmask, table)
     }
 
+    #[cfg(feature = "legacy-tc")]
     /// Replace a static neighbour entry (IP → MAC, permanent).
     pub(crate) fn neigh_replace(
         &mut self,
@@ -617,15 +918,24 @@ impl NlSock {
 }
 
 /// Address families and route enums re-exported for call sites.
+#[cfg(feature = "legacy-tc")]
 pub(crate) const FAM_V4: u8 = AF_INET as u8;
+#[cfg(feature = "legacy-tc")]
 pub(crate) const FAM_V6: u8 = AF_INET6 as u8;
+#[cfg(feature = "legacy-tc")]
 pub(crate) const ROUTE_UNICAST: u8 = RTN_UNICAST;
+#[cfg(feature = "legacy-tc")]
 pub(crate) const ROUTE_LOCAL: u8 = RTN_LOCAL;
+#[cfg(feature = "legacy-tc")]
 pub(crate) const PROTO_STATIC: u8 = RTPROT_STATIC;
+#[cfg(feature = "legacy-tc")]
 pub(crate) const SCOPE_LINK: u8 = RT_SCOPE_LINK;
+#[cfg(feature = "legacy-tc")]
 pub(crate) const SCOPE_UNIVERSE: u8 = RT_SCOPE_UNIVERSE;
+#[cfg(feature = "legacy-tc")]
 pub(crate) const SCOPE_HOST: u8 = RT_SCOPE_HOST;
 
+#[cfg(feature = "legacy-tc")]
 /// Read an interface's ifindex in the mounted sysfs view, not a scoped setns view.
 pub(crate) fn ifindex_of(name: &str) -> io::Result<u32> {
     let s = std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))?;
@@ -634,6 +944,7 @@ pub(crate) fn ifindex_of(name: &str) -> io::Result<u32> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+#[cfg(feature = "legacy-tc")]
 /// Read an interface's MAC from /sys (namespace-relative).
 pub(crate) fn mac_of(name: &str) -> io::Result<[u8; 6]> {
     let s = std::fs::read_to_string(format!("/sys/class/net/{name}/address"))?;
@@ -649,179 +960,8 @@ pub(crate) fn mac_of(name: &str) -> io::Result<[u8; 6]> {
     Ok(mac)
 }
 
-/// One link from an RTM_GETLINK dump. Only the fields interface planning
-/// needs; `mac` is optional because L3 devices (tun, wireguard, ppp, sit)
-/// have no 6-byte hardware address.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LinkSnapshot {
-    pub ifindex: NonZeroU32,
-    pub name: String,
-    pub arphrd: u16,
-    /// `ifi_flags`.
-    pub flags: u32,
-    /// `IFLA_MASTER`.
-    pub master: Option<NonZeroU32>,
-    /// `IFLA_LINKINFO` / `IFLA_INFO_KIND`.
-    pub kind: Option<String>,
-    /// `IFLA_ADDRESS` when it is exactly 6 bytes.
-    pub mac: Option<[u8; 6]>,
-}
-
-fn invalid_data(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-/// Walk `len/type/payload` attributes. Any attribute that overruns the buffer is
-/// `InvalidData`; fewer than four trailing bytes are alignment padding.
-fn for_each_attr(
-    mut buf: &[u8],
-    mut visit: impl FnMut(u16, &[u8]) -> io::Result<()>,
-) -> io::Result<()> {
-    while buf.len() >= 4 {
-        let len = u16::from_ne_bytes([buf[0], buf[1]]) as usize;
-        let ty = u16::from_ne_bytes([buf[2], buf[3]]) & 0x3fff; // strip NLA_F_NESTED/NET_BYTEORDER
-        if len < 4 || len > buf.len() {
-            return Err(invalid_data("truncated netlink attribute"));
-        }
-        visit(ty, &buf[4..len])?;
-        buf = &buf[align(len).min(buf.len())..];
-    }
-    Ok(())
-}
-
-fn parse_link(msg: &[u8]) -> io::Result<LinkSnapshot> {
-    // ifinfomsg: family(1) pad(1) type(2) index(4) flags(4) change(4)
-    if msg.len() < 16 {
-        return Err(invalid_data("truncated ifinfomsg"));
-    }
-    let arphrd = u16::from_ne_bytes([msg[2], msg[3]]);
-    let ifindex = i32::from_ne_bytes(msg[4..8].try_into().unwrap());
-    let flags = u32::from_ne_bytes(msg[8..12].try_into().unwrap());
-    let ifindex = u32::try_from(ifindex)
-        .ok()
-        .and_then(NonZeroU32::new)
-        .ok_or_else(|| invalid_data("link with zero ifindex"))?;
-    let mut name = None;
-    let mut master = None;
-    let mut kind = None;
-    let mut mac = None;
-    for_each_attr(&msg[16..], |ty, payload| {
-        match ty {
-            IFLA_IFNAME => {
-                let end = payload
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(payload.len());
-                name = Some(String::from_utf8_lossy(&payload[..end]).into_owned());
-            }
-            IFLA_MASTER => {
-                let raw: [u8; 4] = payload
-                    .try_into()
-                    .map_err(|_| invalid_data("bad IFLA_MASTER length"))?;
-                master = NonZeroU32::new(u32::from_ne_bytes(raw));
-            }
-            IFLA_LINKINFO => for_each_attr(payload, |ty, payload| {
-                if ty == IFLA_INFO_KIND {
-                    let end = payload
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(payload.len());
-                    kind = Some(String::from_utf8_lossy(&payload[..end]).into_owned());
-                }
-                Ok(())
-            })?,
-            IFLA_ADDRESS if payload.len() == 6 => mac = payload.try_into().ok(),
-            _ => {}
-        }
-        Ok(())
-    })?;
-    let name = name
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| invalid_data("link without IFLA_IFNAME"))?;
-    Ok(LinkSnapshot {
-        ifindex,
-        name,
-        arphrd,
-        flags,
-        master,
-        kind,
-        mac,
-    })
-}
-
-/// Fold one datagram of an RTM_GETLINK dump (request `seq`) into `links`.
-/// Returns `true` once NLMSG_DONE is seen. Datagrams of an older request
-/// (different seq) are ignored.
-fn parse_link_datagram(buf: &[u8], seq: u32, links: &mut Vec<LinkSnapshot>) -> io::Result<bool> {
-    let mut off = 0usize;
-    while off + 16 <= buf.len() {
-        let hlen = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
-        if hlen < 16 || off + hlen > buf.len() {
-            return Err(invalid_data("malformed netlink message header"));
-        }
-        let htype = u16::from_ne_bytes(buf[off + 4..off + 6].try_into().unwrap());
-        let hflags = u16::from_ne_bytes(buf[off + 6..off + 8].try_into().unwrap());
-        let hseq = u32::from_ne_bytes(buf[off + 8..off + 12].try_into().unwrap());
-        if hseq != seq {
-            break;
-        }
-        // The dump raced an interface-table change; its contents are not a
-        // consistent snapshot.
-        if hflags & NLM_F_DUMP_INTR != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "link dump interrupted by table change",
-            ));
-        }
-        match htype {
-            NLMSG_DONE => return Ok(true),
-            NLMSG_ERROR => {
-                if hlen < 20 {
-                    return Err(invalid_data("short NLMSG_ERROR"));
-                }
-                let err = i32::from_ne_bytes(buf[off + 16..off + 20].try_into().unwrap());
-                return Err(io::Error::from_raw_os_error(-err));
-            }
-            RTM_NEWLINK => links.push(parse_link(&buf[off + 16..off + hlen])?),
-            _ => {}
-        }
-        off += align(hlen);
-    }
-    Ok(false)
-}
-
+#[cfg(feature = "legacy-tc")]
 impl NlSock {
-    /// Complete RTM_GETLINK dump of the socket's namespace, drained to
-    /// NLMSG_DONE (an early return would leave the tail in the socket buffer
-    /// and poison the next request's reads). Works in any namespace, unlike
-    /// /sys, which shows the host's devices even inside a scoped setns.
-    /// `NLM_F_DUMP_INTR` is `ErrorKind::Interrupted`. Callers that retry an
-    /// interrupted dump must use a fresh socket: the prior dump may still be active.
-    pub(crate) fn dump_links(&mut self) -> io::Result<Vec<LinkSnapshot>> {
-        self.seq += 1;
-        let seq = self.seq;
-        let header = ifinfo(0, 0, 0);
-        let mut buf = Vec::with_capacity(32);
-        buf.extend_from_slice(&[0u8; 4]);
-        buf.extend_from_slice(&RTM_GETLINK.to_ne_bytes());
-        buf.extend_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
-        buf.extend_from_slice(&seq.to_ne_bytes());
-        buf.extend_from_slice(&0u32.to_ne_bytes());
-        buf.extend_from_slice(pod_bytes(&header));
-        let len = buf.len() as u32;
-        buf[0..4].copy_from_slice(&len.to_ne_bytes());
-        self.send_datagram(&buf)?;
-
-        let mut resp = vec![0u8; 8192];
-        let mut links = Vec::new();
-        loop {
-            let n = self.recv_one(&mut resp)?;
-            if parse_link_datagram(&resp[..n], seq, &mut links)? {
-                return Ok(links);
-            }
-        }
-    }
-
     /// Look up a link by name with a 6-byte MAC (client-side filter over
     /// [`Self::dump_links`]); L3 links without a MAC read as not found.
     pub(crate) fn get_link(&mut self, name: &str) -> io::Result<(u32, [u8; 6])> {
@@ -838,5 +978,8 @@ impl NlSock {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tc"))]
 mod tests;
+
+#[cfg(test)]
+mod tun_tests;

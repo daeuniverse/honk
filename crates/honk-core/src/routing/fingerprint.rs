@@ -1,23 +1,23 @@
 use sha2::{Digest, Sha256};
 
 use super::{
-    CompiledCondition, CompiledPredicate, CompiledRoute, RouteAction, domain::DomainMatcherKey,
+    CompiledCondition, CompiledPredicate, CompiledRoute, RouteAction, domain::DomainMatcherDigest,
 };
 
 /// Hash the policy's semantic inputs without depending on derived compiler state.
 pub(super) fn policy(
     routes: &[CompiledRoute],
-    domain_keys: &[DomainMatcherKey],
+    domain_keys: &[DomainMatcherDigest],
     fallback: &RouteAction,
     geo_fingerprint: [u8; 32],
 ) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(b"honk.routing-policy.v2\0");
+    hash.update(b"honk.routing-policy.v4\0");
     let mut encoder = Encoder { hash: &mut hash };
     encode_action(&mut encoder, fallback);
     encoder.fixed(&geo_fingerprint);
     encoder.list(routes, encode_route);
-    encoder.list(domain_keys, encode_domain_key);
+    encoder.list(domain_keys, |encoder, key| encoder.fixed(key.as_bytes()));
     hash.finalize().into()
 }
 
@@ -80,7 +80,8 @@ fn encode_route(encoder: &mut Encoder<'_>, route: &CompiledRoute) {
 fn encode_action(encoder: &mut Encoder<'_>, action: &RouteAction) {
     encoder.string(&action.outbound);
     encoder.bool(action.must);
-    encoder.u32(action.mark.map_or(0, honk_outbound::proxy::DirectMark::get));
+    encoder.bool(action.mark.is_some());
+    encoder.u32(action.mark.unwrap_or(0));
 }
 
 fn encode_condition(encoder: &mut Encoder<'_>, condition: &CompiledCondition) {
@@ -152,13 +153,6 @@ fn encode_ip_nets(encoder: &mut Encoder<'_>, nets: &[ipnet::IpNet]) {
     });
 }
 
-fn encode_domain_key(encoder: &mut Encoder<'_>, key: &DomainMatcherKey) {
-    encoder.list(key, |encoder, (tag, alternative)| {
-        encoder.u8(*tag);
-        encoder.string(alternative);
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,7 +185,7 @@ mod tests {
         }
     }
 
-    fn digest(routes: &[CompiledRoute], keys: &[DomainMatcherKey]) -> [u8; 32] {
+    fn digest(routes: &[CompiledRoute], keys: &[DomainMatcherDigest]) -> [u8; 32] {
         let fallback = RouteAction {
             outbound: "direct".into(),
             must: false,
@@ -264,7 +258,7 @@ mod tests {
             digest(&[], &[full])
         );
         assert_ne!(
-            digest(&[], &[ordinary.clone(), keyword.clone()]),
+            digest(&[], &[ordinary, keyword]),
             digest(&[], &[keyword, ordinary]),
         );
     }
@@ -282,7 +276,7 @@ mod tests {
         let mut changed = base.clone();
         changed.rule_payload = "tcp".into();
         changed.action.must = true;
-        changed.action.mark = honk_outbound::proxy::DirectMark::new(7);
+        changed.action.mark = Some(7);
         assert_ne!(
             digest(std::slice::from_ref(&base), &[]),
             digest(&[changed], &[])
@@ -299,7 +293,11 @@ mod tests {
                 ..plain.clone()
             },
             RouteAction {
-                mark: honk_outbound::proxy::DirectMark::new(7),
+                mark: Some(7),
+                ..plain.clone()
+            },
+            RouteAction {
+                mark: Some(0),
                 ..plain.clone()
             },
         ] {
@@ -328,7 +326,7 @@ mod tests {
             outbound: RoutingOutbound::Simple("direct".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         };
         let first =
             crate::routing::Router::new(&[make_rule("abcdefghijklmnop-first")], "direct").unwrap();

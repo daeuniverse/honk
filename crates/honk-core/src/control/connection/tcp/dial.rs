@@ -377,8 +377,7 @@ impl ControlPlaneHandle {
                         );
                         // Only hot targets earn a speculative ready
                         // dial; a one-off flow gets none.
-                        let Some(_warm_guard) = pool.try_begin_warm(generation.generation(), &key)
-                        else {
+                        let Some(_warm_guard) = pool.try_begin_warm(&key) else {
                             return;
                         };
                         let pool_reporter = pool_feedback.map(|attempt| {
@@ -406,8 +405,7 @@ impl ControlPlaneHandle {
                                     reporter.setup_succeeded();
                                     reporter.finish_setup_only();
                                 }
-                                pool.deposit_ready(generation.generation(), &key, stream)
-                                    .await;
+                                pool.deposit_ready(&key, stream).await;
                             }
                             Err(e) => {
                                 if let Some(reporter) = &pool_reporter {
@@ -574,7 +572,7 @@ impl ControlPlaneHandle {
                 );
                 // Only hot targets earn a speculative ready
                 // dial; a one-off flow gets none.
-                if !pool.note_target(generation.generation(), &key) {
+                if !pool.note_target(&key) {
                     return;
                 }
                 let pool_reporter = pool_feedback.map(|reporter| {
@@ -605,8 +603,7 @@ impl ControlPlaneHandle {
                             reporter.setup_succeeded();
                             reporter.finish_setup_only();
                         }
-                        pool.deposit_ready(generation.generation(), &key, stream)
-                            .await;
+                        pool.deposit_ready(&key, stream).await;
                     }
                     Err(e) => {
                         if let Some(reporter) = &pool_reporter {

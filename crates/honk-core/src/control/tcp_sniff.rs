@@ -13,8 +13,9 @@
 //!
 //! Go ref: `tcp_sniff_policy.go` (311L)
 
-use std::collections::HashMap;
+use lru::LruCache;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,8 @@ const SNIFF_FAILURE_THRESHOLD: u8 = 3;
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(600);
 
 /// Janitor cleanup interval.
+const MAX_KEYS: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
+
 const JANITOR_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Key for the negative sniff cache: (dst_ip, dst_port, outbound).
@@ -48,14 +51,22 @@ struct SniffNegEntry {
 /// Thread-safe via internal `Mutex`. The janitor prunes expired entries
 /// periodically to prevent unbounded growth.
 pub struct TcpSniffNegCache {
-    inner: Mutex<HashMap<SniffNegKey, SniffNegEntry>>,
+    inner: Mutex<NegEntries>,
+}
+
+struct NegEntries {
+    keys: LruCache<SniffNegKey, SniffNegEntry>,
+    peak: usize,
 }
 
 impl TcpSniffNegCache {
     /// Create a new empty cache.
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(NegEntries {
+                keys: LruCache::sparse(MAX_KEYS),
+                peak: 0,
+            }),
         }
     }
 }
@@ -72,12 +83,13 @@ impl TcpSniffNegCache {
     /// Returns `true` if the flow has accumulated enough failures
     /// and the negative cache entry has not yet expired.
     pub fn should_skip_sniff(&self, key: &SniffNegKey, now: Instant) -> bool {
-        let cache = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
-        let Some(entry) = cache.get(key) else {
+        let Some(entry) = cache.keys.get(key) else {
             return false;
         };
         if now >= entry.expires_at {
+            cache.keys.pop(key);
             return false;
         }
         entry.failures >= SNIFF_FAILURE_THRESHOLD
@@ -91,7 +103,7 @@ impl TcpSniffNegCache {
     pub fn note_sniff_failure(&self, key: SniffNegKey, now: Instant) {
         let mut cache = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
-        let entry = cache.entry(key).or_insert(SniffNegEntry {
+        let entry = cache.keys.get_or_insert_mut(key, || SniffNegEntry {
             failures: 0,
             expires_at: now,
         });
@@ -105,6 +117,7 @@ impl TcpSniffNegCache {
             .saturating_add(1)
             .min(SNIFF_FAILURE_THRESHOLD);
         entry.expires_at = now + NEGATIVE_CACHE_TTL;
+        cache.peak = cache.peak.max(cache.keys.len());
     }
 
     /// Clear a negative cache entry (called when sniffing succeeds).
@@ -113,23 +126,28 @@ impl TcpSniffNegCache {
     /// any negative cache entry to allow future sniffing.
     pub fn clear_sniff_negative(&self, key: &SniffNegKey) {
         let mut cache = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        cache.remove(key);
+        cache.keys.pop(key);
     }
 
     /// Prune all expired entries from the cache and shrink oversized backing storage.
     pub fn prune_expired(&self, now: Instant) {
         let mut cache = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let cap = cache.capacity();
-        cache.retain(|_, entry| now < entry.expires_at);
-        if cap > 64 && cache.len() <= cap / 4 {
-            cache.shrink_to_fit();
+        cache.keys.retain(|_, entry| now < entry.expires_at);
+        let len = cache.keys.len();
+        if cache.peak > 64 && len <= cache.peak / 4 {
+            // resize shrinks the backing map while retaining survivor recency.
+            cache
+                .keys
+                .resize(NonZeroUsize::new(len).unwrap_or(NonZeroUsize::MIN));
+            cache.keys.resize(MAX_KEYS);
+            cache.peak = len;
         }
     }
 
     /// Return the number of entries in the cache.
     pub fn len(&self) -> usize {
         let cache = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        cache.len()
+        cache.keys.len()
     }
 
     /// Return `true` if the cache contains no entries.
@@ -140,7 +158,7 @@ impl TcpSniffNegCache {
     /// Clear all entries from the cache.
     pub fn clear_all(&self) {
         let mut cache = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        cache.clear();
+        cache.keys.clear();
     }
 }
 
@@ -261,9 +279,26 @@ mod tests {
     }
 
     #[test]
+    fn full_cache_preserves_recent_hits_without_extending_their_ttl() {
+        let cache = TcpSniffNegCache::new();
+        let now = Instant::now();
+        let key = |port| (SocketAddr::from(([192, 0, 2, 1], port)), 2);
+        for port in 1..=4096 {
+            for _ in 0..SNIFF_FAILURE_THRESHOLD {
+                cache.note_sniff_failure(key(port), now);
+            }
+        }
+        assert!(cache.should_skip_sniff(&key(1), now + Duration::from_secs(599)));
+        cache.note_sniff_failure(key(4097), now + Duration::from_secs(599));
+        assert_eq!(cache.len(), 4096);
+        assert!(!cache.should_skip_sniff(&key(2), now));
+        assert!(!cache.should_skip_sniff(&key(1), now + NEGATIVE_CACHE_TTL));
+    }
+
+    #[test]
     fn test_prune_expired_shrinks_oversized_capacity_with_hysteresis() {
         let key = |host, port| (SocketAddr::from(([198, 51, 100, host], port)), 2);
-        let cap = |c: &TcpSniffNegCache| c.inner.lock().unwrap().capacity();
+        let cap = |c: &TcpSniffNegCache| c.inner.lock().unwrap().peak;
         let now = Instant::now();
         let past = now - NEGATIVE_CACHE_TTL - Duration::from_secs(1);
 

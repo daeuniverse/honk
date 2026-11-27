@@ -21,6 +21,7 @@ pub(crate) mod dns;
 pub(crate) mod kernel;
 pub(crate) mod producer;
 pub(crate) mod record;
+mod slots;
 use honk_outbound::runtime::flow_observation::{GapReason, TransportStatus};
 use record::{Input, InputValues, SnapshotRow, Step, StepData, Summary};
 
@@ -58,7 +59,7 @@ struct Store {
     max_records: usize,
     retention: Duration,
     earliest_ended: Option<Instant>,
-    records: VecDeque<Record>,
+    records: slots::RecordSlots,
     snapshots: Vec<Snapshot>,
     tombstones: VecDeque<(String, Instant)>,
     record_bytes: usize,
@@ -71,6 +72,7 @@ struct Record {
     summary: Summary,
     input: Input,
     steps: Vec<Step>,
+    step_bytes: usize,
     started: Instant,
     ended: Option<Instant>,
     redacted: bool,
@@ -121,6 +123,7 @@ struct Snapshot {
 
 pub(crate) struct FlowGuard {
     store: Weak<FlowStore>,
+    key: Uuid,
     id: String,
     replied: AtomicBool,
     sent: AtomicBool,
@@ -143,7 +146,7 @@ impl Store {
             max_records: MAX_RECORDS,
             retention: TERMINAL_TTL,
             earliest_ended: None,
-            records: VecDeque::new(),
+            records: slots::RecordSlots::default(),
             snapshots: Vec::new(),
             tombstones: VecDeque::new(),
             record_bytes: 0,
@@ -154,7 +157,7 @@ impl Store {
     }
 
     fn retained_record_bytes(&self) -> usize {
-        self.record_bytes + (self.records.capacity() - self.records.len()) * size_of::<Record>()
+        self.record_bytes + self.records.overhead()
     }
 
     /// Everything the owner holds; the records' own share is bounded in
@@ -173,6 +176,10 @@ impl FlowStore {
             recording: AtomicBool::new(true),
             inner: Mutex::new(Store::new(true)),
         }
+    }
+
+    pub(crate) fn recording(&self) -> bool {
+        self.recording.load(Ordering::Acquire)
     }
 
     pub(crate) fn set_recording(&self, enabled: bool) {
@@ -207,7 +214,7 @@ impl FlowStore {
     }
 
     pub(crate) fn maintain(&self) {
-        if !self.recording.load(Ordering::Acquire) {
+        if !self.recording() {
             return;
         }
         self.prune(&mut self.inner.lock(), Instant::now());
@@ -219,7 +226,7 @@ impl FlowStore {
         src: SocketAddr,
         dst: SocketAddr,
     ) -> Option<FlowGuard> {
-        if !self.recording.load(Ordering::Acquire) {
+        if !self.recording() {
             return None;
         }
         let mut store = self.inner.lock();
@@ -227,7 +234,8 @@ impl FlowStore {
             return None;
         }
         let now = Instant::now();
-        let id = Uuid::new_v4().to_string();
+        let key = Uuid::new_v4();
+        let id = key.to_string();
         let mut record = Record {
             summary: Summary {
                 id: id.clone(),
@@ -265,6 +273,7 @@ impl FlowStore {
                 mark: None,
             },
             steps: Vec::new(),
+            step_bytes: 0,
             started: now,
             ended: None,
             redacted: false,
@@ -288,10 +297,11 @@ impl FlowStore {
         record.bytes = record.retained_bytes();
         store.record_bytes += record.bytes;
         self.updated(&record);
-        store.records.push_back(record);
+        store.records.insert(key, record);
         self.enforce_limit(&mut store, now);
         Some(FlowGuard {
             store: Arc::downgrade(self),
+            key,
             id,
             replied: AtomicBool::new(false),
             sent: AtomicBool::new(false),
@@ -301,7 +311,7 @@ impl FlowStore {
     pub(crate) fn connection_evidence(&self, flow_id: &str) -> Option<ConnectionEvidence> {
         let mut store = self.inner.lock();
         self.prune(&mut store, Instant::now());
-        let record = store.records.iter().find(|record| record.id() == flow_id)?;
+        let record = store.records.lookup(flow_id)?;
         let summary = &record.summary;
         Some(ConnectionEvidence {
             chain: summary.chain.clone(),
@@ -315,14 +325,13 @@ impl FlowStore {
     }
 
     /// Expiry stays with the sampler tick; the connection path only pays for
-    /// its own record, which is usually near the back of the ring.
-    fn mutate(&self, id: &str, change: impl FnOnce(&mut Record) -> bool) -> bool {
+    /// its own record.
+    fn mutate(&self, id: &Uuid, change: impl FnOnce(&mut Record) -> bool) -> bool {
         let mut store = self.inner.lock();
         let now = Instant::now();
-        let Some(index) = store.records.iter().rposition(|record| record.id() == id) else {
+        let Some(record) = store.records.get_mut(id) else {
             return false;
         };
-        let record = &mut store.records[index];
         if record.ended.is_some() {
             return false;
         }
@@ -332,6 +341,7 @@ impl FlowStore {
         }
         let revision = record.summary.revision;
         if revision == MAX_SAFE_UINT {
+            let index = store.records.position(id).expect("retained record");
             self.evict(&mut store, index, now, "buffer_overflow");
             return false;
         }
@@ -350,20 +360,35 @@ impl FlowStore {
             );
         }
         if self.enforce_limit(&mut store, now) {
-            store.records.iter().any(|record| record.id() == id)
+            store.records.get(id).is_some()
         } else {
             true
         }
     }
 
-    pub(crate) fn record_step(&self, id: &str, generation: Option<u64>, data: StepData) -> bool {
+    pub(crate) fn record_step(&self, id: &Uuid, generation: Option<u64>, data: StepData) -> bool {
         self.record_with(id, generation, |_| Some(data))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn record_step_at(&self, id: &Uuid, data: StepData, at: (Instant, SystemTime)) -> bool {
+        self.record_with_at(id, None, Some(at), |_| Some(data))
     }
 
     fn record_with(
         &self,
-        id: &str,
+        id: &Uuid,
         generation: Option<u64>,
+        build: impl FnOnce(&Record) -> Option<StepData>,
+    ) -> bool {
+        self.record_with_at(id, generation, None, build)
+    }
+
+    fn record_with_at(
+        &self,
+        id: &Uuid,
+        generation: Option<u64>,
+        at: Option<(Instant, SystemTime)>,
         build: impl FnOnce(&Record) -> Option<StepData>,
     ) -> bool {
         let mut accepted = false;
@@ -390,9 +415,10 @@ impl FlowStore {
             record.redacted |= redacted;
             record.overflow |= overflow;
             let previous_count = record.steps.len();
-            let pushed = record.push_step(
+            let pushed = record.push_step_at(
                 generation.map(|generation| format!("{}:{generation}", self.instance_id)),
                 data,
+                at,
             );
             accepted = record.steps.len() != previous_count;
             pushed || changed
@@ -400,7 +426,7 @@ impl FlowStore {
         accepted && retained
     }
 
-    pub(crate) fn mark_gap(&self, id: &str, reason: GapReason) {
+    pub(crate) fn mark_gap(&self, id: &Uuid, reason: GapReason) {
         self.mutate(id, |record| record.mark_gap(reason));
     }
 
@@ -423,7 +449,7 @@ impl FlowStore {
     }
 
     fn evict(&self, store: &mut Store, index: usize, now: Instant, reason: &'static str) {
-        let record = store.records.remove(index).expect("known record index");
+        let record = store.records.remove(index);
         store.record_bytes -= record.bytes;
         store.dropped = store.dropped.saturating_add(1);
         if store
@@ -486,7 +512,7 @@ impl FlowStore {
         let mut earliest_ended: Option<Instant> = None;
         let mut index = 0;
         while index < store.records.len() {
-            let Some(ended) = store.records[index].ended else {
+            let Some(ended) = store.records.at(index).ended else {
                 index += 1;
                 continue;
             };
@@ -597,7 +623,7 @@ impl FlowStore {
     pub(crate) fn get(&self, flow_id: &str) -> Result<Value, FlowMissing> {
         let mut store = self.inner.lock();
         self.prune(&mut store, Instant::now());
-        if let Some(record) = store.records.iter().find(|record| record.id() == flow_id) {
+        if let Some(record) = store.records.lookup(flow_id) {
             return Ok(record.project());
         }
         if store
@@ -643,7 +669,7 @@ impl Record {
             + self.selected_attempt.as_ref().map_or(0, String::capacity)
             + self.input.heap_bytes()
             + self.steps.capacity() * size_of::<Step>()
-            + self.steps.iter().map(Step::heap_bytes).sum::<usize>()
+            + self.step_bytes
     }
 
     /// The generation of the latest traffic-route step that carries `rule_id`.
@@ -658,7 +684,16 @@ impl Record {
             .and_then(|step| step.generation_id.clone())
     }
 
-    fn push_step(&mut self, generation_id: Option<String>, mut data: StepData) -> bool {
+    fn push_step(&mut self, generation_id: Option<String>, data: StepData) -> bool {
+        self.push_step_at(generation_id, data, None)
+    }
+
+    fn push_step_at(
+        &mut self,
+        generation_id: Option<String>,
+        mut data: StepData,
+        at: Option<(Instant, SystemTime)>,
+    ) -> bool {
         if self.steps.len() == MAX_STEPS {
             return !std::mem::replace(&mut self.overflow, true);
         }
@@ -699,15 +734,20 @@ impl Record {
             };
             self.mode_recorded = false;
         }
-        let elapsed = self.started.elapsed().as_micros();
-        self.steps.push(Step {
+        let (monotonic, observed_at) = at.unwrap_or_else(|| (Instant::now(), SystemTime::now()));
+        let elapsed = monotonic
+            .saturating_duration_since(self.started)
+            .as_micros();
+        let step = Step {
             seq: self.steps.len() + 1,
-            observed_at: SystemTime::now(),
+            observed_at,
             elapsed_us: (elapsed <= u128::from(MAX_SAFE_UINT)).then_some(elapsed as u64),
             generation_id,
             evidence: "observed",
             data,
-        });
+        };
+        self.step_bytes += step.heap_bytes();
+        self.steps.push(step);
         true
     }
 

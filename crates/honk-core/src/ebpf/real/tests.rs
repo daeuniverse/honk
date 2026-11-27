@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::ebpf::common::{btf, syscall::bpf_syscall};
+
 mod attachment;
 mod bindings;
 mod btf_source;
@@ -36,7 +38,7 @@ fn cgroup_attached_prog_count(cgroup_fd: RawFd) -> u32 {
         let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
         attr.query.__bindgen_anon_1.target_fd = cgroup_fd as u32;
         attr.query.attach_type = attach_type;
-        if unsafe { syscall::bpf_syscall(BPF_PROG_QUERY as _, &mut attr) }.is_ok() {
+        if unsafe { bpf_syscall(BPF_PROG_QUERY as _, &mut attr) }.is_ok() {
             total += unsafe { attr.query.__bindgen_anon_2.prog_cnt };
         }
     }
@@ -697,7 +699,7 @@ async fn pname_is_ready_before_first_packet() {
     let sockets = worker.join().expect("join named worker");
 
     let expected = match mode {
-        process_name::PnameCaptureMode::Argv0 => {
+        PnameCaptureMode::Argv0 => {
             let executable = std::env::current_exe().expect("resolve test executable");
             let basename = std::os::unix::ffi::OsStrExt::as_bytes(
                 executable.file_name().expect("test executable basename"),
@@ -707,7 +709,7 @@ async fn pname_is_ready_before_first_packet() {
             expected[..len].copy_from_slice(&basename[..len]);
             expected
         }
-        process_name::PnameCaptureMode::Comm => {
+        PnameCaptureMode::Comm => {
             let mut expected = [0u8; TASK_COMM_LEN];
             expected[.."worker-thread".len()].copy_from_slice(b"worker-thread");
             expected

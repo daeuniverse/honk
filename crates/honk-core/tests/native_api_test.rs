@@ -532,11 +532,11 @@ async fn query_parameters_reject_ambiguity_and_out_of_range_values() {
     app.shutdown().await;
 }
 
-fn entry(id: &str, network: &str, source: &str, observed: Instant) -> ConnectionEntry {
+fn entry(id: &str, network: &'static str, source: &str, observed: Instant) -> ConnectionEntry {
     ConnectionEntry {
-        id: id.into(),
-        source: source.into(),
-        destination: "198.51.100.10:443".into(),
+        id: id.parse().unwrap(),
+        source: source.parse().unwrap(),
+        destination: "198.51.100.10:443".parse().unwrap(),
         proxy: "current-leaf-must-not-be-used".into(),
         routed_outbound: Some("routed-group".into()),
         native_flow_id: None,
@@ -547,7 +547,7 @@ fn entry(id: &str, network: &str, source: &str, observed: Instant) -> Connection
         download: Arc::new(AtomicU64::new(0)),
         start_time: observed,
         domain: None,
-        network: network.into(),
+        network,
         process: None,
         process_path: Some("/private/process/path".into()),
     }

@@ -30,7 +30,9 @@ async fn exercise(lab: &Lab, wan: bool) -> anyhow::Result<()> {
     let (synack, mut syns) = original_synack(&mut client, &wire, &tap, source, target).await?;
     let key = conn_key(source, target);
     {
-        let backend = handle.ebpf.read().await;
+        let backend = tokio::sync::RwLockReadGuard::map(handle.ebpf.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         ensure!(
             backend.conn_state_lookup(&key)?.is_some(),
             "native SYN did not publish conn state"

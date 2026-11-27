@@ -17,13 +17,16 @@ bench = false
 [dependencies]
 honk-config.workspace = true
 honk-ebpf-common.workspace = true
+honk-datapath.workspace = true
+honk-netstack.workspace = true
 honk-outbound.workspace = true
 honk-nfqueue = { workspace = true, optional = true }
 
+aya-obj.workspace = true
 # eBPF (optional; enable with the `ebpf` feature)
 aya = { workspace = true, optional = true }
-aya-obj = { workspace = true, optional = true }
 aya-log = { workspace = true, optional = true }
+object = { version = "0.40", default-features = false, features = ["read_core", "elf"], optional = true }
 
 # Async runtime
 tokio.workspace = true
@@ -94,6 +97,7 @@ parking_lot.workspace = true
 dashmap.workspace = true
 nix.workspace = true
 sha2.workspace = true
+boring.workspace = true
 aes-gcm.workspace = true
 hkdf.workspace = true
 
@@ -111,12 +115,16 @@ flate2 = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+crossbeam-utils = "0.8.23"
+honk-xsk.workspace = true
 libsystemd.workspace = true
 
 [features]
 default = ["clash-api", "jemalloc", "rprx"]
-# Enable real eBPF support (requires Linux kernel 6.12+)
-ebpf = ["aya", "aya-obj", "aya-log", "dep:honk-nfqueue"]
+# Backward-compatible full Linux datapath, including traditional TC and NFQUEUE.
+ebpf = ["legacy-tc"]
+legacy-tc = ["packet-ebpf", "dep:honk-nfqueue", "dep:aya-log"]
+packet-ebpf = ["dep:aya", "dep:object", "honk-ebpf-common/aya-pod", "honk-xsk/host"]
 # Enable the Clash-compatible REST API (experimental.clash_api)
 clash-api = ["dep:axum", "axum/ws", "dep:tower-http", "dep:zip"]
 native-api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:subtle", "dep:hmac", "dep:serde_path_to_error", "honk-outbound/flow-observation", "honk-outbound/owned-tasks"]
@@ -152,7 +160,6 @@ tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
 rcgen.workspace = true
-boring.workspace = true
 tokio-boring.workspace = true
 rustls-pemfile.workspace = true
 webpki-roots.workspace = true
@@ -161,6 +168,7 @@ criterion = { version = "0.8", features = ["async_tokio", "html_reports"] }
 futures-util = "0.3"
 stats_alloc = "0.1.10"
 jsonschema = { version = "0.59", default-features = false }
+
 
 [[bench]]
 name = "dns"

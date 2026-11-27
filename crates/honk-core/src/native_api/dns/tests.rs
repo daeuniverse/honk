@@ -321,6 +321,7 @@ async fn root_query_replays_lists_and_invalidates_only_root() {
         outbound: None,
     }];
     let state = dns_state(config).await;
+    state.observation.core.flows.set_recording(false);
     let id = RequestId("root-dns".into());
     for name in ["", "..", "ordinary..example"] {
         let request = query_request("", json!({"domain": name, "type": ["NS"]}));
@@ -336,7 +337,14 @@ async fn root_query_replays_lists_and_invalidates_only_root() {
         ("OrDiNaRy.Example.", "ordinary.example.", false),
         ("ordinary.example", "ordinary.example.", true),
     ] {
-        let request = query_request("?detail=full", json!({"domain": name, "type": ["NS"]}));
+        let mut body = json!({"domain": name, "type": ["NS"]});
+        let route_source = if expected == "." {
+            "default"
+        } else {
+            body["upstream"] = json!("default");
+            "forced"
+        };
+        let request = query_request("?detail=full", body);
         let response = tokio::time::timeout(Duration::from_secs(2), query(&state, request, &id))
             .await
             .unwrap()
@@ -353,6 +361,10 @@ async fn root_query_replays_lists_and_invalidates_only_root() {
             json!({"name":expected,"type":"NS","class":"IN"})
         );
         assert_eq!(result["status"], "NOERROR");
+        assert_eq!(
+            result["route"],
+            json!({"source": route_source, "rule": null})
+        );
         assert_eq!(result["cached"], cached);
         assert_eq!(
             result["upstream"],

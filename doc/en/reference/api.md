@@ -153,6 +153,8 @@ The probe target is chosen at startup. Reason `restart_required` means a reload 
 
 For `pname_routing`, absent hooks leave `pname()` conditions without a process name: positive conditions never match, and negated conditions always match. Reason `comm_fallback` means conditions use the thread name instead of argv.
 
+For an admitted packet Host source, process support is Host-only, not a global capability: code `pname_routing_host_only` has reason `host_only`, or `host_only_comm_fallback` when only thread names are available. Plain records and Host records missing a usable name retain the same Missing/negation behavior.
+
 With `iface_watch`, reconciliation runs every 60 seconds without event notifications. Its code is `interface_watcher_disabled`; its reason is `subscribe_failed` or `poll_setup_failed`.
 
 `interface_binding` uses code `interface_binding_incomplete` and message "A configured network interface is not fully bound; traffic interception may be incomplete."
@@ -654,6 +656,11 @@ With `config_write: true` and either a nonempty secret or `password_auth`, the a
 Subscription and generated sources are not writable. Ordinary include glob ordering, entry-root confinement, duplicate or cycle rejection and no-match semantics remain unchanged. Saving does not flatten or reformat other files.
 
 A refused configuration write names its cause in `details.reason`, merged with any other details such as `stage`. Non-object details are preserved under `value`. The `code`, `message` and HTTP status do not change.
+
+Full admission also checks the selected XDP execution policy before durable file or
+database mutation. Backend, Direct profile, interface identity and effective XSK mode
+changes require restart; omitted and explicit ZeroCopy are equivalent. Firewall/NAT policy
+changes remain reloadable. This validates policy, not physical device capabilities.
 
 Each response names the first failed check:
 
@@ -1408,7 +1415,7 @@ The logs capability advertises these limits as `max_buffered_records` and `reten
 
 When effective recording stops, retained logs are released and resume cursors expire.
 
-Like Clash `/logs`, capture always omits the `quinn::endpoint` target: its endpoint-driver ERROR duplicates carrier failures that honk reports with their own context.
+Like Clash `/logs`, capture always omits the `quinn::endpoint` and `boringtun` targets: the endpoint-driver ERROR duplicates carrier failures that honk reports with their own context, and boringtun's handshake-retry and session-expiry lines carry no node name (the same events are reported once by the WireGuard driver).
 
 Use `Last-Event-ID` for resume. Logs have independent stream- and filter-bound cursors and, like `/events`, send ready → replay → live, retaining the supplied cursor on ready until replay advances it. Both reject expired, foreign or filter-changed cursors with `409 event_cursor_expired` before 200, allow 16 clients with 64 queued events each, disconnect full queues and send 15-second heartbeat comments.
 
@@ -1486,6 +1493,25 @@ Map capacity may be known while occupancy remains null. Attached hooks alone do 
 | `ebpf.maps` | `state` (`partial`, `error`, `unknown`) and `conn_state`: null or `{occupancy,capacity,occupancy_known}` |
 
 `errors[]` is `{code,message}` with `code` one of `program_observation_failed`, `hook_observation_incomplete`, `routing_observation_failed`, `admission_observation_failed`, `map_observation_failed` and `observation_limit_reached`.
+
+XDP additionally publishes `x-honk.xdp` from the capture owner's latest observations. The default summary contains `state`, `state_changed_at_unix_ms` and `queue_count`; `detail=full` adds `queues` and `truncated`. Clash `GET /stats` exposes the same full projection as `xdp`. It is null before an XDP owner is installed, including TC/TUN deployments. The producer remains available independently of either HTTP feature. Each XDP projection is bounded to 64 KiB; `truncated: true` means only the first queues in admitted device/queue order fit, while `queue_count` retains the complete admitted count.
+
+`cross_worker_handoffs` counts packet envelopes accepted by the other worker, not deliveries. `handoffs[destination][kind]` splits packets and L3 bytes by destination worker (0 or 1; source is the other worker) and kind (0: ingress requiring classification, 1: Endpoint). `packets` and `l3_bytes` count successful enqueues; `refused` and `refused_l3_bytes` count a full shared cell pool or a destination queue that did not accept the envelope. No L2, driver metadata, or local traffic is counted. These are handoff operations, not TCP application bytes or unique packets. Compare deltas only within the same capture.
+
+`ownership_dir_full`, `udp_reply_queue_full` and `remote_backpressure` report saturated TCP ownership admission, UDP reply admission and remote TCP buffer pressure respectively; a pressure event is not evidence of packet loss. `direct_attach_fallback` counts attempts to use Remote after a Direct attachment could not be made; `direct_attach_fallback_failed` is the subset that did not bind Remote. Both views use decimal strings. Handoff and Direct fallback counters saturate.
+
+`dns_projection_state` distinguishes `disabled_by_config`, `inactive_no_domain_rules`, `staged_closed`, `active_tcp_udp`, `degraded_fallback` (with `dns_projection_reason`), and `closed`. `would_pass_dns` counts shadow decisions, not native traffic. `dns_projection_counters` describes the sampled bank; the full view can also include `dns_realm_revocations` as numeric realm ID/count pairs. No domain or IP is exposed.
+
+`dns_decisions` is a low-frequency sample of cumulative counters for this capture. `pass_dns_d1` counts first native authorizations; `pass_dns_d1_pending_retry` counts reauthorized packets before a conntrack match. Neither includes CT hits or proves delivery. `drop_native_pending_conflict` counts packets whose pending owner could not be reauthorized. `dns_native_pending_capped` is a refusal of a native slot, not a drop. `drop_hold_contention`, `drop_hold_unavailable`, and `hold_guard_release_failed` distinguish an unresolved same-key race, unavailable coordination resources, and failure to release an owned guard. Counter values are decimal strings; null means no reading, not zero.
+`hold_retire_failed` records failed pending cleanup or accounting independently of the current packet's CT verdict. A confirmed CT pass is not evidence that native credit was returned.
+
+For XDP Host, `host_meta_insert_failed` counts refused Endpoint metadata publications. `host_direct_unrecorded` counts packets proved Direct that could not retain a new UDP hold because the table was full; it does not count successful connections. `host_late_packet` counts private TUN input rejected for a missing, invalid, future or more-than-30-second-old admission timestamp. It is not a TCP idle timeout or a NIC drop counter.
+
+Each queue identifies its actual `namespace_cookie`, `attachment_generation`, `ifindex` and `queue_id`, actual `mode` (`copy` or `zerocopy`), `ring_capacity` and RX/control/bulk frame capacities. A physical queue can serve several logical realms. `sequence`, `attempted_at_unix_ms` and `last_success_at_unix_ms` identify sampling attempts and the latest successful socket read; timestamps are decimal Unix milliseconds, and all full-width integers are decimal strings. Sequence and read-error counts saturate. Queue `socket` contains the six raw cumulative XDP_STATISTICS counters: `rx_dropped`, `rx_invalid_descs`, `tx_invalid_descs`, `rx_ring_full`, `rx_fill_ring_empty_descs` and `tx_ring_empty_descs`. `rings` contains raw `producer`/`consumer` u32 indices for `rx`, `tx`, `fill` and `cq`; these wrap and are descriptor indices, not packet counts.
+
+Sampling runs outside DEBUG filtering, at most once per second on existing owner turns, plus a final sample before normal socket close. There is no new idle timer: a quiet queue may retain an old observation. Socket and ring reads are sequential, not an atomic snapshot across counters, rings or queues. `socket_available: false` with null `socket` means unobserved or unavailable, never zero loss; after an attempted failure `socket_error` is `statistics_unavailable`, optional `socket_errno` preserves the numeric errno, and `socket_read_errors` increases even without an errno. `last_success_at_unix_ms` may remain older after failure, but stale successful counters are not returned as current data. Errors remain nonfatal. `rx_fill_ring_empty_descs` records kernel empty-FILL events, not a packet-loss rate; a populated current FILL ring does not disprove earlier starvation. Counters are neither summed into total loss nor converted to rates/deltas.
+
+Lifecycle is `starting` until actual activation, then `active`, `closing` after capture admission closes, `closed` after socket teardown, or terminal `failed_retained` when failure retains capture ownership/UMEM. Terminal states freeze lifecycle; policy reload preserves the same attachment identity and counters. HTTP reads only project retained values: they do not sample sockets, advance sequence, reset counters or alter polling/admission. Diagnostic readers retain the observation's memory funding, without retaining a Port, FD or packet lease.
 
 The optional [business-connection grace](./global.md#shutdown) does not permit detaching unfinished cleanup to claim success. Already-started blocking work is not cancelled by aborting an async wrapper: the StateTick maintenance owner warns after its nominal stop deadline and continues to join the actual SQLite work. Blocking credential KDF/database work and an already-started NSS lookup also retain their real join.
 
@@ -1712,6 +1738,7 @@ Download or extraction failures are logged and do not stop the engine.
 ```text
 {
   outbounds: [{ name, totalConns, activeConns, upload, download, errors }],
+  xdp: null | { state, state_changed_at_unix_ms, queue_count, cross_worker_handoffs, handoffs, ownership_dir_full, udp_reply_queue_full, remote_backpressure, direct_attach_fallback, direct_attach_fallback_failed, dns_projection_state, dns_projection_reason, would_pass_dns, dns_decisions, dns_projection_counters, dns_realm_revocations?, truncated, queues },
   pool: { readyHits, readyMisses, entries },
   dns: {
     socketAdmission: { refused, timeouts },

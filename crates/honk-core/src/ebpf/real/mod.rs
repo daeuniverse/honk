@@ -13,12 +13,13 @@ use tracing::{debug, info, warn};
 
 #[cfg(test)]
 use super::TcpSocketOwnership;
+use super::common::PnameCaptureMode;
 use super::retirement::AuxDeleteTally;
 use super::{
-    EbpfBackend, FlowExpiryHint, RETIRE_BATCH_CAPACITY, RETIRE_FENCE_MAP, RetireCounts,
-    RetireError, RetireKind, RetireOutcome, RetireRequest, UDP_DECISION_SEQUENCE_MAP,
-    UdpDecisionCommitResult, UdpDecisionSequenceStatus, UdpDecisionTransition,
-    probe::BatchCapability, validate_udp_decision_transition,
+    DomainProjectionSink, EbpfBackend, FlowExpiryHint, PolicyBackend, RETIRE_BATCH_CAPACITY,
+    RETIRE_FENCE_MAP, RetireCounts, RetireError, RetireKind, RetireOutcome, RetireRequest,
+    UDP_DECISION_SEQUENCE_MAP, UdpDecisionCommitResult, UdpDecisionSequenceStatus,
+    UdpDecisionTransition, probe::BatchCapability, validate_udp_decision_transition,
 };
 
 /// Parse the running kernel version from /proc/version.
@@ -63,7 +64,7 @@ pub struct RealEbpfBackend {
     cgroup_sock_links: Vec<aya::programs::cgroup_sock::CgroupSockLink>,
     /// cgroup connect4/6 + sendmsg4/6 links; same lifetime rule as above.
     cgroup_sock_addr_links: Vec<aya::programs::cgroup_sock_addr::CgroupSockAddrLink>,
-    pname_mode: process_name::PnameCaptureMode,
+    pname_mode: PnameCaptureMode,
     dae0_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
     dae0peer_ingress_link: Option<aya::programs::tc::SchedClassifierLink>,
     sk_lookup_link: Option<aya::programs::sk_lookup::SkLookupLink>,
@@ -189,7 +190,6 @@ impl RealEbpfBackend {
 
 mod attach;
 mod bindings;
-mod btf;
 mod events;
 mod iface_watch;
 mod interface_startup;
@@ -538,92 +538,7 @@ impl RealEbpfBackend {
     }
 }
 
-#[async_trait]
-impl EbpfBackend for RealEbpfBackend {
-    fn observe_datapath(&self) -> super::DatapathObservation {
-        self.observe_backend()
-    }
-
-    fn interface_binding_snapshot(&self) -> anyhow::Result<super::interface::BindingSnapshot> {
-        self.bindings.snapshot()
-    }
-
-    fn commit_interface_bindings(
-        &mut self,
-        commit: super::interface::BindingCommit,
-    ) -> Vec<std::os::fd::OwnedFd> {
-        self.bindings.commit(commit)
-    }
-
-    fn prepare_tc_programs(
-        &self,
-        programs: &[super::interface::TcProgram],
-    ) -> anyhow::Result<Option<programs::TcProgramPreparation>> {
-        RealEbpfBackend::prepare_tc_programs(self, programs).map(Some)
-    }
-
-    fn commit_tc_programs(&mut self, batch: programs::TcProgramBatch) -> anyhow::Result<()> {
-        RealEbpfBackend::commit_tc_programs(self, batch)
-    }
-
-    fn set_datapath_ready(&mut self, ready: bool) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !ready || !self.retirement_failed,
-            "retirement ownership is unresolved"
-        );
-        if ready && !self.listeners_published {
-            anyhow::bail!("listener socket generation is not fully published");
-        }
-        self.array_set("DATAPATH_STATE_MAP", 0, &u32::from(ready))
-    }
-
-    fn set_datapath_flags(&mut self, flags: u32) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            flags & DATAPATH_FLAG_NFQ_READY == 0
-                || (!self.udp_staging_quiesce_incomplete && !self.retirement_failed),
-            "UDP staging quiescence must complete before NFQUEUE can reopen"
-        );
-        self.array_set("DATAPATH_FLAGS_MAP", 0, &flags)
-    }
-
-    fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
-        self.quiesce_staged_udp()
-    }
-
-    fn publish_routing_plan(
-        &mut self,
-        plan: &crate::control::routing_matcher::RoutingPushPlan,
-        learned_domains: &[(LpmKey, DomainRouting)],
-    ) -> anyhow::Result<()> {
-        self.publish_compiled_routing(plan, learned_domains)
-    }
-
-    fn routing_policy_generation(&self) -> u64 {
-        self.routing_generation_counter
-    }
-
-    fn active_routing_slot(&self) -> anyhow::Result<u32> {
-        Ok(self.routing_slot)
-    }
-
-    fn add_domain_ip_bitmap(
-        &mut self,
-        ip_key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
-        let map = self.active_domain_mut().map_err(anyhow::Error::from)?;
-        let mut value = match map.get(&ip_key.data, 0) {
-            Ok(value) => value,
-            Err(error) if Self::map_error_is_missing(&error) => DomainRouting::default(),
-            Err(error) => return Err(anyhow::anyhow!("active domain map lookup: {error}")),
-        };
-        for (current, update) in value.bitmap.iter_mut().zip(bitmap.bitmap) {
-            *current |= update;
-        }
-        map.insert(&ip_key.data, &value, 0)
-            .map_err(|error| anyhow::anyhow!("active domain map insert: {error}"))
-    }
-
+impl DomainProjectionSink for RealEbpfBackend {
     fn set_domain_ip_bitmap(
         &mut self,
         ip_key: &LpmKey,
@@ -656,6 +571,194 @@ impl EbpfBackend for RealEbpfBackend {
                 "active domain map delete: {error}"
             ))),
         }
+    }
+}
+
+#[async_trait]
+impl PolicyBackend for RealEbpfBackend {
+    fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)> {
+        Ok(self)
+    }
+
+    fn tc_mut(&mut self) -> anyhow::Result<&mut (dyn EbpfBackend + 'static)> {
+        Ok(self)
+    }
+
+    fn observe_datapath(&self) -> super::DatapathObservation {
+        self.observe_backend()
+    }
+
+    fn set_datapath_ready(&mut self, ready: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !ready || !self.retirement_failed,
+            "retirement ownership is unresolved"
+        );
+        if ready && !self.listeners_published {
+            anyhow::bail!("listener socket generation is not fully published");
+        }
+        self.array_set("DATAPATH_STATE_MAP", 0, &u32::from(ready))
+    }
+
+    fn set_datapath_flags(&mut self, flags: u32) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            flags & DATAPATH_FLAG_NFQ_READY == 0
+                || (!self.udp_staging_quiesce_incomplete && !self.retirement_failed),
+            "UDP staging quiescence must complete before NFQUEUE can reopen"
+        );
+        self.array_set("DATAPATH_FLAGS_MAP", 0, &flags)
+    }
+
+    fn quiesce_udp_staging_if_supported(&mut self) -> anyhow::Result<bool> {
+        self.quiesce_udp_staging().map(|()| true)
+    }
+
+    #[cfg(feature = "native-api")]
+    fn supports_kernel_trace(&self) -> bool {
+        true
+    }
+
+    fn publish_routing_plan(
+        &mut self,
+        plan: &crate::control::routing_matcher::RoutingPushPlan,
+        learned_domains: &[(LpmKey, DomainRouting)],
+    ) -> anyhow::Result<()> {
+        self.publish_compiled_routing(plan, learned_domains)
+    }
+
+    fn routing_policy_generation(&self) -> u64 {
+        self.routing_generation_counter
+    }
+
+    #[cfg(feature = "native-api")]
+    fn bind_kernel_trace_dictionary(
+        &mut self,
+        dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
+    ) {
+        if let Some(owner) = &self.routing_generation {
+            self.trace_dictionaries
+                .bind(owner.trace_policy, owner.fingerprint, dictionary);
+        }
+    }
+
+    fn active_routing_slot(&self) -> anyhow::Result<u32> {
+        Ok(self.routing_slot)
+    }
+
+    fn add_domain_ip_bitmap(
+        &mut self,
+        ip_key: &LpmKey,
+        bitmap: &DomainRouting,
+    ) -> anyhow::Result<()> {
+        let map = self.active_domain_mut().map_err(anyhow::Error::from)?;
+        let mut value = match map.get(&ip_key.data, 0) {
+            Ok(value) => value,
+            Err(error) if Self::map_error_is_missing(&error) => DomainRouting::default(),
+            Err(error) => return Err(anyhow::anyhow!("active domain map lookup: {error}")),
+        };
+        for (current, update) in value.bitmap.iter_mut().zip(bitmap.bitmap) {
+            *current |= update;
+        }
+        map.insert(&ip_key.data, &value, 0)
+            .map_err(|error| anyhow::anyhow!("active domain map insert: {error}"))
+    }
+
+    /// Without the cgroup hooks `pname()` never matches and `!pname()`
+    /// always does; without argv capture they see the thread name.
+    fn pname_support(&self) -> super::PnameSupport {
+        if self.cgroup_sock_links.is_empty() {
+            super::PnameSupport::Unavailable
+        } else if self.pname_mode == PnameCaptureMode::Comm {
+            super::PnameSupport::ThreadName
+        } else {
+            super::PnameSupport::Full
+        }
+    }
+
+    fn set_outbound_alive(
+        &mut self,
+        outbound: u8,
+        domain: u32,
+        ipver: u32,
+        alive: bool,
+    ) -> anyhow::Result<()> {
+        let key = conn_key(outbound, domain, ipver);
+        self.array_set("OUTBOUND_CONNECTIVITY_MAP", key, &u64::from(alive))
+    }
+
+    fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool> {
+        let key = conn_key(outbound, domain, ipver);
+        Ok(self
+            .array_get::<u64>("OUTBOUND_CONNECTIVITY_MAP", key)?
+            .unwrap_or(0)
+            != 0)
+    }
+
+    async fn cleanup(&mut self) -> anyhow::Result<()> {
+        // Detach eBPF programs immediately to restore network connectivity.
+        self.detach_hooks()?;
+
+        // Stop the aya-log flush task before dropping the Ebpf object.
+        if let Some(h) = self.log_flush_handle.take() {
+            h.abort();
+            let _ = h.await;
+        }
+        // The root and generated freplace links remain valid until every
+        // network entry point is detached above.
+        self.routing_generation = None;
+        // Stop the DaeEvent consumer, which owns a duplicate map handle.
+        if let Some(h) = self.event_flush_handle.take() {
+            h.abort();
+            let _ = h.await;
+        }
+        #[cfg(feature = "native-api")]
+        if let Some(programs) = &self.programs {
+            programs.close_receive_trace();
+        }
+
+        // Pending verifier jobs retain original map FDs until their blocking work finishes.
+        self.programs = None;
+        self.maps = None;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Err(error) = self.remove_nonpersistent_pins() {
+            if error.raw_os_error() == Some(libc::EBUSY) {
+                debug!(
+                    "BPF pin still busy after teardown, will be cleaned up later: {}",
+                    error
+                );
+            } else {
+                warn!("cleanup transient BPF pins: {}", error);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl EbpfBackend for RealEbpfBackend {
+    fn prepare_tc_programs(
+        &self,
+        programs: &[super::interface::TcProgram],
+    ) -> anyhow::Result<Option<programs::TcProgramPreparation>> {
+        RealEbpfBackend::prepare_tc_programs(self, programs).map(Some)
+    }
+
+    fn commit_tc_programs(&mut self, batch: programs::TcProgramBatch) -> anyhow::Result<()> {
+        RealEbpfBackend::commit_tc_programs(self, batch)
+    }
+
+    fn interface_binding_snapshot(&self) -> anyhow::Result<super::interface::BindingSnapshot> {
+        self.bindings.snapshot()
+    }
+
+    fn commit_interface_bindings(
+        &mut self,
+        commit: super::interface::BindingCommit,
+    ) -> Vec<std::os::fd::OwnedFd> {
+        self.bindings.commit(commit)
+    }
+
+    fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
+        self.quiesce_staged_udp()
     }
 
     fn conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>> {
@@ -828,17 +931,6 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     #[cfg(feature = "native-api")]
-    fn bind_kernel_trace_dictionary(
-        &mut self,
-        dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
-    ) {
-        if let Some(owner) = &self.routing_generation {
-            self.trace_dictionaries
-                .bind(owner.trace_policy, owner.fingerprint, dictionary);
-        }
-    }
-
-    #[cfg(feature = "native-api")]
     fn capture_kernel_route(
         &self,
         key: &TuplesKey,
@@ -855,18 +947,6 @@ impl EbpfBackend for RealEbpfBackend {
             .map_err(|_| "kernel_trace_lookup_failed")?
             .ok_or("kernel_trace_sidecar_missing")?;
         self.trace_dictionaries.capture(&witness, key, reference)
-    }
-
-    /// Without the cgroup hooks `pname()` never matches and `!pname()`
-    /// always does; without argv capture they see the thread name.
-    fn pname_support(&self) -> super::PnameSupport {
-        if self.cgroup_sock_links.is_empty() {
-            super::PnameSupport::Unavailable
-        } else if self.pname_mode == process_name::PnameCaptureMode::Comm {
-            super::PnameSupport::ThreadName
-        } else {
-            super::PnameSupport::Full
-        }
     }
 
     #[cfg(feature = "native-api")]
@@ -930,25 +1010,6 @@ impl EbpfBackend for RealEbpfBackend {
 
     fn set_admission_pressure(&mut self, pressured: bool) -> anyhow::Result<()> {
         self.array_set("ADMISSION_PRESSURE", 0, &u32::from(pressured))
-    }
-
-    fn set_outbound_alive(
-        &mut self,
-        outbound: u8,
-        domain: u32,
-        ipver: u32,
-        alive: bool,
-    ) -> anyhow::Result<()> {
-        let key = conn_key(outbound, domain, ipver);
-        self.array_set("OUTBOUND_CONNECTIVITY_MAP", key, &u64::from(alive))
-    }
-
-    fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool> {
-        let key = conn_key(outbound, domain, ipver);
-        Ok(self
-            .array_get::<u64>("OUTBOUND_CONNECTIVITY_MAP", key)?
-            .unwrap_or(0)
-            != 0)
     }
 
     fn get_bpf_stats(&self, k: u32) -> anyhow::Result<Option<u64>> {
@@ -1073,46 +1134,6 @@ impl EbpfBackend for RealEbpfBackend {
                 Ok(()) => {}
                 Err(error) if Self::sockmap_slot_is_empty(&error) => {}
                 Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(())
-    }
-
-    async fn cleanup(&mut self) -> anyhow::Result<()> {
-        // Detach eBPF programs immediately to restore network connectivity.
-        self.detach_hooks()?;
-
-        // Stop the aya-log flush task before dropping the Ebpf object.
-        if let Some(h) = self.log_flush_handle.take() {
-            h.abort();
-            let _ = h.await;
-        }
-        // The root and generated freplace links remain valid until every
-        // network entry point is detached above.
-        self.routing_generation = None;
-        // Stop the DaeEvent consumer, which owns a duplicate map handle.
-        if let Some(h) = self.event_flush_handle.take() {
-            h.abort();
-            let _ = h.await;
-        }
-        #[cfg(feature = "native-api")]
-        if let Some(programs) = &self.programs {
-            programs.close_receive_trace();
-        }
-
-        // Pending verifier jobs retain original map FDs until their blocking work finishes.
-        self.programs = None;
-        self.maps = None;
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        if let Err(error) = self.remove_nonpersistent_pins() {
-            if error.raw_os_error() == Some(libc::EBUSY) {
-                debug!(
-                    "BPF pin still busy after teardown, will be cleaned up later: {}",
-                    error
-                );
-            } else {
-                warn!("cleanup transient BPF pins: {}", error);
             }
         }
         Ok(())

@@ -4,23 +4,29 @@ mod bootstrap;
 mod cache;
 pub(crate) mod client;
 mod connection;
+#[cfg(target_os = "linux")]
+pub mod core_forward;
 pub mod dns_control;
-mod dns_listener;
+pub(crate) mod dns_listener;
 pub mod drain;
 pub mod janitor;
-#[cfg(feature = "ebpf")]
+pub mod netstack;
+#[cfg(feature = "legacy-tc")]
 pub(crate) mod nfqueue;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 mod nfqueue_runtime;
-#[cfg(all(test, feature = "ebpf"))]
+pub mod packet_endpoint;
+#[cfg(all(test, feature = "legacy-tc"))]
 use nfqueue_runtime::{
     NFQUEUE_INGEST_BYTE_BUDGET, NFQUEUE_INGEST_QUEUE_LEN, NfqueueActorQueue, NfqueueRuntimeFatal,
     NfqueueTokenRetryBackoff,
 };
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 use nfqueue_runtime::{NfqueueRuntime, NfqueueRuntimeEvent, wait_nfqueue_event};
 mod lifecycle;
 pub mod packet_sniffer;
+#[cfg(target_os = "linux")]
+pub(crate) mod poll_budget;
 mod preconnect;
 mod probers;
 pub mod quic;
@@ -28,16 +34,23 @@ pub(crate) mod reload;
 #[cfg(test)]
 mod reload_tests;
 mod resource_budget;
+#[cfg(target_os = "linux")]
+pub use poll_budget::{PollBudgetBinding, PollBudgetPublisher, ProcessPollBudget};
 mod runtime;
 mod shutdown;
+mod task_registry;
+#[cfg(target_os = "linux")]
+pub(crate) use task_registry::TASK_BOOKKEEPING;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 #[cfg(test)]
 use udp_ingress::{
     UdpLoopState, UdpSlowPathWork, begin_udp_slow_path, dispatch_udp_slow_path,
     reserve_udp_slow_path, try_admit_udp_slow_path, udp_fast_path,
 };
 mod retirement_worker;
+mod tc_kernel;
+use tc_kernel::TcKernelController;
 pub mod routing_matcher;
 mod sockets;
 pub mod tcp_sniff;
@@ -49,7 +62,8 @@ use crate::control::packet_sniffer::PacketSnifferPool;
 use crate::control::udp_endpoint::{EndpointReservation, UdpEndpointPool, UdpInitLease};
 use crate::dns::DnsResolver;
 use crate::dns::query::{ValidatedDnsQuery, validate_exact_dns_query};
-use crate::ebpf::EbpfBackend;
+#[cfg(test)]
+use crate::ebpf::{EbpfBackend, PolicyBackend};
 use crate::group::{GroupManager, SharedGroupManager};
 use crate::pool::ConnectionPool;
 use crate::proxy::ProxyRegistry;
@@ -59,7 +73,7 @@ use crate::sniffing;
 use crate::stats::StatsManager;
 use bytes::Bytes;
 use drain::DrainTracker;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 use futures::FutureExt;
 use honk_config::node::{Group, GroupPolicy};
 use honk_config::{
@@ -79,7 +93,7 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
 use std::time::Duration;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 use std::time::Instant;
 use tokio::io::Interest;
 #[cfg(test)]
@@ -99,6 +113,8 @@ pub(crate) use reload::restart_required_fields;
 use reload::*;
 pub(crate) use reload::{LogFiles, StartupDowngrades};
 pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
+#[cfg(target_os = "linux")]
+pub(crate) use sockets::probe_socket_marks;
 use sockets::*;
 #[cfg(all(test, feature = "native-api"))]
 pub(crate) use tests::reload_harness::ReloadBehavior;
@@ -148,6 +164,61 @@ pub(crate) enum EnginePhase {
     Failed,
 }
 
+#[derive(Default)]
+pub(crate) struct ShutdownIntent {
+    requested: std::sync::atomic::AtomicBool,
+    // Orders XDP relay binding and capture admission against shutdown.
+    #[cfg(target_os = "linux")]
+    capture_start: parking_lot::Mutex<()>,
+    changed: tokio::sync::Notify,
+}
+
+impl ShutdownIntent {
+    pub(crate) fn requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn request(&self) {
+        {
+            #[cfg(target_os = "linux")]
+            let _start = self.capture_start.lock();
+            self.requested
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.changed.notify_waiters();
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn lock_capture_start(&self) -> std::io::Result<parking_lot::MutexGuard<'_, ()>> {
+        let start = self.capture_start.lock();
+        if self.requested() {
+            return Err(std::io::Error::other(
+                "shutdown requested before XDP activation",
+            ));
+        }
+        Ok(start)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_capture(
+        &self,
+        admission: &std::sync::atomic::AtomicBool,
+    ) -> anyhow::Result<()> {
+        let _start = self.lock_capture_start()?;
+        admission.store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) async fn wait(&self) {
+        let notified = self.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.requested() {
+            notified.await;
+        }
+    }
+}
+
 /// The main control plane.
 pub struct ControlPlane {
     dns_audit: Option<crate::audit::DnsAuditWorker>,
@@ -157,7 +228,8 @@ pub struct ControlPlane {
     reload_lock: tokio::sync::Mutex<()>,
     log_files: LogFiles,
     startup_downgrades: StartupDowngrades,
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
+    tc_kernel: Option<Arc<TcKernelController>>,
     router: Arc<RwLock<Router>>,
     proxy_registry: Arc<ProxyRegistry>,
     dns_resolver: Arc<DnsResolver>,
@@ -197,6 +269,10 @@ pub struct ControlPlane {
     outbound_id_map: Arc<parking_lot::RwLock<OutboundHealthIndex>>,
     resource_budget: ResourceBudget,
     dns_socket_budget: crate::dns::transport::DnsSocketBudget,
+    #[cfg(target_os = "linux")]
+    process_polling: Option<PollBudgetBinding>,
+    #[cfg(target_os = "linux")]
+    polling: Option<Arc<crate::xdp::polling::PollingPublication>>,
     concurrency_limit: Arc<tokio::sync::Semaphore>,
     tcp_admission_target: Arc<std::sync::atomic::AtomicUsize>,
     /// Cold non-DNS UDP initialization budget. Ready endpoints bypass it.
@@ -222,7 +298,7 @@ pub struct ControlPlane {
     mode_state: Option<crate::mode::SharedModeState>,
     /// Sole writer for mode state and DATAPATH_FLAGS_MAP publication.
     datapath_flags: Option<crate::mode::DatapathFlagsHandle>,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pending_udp_verdicts: Option<Arc<nfqueue::PendingUdpVerdicts>>,
     datapath_healthy: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "native-api")]
@@ -234,10 +310,14 @@ pub struct ControlPlane {
     native_owner: Option<Arc<dyn crate::observe::Owner>>,
     #[cfg(feature = "native-api")]
     subscriptions: Option<crate::subscription::SubscriptionSupervisorHandle>,
-    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_requested: Arc<ShutdownIntent>,
     #[cfg(feature = "clash-api")]
     ui_download: Arc<tokio::sync::Mutex<Option<crate::clash_api::ui::UiDownloadTask>>>,
     active_routing_plan: routing_matcher::SharedRoutingPlan,
+    #[cfg(target_os = "linux")]
+    core_forward_users: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(target_os = "linux")]
+    core_forward_mixed_users: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(feature = "reload-bench-counters")]
     reload_slow_path_entries: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -246,7 +326,7 @@ pub struct ControlPlane {
     clash_publication_pause: parking_lot::Mutex<Option<ClashPublicationPause>>,
     /// Interface watcher, stopped and joined before `detach_hooks` during
     /// shutdown so it cannot re-attach hooks mid-drain.
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     iface_watcher: Option<crate::ebpf::real::IfaceWatcher>,
 }
 
@@ -282,7 +362,7 @@ impl ControlPlane {
         Arc::clone(&self.degradations)
     }
 
-    #[cfg(feature = "native-api")]
+    #[cfg(any(target_os = "linux", feature = "native-api"))]
     pub(crate) fn datapath_health_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
         Arc::clone(&self.datapath_healthy)
     }
@@ -335,6 +415,9 @@ impl ControlPlane {
     pub fn config_handle(&self) -> Arc<RwLock<Arc<Config>>> {
         self.config.clone()
     }
+    pub(crate) fn packet_udp_capacity(&self) -> usize {
+        self.resource_budget.udp_endpoints.min(64)
+    }
     #[cfg(feature = "native-api")]
     pub(crate) fn log_files(&self) -> LogFiles {
         self.log_files.clone()
@@ -357,14 +440,14 @@ impl ControlPlane {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Shared backend cell, used by the interface watcher for dynamic attach.
-    pub fn ebpf_handle(&self) -> Arc<RwLock<Box<dyn EbpfBackend>>> {
+    /// The sole policy publication cell; TC consumers borrow its explicit capability view.
+    pub fn policy_backend_handle(&self) -> Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> {
         self.ebpf.clone()
     }
 
     /// Hand the interface watcher to the control plane so shutdown can stop
     /// it before detaching hooks.
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub fn set_iface_watcher(&mut self, watcher: Option<crate::ebpf::real::IfaceWatcher>) {
         self.iface_watcher = watcher;
     }
@@ -410,6 +493,13 @@ impl ControlPlane {
         self.dns_controller.dns_service()
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn packet_routing_projection(
+        &self,
+    ) -> Arc<crate::dns::projection::RoutingProjection> {
+        self.dns_controller.routing_projection()
+    }
+
     pub(crate) fn command_sender(&self) -> mpsc::Sender<ControlCommand> {
         self.command_tx.clone()
     }
@@ -433,7 +523,7 @@ impl ControlPlane {
         self.subscriptions = Some(subscriptions);
     }
 
-    pub(crate) fn shutdown_intent(&self) -> Arc<std::sync::atomic::AtomicBool> {
+    pub(crate) fn shutdown_intent(&self) -> Arc<ShutdownIntent> {
         Arc::clone(&self.shutdown_requested)
     }
 
@@ -453,6 +543,10 @@ impl ControlPlane {
 }
 
 impl ControlPlane {
+    pub(crate) fn active_routing_plan_handle(&self) -> routing_matcher::SharedRoutingPlan {
+        Arc::clone(&self.active_routing_plan)
+    }
+
     pub(crate) fn compile_routing_plan(
         config: &Config,
         router: &Router,

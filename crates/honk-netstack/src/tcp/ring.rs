@@ -1,0 +1,986 @@
+//! Chunk pool and the byte rings that live on it (design §5).
+//!
+//! Payload reservations are whole chunks; descriptor reservations use their allocated
+//! capacity. Each admitted flow reserves its progress floor before using shared space.
+
+use std::collections::VecDeque;
+use std::io::{self, IoSlice, IoSliceMut};
+use std::sync::Arc;
+
+use crate::budget::MemoryBudget;
+
+/// Endpoint-mode chunk size and the default of a [`Pool`] built without [`Pool::with_chunk`].
+pub const CHUNK: usize = 16 * 1024;
+/// Transparent-mode default: with many small client flows a 4 KiB chunk keeps the per-flow floor
+/// (accounting only, an idle flow holds no chunk) near 9 KiB.
+pub const TRANSPARENT_CHUNK: usize = 4 * 1024;
+/// Smallest and largest configurable chunk.
+pub const MIN_CHUNK: usize = 4 * 1024;
+pub const MAX_CHUNK: usize = 64 * 1024;
+/// Payload slices a maximum-size (64 KiB) IP packet can span at the smallest chunk, including an
+/// unaligned first chunk.
+pub const MAX_PARTS: usize = 65536 / MIN_CHUNK + 2;
+/// A 64 KiB application loan can start at the last byte of a 4 KiB chunk.
+pub(crate) const STREAM_PARTS: usize = 65536 / MIN_CHUNK + 1;
+
+/// What admission reserves for one TCP flow: a TX and an RX chunk and the descriptor floor.
+pub const fn floor(chunk: usize) -> usize {
+    2 * chunk + super::sent::FLOOR_BYTES
+}
+
+/// A configured chunk size, clamped to `[MIN_CHUNK, MAX_CHUNK]`.
+pub fn clamp_chunk(chunk: usize) -> usize {
+    chunk.clamp(MIN_CHUNK, MAX_CHUNK)
+}
+
+/// Free chunks kept for reuse at most, so a bulk flow does not return a chunk to the allocator and
+/// take one back for every 16 KiB. An idle pool keeps one (see `free`).
+const FREE_CACHE: usize = 256;
+/// Chunk-list slots an emptied ring keeps, so a flow draining a few chunks per batch does not
+/// reallocate its list each time; a ring that once held a whole window gives the rest back.
+const KEEP_SLOTS: usize = 4;
+
+pub(super) const fn index_floor_bytes() -> usize {
+    KEEP_SLOTS * (std::mem::size_of::<Chunk>() + std::mem::size_of::<Option<Chunk>>())
+}
+
+fn trim<T>(chunks: &mut VecDeque<T>) {
+    if chunks.capacity() > KEEP_SLOTS {
+        chunks.shrink_to(KEEP_SLOTS);
+    }
+}
+
+fn index_cells(needed: usize) -> usize {
+    needed.max(KEEP_SLOTS).next_power_of_two()
+}
+
+fn fund_indices<T>(pool: &mut Pool, reserved: &mut u32, needed: usize) -> bool {
+    if !pool.account_indices {
+        return true;
+    }
+    let old = (*reserved as usize).max(KEEP_SLOTS);
+    let new = index_cells(needed).max(old);
+    if new != old && !pool.charge_indices((new - old) * std::mem::size_of::<T>()) {
+        return false;
+    }
+    *reserved = new as u32;
+    true
+}
+
+fn materialize_indices<T>(chunks: &mut VecDeque<T>, reserved: u32, needed: usize) {
+    if needed > chunks.capacity() && reserved != 0 {
+        chunks.reserve_exact(index_cells(needed) - chunks.len());
+        assert!(
+            chunks.capacity() <= reserved as usize,
+            "unfunded ring capacity"
+        );
+    }
+}
+
+fn retain_indices<T>(pool: &mut Pool, reserved: &mut u32, needed: usize) {
+    if !pool.account_indices {
+        return;
+    }
+    let old = (*reserved as usize).max(KEEP_SLOTS);
+    let new = index_cells(needed);
+    debug_assert!(new <= old);
+    pool.refund_indices((old - new) * std::mem::size_of::<T>());
+    *reserved = new as u32;
+}
+
+/// `Box<[u8]>` of the pool's chunk size.
+pub type Chunk = Box<[u8]>;
+
+pub struct Pool {
+    chunk: usize,
+    free: Vec<Chunk>,
+    shared_limit: usize,
+    shared_used: usize,
+    local_release_epoch: u64,
+    live: usize,
+    metadata: usize,
+    total_limit: usize,
+    /// Process-wide budget, charged for floors and shared reservations next to this pool's own
+    /// limits; `held` is what this pool owes it back.
+    budget: Option<Arc<MemoryBudget>>,
+    held: usize,
+    account_indices: bool,
+    index_held: usize,
+}
+
+impl Pool {
+    #[cfg(test)]
+    pub fn new(shared_limit_chunks: usize) -> Pool {
+        Self::with_limits(shared_limit_chunks * CHUNK, usize::MAX)
+    }
+
+    pub fn with_limits(shared_limit_bytes: usize, total_limit: usize) -> Pool {
+        Pool {
+            chunk: CHUNK,
+            free: Vec::new(),
+            shared_limit: shared_limit_bytes,
+            shared_used: 0,
+            local_release_epoch: 0,
+            live: 0,
+            metadata: 0,
+            total_limit,
+            budget: None,
+            held: 0,
+            account_indices: false,
+            index_held: 0,
+        }
+    }
+
+    pub fn with_budget(mut self, budget: Option<Arc<MemoryBudget>>) -> Pool {
+        self.budget = budget;
+        self
+    }
+
+    pub fn with_index_accounting(mut self) -> Self {
+        self.account_indices = true;
+        self
+    }
+
+    pub fn index_budget(&self) -> Option<&Arc<MemoryBudget>> {
+        if self.account_indices {
+            self.budget.as_ref()
+        } else {
+            None
+        }
+    }
+
+    pub fn overhead_bound(memory_limit: usize) -> Option<usize> {
+        crate::budget::collection_peak::<Chunk>(FREE_CACHE)?.checked_add(memory_limit)
+    }
+
+    fn charge_indices(&mut self, bytes: usize) -> bool {
+        if !self.charge(bytes) {
+            return false;
+        }
+        self.index_held += bytes;
+        true
+    }
+
+    fn refund_indices(&mut self, bytes: usize) {
+        self.index_held -= bytes;
+        self.refund(bytes);
+    }
+
+    /// Chunk size for every chunk this pool hands out; call before the first allocation.
+    pub fn with_chunk(mut self, chunk: usize) -> Pool {
+        self.chunk = chunk;
+        self
+    }
+
+    pub fn chunk(&self) -> usize {
+        self.chunk
+    }
+
+    pub fn floor(&self) -> usize {
+        floor(self.chunk)
+    }
+
+    /// Charges one flow's floor to the process budget (the pool's own floors are carved out of
+    /// its limit up front). Pair with `release_floor` when the flow retires.
+    pub fn admit_floor(&mut self) -> bool {
+        self.charge(self.floor())
+    }
+
+    pub fn release_floor(&mut self) {
+        self.refund(self.floor());
+    }
+
+    fn charge(&mut self, bytes: usize) -> bool {
+        if let Some(b) = &self.budget {
+            if !b.try_charge(bytes) {
+                return false;
+            }
+            self.held += bytes;
+        }
+        true
+    }
+
+    fn refund(&mut self, bytes: usize) {
+        if let Some(b) = &self.budget {
+            debug_assert!(bytes <= self.held);
+            b.refund(bytes);
+            self.held -= bytes;
+        } else if bytes != 0 {
+            self.local_release_epoch = self.local_release_epoch.wrapping_add(1);
+        }
+    }
+
+    pub fn release_epochs(&self) -> (u64, u64) {
+        (
+            self.budget.as_ref().map_or(0, |b| b.release_epoch()),
+            self.local_release_epoch,
+        )
+    }
+
+    pub fn reserve(&mut self, chunks: usize) -> bool {
+        self.reserve_bytes(chunks * self.chunk)
+    }
+
+    pub fn reserve_bytes(&mut self, bytes: usize) -> bool {
+        if bytes > self.shared_limit.saturating_sub(self.shared_used) || !self.charge(bytes) {
+            return false;
+        }
+        self.shared_used += bytes;
+        true
+    }
+
+    pub fn release(&mut self, chunks: usize) {
+        self.release_bytes(chunks * self.chunk);
+    }
+
+    pub fn release_bytes(&mut self, bytes: usize) {
+        debug_assert!(bytes <= self.shared_used);
+        let bytes = bytes.min(self.shared_used);
+        self.shared_used -= bytes;
+        self.refund(bytes);
+    }
+
+    pub fn shared_free(&self) -> usize {
+        let own = self.shared_limit - self.shared_used;
+        self.budget.as_ref().map_or(own, |b| own.min(b.available())) / self.chunk
+    }
+
+    #[cfg(test)]
+    pub fn shared_used(&self) -> usize {
+        self.shared_used / self.chunk
+    }
+
+    pub fn shared_bytes(&self) -> usize {
+        self.shared_used
+    }
+
+    #[cfg(test)]
+    pub fn live_chunks(&self) -> usize {
+        self.live
+    }
+
+    /// Every reservation, chunk and descriptor charge has been returned.
+    #[cfg(feature = "fuzz-checks")]
+    pub fn assert_idle(&self) {
+        assert_eq!(
+            (self.shared_used, self.live, self.metadata, self.held),
+            (0, 0, 0, 0),
+            "pool charges leaked"
+        );
+        assert!(
+            self.free.len() <= 1,
+            "an idle pool caches one chunk at most"
+        );
+    }
+
+    /// With a budget, this pool owes exactly its floors and shared reservations.
+    #[cfg(feature = "fuzz-checks")]
+    pub fn check_held(&self, floors: usize) {
+        if self.budget.is_some() {
+            assert_eq!(
+                self.held,
+                floors * self.floor() + self.shared_used + self.index_held
+            );
+        }
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        (self.live + self.free.len()) * self.chunk + self.metadata
+    }
+
+    pub fn metadata_grow(&mut self, bytes: usize) {
+        self.metadata += bytes;
+        while self.allocated_bytes() > self.total_limit && !self.free.is_empty() {
+            self.free.pop();
+        }
+        debug_assert!(self.allocated_bytes() <= self.total_limit);
+    }
+
+    pub fn metadata_shrink(&mut self, bytes: usize) {
+        self.metadata -= bytes;
+    }
+
+    pub fn alloc(&mut self) -> Chunk {
+        self.live += 1;
+        self.free
+            .pop()
+            .unwrap_or_else(|| vec![0u8; self.chunk].into_boxed_slice())
+    }
+
+    pub fn free(&mut self, chunk: Chunk) {
+        self.live -= 1;
+        // While anything is in use, bursts (a write of 64 packets, then its ACK) refill from the
+        // cache. A pool with nothing in use keeps one spare, the chunk a request/response flow
+        // takes back on its next segment, and returns the rest to the allocator.
+        let cap = if self.live == 0 { 1 } else { FREE_CACHE };
+        if self.free.len() < cap {
+            self.free.push(chunk);
+        }
+        self.free.truncate(cap);
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.free.clear();
+        self.refund(self.held);
+    }
+}
+
+/// Bytes from the oldest unacknowledged byte onward.
+#[derive(Default)]
+pub struct SendRing {
+    chunks: VecDeque<Chunk>,
+    head: usize,
+    len: u32,
+    index_reserved: u32,
+}
+
+impl SendRing {
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn tail_room(&self, pool: &Pool) -> usize {
+        let chunk = pool.chunk();
+        if self.chunks.is_empty() {
+            chunk
+        } else {
+            self.chunks.len() * chunk - self.head - self.len as usize
+        }
+    }
+
+    pub fn can_append(&self, pool: &Pool, bytes: usize) -> bool {
+        let chunk = pool.chunk();
+        let extra = bytes.saturating_sub(self.tail_room(pool)).div_ceil(chunk);
+        let needed = self.chunks.len().max(1) + extra;
+        let payload = extra * chunk;
+        let indices = if pool.account_indices {
+            let old = (self.index_reserved as usize).max(KEEP_SLOTS);
+            index_cells(needed).saturating_sub(old) * std::mem::size_of::<Chunk>()
+        } else {
+            0
+        };
+        payload <= pool.shared_limit - pool.shared_used
+            && pool
+                .budget
+                .as_ref()
+                .is_none_or(|budget| payload + indices <= budget.available())
+    }
+
+    pub fn write(&mut self, pool: &mut Pool, data: &[u8]) -> usize {
+        let chunk = pool.chunk();
+        let mut done = 0;
+        while done < data.len() {
+            let end = self.head + self.len as usize;
+            let (ci, co) = (end / chunk, end % chunk);
+            if ci == self.chunks.len() && !self.push_chunk(pool) {
+                break;
+            }
+            let n = (chunk - co).min(data.len() - done);
+            self.chunks[ci][co..co + n].copy_from_slice(&data[done..done + n]);
+            done += n;
+            self.len += n as u32;
+        }
+        done
+    }
+
+    fn push_chunk(&mut self, pool: &mut Pool) -> bool {
+        if !self.can_append(pool, 1) {
+            return false;
+        }
+        // The first chunk is the progress floor; later ones use shared credit.
+        let shared = !self.chunks.is_empty();
+        if shared && !pool.reserve(1) {
+            return false;
+        }
+        let needed = self.chunks.len() + 1;
+        if !fund_indices::<Chunk>(pool, &mut self.index_reserved, needed) {
+            if shared {
+                pool.release(1);
+            }
+            return false;
+        }
+        materialize_indices(&mut self.chunks, self.index_reserved, needed);
+        self.chunks.push_back(pool.alloc());
+        true
+    }
+
+    pub fn with_spare<const PARTS: usize>(
+        &mut self,
+        pool: &mut Pool,
+        limit: usize,
+        fill: impl FnOnce(&mut [IoSliceMut<'_>]) -> io::Result<usize>,
+    ) -> Option<io::Result<usize>> {
+        let chunk_len = pool.chunk();
+        let end = self.head + self.len();
+        let (first, mut offset) = (end / chunk_len, end % chunk_len);
+        let limit = limit.min(PARTS * chunk_len - offset);
+        let last = first + (offset + limit).div_ceil(chunk_len);
+        let spare = SendSpare {
+            old_capacity: self.chunks.capacity(),
+            ring: self,
+            pool,
+        };
+        while spare.ring.chunks.len() < last && spare.ring.push_chunk(spare.pool) {}
+        let offered = limit.min(spare.ring.chunks.len() * chunk_len - end);
+        if offered == 0 {
+            return None;
+        }
+
+        let count = (offset + offered).div_ceil(chunk_len);
+        let filled = {
+            let mut parts: [IoSliceMut<'_>; PARTS] =
+                std::array::from_fn(|_| IoSliceMut::new(&mut []));
+            let mut left = offered;
+            for (part, chunk) in parts
+                .iter_mut()
+                .zip(spare.ring.chunks.range_mut(first..first + count))
+            {
+                let n = left.min(chunk_len - offset);
+                *part = IoSliceMut::new(&mut chunk[offset..offset + n]);
+                left -= n;
+                offset = 0;
+            }
+            fill(&mut parts[..count])
+        };
+        Some(filled.and_then(|n| spare.commit(n, offered)))
+    }
+
+    /// A maximum-size IP packet spans at most [`MAX_PARTS`] chunks, including an unaligned first
+    /// chunk. The unused array slots never reach the checksum loop.
+    pub fn slices(&self, off: usize, len: usize) -> ([&[u8]; MAX_PARTS], usize) {
+        debug_assert!(off + len <= self.len as usize && len <= usize::from(u16::MAX));
+        let mut parts: [&[u8]; MAX_PARTS] = [&[]; MAX_PARTS];
+        let mut pos = self.head + off;
+        let (mut left, mut count) = (len, 0);
+        let chunk = self.chunks.front().map_or(1, |c| c.len());
+        while left != 0 {
+            let (ci, co) = (pos / chunk, pos % chunk);
+            let n = left.min(chunk - co);
+            parts[count] = &self.chunks[ci][co..co + n];
+            count += 1;
+            pos += n;
+            left -= n;
+        }
+        (parts, count)
+    }
+
+    pub fn consume(&mut self, pool: &mut Pool, n: usize) {
+        debug_assert!(n <= self.len as usize);
+        self.head += n;
+        self.len -= n as u32;
+        if self.len == 0 {
+            self.clear(pool);
+            return;
+        }
+        let chunk = pool.chunk();
+        while self.head >= chunk {
+            self.pop_front(pool);
+            self.head -= chunk;
+        }
+    }
+
+    pub fn clear(&mut self, pool: &mut Pool) {
+        while !self.chunks.is_empty() {
+            self.pop_front(pool);
+        }
+        trim(&mut self.chunks);
+        retain_indices::<Chunk>(pool, &mut self.index_reserved, self.chunks.capacity());
+        self.head = 0;
+        self.len = 0;
+    }
+
+    fn pop_front(&mut self, pool: &mut Pool) {
+        if self.chunks.len() > 1 {
+            pool.release(1);
+        }
+        if let Some(c) = self.chunks.pop_front() {
+            pool.free(c);
+        }
+    }
+
+    #[cfg(feature = "fuzz-checks")]
+    pub fn check_indices(&self) {
+        if self.index_reserved != 0 {
+            assert!(self.chunks.capacity() <= self.index_reserved as usize);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+}
+
+// Keep provisional capacity inside the loan so an unwinding callback also returns it.
+struct SendSpare<'a> {
+    ring: &'a mut SendRing,
+    pool: &'a mut Pool,
+    old_capacity: usize,
+}
+
+impl SendSpare<'_> {
+    fn commit(self, n: usize, offered: usize) -> io::Result<usize> {
+        if n > offered {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        self.ring.len += n as u32;
+        Ok(n)
+    }
+}
+
+impl Drop for SendSpare<'_> {
+    fn drop(&mut self) {
+        let ring = &mut *self.ring;
+        let keep = (ring.head + ring.len()).div_ceil(self.pool.chunk());
+        if ring.chunks.len() == keep {
+            return;
+        }
+        while ring.chunks.len() > keep {
+            let chunk = ring.chunks.pop_back().unwrap();
+            if !ring.chunks.is_empty() {
+                self.pool.release(1);
+            }
+            self.pool.free(chunk);
+        }
+        let capacity = self.old_capacity.max(index_cells(keep));
+        if ring.chunks.capacity() > capacity {
+            ring.chunks.shrink_to(capacity);
+        }
+        retain_indices::<Chunk>(self.pool, &mut ring.index_reserved, ring.chunks.capacity());
+    }
+}
+
+/// Covers `[rd_seq, right edge)`. Chunks are allocated when data lands in them, the
+/// shared-pool charge follows the advertised right edge instead (window commitment).
+pub struct RecvRing {
+    chunks: VecDeque<Option<Chunk>>,
+    head: usize,
+    charged: usize,
+    pub rd_seq: u32,
+    index_reserved: u32,
+}
+
+impl RecvRing {
+    pub fn new(rd_seq: u32) -> RecvRing {
+        RecvRing {
+            chunks: VecDeque::new(),
+            head: 0,
+            charged: 0,
+            rd_seq,
+            index_reserved: 0,
+        }
+    }
+
+    fn want_charge(&self, chunk: usize, right: u32) -> usize {
+        let span = self.head + right.wrapping_sub(self.rd_seq) as usize;
+        span.div_ceil(chunk).saturating_sub(1)
+    }
+
+    pub fn limit_right(&self, pool: &Pool, want: u32) -> u32 {
+        let capacity = (self.charged + 1 + pool.shared_free()) * pool.chunk() - self.head;
+        self.rd_seq.wrapping_add(
+            want.wrapping_sub(self.rd_seq)
+                .min(capacity.min(u32::MAX as usize) as u32),
+        )
+    }
+
+    /// Reserve shared chunks so the window may extend to `right`.
+    pub fn grow(&mut self, pool: &mut Pool, right: u32) -> bool {
+        let want = self.want_charge(pool.chunk(), right);
+        let extra = want.saturating_sub(self.charged);
+        if !pool.reserve(extra) {
+            return false;
+        }
+        if !fund_indices::<Option<Chunk>>(pool, &mut self.index_reserved, want + 1) {
+            pool.release(extra);
+            return false;
+        }
+        self.charged += extra;
+        true
+    }
+
+    pub fn shrink(&mut self, pool: &mut Pool, right: u32) {
+        let want = self.want_charge(pool.chunk(), right);
+        if want < self.charged {
+            pool.release(self.charged - want);
+            self.charged = want;
+        }
+        retain_indices::<Option<Chunk>>(
+            pool,
+            &mut self.index_reserved,
+            self.chunks.capacity().max(want + 1),
+        );
+    }
+
+    /// `seq` must be inside the committed window.
+    pub fn write_at(&mut self, pool: &mut Pool, seq: u32, data: &[u8]) {
+        let chunk_len = pool.chunk();
+        let mut pos = self.head + seq.wrapping_sub(self.rd_seq) as usize;
+        let mut rest = data;
+        while !rest.is_empty() {
+            let (ci, co) = (pos / chunk_len, pos % chunk_len);
+            materialize_indices(&mut self.chunks, self.index_reserved, ci + 1);
+            while self.chunks.len() <= ci {
+                self.chunks.push_back(None);
+            }
+            let chunk = self.chunks[ci].get_or_insert_with(|| pool.alloc());
+            let n = (chunk_len - co).min(rest.len());
+            chunk[co..co + n].copy_from_slice(&rest[..n]);
+            rest = &rest[n..];
+            pos += n;
+        }
+    }
+
+    pub fn peek(&self, mut avail: usize) -> ([IoSlice<'_>; STREAM_PARTS], usize) {
+        let mut parts = [IoSlice::new(&[]); STREAM_PARTS];
+        let mut start = self.head;
+        let mut count = 0;
+        for (part, chunk) in parts.iter_mut().zip(&self.chunks) {
+            if avail == 0 {
+                break;
+            }
+            let Some(chunk) = chunk else {
+                break;
+            };
+            let n = avail.min(chunk.len() - start);
+            *part = IoSlice::new(&chunk[start..start + n]);
+            avail -= n;
+            start = 0;
+            count += 1;
+        }
+        (parts, count)
+    }
+
+    /// Copies up to `avail` in-order bytes.
+    pub fn read(&mut self, pool: &mut Pool, out: &mut [u8], avail: usize) -> usize {
+        self.consume_with(pool, out.len().min(avail), |done, bytes| {
+            out[done..done + bytes.len()].copy_from_slice(bytes);
+        })
+    }
+
+    pub fn consume(&mut self, pool: &mut Pool, n: usize) {
+        let done = self.consume_with(pool, n, |_, _| {});
+        debug_assert_eq!(done, n, "contiguous receive prefix must be backed");
+    }
+
+    fn consume_with(
+        &mut self,
+        pool: &mut Pool,
+        want: usize,
+        mut copy: impl FnMut(usize, &[u8]),
+    ) -> usize {
+        let mut done = 0;
+        while done < want {
+            let Some(Some(chunk)) = self.chunks.front() else {
+                break;
+            };
+            let n = (chunk.len() - self.head).min(want - done);
+            copy(done, &chunk[self.head..self.head + n]);
+            done += n;
+            self.head += n;
+            if self.head == chunk.len() {
+                if let Some(Some(c)) = self.chunks.pop_front() {
+                    pool.free(c);
+                }
+                self.head = 0;
+            }
+        }
+        self.rd_seq = self.rd_seq.wrapping_add(done as u32);
+        done
+    }
+
+    /// The ring is empty and holds nothing out of order: give every chunk back. The progress floor
+    /// stays an accounting guarantee (admission), not resident memory; the pool's small free
+    /// cache keeps request/response traffic from calling the allocator on every drain.
+    pub fn compact(&mut self, pool: &mut Pool, right: u32) {
+        self.free_chunks(pool);
+        self.shrink(pool, right);
+    }
+
+    pub fn release_all(&mut self, pool: &mut Pool) {
+        self.free_chunks(pool);
+        pool.release(self.charged);
+        self.charged = 0;
+        retain_indices::<Option<Chunk>>(pool, &mut self.index_reserved, self.chunks.capacity());
+    }
+
+    fn free_chunks(&mut self, pool: &mut Pool) {
+        while let Some(c) = self.chunks.pop_front() {
+            if let Some(c) = c {
+                pool.free(c);
+            }
+        }
+        trim(&mut self.chunks);
+        self.head = 0;
+    }
+
+    #[cfg(feature = "fuzz-checks")]
+    pub fn check_indices(&self) {
+        if self.index_reserved != 0 {
+            assert!(self.chunks.capacity() <= self.index_reserved as usize);
+            assert!(self.charged < self.index_reserved as usize);
+        }
+    }
+
+    pub fn charged(&self) -> usize {
+        self.charged
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pattern(n: usize, seed: u8) -> Vec<u8> {
+        (0..n)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    #[test]
+    fn send_ring_roundtrip_across_chunks() {
+        let mut pool = Pool::new(8);
+        let mut ring = SendRing::default();
+        let data = pattern(CHUNK * 2 + 100, 1);
+        assert_eq!(ring.write(&mut pool, &data), data.len());
+        assert_eq!(ring.chunk_count(), 3);
+        assert_eq!(pool.shared_used(), 2, "first chunk is the free floor");
+        let ([a, b, ..], count) = ring.slices(CHUNK - 10, 30);
+        assert_eq!(count, 2);
+        assert_eq!((a.len(), b.len()), (10, 20));
+        assert_eq!([a, b].concat(), data[CHUNK - 10..CHUNK + 20]);
+        ring.consume(&mut pool, CHUNK + 5);
+        assert_eq!(ring.len(), data.len() - CHUNK - 5);
+        assert_eq!(pool.shared_used(), 1);
+        assert_eq!(ring.slices(0, 50).0[0], &data[CHUNK + 5..CHUNK + 55]);
+        ring.consume(&mut pool, ring.len());
+        assert_eq!(
+            (pool.shared_used(), pool.live_chunks(), ring.chunk_count()),
+            (0, 0, 0),
+            "a fully acknowledged ring holds no chunk"
+        );
+    }
+
+    #[test]
+    fn send_ring_keeps_its_floor_accounting_across_a_drain() {
+        let mut pool = Pool::new(2);
+        let mut ring = SendRing::default();
+        let data = pattern(CHUNK * 3, 5);
+        for _ in 0..2 {
+            assert_eq!(ring.write(&mut pool, &data), data.len());
+            assert_eq!(pool.shared_used(), 2, "first chunk is the free floor");
+            ring.consume(&mut pool, data.len());
+            assert_eq!((pool.shared_used(), pool.live_chunks()), (0, 0));
+        }
+        assert_eq!(ring.tail_room(&pool), CHUNK);
+    }
+
+    #[test]
+    fn send_ring_stops_when_shared_pool_is_empty() {
+        let mut pool = Pool::new(1);
+        let mut ring = SendRing::default();
+        let data = pattern(CHUNK * 4, 2);
+        assert_eq!(ring.write(&mut pool, &data), 2 * CHUNK);
+        assert_eq!(ring.write(&mut pool, &data), 0);
+    }
+
+    #[test]
+    fn recv_ring_ooo_write_then_inorder_read() {
+        let mut pool = Pool::new(8);
+        let mut ring = RecvRing::new(1000);
+        let right = 1000 + 3 * CHUNK as u32;
+        assert!(ring.grow(&mut pool, right));
+        assert_eq!(ring.charged(), 2);
+        let tail = pattern(100, 9);
+        ring.write_at(&mut pool, 1000 + CHUNK as u32 + 50, &tail);
+        assert_eq!(pool.live_chunks(), 1, "only the touched chunk is allocated");
+        let head = pattern(CHUNK + 50, 3);
+        ring.write_at(&mut pool, 1000, &head);
+        let mut out = vec![0u8; CHUNK + 150];
+        assert_eq!(ring.read(&mut pool, &mut out, CHUNK + 150), CHUNK + 150);
+        assert_eq!(&out[..CHUNK + 50], &head[..]);
+        assert_eq!(&out[CHUNK + 50..], &tail[..]);
+        assert_eq!(ring.rd_seq, 1000 + CHUNK as u32 + 150);
+        ring.shrink(&mut pool, right);
+        assert_eq!(ring.charged(), 1);
+    }
+
+    #[test]
+    fn recv_ring_compact_releases_every_chunk_and_keeps_the_charge_floor() {
+        let mut pool = Pool::new(8);
+        let mut ring = RecvRing::new(5);
+        let right = 5 + 2 * CHUNK as u32;
+        assert!(ring.grow(&mut pool, right));
+        ring.write_at(&mut pool, 5, &pattern(10, 4));
+        let mut out = [0u8; 10];
+        assert_eq!(ring.read(&mut pool, &mut out, 10), 10);
+        ring.compact(&mut pool, right + 10);
+        assert_eq!(pool.live_chunks(), 0, "a drained ring holds no chunk");
+        assert_eq!(ring.charged(), 1, "the window stays committed");
+        ring.write_at(&mut pool, 15, &pattern(10, 5));
+        assert_eq!(
+            pool.live_chunks(),
+            1,
+            "the next segment allocates lazily again"
+        );
+        ring.release_all(&mut pool);
+        assert_eq!((pool.live_chunks(), pool.shared_used()), (0, 0));
+    }
+
+    #[test]
+    fn receive_floor_commits_all_sixteen_kib_without_shared_memory() {
+        let mut pool = Pool::new(0);
+        let mut ring = RecvRing::new(1000);
+        let right = ring.limit_right(&pool, 1000 + u16::MAX as u32);
+        assert_eq!(right, 1000 + CHUNK as u32);
+        assert!(ring.grow(&mut pool, right));
+        assert_eq!(pool.shared_used(), 0);
+    }
+
+    #[test]
+    fn metadata_reclaims_cached_chunks_before_exceeding_truesize_budget() {
+        let mut pool = Pool::with_limits(CHUNK, 3 * CHUNK);
+        let a = pool.alloc();
+        let b = pool.alloc();
+        let c = pool.alloc();
+        pool.free(c);
+        assert_eq!(pool.allocated_bytes(), 3 * CHUNK);
+        pool.metadata_grow(64);
+        assert_eq!(pool.allocated_bytes(), 2 * CHUNK + 64);
+        pool.free(a);
+        pool.free(b);
+        pool.metadata_shrink(64);
+        assert_eq!(
+            pool.allocated_bytes(),
+            CHUNK,
+            "an idle pool caches one chunk"
+        );
+    }
+
+    #[test]
+    fn free_cache_follows_the_chunks_in_use() {
+        let mut pool = Pool::new(0);
+        let chunks: Vec<Chunk> = (0..200).map(|_| pool.alloc()).collect();
+        for c in chunks {
+            pool.free(c);
+        }
+        assert_eq!(pool.live_chunks(), 0);
+        assert_eq!(
+            pool.allocated_bytes(),
+            CHUNK,
+            "drained pool keeps one spare"
+        );
+        let mut held: Vec<Chunk> = (0..300).map(|_| pool.alloc()).collect();
+        let last = held.pop().unwrap();
+        for c in held {
+            pool.free(c);
+        }
+        assert_eq!(
+            pool.allocated_bytes(),
+            257 * CHUNK,
+            "bursts refill from the cache while a chunk is in use"
+        );
+        pool.free(last);
+        assert_eq!(pool.allocated_bytes(), CHUNK);
+        // A refill after a drain is served from the cache, not the allocator.
+        let c = pool.alloc();
+        assert_eq!(pool.allocated_bytes(), CHUNK);
+        pool.free(c);
+    }
+
+    #[test]
+    fn accounted_pool_funds_free_cache_storage() {
+        let memory_limit = 8 * 1024 * 1024;
+        let cache_peak = 3 * 256 * std::mem::size_of::<Chunk>();
+        assert_eq!(
+            Pool::overhead_bound(memory_limit),
+            Some(memory_limit + cache_peak)
+        );
+    }
+
+    #[test]
+    fn failed_tx_index_credit_rolls_back_the_tentative_payload_charge() {
+        let budget = MemoryBudget::new(4 * CHUNK);
+        let mut pool = Pool::with_limits(16 * CHUNK, 32 * CHUNK)
+            .with_budget(Some(budget.clone()))
+            .with_index_accounting();
+        let mut ring = SendRing::default();
+        assert_eq!(ring.write(&mut pool, &[1; 4 * CHUNK]), 4 * CHUNK);
+        assert_eq!(budget.used(), 3 * CHUNK);
+        assert_eq!(ring.write(&mut pool, &[2]), 0);
+        assert_eq!(ring.len(), 4 * CHUNK);
+        assert_eq!(budget.used(), 3 * CHUNK);
+        ring.clear(&mut pool);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn partially_drained_tx_keeps_its_actual_index_high_water_funded() {
+        let budget = MemoryBudget::new(32 * CHUNK);
+        let mut pool = Pool::with_limits(16 * CHUNK, 32 * CHUNK)
+            .with_budget(Some(budget.clone()))
+            .with_index_accounting();
+        let mut ring = SendRing::default();
+        assert_eq!(ring.write(&mut pool, &[1; 9 * CHUNK]), 9 * CHUNK);
+        let indices = (16 - KEEP_SLOTS) * std::mem::size_of::<Chunk>();
+        assert_eq!(budget.used(), 8 * CHUNK + indices);
+        ring.consume(&mut pool, 8 * CHUNK);
+        assert_eq!(ring.chunks.capacity(), 16);
+        assert_eq!(budget.used(), indices);
+        let held = budget.reserve(budget.limit() - budget.used()).unwrap();
+        assert_eq!(ring.write(&mut pool, &[2]), 0);
+        drop(held);
+        ring.clear(&mut pool);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn lazy_rx_backing_and_remaining_promises_keep_their_index_credit() {
+        let budget = MemoryBudget::new(32 * CHUNK);
+        let mut pool = Pool::with_limits(16 * CHUNK, 32 * CHUNK)
+            .with_budget(Some(budget.clone()))
+            .with_index_accounting();
+        let mut ring = RecvRing::new(1000);
+        let right = 1000 + 9 * CHUNK as u32;
+        assert!(ring.grow(&mut pool, right));
+        let indices = (16 - KEEP_SLOTS) * std::mem::size_of::<Option<Chunk>>();
+        assert_eq!(budget.used(), 8 * CHUNK + indices);
+        assert_eq!(
+            ring.chunks.capacity(),
+            0,
+            "window funding is not eager allocation"
+        );
+        let held = budget.reserve(budget.limit() - budget.used()).unwrap();
+        ring.write_at(&mut pool, 1000, &[3; 9 * CHUNK]);
+        let mut read = [0; 8 * CHUNK];
+        assert_eq!(ring.read(&mut pool, &mut read, 8 * CHUNK), 8 * CHUNK);
+        ring.shrink(&mut pool, right);
+        assert_eq!(budget.used(), held.bytes() + indices);
+        assert_eq!(ring.chunks.capacity(), 16);
+        drop(held);
+        ring.release_all(&mut pool);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn receive_index_failure_refunds_optional_payload_growth_and_keeps_the_floor() {
+        let budget = MemoryBudget::new(8 * CHUNK);
+        let mut pool = Pool::with_limits(16 * CHUNK, 32 * CHUNK)
+            .with_budget(Some(budget.clone()))
+            .with_index_accounting();
+        let mut ring = RecvRing::new(1000);
+        assert!(ring.grow(&mut pool, 1000 + CHUNK as u32));
+        assert!(!ring.grow(&mut pool, 1000 + 9 * CHUNK as u32));
+        assert_eq!(budget.used(), 0);
+        assert_eq!(ring.charged(), 0);
+        let held = budget.reserve(budget.limit()).unwrap();
+        ring.write_at(&mut pool, 1000, &[1; CHUNK]);
+        let mut read = [0; CHUNK];
+        assert_eq!(ring.read(&mut pool, &mut read, CHUNK), CHUNK);
+        ring.release_all(&mut pool);
+        assert_eq!(budget.used(), held.bytes());
+        drop(held);
+    }
+}

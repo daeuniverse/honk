@@ -10,6 +10,19 @@ pub(crate) struct GeoRequirements {
 }
 
 impl GeoRequirements {
+    pub(crate) fn for_forwarding(config: &honk_config::Config) -> Self {
+        let mut requirements = Self::for_traffic(&config.routing.rules);
+        if let Some(datapath) = &config.datapath
+            && let Some(firewall) = &datapath.firewall
+        {
+            requirements = requirements.union(&super::firewall::FirewallPolicy::requirements(
+                firewall,
+                &datapath.nat,
+            ));
+        }
+        requirements
+    }
+
     pub(crate) fn for_traffic(rules: &[RoutingRule]) -> Self {
         let mut requirements = Self::default();
         for rule in rules {
@@ -516,62 +529,61 @@ impl GeoAssets {
         Self { geosite, geoip }
     }
 
-    /// Expand geosite codes into compiled domain matchers, cloned from the
-    /// shared per-code index (`Regex` clones are cheap Arc bumps). A
-    /// `category@attr` code filters the category down to entries carrying
-    /// that attribute key (dae semantics: key presence, case-insensitive).
+    /// Borrow entries for a trimmed, lowercased selector from this asset snapshot.
+    pub(super) fn geosite_entries<'a>(
+        &'a self,
+        code: &str,
+    ) -> impl Iterator<Item = &'a GeositeDomain> + Clone {
+        let (base, attr) = code
+            .split_once('@')
+            .map_or((code, None), |(base, attr)| (base, Some(attr)));
+        let category = self.geosite.as_ref().and_then(|index| index.get(base));
+        let domains = category.map_or(&[][..], |cat| cat.domains.as_slice());
+        let attrs = category.and_then(|cat| cat.attrs.as_deref());
+        domains.iter().enumerate().filter_map(move |(i, domain)| {
+            attr.is_none_or(|attr| {
+                attrs.is_some_and(|rows| rows[i].iter().any(|key| key.eq_ignore_ascii_case(attr)))
+            })
+            .then_some(domain)
+        })
+    }
+
+    pub(super) fn report_empty_geosite(&self, code: &str) {
+        if self.geosite.is_some() {
+            tracing::warn!(
+                code,
+                "geosite code expanded to zero matchers; rule will never match"
+            );
+        } else {
+            tracing::debug!(
+                code,
+                "geosite.dat unavailable; geosite conditions match nothing"
+            );
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn geosite_domains(&self, codes: &[String]) -> Vec<GeositeDomain> {
         let mut out = Vec::new();
-        if codes.is_empty() {
-            return out;
-        }
-        match &self.geosite {
-            Some(index) => {
-                for code in codes {
-                    let code = code.trim().to_lowercase();
-                    let (base, attr) = split_geosite_code(&code);
-                    let before = out.len();
-                    if let Some(cat) = index.get(&base) {
-                        match (&attr, &cat.attrs) {
-                            (None, _) => out.extend(cat.domains.iter().cloned()),
-                            (Some(attr), Some(attrs)) => {
-                                out.extend(
-                                    cat.domains
-                                        .iter()
-                                        .zip(attrs.iter())
-                                        .filter(|(_, keys)| {
-                                            keys.iter().any(|k| k.eq_ignore_ascii_case(attr))
-                                        })
-                                        .map(|(d, _)| d.clone()),
-                                );
-                            }
-                            // Index built without attrs for this base means no
-                            // referenced code asked for them — a same-build
-                            // query with @attr can only come from a split/merge
-                            // mismatch; treat as zero matches (warned below).
-                            (Some(_), None) => {}
-                        }
-                    }
-                    if out.len() == before {
-                        // A code that expands to nothing silently disables its
-                        // rule (unknown category, or an `@attr` no entry of the
-                        // category carries) — never stay silent about that.
-                        tracing::warn!(
-                            code,
-                            "geosite code expanded to zero matchers; rule will never match"
-                        );
-                    }
-                }
-                tracing::debug!("expanded geosite codes into {} domain matchers", out.len());
-            }
-            None => {
-                tracing::debug!(
-                    "geosite.dat unavailable; geosite conditions {:?} match nothing",
-                    codes
-                );
+        for code in codes {
+            let code = super::domain::lowercase(code.trim());
+            let before = out.len();
+            out.extend(self.geosite_entries(&code).cloned());
+            if out.len() == before {
+                self.report_empty_geosite(&code);
             }
         }
         out
+    }
+
+    pub(crate) fn has_geoip(&self, code: &str) -> bool {
+        let code = code.trim();
+        code.eq_ignore_ascii_case("private")
+            || self.geoip.as_ref().is_some_and(|index| {
+                index
+                    .get(&code.to_lowercase())
+                    .is_some_and(|nets| !nets.is_empty())
+            })
     }
 
     /// Expand geoip codes into CIDR nets. `private` is built in and never
@@ -1380,6 +1392,8 @@ fn validate_downloaded_asset(kind: &str, bytes: &[u8]) -> anyhow::Result<()> {
 mod scan_tests {
     use super::*;
 
+    mod interning;
+
     #[cfg(feature = "native-api")]
     #[test]
     fn captured_geo_metadata_survives_disk_replacement() {
@@ -1886,7 +1900,7 @@ mod scan_tests {
             outbound: honk_config::routing::RoutingOutbound::Simple("proxy".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         };
         let requirements = GeoRequirements::for_traffic(std::slice::from_ref(&rule));
         assert_eq!(

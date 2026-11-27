@@ -1,8 +1,41 @@
 use super::*;
 use crate::ebpf;
 
+impl DomainProjectionSink for MockEbpfBackend {
+    fn set_domain_ip_bitmap(
+        &mut self,
+        ip_key: &LpmKey,
+        bitmap: &DomainRouting,
+    ) -> Result<(), ebpf::DomainRouteWriteError> {
+        #[cfg(test)]
+        self.take_projection_fault(ProjectionMapOperation::Set)?;
+        self.policy.set_domain(ip_key, bitmap)?;
+        self.count_routing_writes(1);
+        Ok(())
+    }
+
+    fn remove_domain_ip_bitmap(
+        &mut self,
+        ip_key: &LpmKey,
+    ) -> Result<(), ebpf::DomainRouteWriteError> {
+        #[cfg(test)]
+        self.take_projection_fault(ProjectionMapOperation::Remove)?;
+        self.policy.remove_domain(ip_key)?;
+        self.count_routing_writes(1);
+        Ok(())
+    }
+}
+
 #[async_trait]
-impl EbpfBackend for MockEbpfBackend {
+impl PolicyBackend for MockEbpfBackend {
+    fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)> {
+        Ok(self)
+    }
+
+    fn tc_mut(&mut self) -> anyhow::Result<&mut (dyn EbpfBackend + 'static)> {
+        Ok(self)
+    }
+
     fn observe_datapath(&self) -> ebpf::DatapathObservation {
         #[cfg(test)]
         if let Some(observation) = &self.datapath_observation_fixture {
@@ -45,6 +78,7 @@ impl EbpfBackend for MockEbpfBackend {
     #[cfg(test)]
     fn projection_map_snapshot(&self) -> Vec<([u8; 20], DomainRouting)> {
         let mut snapshot = self
+            .policy
             .routing_generation
             .as_ref()
             .map(|generation| {
@@ -76,6 +110,194 @@ impl EbpfBackend for MockEbpfBackend {
     fn clear_projection_write_log(&mut self) {
         self.projection_writes.clear();
     }
+
+    fn set_datapath_ready(&mut self, ready: bool) -> anyhow::Result<()> {
+        if ready && !self.listener_sockets_published {
+            anyhow::bail!("listener socket generation is not fully published");
+        }
+        self.datapath_ready = ready;
+        Ok(())
+    }
+
+    fn set_datapath_flags(&mut self, flags: u32) -> anyhow::Result<()> {
+        self.datapath_flags_writes.lock().push(flags);
+        #[cfg(test)]
+        {
+            self.datapath_flags_writes_after_arm =
+                self.datapath_flags_writes_after_arm.saturating_add(1);
+            let ordinal = self.datapath_flags_writes_after_arm;
+            let failed = self.datapath_flags_fault_nth == Some(ordinal);
+            self.datapath_flags_write_trace
+                .push(DatapathFlagsWriteTrace {
+                    ordinal,
+                    origin: std::mem::take(&mut self.datapath_flags_write_origin),
+                    flags,
+                    failed,
+                });
+            if failed {
+                self.datapath_flags_fault_nth = None;
+                anyhow::bail!("injected datapath flags write failure at ordinal {ordinal}");
+            }
+        }
+        Ok(())
+    }
+
+    fn quiesce_udp_staging_if_supported(&mut self) -> anyhow::Result<bool> {
+        self.quiesce_udp_staging().map(|()| true)
+    }
+
+    #[cfg(feature = "native-api")]
+    fn supports_kernel_trace(&self) -> bool {
+        true
+    }
+
+    #[cfg(test)]
+    fn arm_datapath_flags_write_fault(&mut self, nth: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(nth != 0, "datapath flags write ordinal must be non-zero");
+        self.datapath_flags_fault_nth = Some(nth);
+        self.datapath_flags_writes_after_arm = 0;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn mark_datapath_flags_write_origin(&mut self, origin: DatapathFlagsWriteOrigin) {
+        self.datapath_flags_write_origin = origin;
+    }
+
+    #[cfg(test)]
+    fn datapath_flags_write_log(&self) -> Vec<u32> {
+        self.datapath_flags_writes.lock().clone()
+    }
+
+    #[cfg(test)]
+    fn datapath_flags_write_trace(&self) -> Vec<DatapathFlagsWriteTrace> {
+        self.datapath_flags_write_trace.clone()
+    }
+
+    #[cfg(test)]
+    fn clear_datapath_flags_write_log(&mut self) {
+        self.datapath_flags_writes.lock().clear();
+        self.datapath_flags_write_trace.clear();
+        self.datapath_flags_writes_after_arm = 0;
+    }
+
+    fn publish_routing_plan(
+        &mut self,
+        plan: &crate::control::routing_matcher::RoutingPushPlan,
+        learned_domains: &[(LpmKey, DomainRouting)],
+    ) -> anyhow::Result<()> {
+        let fault = &mut self.routing_fault;
+        let order = &mut self.routing_publication_order;
+        self.policy.publish(plan, learned_domains, |phase, slot| {
+            if let Some((configured, remaining)) = *fault
+                && configured == phase
+            {
+                *fault = (remaining > 1).then_some((configured, remaining - 1));
+                anyhow::bail!("injected routing push failure at {phase:?}");
+            }
+            let write = match phase {
+                RoutingPushPhase::MacLpm => MockRoutingPublicationWrite::FactMaps(slot),
+                RoutingPushPhase::Program => MockRoutingPublicationWrite::Program(slot),
+                RoutingPushPhase::Attach => MockRoutingPublicationWrite::Attach(slot),
+                RoutingPushPhase::Root => MockRoutingPublicationWrite::Root(slot),
+                _ => return Ok(()),
+            };
+            order.push(write);
+            Ok(())
+        })?;
+        self.count_routing_writes(
+            (plan.facts.destination_v4.len()
+                + plan.facts.destination_v6.len()
+                + plan.facts.source_v4.len()
+                + plan.facts.source_v6.len()
+                + plan.facts.mac.len()
+                + plan.rules.len()
+                + self
+                    .policy
+                    .routing_generation
+                    .as_ref()
+                    .unwrap()
+                    .domain
+                    .len()
+                + 1) as u64,
+        );
+        Ok(())
+    }
+
+    fn routing_policy_generation(&self) -> u64 {
+        self.policy.next_generation
+    }
+
+    #[cfg(feature = "native-api")]
+    fn bind_kernel_trace_dictionary(
+        &mut self,
+        dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
+    ) {
+        if let Some(owner) = &self.policy.routing_generation {
+            self.trace_dictionaries.bind(
+                self.policy.descriptor.trace_policy,
+                owner.fingerprint,
+                dictionary,
+            );
+        }
+    }
+
+    fn active_routing_slot(&self) -> anyhow::Result<u32> {
+        Ok(self.policy.active_slot)
+    }
+
+    fn add_domain_ip_bitmap(
+        &mut self,
+        ip_key: &LpmKey,
+        bitmap: &DomainRouting,
+    ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self.domain_bitmap_add_faults > 0 {
+            self.domain_bitmap_add_faults -= 1;
+            anyhow::bail!("injected domain bitmap write failure");
+        }
+        self.policy.add_domain(ip_key, bitmap)?;
+        self.count_routing_writes(1);
+        Ok(())
+    }
+
+    fn set_outbound_alive(
+        &mut self,
+        outbound: u8,
+        domain: u32,
+        ipver: u32,
+        alive: bool,
+    ) -> anyhow::Result<()> {
+        self.count_outbound_alive_write();
+        self.policy.set_alive(outbound, domain, ipver, alive);
+        Ok(())
+    }
+
+    fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool> {
+        Ok(self.policy.alive(outbound, domain, ipver))
+    }
+
+    async fn cleanup(&mut self) -> anyhow::Result<()> {
+        self.datapath_ready = false;
+        self.admission_pressure
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.listener_sockets_published = false;
+        self.listener_socket_slots.clear();
+        self.policy.routing_generation = None;
+        self.policy.descriptor = RoutingPolicyDescriptor::default();
+        self.tcp_conn_states.clear();
+        self.udp_conn_states.clear();
+        self.redirect_tracks.clear();
+        self.routing_handoffs.get_mut().clear();
+        self.retire_fences.clear();
+        self.route_witnesses.clear();
+        self.policy.outbound_alive.clear();
+        self.bpf_stats.clear();
+        Ok(())
+    }
+}
+
+impl EbpfBackend for MockEbpfBackend {
     fn publish_listener_sockets(
         &mut self,
         tcp4_fd: std::os::fd::RawFd,
@@ -113,70 +335,9 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
-    fn set_datapath_ready(&mut self, ready: bool) -> anyhow::Result<()> {
-        if ready && !self.listener_sockets_published {
-            anyhow::bail!("listener socket generation is not fully published");
-        }
-        self.datapath_ready = ready;
-        Ok(())
-    }
-
-    fn set_datapath_flags(&mut self, flags: u32) -> anyhow::Result<()> {
-        self.datapath_flags_writes.lock().push(flags);
-        #[cfg(test)]
-        {
-            self.datapath_flags_writes_after_arm =
-                self.datapath_flags_writes_after_arm.saturating_add(1);
-            let ordinal = self.datapath_flags_writes_after_arm;
-            let failed = self.datapath_flags_fault_nth == Some(ordinal);
-            self.datapath_flags_write_trace
-                .push(DatapathFlagsWriteTrace {
-                    ordinal,
-                    origin: std::mem::take(&mut self.datapath_flags_write_origin),
-                    flags,
-                    failed,
-                });
-            if failed {
-                self.datapath_flags_fault_nth = None;
-                anyhow::bail!("injected datapath flags write failure at ordinal {ordinal}");
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn arm_datapath_flags_write_fault(&mut self, nth: usize) -> anyhow::Result<()> {
-        anyhow::ensure!(nth != 0, "datapath flags write ordinal must be non-zero");
-        self.datapath_flags_fault_nth = Some(nth);
-        self.datapath_flags_writes_after_arm = 0;
-        Ok(())
-    }
-
     #[cfg(test)]
     fn arm_quiesce_fault(&mut self) {
         self.fail_next_quiesce = true;
-    }
-
-    #[cfg(test)]
-    fn mark_datapath_flags_write_origin(&mut self, origin: DatapathFlagsWriteOrigin) {
-        self.datapath_flags_write_origin = origin;
-    }
-
-    #[cfg(test)]
-    fn datapath_flags_write_log(&self) -> Vec<u32> {
-        self.datapath_flags_writes.lock().clone()
-    }
-
-    #[cfg(test)]
-    fn datapath_flags_write_trace(&self) -> Vec<DatapathFlagsWriteTrace> {
-        self.datapath_flags_write_trace.clone()
-    }
-
-    #[cfg(test)]
-    fn clear_datapath_flags_write_log(&mut self) {
-        self.datapath_flags_writes.lock().clear();
-        self.datapath_flags_write_trace.clear();
-        self.datapath_flags_writes_after_arm = 0;
     }
 
     fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
@@ -201,154 +362,16 @@ impl EbpfBackend for MockEbpfBackend {
         retire_staged_udp(&staged, |requests, outcomes| {
             self.retire_batch(requests, outcomes)
         })?;
-        if self.routing_generation.is_some() {
+        if self.policy.routing_generation.is_some() {
             let generation = self
+                .policy
                 .next_generation
                 .checked_add(1)
                 .filter(|generation| *generation <= DNS_ROUTE_GENERATION_MAX)
                 .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
-            self.next_generation = generation;
-            self.descriptor.generation = generation;
+            self.policy.next_generation = generation;
+            self.policy.descriptor.generation = generation;
         }
-        Ok(())
-    }
-
-    fn publish_routing_plan(
-        &mut self,
-        plan: &crate::control::routing_matcher::RoutingPushPlan,
-        learned_domains: &[(LpmKey, DomainRouting)],
-    ) -> anyhow::Result<()> {
-        let generation = self
-            .next_generation
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
-        anyhow::ensure!(
-            generation <= DNS_ROUTE_GENERATION_MAX,
-            "routing generation counter exhausted at {DNS_ROUTE_GENERATION_MAX}"
-        );
-        anyhow::ensure!(
-            self.active_slot < 2,
-            "invalid active routing slot {}",
-            self.active_slot
-        );
-        let slot = self.active_slot ^ 1;
-        let trace_policy = if plan.trace_enabled() {
-            self.next_trace_policy = self.next_trace_policy.saturating_add(1);
-            self.next_trace_policy
-        } else {
-            0
-        };
-        self.take_routing_fault(RoutingPushPhase::DomainRouting)?;
-        let domain: HashMap<_, _> = learned_domains
-            .iter()
-            .map(|(key, bitmap)| (key.data, *bitmap))
-            .collect();
-        self.take_routing_fault(RoutingPushPhase::DestinationLpm)?;
-        self.take_routing_fault(RoutingPushPhase::SourceLpm)?;
-        self.take_routing_fault(RoutingPushPhase::MacLpm)?;
-        let domain_write_count = domain.len();
-        self.routing_publication_order
-            .push(MockRoutingPublicationWrite::FactMaps(slot));
-        self.take_routing_fault(RoutingPushPhase::Program)?;
-        self.routing_publication_order
-            .push(MockRoutingPublicationWrite::Program(slot));
-        self.take_routing_fault(RoutingPushPhase::Attach)?;
-        self.routing_publication_order
-            .push(MockRoutingPublicationWrite::Attach(slot));
-
-        let domain_map_id = self
-            .next_domain_map_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("domain map id counter exhausted"))?;
-        let candidate = MockRoutingGeneration {
-            fingerprint: plan.fingerprint,
-            rule_count: plan.rules.len(),
-            facts: plan.facts.clone(),
-            domain,
-        };
-        self.take_routing_fault(RoutingPushPhase::Root)?;
-        self.routing_generation = Some(candidate);
-        self.active_slot = slot;
-        self.descriptor = RoutingPolicyDescriptor {
-            slot,
-            features: plan.features,
-            generation,
-            domain_map_id,
-            trace_policy,
-        };
-        self.next_generation = generation;
-        self.next_domain_map_id = domain_map_id;
-        self.routing_publication_order
-            .push(MockRoutingPublicationWrite::Root(slot));
-        self.count_routing_writes(
-            (plan.facts.destination_v4.len()
-                + plan.facts.destination_v6.len()
-                + plan.facts.source_v4.len()
-                + plan.facts.source_v6.len()
-                + plan.facts.mac.len()
-                + plan.rules.len()
-                + domain_write_count
-                + 1) as u64,
-        );
-        Ok(())
-    }
-
-    fn routing_policy_generation(&self) -> u64 {
-        self.next_generation
-    }
-
-    fn active_routing_slot(&self) -> anyhow::Result<u32> {
-        Ok(self.active_slot)
-    }
-
-    fn add_domain_ip_bitmap(
-        &mut self,
-        ip_key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> anyhow::Result<()> {
-        #[cfg(test)]
-        if self.domain_bitmap_add_faults > 0 {
-            self.domain_bitmap_add_faults -= 1;
-            anyhow::bail!("injected domain bitmap write failure");
-        }
-        let generation = self
-            .routing_generation
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("no active routing generation"))?;
-        let current = generation.domain.entry(ip_key.data).or_default();
-        for (current, update) in current.bitmap.iter_mut().zip(bitmap.bitmap) {
-            *current |= update;
-        }
-        self.count_routing_writes(1);
-        Ok(())
-    }
-
-    fn set_domain_ip_bitmap(
-        &mut self,
-        ip_key: &LpmKey,
-        bitmap: &DomainRouting,
-    ) -> Result<(), ebpf::DomainRouteWriteError> {
-        #[cfg(test)]
-        self.take_projection_fault(ProjectionMapOperation::Set)?;
-        let generation = self.routing_generation.as_mut().ok_or_else(|| {
-            ebpf::DomainRouteWriteError::Other(anyhow::anyhow!("no active routing generation"))
-        })?;
-        generation.domain.insert(ip_key.data, *bitmap);
-        self.count_routing_writes(1);
-        Ok(())
-    }
-
-    fn remove_domain_ip_bitmap(
-        &mut self,
-        ip_key: &LpmKey,
-    ) -> Result<(), ebpf::DomainRouteWriteError> {
-        #[cfg(test)]
-        self.take_projection_fault(ProjectionMapOperation::Remove)?;
-        let generation = self.routing_generation.as_mut().ok_or_else(|| {
-            ebpf::DomainRouteWriteError::Other(anyhow::anyhow!("no active routing generation"))
-        })?;
-        generation.domain.remove(&ip_key.data);
-        self.count_routing_writes(1);
         Ok(())
     }
 
@@ -697,20 +720,6 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     #[cfg(feature = "native-api")]
-    fn bind_kernel_trace_dictionary(
-        &mut self,
-        dictionary: crate::observe::flows::kernel::KernelTraceDictionary,
-    ) {
-        if let Some(owner) = &self.routing_generation {
-            self.trace_dictionaries.bind(
-                self.descriptor.trace_policy,
-                owner.fingerprint,
-                dictionary,
-            );
-        }
-    }
-
-    #[cfg(feature = "native-api")]
     fn capture_kernel_route(
         &self,
         key: &TuplesKey,
@@ -727,30 +736,6 @@ impl EbpfBackend for MockEbpfBackend {
             .get(&reference.trace_id)
             .ok_or("kernel_trace_sidecar_missing")?;
         self.trace_dictionaries.capture(witness, key, reference)
-    }
-
-    fn set_outbound_alive(
-        &mut self,
-        outbound: u8,
-        domain: u32,
-        ipver: u32,
-        alive: bool,
-    ) -> anyhow::Result<()> {
-        let key = (outbound as u32)
-            .wrapping_mul(6)
-            .wrapping_add(domain.wrapping_mul(2))
-            .wrapping_add(ipver);
-        self.count_outbound_alive_write();
-        self.outbound_alive.insert(key, if alive { 1 } else { 0 });
-        Ok(())
-    }
-
-    fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool> {
-        let key = (outbound as u32)
-            .wrapping_mul(6)
-            .wrapping_add(domain.wrapping_mul(2))
-            .wrapping_add(ipver);
-        Ok(self.outbound_alive.get(&key).copied().unwrap_or(0) != 0)
     }
 
     fn get_bpf_stats(&self, key: u32) -> anyhow::Result<Option<u64>> {
@@ -821,12 +806,12 @@ impl EbpfBackend for MockEbpfBackend {
     fn detach_hooks(&mut self) -> anyhow::Result<()> {
         self.detach_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         self.bound_interfaces.clear();
         Ok(())
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     fn interface_binding_snapshot(&self) -> anyhow::Result<ebpf::interface::BindingSnapshot> {
         let owned = self
             .bound_interfaces
@@ -839,7 +824,7 @@ impl EbpfBackend for MockEbpfBackend {
         })
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     fn prepare_tc_programs(
         &self,
         _programs: &[ebpf::interface::TcProgram],
@@ -851,7 +836,7 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(None)
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     fn commit_interface_bindings(
         &mut self,
         commit: ebpf::interface::BindingCommit,
@@ -859,24 +844,5 @@ impl EbpfBackend for MockEbpfBackend {
         self.binding_commits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         commit.apply_to(&mut self.bound_interfaces)
-    }
-
-    async fn cleanup(&mut self) -> anyhow::Result<()> {
-        self.datapath_ready = false;
-        self.admission_pressure
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.listener_sockets_published = false;
-        self.listener_socket_slots.clear();
-        self.routing_generation = None;
-        self.descriptor = RoutingPolicyDescriptor::default();
-        self.tcp_conn_states.clear();
-        self.udp_conn_states.clear();
-        self.redirect_tracks.clear();
-        self.routing_handoffs.get_mut().clear();
-        self.retire_fences.clear();
-        self.route_witnesses.clear();
-        self.outbound_alive.clear();
-        self.bpf_stats.clear();
-        Ok(())
     }
 }

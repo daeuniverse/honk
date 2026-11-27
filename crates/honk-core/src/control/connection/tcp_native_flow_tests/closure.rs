@@ -123,9 +123,9 @@ async fn native_bulk_oversize_counts_unowned_mapped_sources_before_any_close() -
         let tracker = &fixture.handle.connection_tracker;
         for index in 0..1000 {
             tracker.register(crate::connection_tracker::ConnectionEntry {
-                id: format!("observed-{index}"),
-                source: format!("[::ffff:127.0.0.1]:{}", index + 1),
-                destination: "192.0.2.1:443".into(),
+                id: uuid::Uuid::from_u128(index as u128),
+                source: format!("[::ffff:127.0.0.1]:{}", index + 1).parse().unwrap(),
+                destination: "192.0.2.1:443".parse().unwrap(),
                 proxy: "direct".into(),
                 routed_outbound: None,
                 native_flow_id: None,
@@ -136,7 +136,7 @@ async fn native_bulk_oversize_counts_unowned_mapped_sources_before_any_close() -
                 download: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 start_time: std::time::Instant::now(),
                 domain: None,
-                network: "tcp".into(),
+                network: "tcp",
                 process: None,
                 process_path: None,
             });
@@ -159,12 +159,12 @@ async fn native_bulk_oversize_counts_unowned_mapped_sources_before_any_close() -
         assert_eq!(&byte, b"y");
         let unowned = fixture
             .http
-            .delete(format!("{base}/observed-0"))
+            .delete(format!("{base}/{}", uuid::Uuid::nil()))
             .send()
             .await?;
         assert_eq!(unowned.status(), reqwest::StatusCode::CONFLICT);
         for index in 0..1000 {
-            tracker.remove(&format!("observed-{index}"));
+            tracker.remove(&uuid::Uuid::from_u128(index as u128));
         }
         let closed: Value = fixture
             .http

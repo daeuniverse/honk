@@ -101,46 +101,50 @@ impl ClashDelay {
         self.measure_with_reply(Some(status), while_pending)
     }
 
-    async fn measure_with_reply<T>(
+    fn measure_with_reply<T>(
         &self,
         status: Option<&str>,
         while_pending: impl Future<Output = T>,
-    ) -> ((StatusCode, Value), T) {
-        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = target.local_addr().unwrap();
-        let probe = async {
-            let response = self
-                .client
-                .get(format!(
-                    "http://{}{}?url=http://{addr}/probe&timeout=8000",
-                    self.api, self.path
-                ))
-                .send()
+    ) -> impl Future<Output = ((StatusCode, Value), T)> {
+        // Reload can be a large future. The probe, peer, join and timeout retain only its pin.
+        let while_pending = Box::pin(while_pending);
+        async move {
+            let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = target.local_addr().unwrap();
+            let probe = async {
+                let response = self
+                    .client
+                    .get(format!(
+                        "http://{}{}?url=http://{addr}/probe&timeout=8000",
+                        self.api, self.path
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                (response.status(), response.json().await.unwrap())
+            };
+            let peer = async {
+                let (stream, _) = target.accept().await.unwrap();
+                if let Some(exit) = &self.exit {
+                    assert!(exit.requests.lock().contains(&addr));
+                }
+                let mut peer = BufReader::new(stream);
+                read_head(&mut peer).await;
+                peer.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+                read_head(&mut peer).await;
+                let result = while_pending.await;
+                if let Some(status) = status {
+                    let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
+                    peer.write_all(response.as_bytes()).await.unwrap();
+                }
+                result
+            };
+            tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(probe, peer) })
                 .await
-                .unwrap();
-            (response.status(), response.json().await.unwrap())
-        };
-        let peer = async {
-            let (stream, _) = target.accept().await.unwrap();
-            if let Some(exit) = &self.exit {
-                assert!(exit.requests.lock().contains(&addr));
-            }
-            let mut peer = BufReader::new(stream);
-            read_head(&mut peer).await;
-            peer.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                .await
-                .unwrap();
-            read_head(&mut peer).await;
-            let result = while_pending.await;
-            if let Some(status) = status {
-                let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
-                peer.write_all(response.as_bytes()).await.unwrap();
-            }
-            result
-        };
-        tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(probe, peer) })
-            .await
-            .expect("delay did not complete both HTTP rounds")
+                .expect("delay did not complete both HTTP rounds")
+        }
     }
 
     fn success(&self, (status, body): (StatusCode, Value)) -> u64 {

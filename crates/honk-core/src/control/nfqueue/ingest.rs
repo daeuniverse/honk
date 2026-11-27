@@ -143,14 +143,19 @@ impl PendingUdpVerdicts {
                 return NfqueueIngest::Dropped;
             }
         };
-        self.ingest_admitted_with_backend(
-            packet,
-            held,
-            slow_permit,
-            backend.as_ref(),
-            key,
-            decision_token,
-        )
+        let tc = match backend.tc() {
+            Ok(tc) => tc,
+            Err(error) => {
+                self.signal_fatal(PendingUdpFatal::new(
+                    "ingest capability",
+                    format!("{error:#}"),
+                ));
+                drop(backend);
+                self.reject_before_backend(&packet, held, DropOutcome::Cancel);
+                return NfqueueIngest::Dropped;
+            }
+        };
+        self.ingest_admitted_with_backend(packet, held, slow_permit, tc, key, decision_token)
     }
 
     pub(in crate::control) fn reject_actor_queue(&self, packet: QueuedPacket, guard: VerdictGuard) {
@@ -305,6 +310,7 @@ impl PendingUdpVerdicts {
                     return NfqueueIngest::Dropped;
                 };
                 let result = self.endpoints.reserve_owned_or_enqueue_at(
+                    honk_datapath::ScopeId::HOST,
                     cell.identity.client(),
                     cell.identity.destination(),
                     payload,
@@ -355,6 +361,7 @@ impl PendingUdpVerdicts {
                     return NfqueueIngest::Dropped;
                 };
                 let result = self.endpoints.reserve_owned_or_enqueue_at(
+                    honk_datapath::ScopeId::HOST,
                     cell.identity.client(),
                     cell.identity.destination(),
                     payload,
@@ -469,6 +476,7 @@ impl PendingUdpVerdicts {
                     return NfqueueIngest::Dropped;
                 };
                 match self.endpoints.reserve_owned_or_enqueue_at(
+                    honk_datapath::ScopeId::HOST,
                     key.client,
                     key.destination,
                     payload,
@@ -525,7 +533,7 @@ impl PendingUdpVerdicts {
             RetainedState::ActiveDirect(final_mark) => {
                 drop(payload);
                 drop(slow_permit);
-                let identity = PendingUdpIdentity::new(key, owner, 0);
+                let identity = PendingUdpIdentity::new(honk_datapath::ScopeId::HOST, key, owner, 0);
                 vacant.insert(Arc::new(FlowCell::terminal(
                     identity,
                     CellState::ActiveDirect {
@@ -541,6 +549,7 @@ impl PendingUdpVerdicts {
             RetainedState::Proxy => {
                 drop(slow_permit);
                 match self.endpoints.enqueue_owned_by_token_at(
+                    honk_datapath::ScopeId::HOST,
                     key.client,
                     key.destination,
                     payload,
@@ -549,7 +558,12 @@ impl PendingUdpVerdicts {
                     &self.stats,
                 ) {
                     Ok(generation) => {
-                        let identity = PendingUdpIdentity::new(key, owner, generation);
+                        let identity = PendingUdpIdentity::new(
+                            honk_datapath::ScopeId::HOST,
+                            key,
+                            owner,
+                            generation,
+                        );
                         vacant.insert(Arc::new(FlowCell::terminal(
                             identity,
                             CellState::Proxy {
@@ -577,7 +591,7 @@ impl PendingUdpVerdicts {
             RetainedState::Block => {
                 drop(payload);
                 drop(slow_permit);
-                let identity = PendingUdpIdentity::new(key, owner, 0);
+                let identity = PendingUdpIdentity::new(honk_datapath::ScopeId::HOST, key, owner, 0);
                 vacant.insert(Arc::new(FlowCell::terminal(
                     identity,
                     CellState::Block {

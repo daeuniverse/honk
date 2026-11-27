@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const WAIT: Duration = Duration::from_secs(20);
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 impl ControlPlane {
     pub(crate) fn tc_health_fixture(
         config: Config,
@@ -46,8 +46,8 @@ struct Fixture {
     commands: mpsc::Sender<ControlCommand>,
     phase: watch::Receiver<EnginePhase>,
     native: Arc<crate::native_api::observation::NativeObservation>,
-    backend: Arc<RwLock<Box<dyn EbpfBackend>>>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
+    shutdown: Arc<crate::control::ShutdownIntent>,
     task: tokio::task::JoinHandle<(ControlPlane, anyhow::Result<()>)>,
     api: crate::native_api::NativeServer,
     tproxy: SocketAddr,
@@ -179,7 +179,7 @@ impl Fixture {
         let phase = plane.observe_phase();
         let native = Arc::clone(&state.observation);
         let commands = plane.command_sender();
-        let backend = plane.ebpf_handle();
+        let backend = plane.policy_backend_handle();
         let shutdown = plane.shutdown_requested.clone();
         plane.alive_set().shutdown_health_checks().await?;
         let api = crate::native_api::NativeServer::start(listener, Arc::new(state));
@@ -227,14 +227,19 @@ impl Fixture {
             client.port(),
             6,
         );
-        self.backend.write().await.tcp_conn_state_store(
-            &tuples,
-            &honk_ebpf_common::ConnState {
-                state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
-                last_seen_ns: crate::control::janitor::monotonic_now_ns()?,
-                ..Default::default()
-            },
-        )?;
+        self.backend
+            .write()
+            .await
+            .tc_mut()
+            .unwrap()
+            .tcp_conn_state_store(
+                &tuples,
+                &honk_ebpf_common::ConnState {
+                    state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
+                    last_seen_ns: crate::control::janitor::monotonic_now_ns()?,
+                    ..Default::default()
+                },
+            )?;
         Ok(tokio::time::timeout(WAIT, socket.connect(self.tproxy)).await??)
     }
 
@@ -244,7 +249,7 @@ impl Fixture {
 
     async fn finish(self, failure: bool) -> ControlPlane {
         if !self.task.is_finished() {
-            self.shutdown.store(true, Ordering::Release);
+            self.shutdown.request();
             let _ = self.commands.send(ControlCommand::Shutdown).await;
         }
         let (plane, result) = tokio::time::timeout(WAIT, self.task)
@@ -328,7 +333,7 @@ async fn ordinary_shutdown_preserves_live_tcp_until_graceful_completion() -> any
         .await
         .expect("timed out receiving graceful-shutdown TCP request at the SOCKS peer")?;
     assert_eq!(&request, b"request");
-    fixture.shutdown.store(true, Ordering::Release);
+    fixture.shutdown.request();
     fixture.commands.send(ControlCommand::Shutdown).await?;
     tokio::time::timeout(
         WAIT,
@@ -349,7 +354,7 @@ async fn ordinary_shutdown_preserves_live_tcp_until_graceful_completion() -> any
     Ok(())
 }
 
-#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "native-api", feature = "legacy-tc", target_os = "linux"))]
 #[tokio::test]
 async fn a_socket_without_any_receive_trace_is_untraced() {
     use std::os::fd::{FromRawFd, IntoRawFd};
@@ -358,17 +363,18 @@ async fn a_socket_without_any_receive_trace_is_untraced() {
     let socket = unsafe { std::net::UdpSocket::from_raw_fd(read.into_raw_fd()) };
     socket.set_nonblocking(true).unwrap();
     let socket = tokio::net::UdpSocket::from_std(socket).unwrap();
-    let ebpf: RwLock<Box<dyn EbpfBackend>> =
-        RwLock::new(Box::new(crate::ebpf::mock::MockEbpfBackend::new()));
+    let (_, controller) =
+        TcKernelController::share(Box::new(crate::ebpf::mock::MockEbpfBackend::new()));
+    let tc = controller.unwrap();
     let mut batch = sockets::UdpRecvBatch::new().unwrap();
     assert!(
-        super::enable_receive_trace(&ebpf, &mut batch, &socket)
+        super::tc::enable_receive_trace(&tc, &mut batch, &socket)
             .await
             .is_err()
     );
 }
 
-#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "native-api", feature = "legacy-tc", target_os = "linux"))]
 #[test]
 fn udp_trace_is_reported_until_a_listener_generation_traces() {
     let degradations = crate::degradations::Degradations::default();
@@ -382,11 +388,11 @@ fn udp_trace_is_reported_until_a_listener_generation_traces() {
         ([false, true], "ipv6_unavailable"),
         ([true, true], "unavailable"),
     ] {
-        assert!(super::record_udp_trace(&degradations, unavailable));
-        assert!(!super::record_udp_trace(&degradations, unavailable));
+        assert!(super::tc::record_udp_trace(&degradations, unavailable));
+        assert!(!super::tc::record_udp_trace(&degradations, unavailable));
         assert_eq!(reason(), Some(expected));
     }
-    super::record_udp_trace(&degradations, [false, false]);
+    super::tc::record_udp_trace(&degradations, [false, false]);
     assert_eq!(reason(), None);
 }
 
@@ -407,7 +413,9 @@ async fn shutdown_quiesces_nfqueue_before_closing_datapath_admission() -> anyhow
     plane.start_datapath_flags_coordinator()?;
     plane.initialize_datapath_flags(true, true).await?;
     {
-        let mut ebpf = plane.ebpf.write().await;
+        let mut ebpf = tokio::sync::RwLockWriteGuard::map(plane.ebpf.write().await, |backend| {
+            backend.tc_mut().unwrap()
+        });
         ebpf.publish_listener_sockets(0, None, &[], &[])?;
         ebpf.set_datapath_ready(true)?;
     }
@@ -443,6 +451,113 @@ async fn shutdown_detaches_hooks_only_after_udp_cleanup() -> anyhow::Result<()> 
     release.send(()).unwrap();
     shutdown.await?;
     assert_eq!(detached.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+fn wireguard_node(peer: SocketAddr) -> anyhow::Result<honk_config::node::Node> {
+    use base64::Engine as _;
+    use honk_config::node::{Node, OutboundConfig, WireGuardConfig, WireGuardKey};
+
+    let key = |byte: u8| -> WireGuardKey {
+        base64::engine::general_purpose::STANDARD
+            .encode([byte; 32])
+            .parse()
+            .unwrap()
+    };
+    let mut node = Node {
+        name: "wg-teardown".into(),
+        host: "127.0.0.1".into(),
+        port: peer.port(),
+        outbound: OutboundConfig::WireGuard(WireGuardConfig {
+            private_key: Some(key(7)),
+            public_key: Some(key(8)),
+            local_v4: Some("10.0.0.2".parse()?),
+            ..WireGuardConfig::default()
+        }),
+        ..Node::default()
+    };
+    node.normalize_wireguard();
+    node.id = node.derive_id();
+    Ok(node)
+}
+
+/// A plane whose runtime generation is warming a WireGuard tunnel to `peer` (which never
+/// answers), returned once the tunnel's first initiation reaches `peer` from an outer address
+/// other than `known`. Warming through the plane's runtime is what puts the tunnel in the plane's
+/// own registry.
+async fn plane_warming_a_tunnel(
+    node: &honk_config::node::Node,
+    peer: &tokio::net::UdpSocket,
+    known: Option<SocketAddr>,
+) -> anyhow::Result<(
+    ControlPlane,
+    tokio::task::JoinHandle<anyhow::Result<honk_outbound::proxy::WarmOutcome>>,
+    SocketAddr,
+)> {
+    let plane = mock_plane(crate::ebpf::mock::MockEbpfBackend::new()).await;
+    let generation = Arc::new(honk_outbound::runtime::OutboundRuntimeRegistry::build(
+        std::slice::from_ref(node),
+    )?);
+    *plane.runtime_registry.write() = Arc::clone(&generation);
+    let proxy = ProxyRegistry::default_resolver()?;
+    let id = node.id;
+    let warm = tokio::spawn(async move { proxy.warm_session(generation, id, WAIT).await });
+    let mut buffer = [0; 2048];
+    let outer = tokio::time::timeout(WAIT, async {
+        loop {
+            let (_, from) = peer.recv_from(&mut buffer).await?;
+            if Some(from) != known {
+                return anyhow::Ok(from);
+            }
+        }
+    })
+    .await??;
+    Ok((plane, warm, outer))
+}
+
+/// Whether the tunnel that owned the outer UDP port `outer` has ended and released its socket.
+fn tunnel_socket_released(outer: SocketAddr) -> bool {
+    std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], outer.port()))).is_ok()
+}
+
+/// WireGuard tunnels own marked UDP sockets; the terminal teardown must close and join its plane's
+/// tunnels, not leave them to idle out.
+#[tokio::test]
+async fn shutdown_closes_and_joins_the_planes_wireguard_tunnels() -> anyhow::Result<()> {
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let node = wireguard_node(peer.local_addr()?)?;
+    let (mut plane, warm, outer) = plane_warming_a_tunnel(&node, &peer, None).await?;
+    assert!(!tunnel_socket_released(outer), "the tunnel is running");
+    plane.shutdown_runtime(None, None).await?;
+    assert!(
+        tunnel_socket_released(outer),
+        "teardown left a live tunnel behind"
+    );
+    let _ = tokio::time::timeout(WAIT, warm).await??;
+    Ok(())
+}
+
+/// Two planes (one embedder, or tests in one process) with the same WireGuard node each have their
+/// own tunnel; one plane's teardown neither ends nor waits for the other's.
+#[tokio::test]
+async fn shutdown_leaves_another_planes_wireguard_tunnels_alone() -> anyhow::Result<()> {
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let node = wireguard_node(peer.local_addr()?)?;
+    let (mut first, first_warm, first_outer) = plane_warming_a_tunnel(&node, &peer, None).await?;
+    let (mut second, second_warm, second_outer) =
+        plane_warming_a_tunnel(&node, &peer, Some(first_outer)).await?;
+    assert_ne!(first_outer, second_outer, "one tunnel per plane");
+
+    first.shutdown_runtime(None, None).await?;
+    assert!(tunnel_socket_released(first_outer));
+    assert!(
+        !tunnel_socket_released(second_outer) && !second_warm.is_finished(),
+        "the other plane's tunnel is still running"
+    );
+
+    second.shutdown_runtime(None, None).await?;
+    assert!(tunnel_socket_released(second_outer));
+    let _ = tokio::time::timeout(WAIT, async { tokio::join!(first_warm, second_warm) }).await?;
     Ok(())
 }
 

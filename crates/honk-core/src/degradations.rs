@@ -12,16 +12,16 @@ use parking_lot::Mutex;
 pub(crate) enum Component {
     Persistence,
     StateCache,
-    #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+    #[cfg_attr(not(feature = "legacy-tc"), allow(dead_code))]
     IfaceWatch,
     PnameRouting,
     #[cfg_attr(
-        not(all(feature = "native-api", feature = "ebpf", target_os = "linux")),
+        not(all(feature = "native-api", feature = "legacy-tc", target_os = "linux")),
         allow(dead_code)
     )]
     UdpTrace,
     QuicProbe,
-    #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+    #[cfg_attr(not(feature = "legacy-tc"), allow(dead_code))]
     InterfaceBinding,
 }
 
@@ -116,7 +116,7 @@ impl Degradations {
 
     #[cfg(any(
         test,
-        all(feature = "native-api", feature = "ebpf", target_os = "linux")
+        all(feature = "native-api", feature = "legacy-tc", target_os = "linux")
     ))]
     pub(crate) fn get(&self, component: Component) -> Option<Issue> {
         self.entries.lock()[component as usize]

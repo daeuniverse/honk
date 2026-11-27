@@ -1,11 +1,35 @@
 use super::*;
 
+/// Proves the bypass mark sticks on real TCP and UDP sockets and returns the
+/// cookie of the namespace they were created in.
+#[cfg(target_os = "linux")]
+pub(crate) fn probe_socket_marks(mark: u32) -> anyhow::Result<u64> {
+    use anyhow::Context as _;
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::os::fd::AsRawFd as _;
+
+    let mut cookie = 0;
+    for (label, kind, protocol) in [
+        ("TCP", Type::STREAM, Protocol::TCP),
+        ("UDP", Type::DGRAM, Protocol::UDP),
+    ] {
+        let socket = Socket::new(Domain::IPV4, kind, Some(protocol))
+            .with_context(|| format!("create {label} SO_MARK probe"))?;
+        honk_outbound::util::set_mark_verified(&socket, mark).with_context(|| {
+            format!("capture requires SO_MARK {mark:#x} on {label} sockets (CAP_NET_ADMIN)")
+        })?;
+        cookie = crate::netlink::fib::namespace_cookie(socket.as_raw_fd())
+            .context("read SO_NETNS_COOKIE (Linux 5.14 or newer)")?;
+    }
+    Ok(cookie)
+}
+
 #[cfg(target_os = "linux")]
 const IPV6_ORIGDSTADDR_OPT: libc::c_int = 74;
-#[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", feature = "native-api", target_os = "linux"))]
 const SO_RCVPRIORITY_OPT: libc::c_int = 82;
 
-#[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", feature = "native-api", target_os = "linux"))]
 pub(super) fn set_so_recvpriority(socket: &impl std::os::fd::AsRawFd) -> io::Result<()> {
     let enabled: libc::c_int = 1;
     let status = unsafe {
@@ -41,30 +65,39 @@ pub(super) fn bind_tproxy_tcp(
     addr: SocketAddr,
     _mark: u32,
 ) -> anyhow::Result<std::net::TcpListener> {
-    #[cfg(target_os = "linux")]
+    Ok(in_listener_namespace(
+        "bind TPROXY TCP listener",
+        |transparent| build_tproxy_tcp(addr, transparent),
+    )?)
+}
+
+pub(super) fn daens_netns_exists() -> bool {
+    #[cfg(all(target_os = "linux", feature = "legacy-tc"))]
+    {
+        crate::daens::DAENS_READY.load(std::sync::atomic::Ordering::Acquire)
+    }
+    #[cfg(not(all(target_os = "linux", feature = "legacy-tc")))]
+    {
+        false
+    }
+}
+
+fn in_listener_namespace<T>(
+    _operation: &str,
+    build: impl FnOnce(bool) -> io::Result<T>,
+) -> io::Result<T> {
+    #[cfg(all(target_os = "linux", feature = "legacy-tc"))]
     if daens_netns_exists() {
-        return crate::daens::with_daens_netns("bind TPROXY TCP listener", || {
-            build_tproxy_tcp(addr, true)
+        return crate::daens::with_daens_netns(_operation, || Ok(build(true)?)).map_err(|error| {
+            error
+                .downcast::<io::Error>()
+                .unwrap_or_else(io::Error::other)
         });
     }
-    build_tproxy_tcp(addr, false)
+    build(false)
 }
 
-/// Whether the daens namespace is fully set up (FD-owned namespace +
-/// policy routing live). Only real eBPF mode creates it (mock mode and
-/// tests stay entirely in the host netns), so this flag is the switch
-/// between "bind inside daens" and "bind here".
-#[cfg(target_os = "linux")]
-pub(super) fn daens_netns_exists() -> bool {
-    crate::daens::DAENS_READY.load(std::sync::atomic::Ordering::Acquire)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(super) fn daens_netns_exists() -> bool {
-    false
-}
-
-fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<std::net::TcpListener> {
+fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> io::Result<std::net::TcpListener> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -143,17 +176,14 @@ pub(super) fn bind_tproxy_udp_listeners(
     addr: SocketAddr,
     count: usize,
 ) -> anyhow::Result<Vec<UdpSocket>> {
-    #[cfg(target_os = "linux")]
-    if daens_netns_exists() {
-        return crate::daens::with_daens_netns("bind TPROXY UDP listener group", || {
+    Ok(in_listener_namespace(
+        "bind TPROXY UDP listener group",
+        |transparent| {
             (0..count)
-                .map(|_| build_tproxy_udp(addr, true, true))
+                .map(|_| build_tproxy_udp(addr, true, transparent))
                 .collect()
-        });
-    }
-    (0..count)
-        .map(|_| build_tproxy_udp(addr, true, false))
-        .collect()
+        },
+    )?)
 }
 
 pub(super) fn new_udp_listener_socket(domain: Domain, reuse_port: bool) -> io::Result<Socket> {
@@ -194,7 +224,7 @@ fn build_tproxy_udp(
     addr: SocketAddr,
     reuse_port: bool,
     transparent: bool,
-) -> anyhow::Result<UdpSocket> {
+) -> io::Result<UdpSocket> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -247,7 +277,7 @@ fn build_tproxy_udp(
     let _ = transparent;
 
     socket.bind(&addr.into())?;
-    Ok(UdpSocket::from_std(socket.into())?)
+    UdpSocket::from_std(socket.into())
 }
 
 /// Send a UDP reply for a TPROXY-received datagram using the original
@@ -320,31 +350,10 @@ pub(super) async fn send_udp_reply_from_orig_dst(
 /// in, so after creation it may be used from any (host-netns) worker thread.
 /// In mock mode there is no daens and the socket is created in the current
 /// (host) netns.
-#[cfg(target_os = "linux")]
 pub(super) fn new_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
-    if daens_netns_exists() {
-        return crate::daens::with_daens_netns("create UDP reply socket", || {
-            build_udp_reply_socket(original_dst).map_err(anyhow::Error::from)
-        })
-        .map_err(into_io_error);
-    }
-    build_udp_reply_socket(original_dst)
-}
-
-/// Non-Linux fallback: no daens netns exists; create the socket in the
-/// current namespace.
-#[cfg(not(target_os = "linux"))]
-pub(super) fn new_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
-    build_udp_reply_socket(original_dst)
-}
-
-/// Flatten a `with_daens_netns` error back into an `io::Error`, preserving
-/// the original `io::Error` (and its kind) when the scoped closure produced
-/// one.
-#[cfg(target_os = "linux")]
-fn into_io_error(e: anyhow::Error) -> io::Error {
-    e.downcast::<io::Error>()
-        .unwrap_or_else(|e| io::Error::other(e.to_string()))
+    in_listener_namespace("create UDP reply socket", |_| {
+        build_udp_reply_socket(original_dst)
+    })
 }
 
 fn build_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
@@ -416,13 +425,9 @@ fn dns_reply_socket_cache(is_v6: bool) -> &'static Mutex<Option<Arc<UdpSocket>>>
 /// Mock mode has no daens and creates the socket in the current netns.
 #[cfg(target_os = "linux")]
 fn new_dns_reply_socket(is_v6: bool) -> io::Result<UdpSocket> {
-    if daens_netns_exists() {
-        return crate::daens::with_daens_netns("create cached DNS reply socket", || {
-            build_dns_reply_socket(is_v6).map_err(anyhow::Error::from)
-        })
-        .map_err(into_io_error);
-    }
-    build_dns_reply_socket(is_v6)
+    in_listener_namespace("create cached DNS reply socket", |_| {
+        build_dns_reply_socket(is_v6)
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -746,7 +751,7 @@ pub(super) struct UdpRecvBatch {
     results: [Option<io::Result<UdpRecvPacket>>; UDP_RECV_BATCH_SIZE],
     received: usize,
     limit: usize,
-    #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+    #[cfg(all(feature = "legacy-tc", feature = "native-api", target_os = "linux"))]
     trace: Option<crate::ebpf::real::receive_trace::ReceiveRegistration>,
 }
 
@@ -782,12 +787,12 @@ impl UdpRecvBatch {
             results: std::array::from_fn(|_| None),
             received: 0,
             limit: UDP_RECV_BATCH_SIZE,
-            #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+            #[cfg(all(feature = "legacy-tc", feature = "native-api", target_os = "linux"))]
             trace: None,
         })
     }
 
-    #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+    #[cfg(all(feature = "legacy-tc", feature = "native-api", target_os = "linux"))]
     pub(super) fn enable_trace(
         &mut self,
         socket: &UdpSocket,
@@ -800,7 +805,7 @@ impl UdpRecvBatch {
         self.register_trace(socket, &trace)
     }
 
-    #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+    #[cfg(all(feature = "legacy-tc", feature = "native-api", target_os = "linux"))]
     fn register_trace(
         &mut self,
         socket: &UdpSocket,
@@ -851,7 +856,7 @@ impl UdpRecvBatch {
             message.msg_controllen = CMSG_CONTROL_CAPACITY as _;
         }
 
-        #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+        #[cfg(all(feature = "legacy-tc", feature = "native-api", target_os = "linux"))]
         let trace_armed = self.trace.as_mut().is_some_and(|trace| trace.begin(fd));
 
         // SAFETY: every mmsghdr points to live, disjoint storage above and the
@@ -866,7 +871,7 @@ impl UdpRecvBatch {
             )
         };
         let receive_error = (count < 0).then(io::Error::last_os_error);
-        #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+        #[cfg(all(feature = "legacy-tc", feature = "native-api", target_os = "linux"))]
         let trace_packets = self
             .trace
             .as_mut()
@@ -928,7 +933,7 @@ impl UdpRecvBatch {
                     message.msg_hdr.msg_flags,
                     local_addr,
                 )?;
-                #[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+                #[cfg(all(feature = "legacy-tc", feature = "native-api", target_os = "linux"))]
                 let meta = if let Some(packets) = trace_packets {
                     UdpRecvMeta {
                         packet_priority: crate::ebpf::real::receive_trace::packet_priority(

@@ -1,6 +1,6 @@
 # Architecture overview
 
-`honk` is a Linux eBPF transparent-proxy engine for gateway and host traffic. It is experimental alpha, licensed `GPL-3.0-only`, and developed in `daeuniverse/honk`. This page describes its architecture and runtime invariants.
+`honk` is a Linux transparent-proxy engine for gateway and host traffic, with default TC/eBPF capture and explicit XDP or TUN packet backends. This page describes its architecture and runtime invariants. The project is experimental alpha, licensed `GPL-3.0-only`, and developed in `daeuniverse/honk`.
 
 The configuration syntax and TC datapath derive from dae and stay dae-compatible where documented. Outbound handlers, groups, and the Clash API follow sing-box designs. `honk` is an independent implementation and has diverged substantially from both.
 
@@ -20,13 +20,16 @@ The configuration syntax and TC datapath derive from dae and stay dae-compatible
 
 ## Crate map
 
-The root workspace contains six crates. `honk-ebpf` is a separate Cargo project because it targets `bpfel-unknown-none`; it is excluded from the workspace and keeps its own `Cargo.lock`.
+The root workspace contains nine crates. `honk-ebpf` is a separate Cargo project because it targets `bpfel-unknown-none`; it is excluded from the workspace and keeps its own `Cargo.lock`.
 
 | Crate | Workspace | Responsibility |
 | --- | --- | --- |
 | `honk-config` | member | Shared configuration model, dae-syntax parser, include handling, share-link parsing, and subscription decoding. |
 | `honk-ebpf-common` | member | `no_std`, `#[repr(C)]` constants and ABI types shared by kernel programs and userspace map writers. |
 | `honk-nfqueue` | member | Raw `NETLINK_NETFILTER` queue `320`, verdict ownership, and the owned nftables transaction. |
+| `honk-netstack` | member | Sans-I/O IPv4/IPv6 TCP/UDP stack for WireGuard and scoped packet Endpoint execution, including configured XDP/TUN; depends only on `blake3` and `thiserror`. See [Userspace network stack](./netstack.md). |
+| `honk-datapath` | member | Scoped frame ownership, pure Core transit and stateful firewall/NAT; canonical policy and platform FIB authority remain in core/adapters. |
+| `honk-xsk` | member | Linux XDP/AF_XDP primitives used by the configured daemon and explicit experimental consumers; no deferred-DMA release fence or hardware acceptance claim. |
 | `honk-outbound` | member | Protocol handlers, per-node runtimes, outbound groups, health state, URLTest probing, and the always-compiled Score scorer. |
 | `honk-core` | member | Engine library and binary: eBPF/NFQUEUE runtime, control plane, DNS, routing, relay, and Clash API. |
 | `honk-tool` | member | CLI toolbox for subscription/node probing, datapath diagnostics, pinned-map inspection, and geo-asset queries. |
@@ -40,6 +43,7 @@ flowchart LR
   COMMON --> OUT
   COMMON --> EBPF[honk-ebpf]
   CORE --> OUT
+  OUT --> NS[honk-netstack]
   CORE -->|optional ebpf feature| NFQ[honk-nfqueue]
   CORE -->|build.rs embeds object| EBPF
   TOOL[honk-tool] --> CFG
@@ -56,7 +60,7 @@ Changes to shared map keys, values, constants, or layouts must move together acr
 - Standalone `Node` serde reports each ignored protocol-incompatible field once. It reports them even when a later conversion fails. Diagnostics name schema fields only, never node names or values. `node::NodeSeed` returns the same warnings through a caller-owned sink and does not log; `FlatNode` remains the only flat wire adapter.
 - `ConfigSeed` uses the Node seed for every original array element. Structured failures report the original node, group, and subscription indices, preserving map order or the declaration order of a sequence. They also report safe schema paths and the decoder's line and column, and never include the decoder's error text. A detailed file or JSON loader keeps the caller's diagnostic prefix when it fails; a successful format fallback removes only the abandoned attempts. When every format fails, the attempted diagnostics stay in order and one terminal cause follows. A dae semantic failure is final, unless the complete document decodes as a YAML, TOML, or JSON mapping with at least one known Config root key. In that case the structured loaders report their own outcome. Include and unsupported-policy errors stay final.
 - Parser and share-link entry points return safe diagnostics and never log. They withhold scalar values, names, links, and raw error payloads. Static failure causes and migration guidance stay available, including the replacement of `dns.hosts_file` with `dns.use_host`. Group, filter, subscription, and entry positions use the original ordinals. Detailed dae diagnostics share a metadata-only source table, which records include-parent links and available physical line numbers. Only the outer attempt appends a terminal cause.
-- `src/node/validation.rs` owns collection admission and shared checks. `src/node/vless.rs` exclusively owns canonical `VlessConfig` normalization, path selection, and combination validation. `src/node/protocol.rs` owns the other protocol configs and the shared TLS/stream/QUIC options. Detailed loaders keep typed causes and original one-based node coordinates.
+- `src/node/validation.rs` owns collection admission and shared checks. `src/node/vless.rs` exclusively owns canonical `VlessConfig` normalization, path selection, and combination validation. `src/node/protocol.rs` owns the other protocol configs and the shared TLS/stream/QUIC options. Detailed loaders keep typed causes and original one-based node coordinates. `src/node/wireguard.rs` owns single-peer WireGuard identity and admission.
 - `src/parser/` holds `mod.rs`, which owns file-aware `include` and ordered root
   dispatch. `lexer.rs` and `cursor.rs` keep source-backed tokens, comment spans,
   and bounded segments; `read.rs` shares scalar and expression access. Section
@@ -89,6 +93,8 @@ Changes to shared map keys, values, constants, or layouts must move together acr
 - `src/subscription.rs`, `src/types.rs` (`NodeProtocol`, including the Direct and Block built-ins and Chain for proxy chains, plus `DialMode` ip/domain/domain+/domain++, `SubscriptionType`, `DnsProtocol`, and the `default_true`/`parse_duration_secs` helpers), `src/error.rs` (`ConfigError`).
 
 ## High-level data path
+
+The diagram and packet walk below describe default TC. Explicit [TUN Endpoint](./datapath.md#linux-tun-endpoint) uses one daemon-owned FD, scoped Stack, canonical Router and real outbound. Opt-in socket HostFacts support process routing; Direct is a new-dial relay without original socket-operation or pre-NAT/TTL equivalence. XDP retains its separate device/Core contracts.
 
 ```mermaid
 flowchart TB
@@ -123,7 +129,7 @@ flowchart TB
 
 ## Runtime invariants
 
-- Bypass-mark discipline: dials, probes, DNS upstreams, HTTP downloads, QUIC endpoints, and transparent listeners carry the process-configured bypass mark. A nonzero direct rule mark replaces the mark's low 30 bits and adds `CLASSIFIED_MARK`; policy rules must mask with `0x3fffffff`. Accepted TCP sockets have the listener mark cleared. Ordinary host-netns `dns.bind` ingress sockets are deliberately unmarked.
+- **Bypass-mark discipline:** dials, probes, DNS upstreams, HTTP downloads, QUIC endpoints, and TC transparent listeners carry the process-configured mark. TC nonzero direct rule marks use `CLASSIFIED_MARK` with masked policy routing; accepted TC TCP sockets clear the listener mark. TC/XDP standalone `dns.bind` stays unmarked. TUN requires exact effective M on physical egress and strictly sets/reads back M on DNS/management sockets before bind/listen; accepted service children retain it. Permission failures reject TUN rather than risking a routing loop.
 - Anyfrom UDP replies: proxied UDP and transparent port-53 DNS replies use transparent sockets created inside `daens` and bound to the flow's original destination. A reply from the TPROXY listener exposes the `dae0` source and fails on the return path. A reply from an alternate full-cone source returns through the client-only `CLIENT_REPLY_TRACK` framing instead of host forwarding. It never teaches the datapath a native reverse direction for the client's next packet to that source.
 - DNS source boundary: the transparent and `dns.bind` adapters derive the logical client source from the socket peer. Flow-associated lookups use the admitted flow's source. Cache reuse starts only after routing materializes the selected source-neutral scope. Each policy generation's domain-predicate projection stays global and source-independent.
 - UDP source boundary: source-shared protocol reuse is indexed by reused runtime, normalized client, protocol/UDP path, and actual-peer/original-destination reply projection. The full five-tuple endpoint map still owns routing, token/generation, and per-flow Score. The source association owns its one receiver and transport health. Source ownership of every non-VLESS protocol remains available without `rprx`.
@@ -139,6 +145,7 @@ flowchart TB
 - Conditional verification surface: Score proxy objects publish aggregate provisional/usable state, fresh pairwise challenger response relations, and evidence questions and wait reasons with the same readonly selected member. There is no group-wide comparison claim. `/stats` adds fixed group/network verification and budget/cost fields, plus a nested-deduplicated root business count. Observed trial failures are not causal extra failures. Neither surface exports raw target keys or a probability of optimality. See [API verification](../reference/api.md#score-verification).
 - Internal and special traffic: honk's link-internal ranges `169.254.0.0/16` and `fd00:686f:6e6b::/64` are never proxied. L2 broadcast/multicast, IPv4 broadcast/multicast/unspecified destinations, and IPv6 multicast pass through before routing or conntrack.
 - Explicit local routing: users [configure gateway management access](../reference/routing.md#explicit-local-rules) explicitly; no generated interface rules provide it. WAN egress still bypasses destinations matching `PARAM.local_ip`. This is not a general management-access guarantee. `PARAM.local_ip` is a startup snapshot. It selects the first resolved, existing LAN entry with a bindable canonical root, skipping refused roots. If there is none, it falls back to WAN. It then takes that root's first IPv4 address. Canonicalization follows the interface planner: bond/bridge members use their canonical master, while `vrf`/`openvswitch` members stay themselves. If no root is selectable, or the selected root has no IPv4 address, the value is 0 and that bypass stays off. Later interface or address changes do not update the snapshot. A WAN address chosen while the LAN is absent also stays for the process lifetime. Interface observation still serves topology/ECS/health, and the existing non-DNS TCP pure-SYN local-probe skip remains.
+- **TUN ownership:** the daemon exclusively owns its new nonpersistent link, explicit addresses, dedicated capture table, five RPDB rules, blackhole guards and setup receipt. Operators keep main/WAN/LAN/NAT/firewall/forwarding topology stable. Watcher invalidation closes capture but is not an atomic root-route fence. Normal joined stop removes owned containment last; failure retains guards/rules/receipt for exact operator cleanup.
 
 ## Build features and mock mode
 
@@ -153,7 +160,7 @@ flowchart TB
 | `jemalloc` | yes | Pulls in `tikv-jemallocator` and installs jemalloc as the `honk-core` binary allocator; the crate builds jemalloc from C source. On Linux, startup disables transparent huge pages for the process before starting Tokio. Runtime options use `_RJEM_MALLOC_CONF`, not `MALLOC_CONF`, because the crate prefixes jemalloc symbols with `_rjem_`. |
 | `rprx` | yes | Enables `honk-outbound/rprx`, which registers the VLESS and VMess handlers, including the supported VLESS Encryption and `xtls-rprx-vision` paths. |
 
-`mock-ebpf` is not a Cargo feature. A build without `ebpf` uses `MockEbpfBackend`, and `--mock-ebpf` selects the unprivileged development path explicitly. If `global.nfqueue_enable = true` is requested, startup logs a warning and disables NFQUEUE staging for that process. The config file is unchanged.
+`mock-ebpf` is not a Cargo feature. Default TC without `ebpf` uses `MockEbpfBackend`; `--mock-ebpf` selects unprivileged development and disables requested NFQUEUE for the process. XDP/TUN use the shared userspace policy backend; TUN `host_facts: true` requires `ebpf`, while false does not. TUN requires `/dev/net/tun`, device/route and socket-mark privileges, rejects mock and requires `nfqueue_enable: false`; it never falls back to TC/NFQUEUE.
 
 When embedding eBPF, `build.rs` rebuilds with the kernel crate's pinned compiler and standalone release policy. It does not inherit host `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, or `CARGO_PROFILE_*` profiling overrides. The compiler sidecar must be no older than the embedding build script, so an embedding-policy change invalidates previously built objects. Explicit `--bpf-object` artifacts and manual kernel builds remain the caller's responsibility.
 

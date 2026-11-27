@@ -293,6 +293,8 @@ UDP NFQUEUE 沒有環境變數開關，由 `global.nfqueue_enable` 控制，預�
 
 啟用 `ebpf` feature 時，`build.rs` 透過 `include_bytes!` 內嵌物件檔。`--bpf-object` 會在執行期替換這些位元組。
 
+`packet-ebpf` 建置支援 XDP/TUN，須明確設定 XDP 或 TUN 並設 `global.nfqueue_enable: false`。此建置拒絕 `--bpf-object`（`-b`）。`legacy-tc` 與相容入口 `ebpf` 均包含三個物件。
+
 honk 在 probe/loading 之前就拒絕物件宣告的 `ByName` pinning：要用未 pin 的 map 重新建置，把 pin 路徑交給 core 管理。沒有啟用 `ebpf` 的建置使用 mock 後端。
 
 ### 核心 BTF

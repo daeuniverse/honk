@@ -204,11 +204,13 @@ async fn pump(
     } else {
         &progress.download
     };
-    let aggregate = if upload {
-        &progress.outbound_upload
-    } else {
-        &progress.outbound_download
-    };
+    let aggregate = progress.outbound.as_ref().map(|tracker| {
+        if upload {
+            &tracker.tx_bytes
+        } else {
+            &tracker.rx_bytes
+        }
+    });
     let mut first_response = if upload {
         None
     } else {
@@ -312,8 +314,7 @@ pub(super) async fn run(
     let mut progress = progress.unwrap_or_else(|| super::RelayProgress {
         upload: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         download: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        outbound_upload: None,
-        outbound_download: None,
+        outbound: None,
         first_response: None,
         on_transfer: None,
     });

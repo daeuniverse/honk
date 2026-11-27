@@ -85,6 +85,7 @@ jobs:
               - 'changes/**'
             parser:
               - 'crates/honk-config/**'
+              - 'crates/honk-netstack/**'
               - 'tools/dae-parse/**'
               - 'fuzz/**'
               - 'doc/en/reference/dialect.md'
@@ -101,14 +102,27 @@ jobs:
               - '.github/workflows/ci.yml'
             ebpf:
               - 'crates/honk-ebpf*/**'
+              - 'crates/honk-xsk/**'
+              - 'crates/honk-datapath/**'
+              - 'crates/honk-netstack/**'
+              - 'crates/honk-core/src/xdp.rs'
+              - 'crates/honk-core/src/xdp/**'
+              - 'crates/honk-core/src/lib.rs'
+              - 'crates/honk-core/src/netlink/**'
+              - 'crates/honk-core/src/control/core_forward.rs'
+              - 'crates/honk-core/src/control/core_forward/**'
+              - 'crates/honk-core/src/control/packet_endpoint.rs'
+              - 'crates/honk-core/src/control/packet_endpoint/**'
+              - 'crates/honk-core/src/control/netstack.rs'
+              - 'crates/honk-core/src/control/netstack/**'
+              - 'crates/honk-core/src/control/reload/**'
               - 'crates/honk-core/src/ebpf/**'
               - 'crates/honk-core/src/control/routing_matcher/**'
               - 'crates/honk-core/src/control/routing_matcher.rs'
               - 'crates/honk-core/src/control/tests.rs'
               - 'crates/honk-core/src/control/tests/**'
               - 'crates/honk-core/src/routing/**'
-              - 'crates/honk-config/src/routing.rs'
-              - 'crates/honk-config/src/parser/routing.rs'
+              - 'crates/honk-config/**'
               - 'crates/honk-core/build.rs'
               - 'crates/honk-core/tests/**'
               - 'crates/honk-outbound/src/util.rs'
@@ -121,6 +135,8 @@ jobs:
               - '.github/ci/pins.env'
               - '.github/ci/run-vm-gate.sh'
               - '.github/ci/ebpf-vm-tests.sh'
+              - '.github/ci/host-daemon-*'
+              - '.github/ci/xdp*'
               - 'rust-toolchain.toml'
               - '.cargo/**'
               - '.github/workflows/ci.yml'
@@ -174,7 +190,7 @@ jobs:
   parser:
     needs: [changes]
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.parser == 'true' || needs.changes.outputs.full == 'true') }}
-    name: dae-config parser (conformance + fuzz replay)
+    name: dae-config parser + netstack (conformance + fuzz replay)
     runs-on: ubuntu-24.04
     timeout-minutes: 8
     steps:
@@ -216,6 +232,9 @@ jobs:
         env:
           FUZZ_REPLAY_RESULT: ${{ runner.temp }}/fuzz-replay-result.json
         run: env -u DAE_PARSE_BIN cargo test -p honk-config --features fuzz-checks --test fuzz_replay -- --nocapture
+      - name: Replay netstack fuzz inputs on stable
+        if: ${{ !cancelled() }}
+        run: cargo test -p honk-netstack --features fuzz-checks --test fuzz_replay -- --nocapture
       - name: Write parser CI report
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -733,9 +752,9 @@ jobs:
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
           sudo apt-get -o Acquire::Retries=5 update
           sudo apt-get -o Acquire::Retries=5 install --yes --no-install-recommends \
-            busybox-static clang cmake coreutils file iproute2 iptables jq kbd kmod \
+            busybox-static clang cmake coreutils ethtool file iproute2 iptables jq kbd kmod nftables \
             libbpf-dev libclang-dev libvirt-clients llvm pkg-config python3-argcomplete \
-            python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd zstd
+            python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd wireguard-tools zstd
       - name: Configure KVM
         run: |
           set -euo pipefail
@@ -1038,9 +1057,9 @@ jobs:
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
           sudo apt-get -o Acquire::Retries=5 update
           sudo apt-get -o Acquire::Retries=5 install --yes --no-install-recommends \
-            busybox-static clang cmake coreutils file iproute2 iptables jq kbd kmod \
+            busybox-static clang cmake coreutils ethtool file iproute2 iptables jq kbd kmod nftables \
             libbpf-dev libclang-dev libvirt-clients llvm pkg-config python3-argcomplete \
-            python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd zstd
+            python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd wireguard-tools zstd
       - name: Configure KVM
         run: |
           set -euo pipefail
@@ -1382,16 +1401,8 @@ jobs:
           echo "$BPF_LINKER_SHA256  $archive" | sha256sum -c -
           zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
           bpf-linker --version
-      - name: Prepare eBPF object
-        working-directory: crates/honk-ebpf
-        env:
-          EBPF_TOOLCHAIN: ${{ steps.toolchain.outputs.ebpf }}
-        run: |
-          set -euo pipefail
-          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
-          readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
-          # build.rs requires the compiler identity as well as source freshness.
-          printf '%s' "$EBPF_TOOLCHAIN" > target/bpfel-unknown-none/release/honk-ebpf.toolchain
+      - name: Prepare eBPF objects
+        run: sh ci/ebpf-objects.sh build legacy-tc
       - run: cargo check -p honk-core --no-default-features
       - run: cargo check -p honk-core --no-default-features --features udp-bench --bench udp_io
       - run: cargo check -p honk-core --no-default-features --features dns-syslog
@@ -1528,16 +1539,8 @@ jobs:
           echo "$BPF_LINKER_SHA256  $archive" | sha256sum -c -
           zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
           bpf-linker --version
-      - name: Prepare eBPF object
-        working-directory: crates/honk-ebpf
-        env:
-          EBPF_TOOLCHAIN: ${{ steps.toolchain.outputs.ebpf }}
-        run: |
-          set -euo pipefail
-          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
-          readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
-          # build.rs requires the compiler identity as well as source freshness.
-          printf '%s' "$EBPF_TOOLCHAIN" > target/bpfel-unknown-none/release/honk-ebpf.toolchain
+      - name: Prepare eBPF objects
+        run: sh ci/ebpf-objects.sh build legacy-tc
       - name: Build core and toolbox in Alpine 3.24
         run: |
           set -euo pipefail

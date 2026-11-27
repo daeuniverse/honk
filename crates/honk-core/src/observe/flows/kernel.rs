@@ -264,6 +264,7 @@ impl KernelTraceDictionary {
             outbound,
             effective_outbound,
             must: output.decision.must != 0,
+            mark_kind: output.mark_kind,
             mark: output.decision.mark,
             truncated,
             ambiguous,
@@ -303,6 +304,7 @@ pub struct CapturedKernelRoute {
     pub(crate) outbound: Option<String>,
     pub(crate) effective_outbound: Option<String>,
     pub(crate) must: bool,
+    pub(crate) mark_kind: u32,
     pub(crate) mark: u32,
     pub(crate) truncated: bool,
     pub(crate) ambiguous: bool,
@@ -389,6 +391,8 @@ impl KernelTraceDictionaries {
             || input.pname_len as usize > input.pname.len()
             || output.decision.outbound > u8::MAX as u32
             || output.decision.must > 1
+            || !matches!(output.mark_kind, ROUTING_MARK_KEEP | ROUTING_MARK_SET)
+            || (output.mark_kind == ROUTING_MARK_KEEP && output.decision.mark != 0)
         {
             return Err("kernel_trace_input_mismatch");
         }

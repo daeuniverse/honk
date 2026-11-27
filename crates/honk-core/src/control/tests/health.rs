@@ -755,7 +755,7 @@ async fn fifty_ambiguous_udp_closures_preserve_sibling_route_and_bare_exit() {
         outbound: RoutingOutbound::Simple(outbound.into()),
         priority: 0,
         must: true,
-        mark: 0,
+        mark: None,
     })
     .into();
     let config = config.assemble(|_, _, _| {}).unwrap();
@@ -791,9 +791,19 @@ async fn fifty_ambiguous_udp_closures_preserve_sibling_route_and_bare_exit() {
         .unwrap();
     assert_eq!(relay.requests.lock()[..], [land_addr]);
     plane.udp_pool.remove_by_node(front.id);
-    assert!(plane.udp_pool.get(client, retired).is_some());
+    assert!(
+        plane
+            .udp_pool
+            .get(honk_datapath::ScopeId::HOST, client, retired)
+            .is_some()
+    );
     plane.udp_pool.remove_by_node(land.id);
-    assert!(plane.udp_pool.get(client, retired).is_none());
+    assert!(
+        plane
+            .udp_pool
+            .get(honk_datapath::ScopeId::HOST, client, retired)
+            .is_none()
+    );
     drop(accepted.recv().await.unwrap());
 
     let protected = [
@@ -819,13 +829,23 @@ async fn fifty_ambiguous_udp_closures_preserve_sibling_route_and_bare_exit() {
             .unwrap();
         assert_eq!(&reply[..len], b"alive");
     }
-    let original_endpoints = protected.map(|target| plane.udp_pool.get(client, target).unwrap());
+    let original_endpoints = protected.map(|target| {
+        plane
+            .udp_pool
+            .get(honk_datapath::ScopeId::HOST, client, target)
+            .unwrap()
+    });
     for seq in 0u8..50 {
         let dst = SocketAddr::new(retired.ip(), 6000 + u16::from(seq));
         super::support::serve_test_udp_to(&handle, client, dst, &[seq])
             .await
             .unwrap();
-        assert!(plane.udp_pool.get(client, dst).is_some());
+        assert!(
+            plane
+                .udp_pool
+                .get(honk_datapath::ScopeId::HOST, client, dst)
+                .is_some()
+        );
         let mut stream = tokio::time::timeout(Duration::from_secs(3), accepted.recv())
             .await
             .unwrap()
@@ -837,7 +857,11 @@ async fn fifty_ambiguous_udp_closures_preserve_sibling_route_and_bare_exit() {
         stream.write_all(&[1, 192]).await.unwrap();
         drop(stream);
         tokio::time::timeout(Duration::from_secs(3), async {
-            while plane.udp_pool.get(client, dst).is_some() {
+            while plane
+                .udp_pool
+                .get(honk_datapath::ScopeId::HOST, client, dst)
+                .is_some()
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -849,7 +873,10 @@ async fn fifty_ambiguous_udp_closures_preserve_sibling_route_and_bare_exit() {
     for (target, original) in protected.into_iter().zip(original_endpoints) {
         assert!(Arc::ptr_eq(
             &original,
-            &plane.udp_pool.get(client, target).unwrap()
+            &plane
+                .udp_pool
+                .get(honk_datapath::ScopeId::HOST, client, target)
+                .unwrap()
         ));
         super::support::serve_test_udp_to(&handle, client, target, b"")
             .await
@@ -967,9 +994,15 @@ async fn fifty_ambiguous_udp_closures_preserve_sibling_route_and_bare_exit() {
             .try_acquire_owned()
             .unwrap();
         let dst = SocketAddr::new(retired.ip(), port);
-        let crate::control::udp_endpoint::EndpointReservation::Initializing(lease) = plane
-            .udp_pool
-            .reserve_or_enqueue(client, dst, b"waiting", permit, &handle.stats)
+        let crate::control::udp_endpoint::EndpointReservation::Initializing(lease) =
+            plane.udp_pool.reserve_or_enqueue(
+                honk_datapath::ScopeId::HOST,
+                client,
+                dst,
+                b"waiting",
+                permit,
+                &handle.stats,
+            )
         else {
             panic!("fresh reservation");
         };
@@ -992,31 +1025,59 @@ async fn fifty_ambiguous_udp_closures_preserve_sibling_route_and_bare_exit() {
         assert_eq!(wire[79], seq);
         stream.write_all(&[9]).await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
-            while plane.udp_pool.get(client, dst).is_some() {
+            while plane
+                .udp_pool
+                .get(honk_datapath::ScopeId::HOST, client, dst)
+                .is_some()
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("typed bad record must terminate its flow");
         for live in protected.into_iter().chain(shared_dest) {
-            assert!(plane.udp_pool.get(client, live).is_some());
+            assert!(
+                plane
+                    .udp_pool
+                    .get(honk_datapath::ScopeId::HOST, client, live)
+                    .is_some()
+            );
         }
     }
     // One receiver settles the fiftieth independent fault for both of its
     // bound views; the death callback also retires other affected owners.
     shared_wire.write_all(&[9]).await.unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
-        while plane.udp_pool.get(client, protected[1]).is_some() {
+        while plane
+            .udp_pool
+            .get(honk_datapath::ScopeId::HOST, client, protected[1])
+            .is_some()
+        {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("the shared receiver must publish its typed framing failure");
     for dead in protected.into_iter().chain(shared_dest) {
-        assert!(plane.udp_pool.get(client, dead).is_none());
+        assert!(
+            plane
+                .udp_pool
+                .get(honk_datapath::ScopeId::HOST, client, dead)
+                .is_none()
+        );
     }
-    assert!(plane.udp_pool.get(mixed_addr, creator).is_some());
-    assert!(plane.udp_pool.get(mixed_addr, reused).is_none());
+    assert!(
+        plane
+            .udp_pool
+            .get(honk_datapath::ScopeId::HOST, mixed_addr, creator)
+            .is_some()
+    );
+    assert!(
+        plane
+            .udp_pool
+            .get(honk_datapath::ScopeId::HOST, mixed_addr, reused)
+            .is_none()
+    );
     assert!(!bound[0].still_initializing());
     assert!(bound[1].still_initializing());
     drop(bound);

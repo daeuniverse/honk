@@ -15,7 +15,6 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[cfg(feature = "ebpf")]
 pub mod codegen;
 
 /// A condition in the native rule representation.
@@ -65,7 +64,7 @@ impl KernelPredicate {
 pub struct KernelAction {
     pub outbound: u8,
     pub must: bool,
-    pub mark: u32,
+    pub mark: Option<u32>,
     pub direct_mark_index: Option<u8>,
 }
 
@@ -91,7 +90,7 @@ impl KernelAction {
                 outbound
             },
             must: action.must,
-            mark: action.mark.map_or(0, honk_outbound::proxy::DirectMark::get),
+            mark: action.mark,
             direct_mark_index: action.direct_mark_index,
         })
     }
@@ -106,7 +105,7 @@ pub struct KernelRule {
 }
 
 impl KernelRule {
-    fn folded_false(&self) -> bool {
+    pub(crate) fn folded_false(&self) -> bool {
         self.conditions.is_empty()
             || self
                 .conditions
@@ -114,7 +113,9 @@ impl KernelRule {
                 .any(|condition| !condition.not && condition.predicate.is_empty())
     }
 
-    fn runtime_conditions(&self) -> impl Iterator<Item = (usize, &KernelCondition)> + Clone {
+    pub(crate) fn runtime_conditions(
+        &self,
+    ) -> impl Iterator<Item = (usize, &KernelCondition)> + Clone {
         let live = self
             .conditions
             .iter()
@@ -192,15 +193,15 @@ struct ColdUdpSlot {
 }
 
 /// The compiled policy and the history of its bounded numeric UDP namespace share one writer.
-pub(super) struct ActiveRoutingPlan {
-    pub(super) plan: Arc<RoutingPushPlan>,
+pub(crate) struct ActiveRoutingPlan {
+    pub(crate) plan: Arc<RoutingPushPlan>,
     slots: Box<[ColdUdpSlot; USER_SLOTS]>,
     rebind_requires_commit: bool,
     // A weak pointer retains allocation identity without holding old config content.
     manager_config: std::sync::Weak<honk_config::Config>,
 }
 
-pub(super) type SharedRoutingPlan = Arc<parking_lot::RwLock<ActiveRoutingPlan>>;
+pub(crate) type SharedRoutingPlan = Arc<parking_lot::RwLock<ActiveRoutingPlan>>;
 
 impl ActiveRoutingPlan {
     pub(super) fn new(
@@ -326,8 +327,10 @@ pub struct RoutingPushPlan {
     pub(crate) rules: Vec<KernelRule>,
     pub(crate) facts: RoutingFactMaps,
     pub(crate) fallback: KernelAction,
+    pub(crate) dial_mode: DialMode,
     pub(crate) features: u32,
     pub(crate) fingerprint: [u8; 32],
+    pub(crate) policy_fingerprint: [u8; 32],
     pub has_domain_rules: bool,
     pub(crate) domain_predicate_count: usize,
     pub(crate) trace_enabled: bool,
@@ -349,7 +352,7 @@ impl RoutingPushPlan {
         (*slot == outbound).then_some(name.as_str())
     }
 
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(any(feature = "legacy-tc", test))]
     pub(super) fn group_index(&self, name: &str) -> Option<u8> {
         // The compiler uses the last declaration when names repeat.
         self.group_slots
@@ -360,9 +363,11 @@ impl RoutingPushPlan {
 
     pub fn semantically_eq(&self, other: &Self) -> bool {
         self.fallback == other.fallback
+            && self.dial_mode == other.dial_mode
             && self.features == other.features
             && self.trace_enabled == other.trace_enabled
             && self.fingerprint == other.fingerprint
+            && self.policy_fingerprint == other.policy_fingerprint
             && self.has_domain_rules == other.has_domain_rules
             && self.group_slots == other.group_slots
             && self.domain_predicate_count == other.domain_predicate_count
@@ -599,8 +604,10 @@ impl RoutingPushPlan {
             rules,
             facts,
             fallback,
+            dial_mode,
             features,
             fingerprint: hash.finalize().into(),
+            policy_fingerprint: router.policy_fingerprint(),
             has_domain_rules: has_domain,
             domain_predicate_count,
             trace_enabled: false,
@@ -822,6 +829,11 @@ mod tests {
         ] {
             assert!(!compile(fallback).semantically_eq(&marked), "{fallback}");
         }
+        let keep = compile("direct");
+        let zero = compile("direct(mark: 0)");
+        assert_eq!(keep.fallback.mark, None);
+        assert_eq!(zero.fallback.mark, Some(0));
+        assert!(!keep.semantically_eq(&zero));
     }
 
     #[test]
@@ -878,7 +890,7 @@ mod fact_sharing_tests {
                 outbound: RoutingOutbound::Simple("direct".into()),
                 priority: 0,
                 must: false,
-                mark: 0,
+                mark: None,
             })
             .collect();
         let router = Router::new(&rules, "direct").unwrap();

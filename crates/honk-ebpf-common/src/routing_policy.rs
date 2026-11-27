@@ -8,6 +8,9 @@ pub const ROUTING_FEATURE_PROCESS: u32 = 1 << 2;
 pub const ROUTING_PROCESS_MAX_LEN: usize = 48;
 pub const ROUTING_FACT_CAPACITY: usize = 256;
 
+pub const ROUTING_MARK_KEEP: u32 = 0;
+pub const ROUTING_MARK_SET: u32 = 1;
+
 pub const ROUTE_TRACE_VALUES: usize = 256;
 pub const ROUTE_TRACE_WORDS: usize = ROUTE_TRACE_VALUES / 16;
 pub const ROUTE_TRACE_ENABLED: u32 = 1;
@@ -15,7 +18,7 @@ pub const ROUTE_TRACE_COMPLETE: u32 = 1 << 1;
 pub const ROUTE_TRACE_OVERFLOW: u32 = 1 << 2;
 pub const ROUTE_TRACE_AMBIGUOUS: u32 = 1 << 3;
 pub const ROUTE_TRACE_DNS_OVERRIDE: u32 = 1 << 4;
-pub const ROUTE_TRACE_VERSION: u32 = 1 << 24;
+pub const ROUTE_TRACE_VERSION: u32 = 2 << 24;
 pub const ROUTE_TRACE_VERSION_MASK: u32 = 0xff << 24;
 pub const ROUTE_TRACE_LOST: u32 = u32::MAX;
 pub const ROUTE_TRACE_CAPACITY: u32 = 1024;
@@ -151,7 +154,7 @@ fn unresolved_direct_handoff_keeps_sniffing_authority() {
 pub struct KernelRouteOutput {
     pub decision: RoutingDecision,
     pub flags: u32,
-    pub padding: [u8; 4],
+    pub mark_kind: u32,
     pub generation: u64,
     pub policy_id: u32,
     pub fact_state: u32,
@@ -161,6 +164,16 @@ pub struct KernelRouteOutput {
 }
 
 impl KernelRouteOutput {
+    /// Preserve the canonical effect while applying the legacy mode override.
+    #[inline(always)]
+    pub fn apply_mode_flags(&mut self, flags: u32, dst_port: u16) {
+        let outbound = self.decision.outbound;
+        self.decision.apply_mode_flags(flags, dst_port);
+        if outbound != self.decision.outbound {
+            self.mark_kind = ROUTING_MARK_KEEP;
+        }
+    }
+
     pub fn outcome(&self, slot: usize) -> Option<u32> {
         self.outcomes
             .get(slot / 16)
@@ -212,6 +225,59 @@ fn all_direct_mode_matches_userspace_override() {
         );
     }
 }
+
+#[cfg(test)]
+#[test]
+fn full_mark_mode_override_preserves_direct_effects() {
+    use crate::OutboundIndex::{Block, Direct, UserBase};
+    for mark in [None, Some(0), Some(0x8000_0000), Some(u32::MAX)] {
+        for outbound in [Direct, Block, UserBase] {
+            for (flags, port, must) in [
+                (crate::DATAPATH_FLAG_OFFLOAD_ALL, 443, 0),
+                (crate::DATAPATH_FLAG_OFFLOAD_ALL, 53, 0),
+                (crate::DATAPATH_FLAG_OFFLOAD_ALL, 443, 1),
+                (crate::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT, 443, 0),
+            ] {
+                let kind = if mark.is_some() {
+                    ROUTING_MARK_SET
+                } else {
+                    ROUTING_MARK_KEEP
+                };
+                let mut output = KernelRouteOutput {
+                    decision: RoutingDecision {
+                        outbound: outbound as u32,
+                        mark: mark.unwrap_or(0),
+                        must,
+                        ..Default::default()
+                    },
+                    mark_kind: kind,
+                    ..Default::default()
+                };
+                output.apply_mode_flags(flags, port);
+                let overridden = flags & crate::DATAPATH_FLAG_OFFLOAD_ALL != 0
+                    && port != 53
+                    && must == 0
+                    && outbound == UserBase;
+                assert_eq!(
+                    output.mark_kind,
+                    if overridden { ROUTING_MARK_KEEP } else { kind }
+                );
+                assert_eq!(
+                    output.decision.mark,
+                    if overridden { 0 } else { mark.unwrap_or(0) }
+                );
+                assert_eq!(
+                    output.decision.outbound,
+                    if overridden {
+                        Direct as u32
+                    } else {
+                        outbound as u32
+                    }
+                );
+            }
+        }
+    }
+}
 /// Result written by the optional real-kernel routing differential fixture.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -246,7 +312,7 @@ const _: () = assert!(core::mem::size_of::<KernelRouteOutput>() == 272);
 const _: () = assert!(core::mem::align_of::<KernelRouteOutput>() == 8);
 const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, decision) == 0);
 const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, flags) == 24);
-const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, padding) == 28);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, mark_kind) == 28);
 const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, generation) == 32);
 const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, policy_id) == 40);
 const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, fact_state) == 44);
@@ -318,17 +384,17 @@ const _: () = {
 // SAFETY: The recursive field-size sums exclude implicit padding. All leaves
 // are integer scalars/arrays (including flags and decisions), never Rust enums,
 // bools, pointers or references, so every byte pattern is a valid value.
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for RoutingInput {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for RoutingDecision {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for RoutingPolicyDescriptor {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for RoutingTestResult {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for KernelRouteOutput {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for KernelRouteWitness {}
 
 /// Canonicalize the fixed process-name handoff without allocation.

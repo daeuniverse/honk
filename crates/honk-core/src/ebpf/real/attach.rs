@@ -1,4 +1,5 @@
 use super::*;
+use crate::ebpf::common::{btf, syscall::map_raw_fd};
 use anyhow::Context as _;
 
 struct StartupPins<'a> {
@@ -92,8 +93,7 @@ impl RealEbpfBackend {
             wan_ifindex,
             dae0peer_mac,
             use_redirect_peer,
-            has_bpf_get_current_task: matches!(pname_mode, process_name::PnameCaptureMode::Argv0)
-                as u8,
+            has_bpf_get_current_task: matches!(pname_mode, PnameCaptureMode::Argv0) as u8,
             dae_socket_mark: honk_outbound::util::bypass_mark(),
             control_plane_pid: std::process::id(),
             tcp_daens_netns_id,
@@ -125,7 +125,7 @@ impl RealEbpfBackend {
             .override_global("TCP_DAENS_NETNS_COOKIE", &tcp_daens_netns_cookie, true)
             .override_global("IPV6_SOCKETS_AVAILABLE", &ipv6_sockets_available, true)
             .map_pin_path(UDP_DECISION_SEQUENCE_MAP, sequence_pin.as_path());
-        if matches!(pname_mode, process_name::PnameCaptureMode::Argv0)
+        if matches!(pname_mode, PnameCaptureMode::Argv0)
             && let Some(offsets) = process_name_offsets.as_ref()
         {
             loader
@@ -141,7 +141,7 @@ impl RealEbpfBackend {
         let mut bpf = loader.load(obj)?;
         layout::validate_loaded_maps(&bpf)?;
         layout::validate_socket_identity(&bpf)?;
-        syscall::validate_udp_decision_sequence_fd(syscall::map_raw_fd(
+        syscall::validate_udp_decision_sequence_fd(map_raw_fd(
             bpf.map(UDP_DECISION_SEQUENCE_MAP)
                 .ok_or_else(|| anyhow::anyhow!("UDP decision sequence map unavailable"))?,
         ))?;
@@ -205,10 +205,10 @@ impl RealEbpfBackend {
         }
         .map_err(|error| anyhow::anyhow!("required EVENT_RINGBUF AsyncFd setup: {error}"))?;
         match pname_mode {
-            process_name::PnameCaptureMode::Argv0 => {
+            PnameCaptureMode::Argv0 => {
                 info!("process-name routing uses argv[0] basename")
             }
-            process_name::PnameCaptureMode::Comm => {
+            PnameCaptureMode::Comm => {
                 warn!("kernel argv capture unavailable; using thread comm")
             }
         }
@@ -221,7 +221,7 @@ impl RealEbpfBackend {
         let cgroup_file = std::fs::File::open(&cgroup_path)
             .map_err(|e| anyhow::anyhow!("open cgroup {}: {}", cgroup_path, e))?;
         let (create_name, cg_addr_names) = match pname_mode {
-            process_name::PnameCaptureMode::Argv0 => (
+            PnameCaptureMode::Argv0 => (
                 "tproxy_wan_cg_sock_create",
                 [
                     "tproxy_wan_cg_connect4",
@@ -230,7 +230,7 @@ impl RealEbpfBackend {
                     "tproxy_wan_cg_sendmsg6",
                 ],
             ),
-            process_name::PnameCaptureMode::Comm => (
+            PnameCaptureMode::Comm => (
                 "tproxy_wan_cg_sock_create_comm",
                 [
                     "tproxy_wan_cg_connect4_comm",

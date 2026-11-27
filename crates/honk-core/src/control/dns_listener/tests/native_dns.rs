@@ -86,8 +86,11 @@ async fn native_bound_dns_records_each_udp_query_and_tcp_frame_without_dns_log()
     controller
         .dns_service()
         .attach_observer(Arc::downgrade(&native.dns.recorder));
-    let bound =
-        BoundDnsListener::bind(&DnsBindEndpoint::parse("tcp+udp://127.0.0.1:0").unwrap()).unwrap();
+    let bound = BoundDnsListener::bind(
+        &DnsBindEndpoint::parse("tcp+udp://127.0.0.1:0").unwrap(),
+        None,
+    )
+    .unwrap();
     let address = bound.local_addr();
     let drain = Arc::new(DrainTracker::new());
     let mut listener = bound
@@ -98,6 +101,7 @@ async fn native_bound_dns_records_each_udp_query_and_tcp_frame_without_dns_log()
             Arc::clone(&drain),
             Some(Arc::clone(&native.core)),
             plane.diagnostics.clone(),
+            ScopeId::HOST,
         )
         .unwrap();
     let response = udp_exchange(address, &query("udp.flow.test", 1)).await;
@@ -117,8 +121,8 @@ async fn native_bound_dns_records_each_udp_query_and_tcp_frame_without_dns_log()
     saturated
         .dns_service()
         .attach_observer(Arc::downgrade(&native.dns.recorder));
-    let bound =
-        BoundDnsListener::bind(&DnsBindEndpoint::parse("udp://127.0.0.1:0").unwrap()).unwrap();
+    let bound = BoundDnsListener::bind(&DnsBindEndpoint::parse("udp://127.0.0.1:0").unwrap(), None)
+        .unwrap();
     let address = bound.local_addr();
     let drain = Arc::new(DrainTracker::new());
     let mut listener = bound
@@ -129,6 +133,7 @@ async fn native_bound_dns_records_each_udp_query_and_tcp_frame_without_dns_log()
             Arc::clone(&drain),
             Some(Arc::clone(&native.core)),
             plane.diagnostics.clone(),
+            ScopeId::HOST,
         )
         .unwrap();
     let refused = udp_exchange(address, &query("refused.flow.test", 4)).await;

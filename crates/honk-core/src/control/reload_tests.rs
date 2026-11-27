@@ -103,6 +103,352 @@ fn lan_and_wan_interface_changes_stay_restart_required() {
 }
 
 #[test]
+fn datapath_restart_identity_uses_effective_setup_not_policy() {
+    use honk_config::datapath::{DatapathConfig, XskMode};
+
+    let current = Config::default();
+    let mut candidate = current.clone();
+    candidate.datapath = Some(DatapathConfig::default());
+    assert!(restart_required_changes(&current, &candidate).is_empty());
+    assert!(restart_required_changes(&candidate, &current).is_empty());
+
+    let mut xdp = honk_config::parser::parse_dae_config(
+        "datapath {\n backend: xdp\n direct: core\n interface {\n eth0: lan\n }\n }",
+    )
+    .unwrap();
+    assert_eq!(restart_required_changes(&current, &xdp), ["datapath"]);
+    assert_eq!(restart_required_changes(&xdp, &current), ["datapath"]);
+    candidate = xdp.clone();
+    candidate.datapath.as_mut().unwrap().xsk_mode = Some(XskMode::ZeroCopy);
+    assert!(restart_required_changes(&xdp, &candidate).is_empty());
+    assert!(restart_required_changes(&candidate, &xdp).is_empty());
+
+    xdp.datapath.as_mut().unwrap().firewall = Some(Default::default());
+    assert!(restart_required_changes(&candidate, &xdp).is_empty());
+    candidate.datapath.as_mut().unwrap().xsk_mode = Some(XskMode::Copy);
+    assert_eq!(restart_required_changes(&xdp, &candidate), ["datapath"]);
+}
+
+fn tun_endpoint_config() -> Config {
+    honk_config::parser::parse_dae_config(
+        "global { nfqueue_enable: false }\ndatapath {\n backend: tun\n direct: endpoint\n tun {\n name: honk0\n address4: 198.18.0.1/32\n address6: fd00:686f:6e6b:100::1/128\n table: 202\n rule_priority: 10000\n capture {\n 0.0.0.0/0\n ::/0\n }\n }\n }",
+    ).unwrap()
+}
+
+#[test]
+fn tun_restart_identity_covers_every_owned_device_value() {
+    let current = tun_endpoint_config();
+    let tun = current.datapath.as_ref().unwrap().tun.as_ref().unwrap();
+    assert_eq!(tun.mtu, 1500);
+    assert_eq!(tun.queues, 1);
+    let mut explicit = serde_json::to_value(&current).unwrap();
+    explicit["datapath"]["tun"]["mtu"] = serde_json::json!(1500);
+    explicit["datapath"]["tun"]["queues"] = serde_json::json!(1);
+    explicit["datapath"]["tun"]["host_facts"] = serde_json::json!(false);
+    let explicit: Config = serde_json::from_value(explicit).unwrap();
+    assert!(restart_required_changes(&current, &explicit).is_empty());
+    let mut policy = current.clone();
+    policy.routing.default_outbound = "block".into();
+    assert!(restart_required_changes(&current, &policy).is_empty());
+    for field in [
+        "queues",
+        "name",
+        "mtu",
+        "address4",
+        "address6",
+        "table",
+        "rule_priority",
+        "capture",
+        "host_facts",
+    ] {
+        let mut candidate = current.clone();
+        let tun = candidate.datapath.as_mut().unwrap().tun.as_mut().unwrap();
+        match field {
+            "name" => tun.name = "honk1".into(),
+            "mtu" => tun.mtu = 1280,
+            "queues" => tun.queues = 3,
+            "address4" => tun.address4 = Some("198.18.0.2".parse().unwrap()),
+            "address6" => tun.address6 = Some("fd00:686f:6e6b:100::2".parse().unwrap()),
+            "table" => tun.table = 203,
+            "rule_priority" => tun.rule_priority = 10010,
+            "capture" => tun.capture = vec!["0.0.0.0/1".parse().unwrap(), "::/1".parse().unwrap()],
+            "host_facts" => tun.host_facts = true,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            restart_required_changes(&current, &candidate),
+            ["datapath"],
+            "{field}"
+        );
+        assert_eq!(
+            restart_required_changes(&candidate, &current),
+            ["datapath"],
+            "{field}"
+        );
+    }
+    for (backend, direct) in [
+        (
+            honk_config::datapath::Backend::Tc,
+            Some(honk_config::datapath::DirectProfile::Endpoint),
+        ),
+        (
+            honk_config::datapath::Backend::Tun,
+            Some(honk_config::datapath::DirectProfile::Core),
+        ),
+    ] {
+        let mut candidate = current.clone();
+        let datapath = candidate.datapath.as_mut().unwrap();
+        datapath.backend = backend;
+        datapath.direct = direct;
+        assert_eq!(restart_required_changes(&current, &candidate), ["datapath"]);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tun_reload_rejects_unavailable_packet_facts_before_publication() {
+    use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+
+    let cp = test_cp().await;
+    let mut accepted = (**cp.config.read().await).clone();
+    accepted.datapath = tun_endpoint_config().datapath;
+    accepted.global.nfqueue_enable = false;
+    *cp.config.write().await = Arc::new(accepted);
+    let before = cp.config.read().await.clone();
+    let generation = cp.diagnostics.read().generation;
+    let plan = cp.active_routing_plan.read().plan.clone();
+    for fact in [
+        "default_mark",
+        "rule_mark",
+        "pname",
+        "not_pname",
+        "mac",
+        "not_mac",
+    ] {
+        let mut candidate = (*before).clone();
+        let mut rule = RoutingRule {
+            name: "unsupported-tun-fact".into(),
+            condition: RoutingCondition::default(),
+            outbound: RoutingOutbound::Simple("direct".into()),
+            priority: 0,
+            must: false,
+            mark: None,
+        };
+        match fact {
+            "default_mark" => candidate.routing.default_mark = Some(1),
+            "rule_mark" => rule.mark = Some(1),
+            "pname" => rule.condition.process_name = vec!["curl".into()],
+            "not_pname" => rule.condition.not.process_name = vec!["curl".into()],
+            "mac" => rule.condition.mac = vec!["02:00:00:00:00:01".into()],
+            "not_mac" => rule.condition.not.mac = vec!["02:00:00:00:00:01".into()],
+            _ => unreachable!(),
+        }
+        candidate.routing.rules.push(rule);
+        assert_eq!(
+            cp.apply_runtime_config(candidate, Default::default(), &DrainTracker::new())
+                .await,
+            ReloadOutcome::Rejected,
+            "{fact}"
+        );
+        assert!(Arc::ptr_eq(&before, &*cp.config.read().await));
+        assert!(Arc::ptr_eq(&plan, &cp.active_routing_plan.read().plan));
+        assert_eq!(cp.diagnostics.read().generation, generation);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn polling_config() -> Config {
+    honk_config::parser::parse_dae_config(
+        r#"
+        global {
+            dial_mode: ip
+            nfqueue_enable: false
+        }
+        datapath {
+            backend: xdp
+            direct: endpoint
+            xsk_mode: copy
+            interface { dut0: lan }
+            busy_poll {
+                pps_enter: 100
+                pps_exit: 10
+                observation_window_us: 1000000
+                enter_windows: 2
+                exit_windows: 2
+                max_busy_us: 100
+                empty_rounds: 3
+                budget_window_us: 10000
+                budget_us: 1000
+            }
+        }
+        routing { fallback: direct }
+    "#,
+    )
+    .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn polling_reload_changes_consumer_but_never_grants_new_quota() {
+    use honk_config::datapath::PollMode;
+    let original = polling_config();
+    let publisher = ProcessPollBudget::test_publisher(true);
+    let handle = publisher.participant_handle();
+    let mut plane = control_plane(original.clone())
+        .with_process_polling(PollBudgetBinding::Publisher(publisher))
+        .unwrap();
+    let (publication, _) = plane.polling_runtime().unwrap();
+    let allowance = |state: super::poll_budget::PollBudgetSnapshot| {
+        (
+            state.net_ns,
+            state.capacity_ns,
+            state.next_refill_ns,
+            state.active_id,
+            state.charged_ns,
+        )
+    };
+    let initial = allowance(handle.snapshot());
+    let revision = publication.revision();
+    let mut changed = original.clone();
+    changed
+        .datapath
+        .as_mut()
+        .unwrap()
+        .busy_poll
+        .as_mut()
+        .unwrap()
+        .max_busy_us -= 1;
+    assert!(restart_required_changes(&original, &changed).is_empty());
+    assert!(
+        plane
+            .reload_runtime_config(changed.clone(), Default::default())
+            .await
+    );
+    assert!(publication.revision() > revision);
+    assert_eq!(allowance(handle.snapshot()), initial);
+    changed.datapath.as_mut().unwrap().poll_mode = Some(PollMode::Event);
+    assert!(
+        plane
+            .reload_runtime_config(changed.clone(), Default::default())
+            .await
+    );
+    assert_eq!(publication.snapshot().mode, PollMode::Event);
+    assert_eq!(
+        allowance(handle.snapshot()),
+        initial,
+        "Event cannot reset or refill the process schedule"
+    );
+    let mut consumer = crate::xdp::polling::AdaptivePoll::new(publication, Some(handle.clone()));
+    assert!(consumer.begin(true, None).is_none());
+    assert_eq!(consumer.reason, "explicit_event");
+    changed.datapath.as_mut().unwrap().poll_mode = Some(PollMode::Adaptive);
+    assert!(
+        plane
+            .reload_runtime_config(changed, Default::default())
+            .await
+    );
+    assert_eq!(
+        allowance(handle.snapshot()),
+        initial,
+        "adaptive reload cannot mint its own initial B"
+    );
+    plane.shutdown_runtime(None, None).await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn participant_prepare_rejects_known_mismatch_but_lost_commit_race_stays_event() {
+    use super::poll_budget::QuotaPolicy;
+    let original = polling_config();
+    let publisher = ProcessPollBudget::test_publisher(true);
+    let handle = publisher.participant_handle();
+    let root = Arc::new(PollBudgetBinding::Publisher(publisher));
+    let initial_policy = QuotaPolicy::from_config(
+        original
+            .datapath
+            .as_ref()
+            .unwrap()
+            .busy_poll
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    root.publish_policy(Some(initial_policy)).unwrap();
+    let mut plane = control_plane(original.clone())
+        .with_process_polling(PollBudgetBinding::Participant(handle.clone()))
+        .unwrap();
+    let before = handle.snapshot();
+    let mut incompatible = original.clone();
+    incompatible
+        .datapath
+        .as_mut()
+        .unwrap()
+        .busy_poll
+        .as_mut()
+        .unwrap()
+        .budget_us += 1;
+    assert!(
+        !plane
+            .reload_runtime_config(incompatible.clone(), Default::default())
+            .await
+    );
+    assert_eq!(handle.snapshot(), before);
+    assert_eq!(
+        plane.polling_runtime().unwrap().0.snapshot().busy,
+        original.datapath.as_ref().unwrap().busy_poll
+    );
+
+    let policy = QuotaPolicy::from_config(
+        incompatible
+            .datapath
+            .as_ref()
+            .unwrap()
+            .busy_poll
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    let expected = Arc::new(parking_lot::Mutex::new(None));
+    let committed = Arc::clone(&expected);
+    let publishing = Arc::clone(&root);
+    let observed = handle.clone();
+    let hook = plane.set_pre_dns_publication_hook(move |_| {
+        publishing.publish_policy(Some(policy)).unwrap();
+        *committed.lock() = Some(observed.snapshot());
+    });
+    let mut candidate = original.clone();
+    candidate
+        .datapath
+        .as_mut()
+        .unwrap()
+        .busy_poll
+        .as_mut()
+        .unwrap()
+        .observation_window_us += 1;
+    assert!(
+        plane
+            .reload_runtime_config(candidate, Default::default())
+            .await
+    );
+    drop(hook);
+    assert_eq!(
+        handle.snapshot(),
+        expected.lock().unwrap(),
+        "the participant commit must not mutate the publisher ledger"
+    );
+    let (publication, participant) = plane.polling_runtime().unwrap();
+    assert_eq!(
+        publication.snapshot().publication_error,
+        Some("process_budget_policy_mismatch")
+    );
+    let mut consumer = crate::xdp::polling::AdaptivePoll::new(publication, participant);
+    assert!(consumer.begin(true, None).is_none());
+    assert_eq!(consumer.reason, "process_budget_policy_mismatch");
+    assert_eq!(handle.snapshot().desired_policy, Some(policy));
+    plane.shutdown_runtime(None, None).await.unwrap();
+}
+
+#[test]
 fn native_api_settings_require_restart() {
     let current = Config::default();
     for (field, value) in [
@@ -1052,7 +1398,7 @@ async fn final_only_leaf_health_push_updates_all_ancestor_datapath_slots() {
     let manager = Arc::new(parking_lot::RwLock::new(Arc::new(
         GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive.clone())),
     )));
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
         Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
     let outbound = OutboundIndex::UserBase as u8;
     for index in 0..config.groups.len() {
@@ -1188,6 +1534,29 @@ async fn test_cp_with_backend(backend: MockEbpfBackend, nfqueue: bool) -> Contro
         .await
         .unwrap();
     control_plane
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn core_forward_rejects_marked_reload_before_policy_publication() {
+    let cp = test_cp().await;
+    let before = cp.config.read().await.clone();
+    let generation = cp.diagnostics.read().generation;
+    let plan = cp.active_routing_plan.read().plan.clone();
+    cp.core_forward_users
+        .store(1, std::sync::atomic::Ordering::Release);
+    let mut candidate = before.as_ref().clone();
+    candidate.global.dial_mode = "ip".into();
+    candidate.routing.default_mark = Some(0x42);
+    candidate.routing.default_must = true;
+    assert!(matches!(
+        cp.apply_runtime_config(candidate, Default::default(), &DrainTracker::new())
+            .await,
+        ReloadOutcome::Rejected
+    ));
+    assert!(Arc::ptr_eq(&before, &*cp.config.read().await));
+    assert!(Arc::ptr_eq(&plan, &cp.active_routing_plan.read().plan));
+    assert_eq!(cp.diagnostics.read().generation, generation);
 }
 
 #[cfg(feature = "native-api")]
@@ -1956,7 +2325,7 @@ async fn quiesce_failure_keeps_reload_fenced_and_unhealthy() {
     {
         let mut ebpf = cp.ebpf.write().await;
         ebpf.clear_datapath_flags_write_log();
-        ebpf.arm_quiesce_fault();
+        ebpf.tc_mut().unwrap().arm_quiesce_fault();
     }
     let drain = DrainTracker::new();
     let revision = 1;
@@ -2305,11 +2674,17 @@ async fn assert_reload_keeps_ready_endpoint(
     let ready_permit = Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()
         .unwrap();
-    let mut ready_lease =
-        match pool.reserve_or_enqueue(ready_client, dst, b"ready-first", ready_permit, &stats) {
-            EndpointReservation::Initializing(lease) => lease,
-            _ => panic!("ready fixture must reserve an initializing entry"),
-        };
+    let mut ready_lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        ready_client,
+        dst,
+        b"ready-first",
+        ready_permit,
+        &stats,
+    ) {
+        EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("ready fixture must reserve an initializing entry"),
+    };
     let transport = Arc::new(ReloadTestTransport {
         relay,
         sent: Mutex::new(Vec::new()),
@@ -2323,6 +2698,7 @@ async fn assert_reload_keeps_ready_endpoint(
     let queue_rx = ready_lease.take_queue_receiver().unwrap();
     let reply_socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let mut driver = pool.spawn_driver(
+        honk_datapath::ScopeId::HOST,
         ready_client,
         dst,
         ready_lease.generation(),
@@ -2354,6 +2730,7 @@ async fn assert_reload_keeps_ready_endpoint(
         .try_acquire_owned()
         .unwrap();
     let initializing_lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
         initializing_client,
         dst,
         b"initializing",
@@ -2385,9 +2762,17 @@ async fn assert_reload_keeps_ready_endpoint(
     .await
     .expect("reload must complete");
     initializer.await.unwrap();
-    assert!(pool.get(initializing_client, dst).is_none());
     assert!(
-        Arc::ptr_eq(&pool.get(ready_client, dst).unwrap(), &ready_endpoint),
+        pool.get(honk_datapath::ScopeId::HOST, initializing_client, dst)
+            .is_none()
+    );
+    assert!(
+        Arc::ptr_eq(
+            &pool
+                .get(honk_datapath::ScopeId::HOST, ready_client, dst)
+                .unwrap(),
+            &ready_endpoint
+        ),
         "a reload without direct marks must not retire Ready endpoint drivers"
     );
 
@@ -2397,7 +2782,14 @@ async fn assert_reload_keeps_ready_endpoint(
         .try_acquire_owned()
         .unwrap();
     assert!(matches!(
-        pool.reserve_or_enqueue(ready_client, dst, b"after-reload", follower_permit, &stats,),
+        pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
+            ready_client,
+            dst,
+            b"after-reload",
+            follower_permit,
+            &stats,
+        ),
         EndpointReservation::Enqueued
     ));
     tokio::time::timeout(
@@ -2416,6 +2808,7 @@ async fn assert_reload_keeps_ready_endpoint(
         .unwrap();
     assert!(matches!(
         pool.reserve_or_enqueue(
+            honk_datapath::ScopeId::HOST,
             initializing_client,
             dst,
             b"next-generation",
@@ -2428,8 +2821,8 @@ async fn assert_reload_keeps_ready_endpoint(
         cp.config_handle().read().await.global.check_tolerance_ms,
         Config::default().global.check_tolerance_ms + 1
     );
-    pool.remove(ready_client, dst);
-    pool.remove(initializing_client, dst);
+    pool.remove(honk_datapath::ScopeId::HOST, ready_client, dst);
+    pool.remove(honk_datapath::ScopeId::HOST, initializing_client, dst);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2442,7 +2835,14 @@ async fn reload_timeout_keeps_runtime_and_restores_admission() {
     let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()
         .unwrap();
-    let lease = match pool.reserve_or_enqueue(client, dst, b"held", slow_permit, &stats) {
+    let lease = match pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        b"held",
+        slow_permit,
+        &stats,
+    ) {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("timeout fixture must hold a real initializer lease"),
     };
@@ -2486,6 +2886,122 @@ async fn reload_timeout_keeps_runtime_and_restores_admission() {
     );
     drop(lease);
     assert!(pool.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn canceled_auxiliary_reload_recovers_the_canonical_config_before_and_after_commit() {
+    use crate::ebpf::userspace::UserspaceBackend;
+    use honk_config::datapath::{InterfaceRole, XdpInterface};
+    let mut config = polling_config();
+    config
+        .datapath
+        .as_mut()
+        .unwrap()
+        .interfaces
+        .push(XdpInterface {
+            name: "wg0".into(),
+            role: InterfaceRole::L3Lan,
+        });
+    let resolver = DnsResolver::new(&config.dns).unwrap();
+    let forwarder = resolver.forwarder();
+    let mut cp = ControlPlane::new(
+        config.clone(),
+        Box::new(UserspaceBackend::new(
+            Default::default(),
+            Arc::new(parking_lot::RwLock::new(
+                crate::ebpf::PnameSupport::Unavailable,
+            )),
+        )),
+        Router::from_config(&config.routing).unwrap(),
+        Arc::new(ProxyRegistry::default_resolver().unwrap()),
+        resolver,
+        forwarder,
+    )
+    .unwrap();
+    cp.set_mode_state(Arc::new(parking_lot::RwLock::new(
+        crate::mode::ModeState::new("Rule", "Proxy"),
+    )));
+    cp.start_datapath_flags_coordinator().unwrap();
+    cp.initialize_datapath_flags(false, false).await.unwrap();
+    let drain = DrainTracker::new();
+    for after_commit in [false, true] {
+        let baseline = cp.diagnostics.read().generation;
+        let mut next = cp.config.read().await.as_ref().clone();
+        next.global.check_tolerance_ms += 1;
+        let router = cp.router.read().await;
+        let mut reload = Box::pin(cp.apply_runtime_config(next, Default::default(), &drain));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while cp.router.try_read().is_ok() {
+                tokio::select! { result = &mut reload => panic!("reload ended before commit: {result:?}"), () = tokio::task::yield_now() => {} }
+            }
+            if after_commit {
+                let before = cp.ebpf.read().await;
+                drop(router);
+                while cp.ebpf.try_read().is_ok() {
+                    tokio::select! { result = &mut reload => panic!("reload ended before backend commit: {result:?}"), () = tokio::task::yield_now() => {} }
+                }
+                let mut after = Box::pin(cp.ebpf.read());
+                assert!(futures::poll!(&mut after).is_pending());
+                drop(before);
+                let _hold_final_flags = tokio::select! {
+                    result = &mut reload => panic!("reload escaped queued reader: {result:?}"), reader = after => reader,
+                };
+                assert_eq!(cp.diagnostics.read().generation, baseline + 1);
+                assert!(futures::poll!(&mut reload).is_pending());
+            }
+            drop(reload);
+        }).await.unwrap();
+        let committed = cp.config.read().await.as_ref().clone();
+        let generation = cp.diagnostics.read().generation;
+        assert_eq!(generation, baseline + u64::from(after_commit));
+        assert!(!cp.is_datapath_healthy());
+        assert!(drain.should_reject() && cp.drain_tracker.should_reject());
+        assert_eq!(
+            cp.apply_runtime_config(committed.clone(), Default::default(), &drain)
+                .await,
+            ReloadOutcome::Committed {
+                generation: generation + 1
+            }
+        );
+        assert!(cp.is_datapath_healthy());
+        assert!(!drain.should_reject() && !cp.drain_tracker.should_reject());
+        assert_eq!(
+            cp.apply_runtime_config(committed, Default::default(), &drain)
+                .await,
+            ReloadOutcome::Noop {
+                generation: generation + 1
+            }
+        );
+    }
+    #[cfg(feature = "native-api")]
+    {
+        use crate::ebpf::userspace::GatewayReload;
+
+        let current = cp.config.read().await.as_ref().clone();
+        let flags = cp.datapath_flags.as_ref().unwrap();
+        *cp.mode_state.as_ref().unwrap().write() = crate::mode::ModeState::native();
+        flags
+            .set_clash_mode("Direct", &current, &Default::default())
+            .await
+            .unwrap();
+        let before = flags.snapshot();
+        let mut ebpf = cp.ebpf.write().await;
+        let before_flags = ebpf.mode_flags().unwrap();
+        ebpf.userspace_mut().unwrap().pause_gateway_auxiliary();
+        drop(ebpf);
+        assert_eq!(
+            cp.apply_runtime_config(current, Default::default(), &drain)
+                .await,
+            ReloadOutcome::Rejected
+        );
+        assert_eq!(
+            flags.snapshot(),
+            before,
+            "rejected source activation changed the native override or revision"
+        );
+        assert_eq!(cp.ebpf.read().await.mode_flags().unwrap(), before_flags);
+    }
 }
 
 /// A non-routing reload publishes a fresh DNS generation without rewriting
@@ -3078,7 +3594,7 @@ async fn normalized_routing_reload_preserves_sniff_only_facts() {
         (crate::ebpf::maps::lpm_key_bytes(&positive), bitmap.bitmap),
         (crate::ebpf::maps::lpm_key_bytes(&negative), zero.bitmap),
     ];
-    let facts = |backend: &dyn crate::ebpf::EbpfBackend| {
+    let facts = |backend: &dyn crate::ebpf::PolicyBackend| {
         backend
             .projection_map_snapshot()
             .into_iter()
@@ -4408,7 +4924,7 @@ async fn ready_pool_reload_fixture() -> (
     ControlPlane,
     Config,
     Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
-    String,
+    crate::pool::ReadyKey,
     tokio::net::TcpStream,
 ) {
     let cp = test_cp().await;
@@ -4429,7 +4945,6 @@ async fn ready_pool_reload_fixture() -> (
     let (peer, _) = listener.accept().await.unwrap();
     cp.connection_pool
         .deposit_ready(
-            generation.generation(),
             &key,
             crate::proxy::ProxyStream {
                 stream: Box::new(client),
@@ -4613,33 +5128,81 @@ async fn subscription_refresh_stale_id_reports_one_safe_rejection() {
 
 #[tokio::test]
 async fn pname_routing_is_reported_only_while_an_applied_rule_uses_pname() {
-    let mut backend = MockEbpfBackend::new();
-    backend.pname_support = crate::ebpf::PnameSupport::Unavailable;
-    let cp = test_cp_with_backend(backend, false).await;
-    let pname = || {
-        cp.degradations
-            .get(crate::degradations::Component::PnameRouting)
-    };
-    let without = changed_routing_config();
-    let mut with = without.clone();
-    with.routing.rules[0].condition.process_name = vec!["curl".into()];
-    for (config, degraded) in [(&with, true), (&without, false)] {
-        let outcome = cp
-            .apply_resolved_runtime_config_locked(
-                config.clone(),
-                &DrainTracker::new(),
-                crate::config_diagnostics::DiagnosticUpdate::Preserve,
-                None,
-                #[cfg(feature = "native-api")]
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(outcome.accepted());
-        assert_eq!(
-            pname().map(|issue| issue.reason),
-            degraded.then_some("cgroup_unavailable")
-        );
+    use crate::ebpf::PnameSupport;
+    for (support, expected) in [
+        (PnameSupport::Full, None),
+        (
+            PnameSupport::ThreadName,
+            Some(("pname_routing_reduced", "comm_fallback")),
+        ),
+        (
+            PnameSupport::Unavailable,
+            Some(("pname_routing_disabled", "cgroup_unavailable")),
+        ),
+        (
+            PnameSupport::HostFull,
+            Some(("pname_routing_host_only", "host_only")),
+        ),
+        (
+            PnameSupport::HostThreadName,
+            Some(("pname_routing_host_only", "host_only_comm_fallback")),
+        ),
+    ] {
+        let mut backend = MockEbpfBackend::new();
+        backend.pname_support = support;
+        let cp = test_cp_with_backend(backend, false).await;
+        let pname = || {
+            cp.degradations
+                .get(crate::degradations::Component::PnameRouting)
+        };
+        let without = changed_routing_config();
+        let mut positive = without.clone();
+        positive.routing.rules[0].condition.process_name = vec!["curl".into()];
+        let mut negative = without.clone();
+        negative.routing.rules[0].condition.not.process_name = vec!["curl".into()];
+        for (config, uses_pname) in [(&positive, true), (&negative, true), (&without, false)] {
+            let outcome = cp
+                .apply_resolved_runtime_config_locked(
+                    config.clone(),
+                    &DrainTracker::new(),
+                    crate::config_diagnostics::DiagnosticUpdate::Preserve,
+                    None,
+                    #[cfg(feature = "native-api")]
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(outcome.accepted());
+            assert_eq!(
+                pname().map(|issue| (issue.code, issue.reason)),
+                if uses_pname { expected } else { None },
+                "{support:?}",
+            );
+            let before = cp.config.read().await.clone();
+            let issue = pname();
+            cp.ebpf
+                .write()
+                .await
+                .inject_routing_fault(RoutingPushPhase::Root, 1)
+                .unwrap();
+            let mut rejected = if uses_pname {
+                without.clone()
+            } else {
+                positive.clone()
+            };
+            rejected.global.check_tolerance_ms += 1;
+            assert_eq!(
+                cp.apply_runtime_config(rejected, Default::default(), &DrainTracker::new())
+                    .await,
+                ReloadOutcome::Rejected,
+            );
+            assert!(Arc::ptr_eq(&before, &*cp.config.read().await));
+            assert_eq!(
+                pname(),
+                issue,
+                "rejected reload changed {support:?} diagnostics"
+            );
+        }
     }
 }
 
@@ -4913,7 +5476,7 @@ async fn manager_only_reload_keeps_the_compiled_groups_numeric_slots() -> anyhow
         outbound: RoutingOutbound::Simple("direct".into()),
         priority: 0,
         must: true,
-        mark: DNS_MARK,
+        mark: Some(DNS_MARK),
     });
     let backend = MockEbpfBackend::new();
     #[cfg(feature = "reload-bench-counters")]

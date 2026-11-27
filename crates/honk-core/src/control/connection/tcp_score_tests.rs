@@ -42,7 +42,7 @@ async fn relay_outcome_is_settled_once_even_when_retirement_fails() -> anyhow::R
                 let (fatal_tx, mut removal_errors) = mpsc::unbounded_channel();
                 let removals = spawn_retirement_worker(
                     Arc::clone(&plane.udp_pool),
-                    Arc::clone(&handle.ebpf),
+                    handle.tc_kernel.clone().unwrap(),
                     Arc::clone(&handle.connection_tracker),
                     fatal_tx,
                     Arc::clone(&handle.tcp_flow_pins),
@@ -259,8 +259,7 @@ async fn client_reset_preserves_score_availability_but_upstream_reset_revokes_ta
             let progress = relay::RelayProgress {
                 upload: Arc::new(AtomicU64::new(0)),
                 download: Arc::new(AtomicU64::new(0)),
-                outbound_upload: None,
-                outbound_download: None,
+                outbound: None,
                 first_response: Some(Arc::new({
                     let reporter = reporter.clone();
                     move || reporter.first_response()

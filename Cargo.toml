@@ -4,6 +4,9 @@ resolver = "2"
 members = [
     "crates/honk-config",
     "crates/honk-ebpf-common",
+    "crates/honk-netstack",
+    "crates/honk-datapath",
+    "crates/honk-xsk",
     "crates/honk-nfqueue",
     "crates/honk-outbound",
     "crates/honk-core",
@@ -22,6 +25,9 @@ authors = ["glassyiris <honk@catmint.cc> and honk contributors"]
 # Internal
 honk-config = { path = "crates/honk-config" }
 honk-ebpf-common = { path = "crates/honk-ebpf-common" }
+honk-netstack = { path = "crates/honk-netstack" }
+honk-datapath = { path = "crates/honk-datapath" }
+honk-xsk = { path = "crates/honk-xsk" }
 honk-nfqueue = { path = "crates/honk-nfqueue" }
 honk-outbound = { path = "crates/honk-outbound" }
 
@@ -184,3 +190,11 @@ boring-sys = { git = "https://github.com/Glassyiris/boring-sys", rev = "3beb573b
 # BBRv3 pacing and per-write local UDP submission evidence.
 quinn = { git = "https://github.com/Glassyiris/quinn", rev = "d98acc02b8c26417a84180a366e1eb5b22af2b24" }
 quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "d98acc02b8c26417a84180a366e1eb5b22af2b24" }
+
+# Optimize packet-processing crates without increasing the whole engine's size profile.
+[profile.release.package.honk-netstack]
+opt-level = 3
+[profile.release.package.honk-xsk]
+opt-level = 3
+[profile.release.package.honk-datapath]
+opt-level = 3

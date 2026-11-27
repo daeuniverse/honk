@@ -35,6 +35,7 @@ fn template(rcode: u8) -> Arc<FlightAnswer> {
     response[2..4].copy_from_slice(&(0x8180_u16 | u16::from(rcode)).to_be_bytes());
     Arc::new(FlightAnswer {
         template: ResponseTemplate::validate(&query, &response).expect("template"),
+        projection_expires_at: None,
         provenance: Provenance::Upstream,
         final_upstream: Some("default".into()),
     })

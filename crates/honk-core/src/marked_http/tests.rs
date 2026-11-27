@@ -26,7 +26,7 @@ fn marked_downloads_netns() {
         return;
     }
     nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
-    honk_outbound::util::init_bypass_mark(0x200).unwrap();
+    honk_outbound::util::init_dae_socket_mark(0x200, false).unwrap();
     for args in [
         vec!["link", "set", "lo", "up"],
         vec!["addr", "add", "198.18.0.1/32", "dev", "lo"],

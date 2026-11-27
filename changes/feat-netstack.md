@@ -1,0 +1,52 @@
+Added
+
+- Add single-peer WireGuard outbounds backed by a bounded sans-I/O IPv4/IPv6 TCP/UDP stack.
+- Add opt-in Linux XDP packet termination and Core forwarding with stateful firewall and IPv4 NAT, while keeping TC as the default when datapath configuration is omitted.
+- Apply scope-local learned DNS rules to new numeric packet TCP/UDP flows while preserving existing transports and terminal routing decisions.
+- Abort packet protocol state before normal shutdown waits for selector retirement, without releasing outstanding output ownership early.
+- Avoid a redundant XDP daemon RX refill while preserving receive-owned replenishment and explicit RX/TX wakeup checks.
+- Default explicit XDP capture to forced AF_XDP ZeroCopy without fallback; keep TC as the default backend and support explicit `xsk_mode: copy` for existing Copy deployments.
+- Amortize AF_XDP transmit wakeup checks within synchronous device turns without delaying packet publication or releasing outstanding owners on failure.
+- Keep packet-scope statistics and quiescence reads passive, and skip retirement locking when no application has closed.
+- Separate shared policy publication from borrowed TC-only authority, rejecting software-backend kernel operations without fabricating kernel state.
+- Sleep the XDP owner on actual readiness and deadlines, retaining bounded fallbacks for unresolved device visibility, completion and budget obligations.
+- Batch scoped packet output and completed-owner returns while preserving class order, bounded device credit and last-descriptor CQ ownership.
+- Drive XDP packet-scope timers and output from the device owner with joined accounted cleanup, real policy readers and failed-startup owner cleanup; keep DNS resolver hooks from retaining packet-scope registration budgets.
+- Apply scope-local DNS predicates to mixed Core forwarding and fence prepared output against same-generation fact withdrawal, replacement and exact expiry; routed-only Core embeddings now reject domain predicates without a packet fact scope.
+- Skip empty passive-accept work before reserving packet TCP/channel capacity, without delaying queued SYN admission behind the receive batch.
+- Generate eligible single-frame XDP Endpoint output directly in reserved UMEM, removing one intermediate CPU-IP-frame copy while preserving CPU UDP/DNS, jumbo SG, original flow retention and real CQ ownership; this is not universal zero-copy or a measured performance gain.
+- Add opt-in daemon-owned Linux TUN Endpoint capture with explicit resource admission, exact bypass/return routing, blackhole guards and setup receipts; Direct TCP/UDP is a real outbound relay, without HostFacts or Native/captured-return claims.
+- Require exact socket marks before TUN service listeners bind/listen, learn standalone DNS facts in the actual packet realm, and preserve joined shutdown with guards retained on failure; device changes require restart while policy updates retain the live FD and scope.
+- Preserve ordinary TUN shutdown across concurrent UDP admission and finalize early setup errors; await owned IPv6 local-route readiness before diversion. IPv4 TUN startup reads `net.ipv4.conf.all.rp_filter` before resource creation and accepts only 0/2, rejecting strict 1, unknown values and read failures: reverse-source lookup for unmarked physical carrier replies reaches the TUN capture route instead of real ingress, and per-device 0 cannot lower the effective global value. honk never writes the global setting; IPv6-only TUN does not read it, and later operator changes to strict are not detected at runtime.
+- Dispatch simulator application work by actual per-flow readiness, retaining shared-budget writer wakeups, deferred acceptance and complete byte/FIN checks without sweeping unrelated flows.
+- Use BoringSSL SHA-256 for the process executable identity while retaining the full-image digest. In a native dev opt0/debug0 diagnostic on a 182,685,912-byte VM daemon image, measured hash work was 2.9553/2.9556 s with sha2 and 0.0996/0.0995 s with boring; this does not measure VM 9p or production throughput.
+- Add a separate ignored recent-kernel igb adaptive-ZeroCopy entry that reuses the complete Copy owner/clock/fairness/accounting/live-feature fixture under the same 180-second deadline, with actual driver and per-queue bind receipts for every owner reconstruction and the existing joined-cleanup frontier.
+- Keep loopback UDP reply ports reserved across shared-source endpoint retirement and recreation in the control tests.
+- Wait up to one shared 10-second deadline for captured Ethernet carrier recovery after initial XDP attachment, preserving strict admission, immediate structural/uplink refusal and terminal runtime topology notifications.
+- Recognize the kernel's sole LINKDOWN flag on native IPv6 multicast routes only while their captured physical output is awaiting XDP-attach carrier recovery; keep final admission and other route facts strict.
+- Wait for the owned adaptive-test capture link to regain carrier before reconstructing its owner, retaining the original fixture deadline and strict production admission.
+- Re-arm XDP queue and topology read readiness after clearing a stale event, so a packet arriving after an empty owner pass wakes the owner instead of waiting for an unrelated deadline.
+- Compile honk-netstack, honk-xsk and honk-datapath at optimization level 3 in release-derived profiles while retaining the size-oriented default for other crates.
+- Publish bounded, timestamped XDP socket and ring observations through native datapath details and Clash stats independently of DEBUG logging, preserving idle scheduling, explicit unavailable samples and capture lifecycle.
+- Negotiate verified 10-byte little-endian TUN vnet headers for TCP receive aggregation and transmit segmentation, preserving logical MTU, checksum provenance, source admission, funded output capacity and whole-record lease retries; WireGuard and XDP offload behavior remain unchanged.
+- Cancel expired unmaterialized TCP tail probes on ACK progress, preserve original output ownership across FIN acknowledgement, and prove TUN smoke close with correlated original-socket and independent-peer byte/EOF/shutdown evidence rather than persistent external Linux TIME_WAIT.
+- Add explicit one/two-worker XDP processing with exclusive queue owners, shared realm limits, bounded handoff and joined shutdown; default remains one worker, with no performance claim or old-flow migration.
+- Preserve legitimate fragment reassembly lifetimes without consuming the complete packet's routing/protocol wait window, including reordered cross-worker input.
+- Support XDP Endpoint home gateways with ordered static-direct D1, FD-owned physical links, per-member Auto binding, bond realms and zone-0 conntrack admission. UDP without confirmed CT, concurrent first packets and reload publication retain documented executor windows; legacy zone and uplink changes require operator coordination.
+- Keep a physical UDP datagram refused by closing Endpoint admission from failing XDP shutdown; device errors and completion-queue failures remain fatal.
+- Stop waking physical AF_XDP queues after link detach; give pending TX and worker quiescence one bounded wait before returning forwarding to the kernel.
+- Use 512 AF_XDP RX frames per queue on eligible single-member, single-realm forced-ZeroCopy Endpoint gateways with sufficient capture memory; other devices retain their existing capacities.
+- Charge recorded packet connection and route payloads to the capture budget through queueing, sniff-based rerouting and task completion. Idle observation slots carry no payload allocation.
+- Add per-family checksum completion for single TCP packets emitted by transparent netstack devices.
+- Standalone TUN writes borrowed packet slices directly and commits transmission after the device accepts a complete record.
+- Narrow DNS projection and control-plane backend capabilities while retaining generation-fenced publication and TC ownership.
+- Build the mock daemon and `honk-tool` without Aya's userspace loader. Real eBPF builds enable the shared ABI's `aya-pod` feature.
+- Share geosite selector expansions between traffic and DNS rules and intern domain predicates by a compact content digest during routing compilation.
+- Add `packet-ebpf` for XDP/TUN without traditional TC or NFQUEUE. `ebpf` continues to enable all three datapaths via `legacy-tc`. Packet-only daemons reject TC configurations and external TC objects before datapath setup.
+- Drive eligible physical XDP Endpoint flows on their queue owner, share bounded Remote TCP buffers per shard, and retain outstanding output across TCP slot reuse.
+- Borrow worker Remote TCP upload chunks directly and halve the per-flow copy buffer reservation.
+- Consolidate reported packet input in `Stack::receive_reported` and expose TCP retention through the lineage-aware query.
+- Add restart-only `datapath.tun.queues` for standalone Linux TUN Endpoint capture, from 1 to 8 queues with a default of 1. Startup requires one plain DNS realm with one owner per configured queue. Multi-queue capture uses bounded handoff and device-wide readiness and failure handling. HostFacts requires one queue. Real-device and scaling measurements are separate from the native tests.
+- Emit one equality jump per singleton source or destination port so longer port lists fit the native routing branch range.
+- Keep gateway and Host routing bytecode independent of the TC flow-recording setting.
+- Distribute UDP from one client IP across XDP and TUN workers by source port. Traffic from one client socket and its replies use the same worker across destinations.

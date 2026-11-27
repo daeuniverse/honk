@@ -5,8 +5,8 @@ use std::sync::Arc;
 use ipnet::IpNet;
 
 use super::{
-    BinaryLpmTrie,
-    domain::{GeositeDomain, GeositeMatcher},
+    BinaryLpmTrie, GeoAssets,
+    domain::{DomainMatcherDigest, GeositeMatcher, lowercase},
 };
 
 /// One canonical condition in a compiled routing rule.
@@ -66,7 +66,13 @@ pub(crate) struct SharedMatchers {
     ip: std::collections::HashMap<u64, Vec<Arc<IpMatcher>>>,
     /// Keyed by selector name, which pins content only within one build's
     /// assets, so these are never offered across builds.
-    geosite: std::collections::HashMap<String, Arc<GeositeMatcher>>,
+    geosite: std::collections::HashMap<String, CachedGeosite>,
+}
+
+struct CachedGeosite {
+    matcher: Arc<GeositeMatcher>,
+    empty: bool,
+    digest: Option<DomainMatcherDigest>,
 }
 
 impl SharedMatchers {
@@ -83,10 +89,62 @@ impl SharedMatchers {
         matcher
     }
 
-    /// One matcher per selector (a category plus its attribute filter).
-    pub(crate) fn geosite(&mut self, code: &str, domains: &[GeositeDomain]) -> Arc<GeositeMatcher> {
-        let matcher = self.geosite.entry(code.trim().to_lowercase());
-        Arc::clone(matcher.or_insert_with(|| Arc::new(GeositeMatcher::build(domains))))
+    pub(crate) fn geosite(&mut self, code: &str, assets: &GeoAssets) -> Arc<GeositeMatcher> {
+        self.normalized_geosite(&lowercase(code.trim()), assets)
+    }
+
+    pub(super) fn normalized_geosite(
+        &mut self,
+        code: &str,
+        assets: &GeoAssets,
+    ) -> Arc<GeositeMatcher> {
+        self.with_geosite(code, assets, 1, |cached| Arc::clone(&cached.matcher))
+    }
+
+    pub(super) fn single_geosite(
+        &mut self,
+        codes: &[String],
+        assets: &GeoAssets,
+    ) -> Option<(DomainMatcherDigest, Arc<GeositeMatcher>)> {
+        let (first, rest) = codes.split_first()?;
+        let code = lowercase(first.trim());
+        if !rest.iter().all(|other| lowercase(other.trim()) == code) {
+            return None;
+        }
+        Some(self.with_geosite(&code, assets, codes.len(), |cached| {
+            let digest = *cached
+                .digest
+                .get_or_insert_with(|| DomainMatcherDigest::geosite(assets.geosite_entries(&code)));
+            (digest, Arc::clone(&cached.matcher))
+        }))
+    }
+
+    fn with_geosite<T>(
+        &mut self,
+        code: &str,
+        assets: &GeoAssets,
+        uses: usize,
+        visit: impl FnOnce(&mut CachedGeosite) -> T,
+    ) -> T {
+        let cached = if let Some(hit) = self.geosite.get_mut(code) {
+            hit
+        } else {
+            let mut entries = assets.geosite_entries(code).peekable();
+            let empty = entries.peek().is_none();
+            self.geosite
+                .entry(code.to_owned())
+                .or_insert_with(|| CachedGeosite {
+                    matcher: Arc::new(GeositeMatcher::build(entries)),
+                    empty,
+                    digest: None,
+                })
+        };
+        if cached.empty {
+            for _ in 0..uses {
+                assets.report_empty_geosite(code);
+            }
+        }
+        visit(cached)
     }
 
     /// DNS answer matching needs only the trie; the nets stay in this build-local registry.

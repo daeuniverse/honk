@@ -4,7 +4,7 @@ use super::headers;
 use super::validation::ValidationFailure;
 use crate::types::NodeProtocol;
 
-use super::{VlessConfig, identity_field};
+use super::{VlessConfig, WireGuardConfig, identity_field};
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TlsOptions {
@@ -281,6 +281,7 @@ pub enum OutboundConfig {
     Tuic(TuicConfig),
     Juicity(JuicityConfig),
     AnyTls(AnyTlsConfig),
+    WireGuard(WireGuardConfig),
     Direct,
     Block,
     Chain(ChainConfig),
@@ -304,6 +305,7 @@ impl OutboundConfig {
             NodeProtocol::Tuic => Self::Tuic(TuicConfig::default()),
             NodeProtocol::Juicity => Self::Juicity(JuicityConfig::default()),
             NodeProtocol::AnyTLS => Self::AnyTls(AnyTlsConfig::default()),
+            NodeProtocol::WireGuard => Self::WireGuard(WireGuardConfig::default()),
             NodeProtocol::Direct => Self::Direct,
             NodeProtocol::Block => Self::Block,
             NodeProtocol::Chain => Self::Chain(ChainConfig::new(Vec::new())),
@@ -321,6 +323,7 @@ impl OutboundConfig {
             Self::Tuic(_) => NodeProtocol::Tuic,
             Self::Juicity(_) => NodeProtocol::Juicity,
             Self::AnyTls(_) => NodeProtocol::AnyTLS,
+            Self::WireGuard(_) => NodeProtocol::WireGuard,
             Self::Direct => NodeProtocol::Direct,
             Self::Block => NodeProtocol::Block,
             Self::Chain(_) => NodeProtocol::Chain,
@@ -338,6 +341,7 @@ impl OutboundConfig {
             Self::AnyTls(config) => Some(&config.tls),
             Self::Shadowsocks(_)
             | Self::Socks5(_)
+            | Self::WireGuard(_)
             | Self::Direct
             | Self::Block
             | Self::Chain(_) => None,
@@ -355,6 +359,7 @@ impl OutboundConfig {
             Self::AnyTls(config) => Some(&mut config.tls),
             Self::Shadowsocks(_)
             | Self::Socks5(_)
+            | Self::WireGuard(_)
             | Self::Direct
             | Self::Block
             | Self::Chain(_) => None,
@@ -385,6 +390,7 @@ impl OutboundConfig {
             Self::Vmess(config) => config.network.as_deref(),
             Self::Vless(config) => config.network.as_deref(),
             Self::AnyTls(config) => config.network.as_deref(),
+            Self::WireGuard(config) => config.network.as_deref(),
             _ => None,
         }
     }
@@ -438,6 +444,7 @@ impl OutboundConfig {
                 config.password.as_deref().unwrap_or(""),
             ]),
             Self::AnyTls(config) => identity_join(&[config.password.as_deref().unwrap_or("")]),
+            Self::WireGuard(config) => config.identity_fingerprint(),
             Self::Direct | Self::Block | Self::Chain(_) => String::new(),
         }
     }

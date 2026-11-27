@@ -7,7 +7,7 @@ fn audited_controller(
 ) -> (Arc<DnsController>, Arc<AtomicUsize>) {
     let (mut forwarder, calls) = forwarder([192, 0, 2, 10]);
     Arc::get_mut(&mut forwarder).unwrap().cache_enabled = cached;
-    let backend: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::EbpfBackend>>> = Arc::new(
+    let backend: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>> = Arc::new(
         tokio::sync::RwLock::new(Box::new(crate::ebpf::mock::MockEbpfBackend::new())),
     );
     let base = DnsController::new(

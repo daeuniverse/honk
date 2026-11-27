@@ -81,7 +81,7 @@ impl ProjectionBenchmark {
             outbound: honk_config::routing::RoutingOutbound::Simple("direct".to_owned()),
             priority: 1,
             must: false,
-            mark: 0,
+            mark: None,
         };
         let matcher = Arc::new(Router::new(&[rule], "direct").expect("benchmark router"));
         let snapshot = Arc::new(RoutingProjectionSnapshot::new(1, matcher));

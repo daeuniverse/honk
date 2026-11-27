@@ -23,14 +23,14 @@ pub(super) async fn receive_loop(
     client_dst: SocketAddr,
     alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
     stats: Arc<StatsManager>,
-    outbound_tracker: OutboundTracker,
+    outbound_tracker: Arc<OutboundTracker>,
 ) -> io::Result<()> {
     let ipver = endpoint.health_family;
     let transport = endpoint
         .flow_transport()
         .expect("ordinary UDP receive loop requires a PacketTransport");
     // Heap, not inline: an inline array adds 64 KiB to every endpoint task.
-    let mut buf = vec![0u8; 65536];
+    let mut buf = vec![0u8; super::super::budget::RECEIVE_BYTES];
     let reply_idle_timeout = tokio::time::sleep(REPLY_IDLE_TIMEOUT);
     tokio::pin!(reply_idle_timeout);
     loop {
@@ -84,7 +84,7 @@ pub(super) async fn receive_loop(
         let reply_socket = if source == client_dst {
             reply_socket.as_ref()
         } else {
-            match foreign_replies.get(source) {
+            match foreign_replies.get(reply_socket.scope(), source, endpoint.packet_source()) {
                 Ok(socket) => {
                     foreign = socket;
                     foreign.as_ref()
@@ -96,6 +96,9 @@ pub(super) async fn receive_loop(
                         .dropped("reply_socket_capacity", Some("capacity"));
                     continue;
                 }
+                Err(error) if is_auxiliary_retirement(&error) => {
+                    return Err(local_reply_error(error));
+                }
                 Err(error) => {
                     endpoint
                         .native
@@ -106,7 +109,10 @@ pub(super) async fn receive_loop(
             }
         };
         let delivered = reply_socket.send_to(&buf[..n], client_addr).await;
-        if delivered.is_err() {
+        if delivered
+            .as_ref()
+            .is_err_and(|error| !is_auxiliary_retirement(error))
+        {
             endpoint
                 .native
                 .dropped("client_delivery_failed", Some("client_send_failed"));

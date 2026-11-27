@@ -138,7 +138,9 @@ async fn unowned(lab: &Lab, closing: bool) -> anyhow::Result<()> {
     backdate(&lab.handle, &s.key, closing).await?;
     // Keep the real retirement worker from reclaiming an expiry hint while
     // checking the kernel's non-deletion contract; packets still execute TC.
-    let backend = lab.handle.ebpf.read().await;
+    let backend = tokio::sync::RwLockReadGuard::map(lab.handle.ebpf.read().await, |backend| {
+        backend.tc().unwrap()
+    });
     let before = metadata(&s.key)?;
     if closing {
         refused(&mut accepted, &mut s.client, DOWN).await?;
@@ -162,7 +164,9 @@ pub(super) fn other_incarnation(family: &str) -> anyhow::Result<()> {
         let newer = supersede(&lab.handle, &s.key).await?;
         ensure!(newer != s.incarnation && s.pins.get(&newer, 0).is_err());
         backdate(&lab.handle, &s.key, true).await?;
-        let backend = lab.handle.ebpf.read().await;
+        let backend = tokio::sync::RwLockReadGuard::map(lab.handle.ebpf.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         let before = metadata(&s.key)?;
         refused(flow.stream_mut(), &mut s.client, DOWN).await?;
         assert_refused_metadata(&s.key, &before, true)?;
@@ -306,6 +310,8 @@ async fn adopt(
         .ebpf
         .read()
         .await
+        .tc()
+        .unwrap()
         .tcp_socket_ownership(stream.as_fd())?;
     ensure!(
         matches!(ownership, TcpSocketOwnership::Kernel(_)),
@@ -678,7 +684,9 @@ async fn close_and_retire(
         !handle.tcp_flow_pins.contains(key),
         "normal closure leaked local tuple pin"
     );
-    let backend = handle.ebpf.read().await;
+    let backend = tokio::sync::RwLockReadGuard::map(handle.ebpf.read().await, |backend| {
+        backend.tc().unwrap()
+    });
     ensure!(
         backend.conn_state_lookup(key)?.is_none(),
         "normal retirement retained conn"
@@ -771,7 +779,9 @@ async fn superseding_syn(lab: &Lab, old: TcpFlowGuard, s: Settled) -> anyhow::Re
     quiesce(&accepted, &client).await?;
     backdate(handle, &key, false).await?;
     {
-        let _backend = handle.ebpf.read().await;
+        let _backend = tokio::sync::RwLockReadGuard::map(handle.ebpf.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         let before = metadata(&key)?;
         refused(&mut client, &mut accepted, UP).await?;
         assert_refused_metadata(&key, &before, false)?;

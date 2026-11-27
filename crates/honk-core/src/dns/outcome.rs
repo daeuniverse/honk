@@ -58,6 +58,48 @@ impl EffectiveExpiry {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectionSource {
+    #[default]
+    Fresh,
+    CacheEntry(u64),
+    SharedFlight,
+}
+
+impl ProjectionSource {
+    pub(crate) const fn cache_revision(self) -> Option<u64> {
+        match self {
+            Self::CacheEntry(revision) => Some(revision),
+            Self::Fresh | Self::SharedFlight => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProjectionLifetime {
+    pub(crate) expires_at: tokio::time::Instant,
+    pub(crate) source: ProjectionSource,
+}
+
+impl ProjectionLifetime {
+    pub(super) fn from_wire(wire: &[u8], observed_at: tokio::time::Instant) -> Self {
+        let ttl = super::forwarder::extract_min_ttl(wire);
+        Self {
+            expires_at: observed_at + Duration::from_secs(u64::from(ttl)),
+            source: ProjectionSource::Fresh,
+        }
+    }
+}
+
+impl From<super::cache::FreshCacheEntry> for ProjectionLifetime {
+    fn from(entry: super::cache::FreshCacheEntry) -> Self {
+        Self {
+            expires_at: entry.expires_at,
+            source: ProjectionSource::CacheEntry(entry.revision),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "native-api", derive(serde::Serialize))]
 pub(crate) enum RouteSource {
@@ -78,6 +120,26 @@ pub(crate) struct RequestRoute {
     pub(crate) rule: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct DnsOutcomeTrace {
+    #[cfg(feature = "native-api")]
+    request_route: RequestRoute,
+    #[cfg(feature = "native-api")]
+    cache_entry_id: Option<String>,
+}
+
+#[cfg(not(feature = "native-api"))]
+const _: () = assert!(std::mem::size_of::<DnsOutcomeTrace>() == 0);
+
+impl DnsOutcomeTrace {
+    fn record_request(&mut self, _prepared: &super::engine::PreparedQuery) {
+        #[cfg(feature = "native-api")]
+        {
+            self.request_route.source = _prepared.request_source();
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DnsOutcome {
     status: OutcomeStatus,
@@ -87,6 +149,7 @@ pub struct DnsOutcome {
     qtype: u16,
     answer_ips: Vec<IpAddr>,
     expiry: EffectiveExpiry,
+    projection_lifetime: Option<ProjectionLifetime>,
     logical_upstream: Option<String>,
     final_upstream: Option<String>,
     requery_history: Vec<String>,
@@ -94,10 +157,7 @@ pub struct DnsOutcome {
     rendered: Vec<u8>,
     template: Option<ResponseTemplate>,
     policy_id: Option<PolicyId>,
-    #[cfg(feature = "native-api")]
-    request_route: RequestRoute,
-    #[cfg(feature = "native-api")]
-    cache_entry_id: Option<String>,
+    trace: DnsOutcomeTrace,
 }
 
 pub(crate) struct OutcomeParts {
@@ -117,8 +177,8 @@ pub(crate) struct OutcomeParts {
     pub policy_id: Option<PolicyId>,
 }
 
+#[cfg(feature = "native-api")]
 impl DnsOutcome {
-    #[cfg(feature = "native-api")]
     pub(crate) fn client_error(
         query: &[u8],
         ingress: super::query::IngressProfile,
@@ -153,12 +213,38 @@ impl DnsOutcome {
         .with_route(source))
     }
 
+    pub(crate) fn request_route(&self) -> &RequestRoute {
+        &self.trace.request_route
+    }
+
+    pub(crate) fn cache_entry_id(&self) -> Option<&str> {
+        self.trace.cache_entry_id.as_deref()
+    }
+
+    fn with_route(mut self, source: RouteSource) -> Self {
+        self.trace.request_route.source = source;
+        self
+    }
+
+    pub(crate) fn with_cache_entry_id(mut self, id: Option<String>) -> Self {
+        self.trace.cache_entry_id = id;
+        self
+    }
+}
+
+impl DnsOutcome {
+    pub(super) fn with_request_route(mut self, prepared: &super::engine::PreparedQuery) -> Self {
+        self.trace.record_request(prepared);
+        self
+    }
+
     pub(crate) fn new(parts: OutcomeParts) -> Self {
         Self {
             status: parts.status,
             response_class: parts.response_class,
             provenance: parts.provenance,
             expiry: parts.expiry,
+            projection_lifetime: None,
             logical_upstream: parts.logical_upstream,
             domain: parts.domain,
             qtype: parts.qtype,
@@ -169,33 +255,8 @@ impl DnsOutcome {
             rendered: parts.rendered,
             template: parts.template,
             policy_id: parts.policy_id,
-            #[cfg(feature = "native-api")]
-            request_route: RequestRoute::default(),
-            #[cfg(feature = "native-api")]
-            cache_entry_id: None,
+            trace: DnsOutcomeTrace::default(),
         }
-    }
-
-    #[cfg(feature = "native-api")]
-    pub(crate) fn request_route(&self) -> &RequestRoute {
-        &self.request_route
-    }
-
-    #[cfg(feature = "native-api")]
-    pub(crate) fn cache_entry_id(&self) -> Option<&str> {
-        self.cache_entry_id.as_deref()
-    }
-
-    #[cfg(feature = "native-api")]
-    pub(crate) fn with_route(mut self, source: RouteSource) -> Self {
-        self.request_route.source = source;
-        self
-    }
-
-    #[cfg(feature = "native-api")]
-    pub(crate) fn with_cache_entry_id(mut self, id: Option<String>) -> Self {
-        self.cache_entry_id = id;
-        self
     }
 
     /// Carry the target verdict and exchange facts into a local alias answer,
@@ -229,6 +290,34 @@ impl DnsOutcome {
 
     pub const fn expiry(&self) -> EffectiveExpiry {
         self.expiry
+    }
+
+    pub(crate) const fn projection_lifetime(&self) -> Option<ProjectionLifetime> {
+        self.projection_lifetime
+    }
+
+    pub(crate) fn routing_lifetime(&self, observed_at: tokio::time::Instant) -> ProjectionLifetime {
+        self.projection_lifetime.unwrap_or_else(|| {
+            if self.expiry.is_cacheable() {
+                ProjectionLifetime {
+                    expires_at: observed_at + self.expiry.ttl(),
+                    source: ProjectionSource::Fresh,
+                }
+            } else {
+                ProjectionLifetime::from_wire(self.reusable(), observed_at)
+            }
+        })
+    }
+
+    pub(crate) fn with_projection_lifetime(mut self, lifetime: Option<ProjectionLifetime>) -> Self {
+        if lifetime.is_some()
+            && self.status == OutcomeStatus::Accepted
+            && self.response_class == ResponseClass::Positive
+            && !super::response::is_truncated(&self.reusable)
+        {
+            self.projection_lifetime = lifetime;
+        }
+        self
     }
 
     pub fn domain(&self) -> &str {

@@ -2,6 +2,12 @@
 
 `routing { ... }` defines ordered traffic matchers and their outbound targets.
 
+## XDP Endpoint gateway
+
+D1 follows the authored rule order. Its static pass requires a terminal Direct action: ordinary Direct needs Rule mode, a non-53 destination and direct finality; a statically decidable `direct(must)` can cover port 53. An earlier block/proxy cannot be skipped. At a reachable domain or geosite predicate, the static pass stops. Only [DNS projection](./global.md#xdp-endpoint-dns-projection) from the same LAN can qualify a pure TCP SYN or a complete UDP datagram for native routing, never traffic to port 53. Source MAC, IP, ports, protocol and DSCP are available; LAN pname is Missing, so a positive pname does not match and its negation does. Without Host, pname rules are reported through `pname_routing` degradation and local-origin flows remain kernel traffic. Mode is read at runtime.
+
+For a local DNS listener, place an appropriate static rule before domain rules, for example `dip(10.10.10.1) && dport(53) -> direct(must)`; honk does not synthesize this rule.
+
 ## Full example
 
 ```dae
@@ -87,6 +93,8 @@ routing {
 `pname(...)` matches the process name by substring patterns normalized to 15 bytes, against the executable basename from `argv[0]`.
 
 Without runtime BTF offsets or verifier-safe kernel argv access, the cgroup hook uses the calling thread's `comm` synchronously. Matches processes on the honk host only, not applications on LAN clients.
+
+For TUN, `pname` and its negation require `host_facts: true` with `queues: 1`. Process facts come from authenticated application-socket Host records when present. Plain input and records with missing facts match only the negated predicate. Plain input may include both Host and Transit traffic. See [Linux TUN Endpoint](./global.md#linux-tun-endpoint).
 
 ```dae
 routing {
@@ -174,11 +182,31 @@ honk skips sniffing in these cases:
 
 ## Policy-routing marks
 
-`direct(mark: 512)` and `direct(mark: 0x200)` select the same direct mark. An unprefixed number is decimal, even with leading zeroes, and `0x`/`0X` selects hexadecimal. The range is `0..=0x3fffffff`; bits `0xc0000000` belong to the datapath, not user policy. Binary and octal prefixes, underscores, signs, overflow, unknown options and duplicate `mark`/`must` options reject the configuration. Unlike the global mark scalar, a malformed direct mark never silently becomes zero. Marks apply to `direct` only, not to proxy or group targets.
+`direct(mark: 512)` and `direct(mark: 0x200)` select the same direct mark.
+Unprefixed numbers are decimal (including leading zeroes); `0x`/`0X` selects
+hexadecimal. Parsing preserves the full `u32` range and distinguishes an omitted
+mark (`Keep`) from an explicit `mark: 0` (`Set(0)`). Backend admission still rejects
+unsupported effects: TC reserves `0xc0000000`, while packet Endpoint/Core paths
+retain their nonzero-mark restrictions. Binary/octal prefixes, underscores, signs,
+overflow, unknown options and duplicate `mark`/`must` options reject the configuration.
+Unlike the global mark scalar, a malformed direct mark never silently becomes zero.
+Marks are supported on `direct`, not proxy/group targets.
 
-`direct(mark: 0x200, must)` and `direct(must, mark: 0x200)` are equivalent, and whitespace inside the option list is allowed. `fallback:` and `default:` accept the same forms. The last merged fallback replaces the whole action, so a plain `direct` clears mark and `must`. It applies after every ordinary rule, even later ones.
+`direct(mark: 0x200, must)` and `direct(must, mark: 0x200)` are equivalent;
+whitespace inside the direct option list is allowed; `fallback:`/`default:`
+accept the same forms. The last merged fallback replaces the whole action (a plain
+`direct` clears mark and `must`) and applies after every ordinary rule, even later ones.
 
-For IPv4/IPv6 TCP and UDP, a nonzero direct mark replaces the global socket-mark payload. It is not OR-ed with `so_mark_from_dae` or `0x100`. On native direct, NFQUEUE-approved direct and userspace direct sockets, honk retains `CLASSIFIED_MARK` (`0x40000000`) alongside this low-30-bit policy payload. For example, a configured `0x200` can appear as `0x40000200`, so Linux policy rules must mask off the reserved bits. `mark: 0` means unspecified: userspace-originated direct sockets use the global mark, while native direct adds no user mark. Proxy carriers, bootstrap and DNS-controller upstreams use the global mark, not a mark from the intercepted traffic rule.
+On the legacy TC/NFQUEUE and userspace direct-socket paths, a nonzero direct mark
+replaces the global socket-mark payload; it is **not OR-ed with `so_mark_from_dae`
+or `0x100`**. These paths retain `CLASSIFIED_MARK` (`0x40000000`) alongside the
+low-30-bit policy payload. For example, a configured `0x200` can appear as
+`0x40000200`; Linux policy rules must mask off the reserved bits. At this legacy
+execution boundary, explicit zero has the same effect as an omitted mark:
+userspace-originated direct sockets use the global mark, while TC direct adds no
+user mark. The canonical configuration and routing result retain the distinction.
+Proxy carriers, bootstrap and DNS-controller upstreams use the global mark,
+not a mark from the intercepted traffic rule.
 
 For example, select two externally configured WAN routing tables:
 
@@ -257,6 +285,87 @@ For an outage-tolerant gateway:
 - Add an explicit private-network `direct(must)` rule where appropriate; decide whether it should also bypass private DNS, as described above.
 - Point `fallback:` at a [`fallback`-policy group](./groups.md) containing at least two nodes, not at one node.
 - Keep at least one DNS upstream on a direct path.
+
+The `routing` target `direct` uses the execution profile selected by
+[`datapath.direct`](./global.md#capture-backend-selection).
+
+## Core forwarding firewall and IPv4 NAT
+
+These typed actions belong to `datapath`, not `routing` outbound names. They require
+`backend: xdp`, `direct: core`, and explicitly configured `lan`/`wan` interfaces.
+They never change the existing TC backend, Endpoint relay, or native forwarding.
+
+```dae
+datapath {
+    backend: xdp
+    direct: core
+    interface { lan0: lan
+                wan0: wan }
+    firewall {
+        original {
+            lan: sip(10.0.0.0/24) && l4proto(tcp,udp) -> allow
+            default: drop
+        }
+        forward {
+            lan: ipversion(4,6) -> allow
+            default: drop
+        }
+    }
+    nat {
+        prerouting {
+            dip(198.51.100.1) && dport(8080) -> dnat(10.0.0.8:80)
+        }
+        postrouting {
+            sip(10.0.0.0/24) -> masquerade(40000-49999)
+        }
+    }
+}
+```
+
+`original` sees the original packet before DNAT; `forward` and `postrouting` see
+the DNAT-translated destination, before SNAT. Rules keep declaration order and
+reuse ordinary routing conditions. The optional `lan:`/`wan:` prefix selects the
+trusted capture-interface role, never a guessed source-address zone; no prefix
+deliberately matches either role. Domain, process and MAC predicates (including
+negations) are rejected because this path does not possess those authorities.
+Structured firewall/NAT conditions also reject unknown fields, including inside
+`not`: use the canonical `source_ip`, not `source_ips`. A typo is an error even
+when another matcher is valid; legacy traffic-routing field tolerance is unchanged.
+Firewall/NAT matcher calls require nonempty arguments and nonempty comma-separated
+elements. Empty calls such as `sip()` or `!pname()` cannot disappear into a broader
+rule. Nested blocks inside a rule chain are errors, not warning-only omissions.
+
+Both firewall chains default to `drop`. `allow` admits a new bidirectional owner;
+`drop` is silent; `reject` requests rate-limited administrative ICMP, including
+for eligible TCP (not a TCP reset). The shared refusal path suppresses responses
+to RST, ICMP errors, multicast and ineligible fragments and requires an authorized
+source and return route. Administrative rejection requires eligible input-FIB
+authority, including an actual prohibit result; directed-broadcast, LocalInput and
+unavailable authority do not grant it. A missing forward neighbor does not suppress
+an otherwise authorized TTL/MTU refusal when its return path is available.
+A rejection after DNAT quotes the original tuple, not the private translated target.
+A lone ACK is not established; UDP replies require the exact
+admitted peer and reverse interface identity. Current admitted owners bypass
+new-flow rules only until expiry or an explicit firewall/NAT revocation epoch.
+Retention never overrides the current traffic-routing `block` decision, including
+after a mode change or a route-only reload with an unchanged security epoch.
+Blocked packets allocate no new translated ID and do not renew an existing binding.
+
+`dnat(IPv4)` preserves the destination port; `dnat(IPv4:port)` replaces it.
+`snat(IPv4)` preserves the source port or fails on collision;
+`snat(IPv4,first-last)` allocates a unique source port. `masquerade()` uses
+1024–65535; `masquerade(first-last)` restricts that pool and requires one
+authoritative kernel-selected local IPv4 source for the actual egress. A separate,
+egress-constrained source-selection query may select a routed local address for an
+unnumbered capture port; it never replaces the real input-FIB decision. Source
+address/link incarnation changes revoke MASQUERADE, while ordinary route/neighbor
+refreshes do not. Combining DNAT and SNAT supports hairpin forwarding.
+NAT requires an explicit firewall. IPv6 supports firewall/routing,
+not translation; an IPv6 packet selecting a NAT action fails closed.
+Port exhaustion, ambiguous egress addresses and unsupported compositions do not
+fall back to Endpoint, native forwarding, or another backend.
+
+See [ownership, fragments and evidence limits](../design/datapath.md#core-forwarding-firewall-and-ipv4-nat).
 
 ## Related docs
 

@@ -36,9 +36,7 @@ fn input(connection: &ConnectionInfo) -> RoutingInput {
         input.pname_len = name.len() as u32;
     }
     if let Some(mac) = &connection.mac {
-        for (index, byte) in mac.split(':').enumerate() {
-            input.mac[10 + index] = u8::from_str_radix(byte, 16).unwrap();
-        }
+        input.mac[10..].copy_from_slice(mac);
         input.flags = honk_ebpf_common::ROUTING_INPUT_MAC_PRESENT;
     }
     input
@@ -71,7 +69,7 @@ fn rule(
         outbound: honk_config::routing::RoutingOutbound::Simple(outbound.into()),
         priority: 0,
         must,
-        mark,
+        mark: (mark != 0).then_some(mark),
     }
 }
 
@@ -217,12 +215,12 @@ fn lazy_fact_cache_short_circuit_reuse_and_alternating_inputs() {
     a.domain = Some("a.test".into());
     a.dst_ip = "192.0.2.10".parse().unwrap();
     a.src_ip = "198.51.100.10".parse().unwrap();
-    a.mac = Some("02:00:00:00:00:0a".into());
+    a.mac = Some([0x2, 0x0, 0x0, 0x0, 0x0, 0xa]);
     let mut b = a.clone();
     b.domain = Some("b.test".into());
     b.dst_ip = "192.0.2.20".parse().unwrap();
     b.src_ip = "198.51.100.20".parse().unwrap();
-    b.mac = Some("02:00:00:00:00:14".into());
+    b.mac = Some([0x2, 0x0, 0x0, 0x0, 0x0, 0x14]);
     let learned = [
         domain_entry(&router, &a, "a.test"),
         domain_entry(&router, &b, "b.test"),
@@ -348,7 +346,7 @@ fn lazy_fact_cache_ipv6_host_overlap_and_default_prefix() {
     let mut host = golden::connection();
     host.dst_ip = "2001:db8:1::42".parse().unwrap();
     host.src_ip = "2001:db8:2::7".parse().unwrap();
-    host.mac = Some("02:00:00:00:00:66".into());
+    host.mac = Some([0x2, 0x0, 0x0, 0x0, 0x0, 0x66]);
     assert_route(
         &mut backend,
         "IPv6 /128 lookup reused by overlapping /48",
@@ -419,7 +417,7 @@ fn lazy_fact_cache_null_zero_mac_presence_and_invalid_family() {
     let mut connection = golden::connection();
     connection.dst_ip = "192.0.2.30".parse().unwrap();
     connection.src_ip = "198.51.100.30".parse().unwrap();
-    connection.mac = Some("02:00:00:00:00:1e".into());
+    connection.mac = Some([0x2, 0x0, 0x0, 0x0, 0x0, 0x1e]);
     let mut backend =
         RealEbpfBackend::load_routing_test_fixture(&object(), DaeParam::default()).unwrap();
     for (label, plan) in [
@@ -467,7 +465,7 @@ fn lazy_fact_cache_null_zero_mac_presence_and_invalid_family() {
         .set_datapath_flags(honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT)
         .unwrap();
     let mut zero_mac = golden::connection();
-    zero_mac.mac = Some("00:00:00:00:00:00".into());
+    zero_mac.mac = Some([0x0, 0x0, 0x0, 0x0, 0x0, 0x0]);
     let absent_mac = golden::connection();
     for (label, connection, expected) in [
         (
@@ -658,7 +656,7 @@ fn large_prefix_fact_policy() {
             outbound: honk_config::routing::RoutingOutbound::Simple("proxy".into()),
             priority: 0,
             must: false,
-            mark: 0x500,
+            mark: Some(0x500),
         }],
         "direct",
     )
@@ -723,7 +721,7 @@ fn predicate_bits_and_capacity_limits() {
                 outbound: honk_config::routing::RoutingOutbound::Simple("proxy".into()),
                 priority: 0,
                 must: false,
-                mark: 0x600 + index,
+                mark: Some(0x600 + index),
             })
             .collect::<Vec<_>>();
         let router = Router::new(&rules, "direct").unwrap();
@@ -744,7 +742,7 @@ fn predicate_bits_and_capacity_limits() {
             } else {
                 connection.dst_ip = format!("192.0.2.{index}").parse().unwrap();
                 connection.src_ip = format!("198.51.100.{index}").parse().unwrap();
-                connection.mac = Some(format!("02:00:00:00:00:{index:02x}"));
+                connection.mac = Some([2, 0, 0, 0, 0, index as u8]);
             }
             preserved_input = input(&connection);
             assert_route(
@@ -778,7 +776,7 @@ fn predicate_bits_and_capacity_limits() {
             outbound: honk_config::routing::RoutingOutbound::Simple("proxy".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         });
         let rejected = Router::new(&overflow, "direct")
             .and_then(|router| RoutingPushPlan::compile(&router, &ids, DialMode::Ip));
@@ -790,6 +788,19 @@ fn predicate_bits_and_capacity_limits() {
             decision(2, 0x6ff, false, 1, 255),
         );
     }
+}
+
+#[test]
+fn empty_target_set_refuses_before_candidate_map_creation() {
+    let router = Router::new(&[], "direct").unwrap();
+    let plan = RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::Ip).unwrap();
+    let error = load_routing_candidate(&[], ROUTING_SLOT_NAMES[1], &plan, &[])
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.to_string(),
+        format!("no routing target for {}", ROUTING_SLOT_NAMES[1])
+    );
 }
 
 #[test]
@@ -806,8 +817,8 @@ fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
     let structure = name("RoutingDecision");
     let slot = name("honk_route_slot0");
     let input_structure = name("RoutingInput");
-    let input_flags = name("flags");
     let old_mac_present = name("mac_present");
+    let old_padding = name("padding");
     let fields = [
         "outbound",
         "mark",
@@ -821,7 +832,7 @@ fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
     let output_fields = [
         ("decision", offset_of!(KernelRouteOutput, decision)),
         ("flags", offset_of!(KernelRouteOutput, flags)),
-        ("padding", offset_of!(KernelRouteOutput, padding)),
+        ("mark_kind", offset_of!(KernelRouteOutput, mark_kind)),
         ("generation", offset_of!(KernelRouteOutput, generation)),
         ("policy_id", offset_of!(KernelRouteOutput, policy_id)),
         ("fact_state", offset_of!(KernelRouteOutput, fact_state)),
@@ -842,12 +853,25 @@ fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
     let input_offset = types.len();
     types.extend([
         input_structure,
-        (4 << 24) | 1,
+        (4 << 24) | 12,
         size_of::<RoutingInput>() as u32,
-        input_flags,
-        1,
-        offset_of!(RoutingInput, flags) as u32 * 8,
     ]);
+    for (field, ty, offset) in [
+        ("src_ip", 11, 0),
+        ("dst_ip", 11, 16),
+        ("mac", 11, 32),
+        ("pname", 12, 48),
+        ("src_port", 1, 96),
+        ("dst_port", 1, 100),
+        ("l4proto", 1, 104),
+        ("ip_version", 1, 108),
+        ("dscp", 1, 112),
+        ("is_wan", 1, 116),
+        ("pname_len", 1, 120),
+        ("flags", 1, 124),
+    ] {
+        types.extend([name(field), ty, offset * 8]);
+    }
     let output_offset = types.len();
     types.extend([
         output,
@@ -857,7 +881,6 @@ fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
     for (index, (field, offset)) in output_fields.into_iter().enumerate() {
         let field_type = match index {
             0 => 2,
-            2 => 10,
             6 => 3,
             _ => 1,
         };
@@ -868,10 +891,13 @@ fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
     let prototype_offset = types.len();
     types.extend([0, (13 << 24) | 2, 1, 0, 6, 0, 5]);
     types.extend([slot, (12 << 24) | 1, 7]);
-    // IDs 9/10: the byte element and explicit four-byte padding array.
+    // IDs 9/10 model the rejected old padding ABI.
     types.extend([byte_integer, 1 << 24, 1, 8]);
-    let padding_offset = types.len();
     types.extend([0, 3 << 24, 0, 9, 1, 4]);
+    types.extend([0, 3 << 24, 0, 9, 1, 16]);
+    types.extend([0, 3 << 24, 0, 9, 1, 48]);
+    types.extend([0, 3 << 24, 0, 1, 1, 4]); // 16 bytes in four u32 elements
+    types.extend([integer, 1 << 24, 4, (1 << 24) | 32]); // signed, ID 14
     let encode = |types: &[u32]| {
         let mut bytes = vec![0x9f, 0xeb, 1, 0];
         for word in [
@@ -890,21 +916,26 @@ fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
         bytes
     };
     validate_routing_decision_abi(&encode(&types), "honk_route_slot0").unwrap();
+    let flags_offset = input_offset + 3 + 11 * 3;
+    let mut swapped = types.clone();
+    swapped.swap(input_offset + 3, input_offset + 6);
+    assert!(validate_routing_decision_abi(&encode(&swapped), "honk_route_slot0").is_err());
     for (word, replacement) in [
+        (input_offset + 4, 13),
+        (input_offset + 4 + 4 * 3, 14),
         (structure_offset + 2, 20),
         (structure_offset + 3 + 5 * 3 + 2, 128),
         (input_offset + 2, 124),
-        (input_offset + 3, old_mac_present),
-        (input_offset + 5, 120 * 8),
-        (input_offset + 4, 2),
+        (flags_offset, old_mac_present),
+        (flags_offset + 2, 120 * 8),
+        (flags_offset + 1, 2),
         (output_offset + 2, 264),
         (output_offset + 3 + 2, 32),
         (output_offset + 3 + 1, 1),
         (output_offset + 3 + 2 * 3, 0),
-        (output_offset + 3 + 2 * 3 + 1, 1),
+        (output_offset + 3 + 2 * 3, old_padding),
+        (output_offset + 3 + 2 * 3 + 1, 10),
         (output_offset + 3 + 2 * 3 + 2, 29 * 8),
-        (padding_offset + 3, 1),
-        (padding_offset + 5, 3),
         (prototype_offset + 4, 5),
         (prototype_offset + 6, 3),
     ] {

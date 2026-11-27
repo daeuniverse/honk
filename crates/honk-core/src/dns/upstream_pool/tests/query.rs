@@ -311,7 +311,7 @@ async fn udp_cold_retry_rechecks_route_for_alternate_address() {
                 outbound: RoutingOutbound::Simple(node.name.clone()),
                 priority: 0,
                 must: false,
-                mark: 0,
+                mark: None,
             }],
             "direct",
         )
@@ -389,7 +389,7 @@ async fn doh3_explicit_udp443_refusal_stops_resolved_route_fallback() {
         outbound: RoutingOutbound::Simple(outbound.into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     };
     let traffic = Arc::new(tokio::sync::RwLock::new(
         Router::new(

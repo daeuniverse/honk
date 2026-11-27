@@ -6,6 +6,7 @@ async fn same_generation_interleaving_converges_exact_mock_value() {
         let (projection, mut receiver, ebpf) = projection_for_test(snapshot(1, 1, 2));
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 30));
         projection.submit(
+            honk_datapath::ScopeId::HOST,
             snapshot(1, 1, 2),
             positive(
                 "a.test",
@@ -17,6 +18,7 @@ async fn same_generation_interleaving_converges_exact_mock_value() {
         projection.clear_worker_wake();
         worker::flush_for_test_after_snapshot(&projection, &ebpf, || {
             projection.submit(
+                honk_datapath::ScopeId::HOST,
                 snapshot(1, 1, 2),
                 positive(
                     "b.test",
@@ -44,6 +46,7 @@ async fn generation_change_before_backend_write_skips_stale_batch() {
     let (projection, mut receiver, ebpf) = projection_for_test(snapshot(1, 1, 2));
     let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 32));
     projection.submit(
+        honk_datapath::ScopeId::HOST,
         snapshot(1, 1, 2),
         positive(
             "a.test",
@@ -78,6 +81,7 @@ async fn stale_remove_is_repaired_by_new_same_generation_owner() {
     let mut backend = backend_for_test(&snapshot(1, 1, 2));
     let key = maps::ip_addr_to_lpm_key(ip);
     state.observe(
+        honk_datapath::ScopeId::HOST,
         positive("a.test", &[ip], now + Duration::from_secs(30)),
         now,
     );
@@ -87,9 +91,10 @@ async fn stale_remove_is_repaired_by_new_same_generation_owner() {
         .expect("initial write");
     assert!(state.commit_success(&initial.sets, &[]));
 
-    state.observe(clear_v4("a.test"), now);
+    state.observe(honk_datapath::ScopeId::HOST, clear_v4("a.test"), now);
     let stale_remove = state.batch(now);
     state.observe(
+        honk_datapath::ScopeId::HOST,
         positive("b.test", &[ip], now + Duration::from_secs(30)),
         now,
     );
@@ -114,6 +119,7 @@ async fn wake_overflow_is_harmless_and_latest_state_converges() {
     let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
     for _ in 0..32 {
         projection.submit(
+            honk_datapath::ScopeId::HOST,
             snapshot(1, 1, 2),
             positive(
                 "a.test",
@@ -136,6 +142,7 @@ async fn wake_gate_reopens_before_snapshot_and_coalesces_duplicates() {
     let second = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 41));
 
     projection.submit(
+        honk_datapath::ScopeId::HOST,
         snapshot(1, 1, 2),
         positive(
             "a.test",
@@ -144,6 +151,7 @@ async fn wake_gate_reopens_before_snapshot_and_coalesces_duplicates() {
         ),
     );
     projection.submit(
+        honk_datapath::ScopeId::HOST,
         snapshot(1, 1, 2),
         positive(
             "a.test",
@@ -156,6 +164,7 @@ async fn wake_gate_reopens_before_snapshot_and_coalesces_duplicates() {
     projection.clear_worker_wake();
 
     projection.submit(
+        honk_datapath::ScopeId::HOST,
         snapshot(1, 1, 2),
         positive(
             "a.test",
@@ -178,6 +187,7 @@ async fn set_and_map_full_failures_keep_dirty_until_retry() {
             .inject_projection_fault(ProjectionMapOperation::Set, 1, map_full)
             .expect("fault injection");
         projection.submit(
+            honk_datapath::ScopeId::HOST,
             snapshot(1, 1, 2),
             positive(
                 "a.test",
@@ -205,6 +215,7 @@ async fn changed_entry_is_written_before_obsolete_entry_is_deleted_and_delete_re
     let old_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 3));
     let new_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 4));
     projection.submit(
+        honk_datapath::ScopeId::HOST,
         snapshot(1, 1, 2),
         positive(
             "a.test",
@@ -219,6 +230,7 @@ async fn changed_entry_is_written_before_obsolete_entry_is_deleted_and_delete_re
         .inject_projection_fault(ProjectionMapOperation::Remove, 1, false)
         .expect("fault injection");
     projection.submit(
+        honk_datapath::ScopeId::HOST,
         snapshot(1, 1, 2),
         positive(
             "a.test",
@@ -243,9 +255,9 @@ async fn changed_entry_is_written_before_obsolete_entry_is_deleted_and_delete_re
 #[tokio::test(start_paused = true)]
 async fn spawned_worker_converges_mock_map_after_transient_failure() {
     let current = snapshot(7, 1, 2);
-    let ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> = Arc::new(tokio::sync::RwLock::new(
-        Box::new(backend_for_test(&current)),
-    ));
+    let ebpf: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>> = Arc::new(
+        tokio::sync::RwLock::new(Box::new(backend_for_test(&current))),
+    );
     ebpf.write()
         .await
         .inject_projection_fault(ProjectionMapOperation::Set, 1, false)
@@ -253,6 +265,7 @@ async fn spawned_worker_converges_mock_map_after_transient_failure() {
     let projection = RoutingProjection::spawn(Arc::clone(&ebpf), Arc::clone(&current));
     let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
     projection.submit(
+        honk_datapath::ScopeId::HOST,
         current,
         positive(
             "a.test",
@@ -289,6 +302,7 @@ async fn one_observation_drains_multiple_batches_without_another_wake() {
         .map(|ip| IpAddr::V4(Ipv4Addr::from(0xc0000200 + ip)))
         .collect::<Vec<_>>();
     projection.submit(
+        honk_datapath::ScopeId::HOST,
         current,
         positive(
             "a.test",
@@ -324,6 +338,7 @@ async fn reload_prefilled_facts_are_removed_after_clear_or_concurrent_expiry() {
         let (projection, _receiver, ebpf) = projection_for_test(Arc::clone(&old));
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 91));
         projection.submit(
+            honk_datapath::ScopeId::HOST,
             old,
             positive(
                 "a.test",
@@ -355,7 +370,7 @@ async fn reload_prefilled_facts_are_removed_after_clear_or_concurrent_expiry() {
         publication.commit(Arc::clone(&new), Some(published));
         drop(backend);
         if !expire_during_publication {
-            projection.submit(new, clear_v4("a.test"));
+            projection.submit(honk_datapath::ScopeId::HOST, new, clear_v4("a.test"));
         }
         worker::flush_for_test(&projection, &ebpf).await;
         assert!(
@@ -368,12 +383,13 @@ async fn reload_prefilled_facts_are_removed_after_clear_or_concurrent_expiry() {
 #[tokio::test]
 async fn shutdown_timeout_aborts_wedged_worker() {
     // Given a worker wedged on the backend write lock mid-flush.
-    let ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+    let ebpf: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
         Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
     let projection = RoutingProjection::spawn(ebpf.clone(), snapshot(1, 1, 2));
     let termination = projection.termination_probe_for_test();
     let guard = ebpf.write().await;
     projection.submit(
+        honk_datapath::ScopeId::HOST,
         snapshot(1, 1, 2),
         positive(
             "a.test",
@@ -396,7 +412,7 @@ async fn shutdown_timeout_aborts_wedged_worker() {
 async fn shutdown_is_idempotent_and_awaits_worker_termination() {
     for _ in 0..10 {
         // Given
-        let ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+        let ebpf: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
             Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
         let projection = RoutingProjection::spawn(ebpf, snapshot(1, 1, 2));
         let termination = projection.termination_probe_for_test();
@@ -416,7 +432,7 @@ async fn shutdown_is_idempotent_and_awaits_worker_termination() {
 async fn drop_cancels_projection_worker() {
     for _ in 0..10 {
         // Given
-        let ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+        let ebpf: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
             Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
         let projection = RoutingProjection::spawn(ebpf, snapshot(1, 1, 2));
         let termination = projection.termination_probe_for_test();
@@ -428,4 +444,75 @@ async fn drop_cancels_projection_worker() {
         // Then
         assert!(termination.is_terminated());
     }
+}
+
+#[derive(Default)]
+struct OneEntrySink(Option<([u8; 20], honk_ebpf_common::DomainRouting)>);
+
+impl DomainProjectionSink for OneEntrySink {
+    fn set_domain_ip_bitmap(
+        &mut self,
+        key: &maps::LpmKey,
+        bitmap: &honk_ebpf_common::DomainRouting,
+    ) -> Result<(), crate::ebpf::DomainRouteWriteError> {
+        let key = maps::lpm_key_bytes(key);
+        if self.0.as_ref().is_some_and(|(held, _)| *held != key) {
+            return Err(crate::ebpf::DomainRouteWriteError::MapFull);
+        }
+        self.0 = Some((key, *bitmap));
+        Ok(())
+    }
+
+    fn remove_domain_ip_bitmap(
+        &mut self,
+        key: &maps::LpmKey,
+    ) -> Result<(), crate::ebpf::DomainRouteWriteError> {
+        let key = maps::lpm_key_bytes(key);
+        if self.0.as_ref().is_some_and(|(held, _)| *held == key) {
+            self.0 = None;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn projection_sink_fences_stale_writes_and_recovers_map_capacity() {
+    let first = snapshot(1, 1, 2);
+    let next = snapshot(2, 4, 8);
+    let (projection, _wake) = unspawned_projection(Arc::clone(&first));
+    let sink = tokio::sync::RwLock::new(Box::new(OneEntrySink::default()));
+    let a = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 4));
+    let b = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+    let expires = tokio::time::Instant::now() + Duration::from_secs(30);
+    let scope = honk_datapath::ScopeId::HOST;
+    projection.submit(scope, first, positive("a.test", &[a], expires));
+    worker::flush_for_test_after_snapshot(&projection, &sink, || {
+        projection.update_snapshot(Arc::clone(&next))
+    })
+    .await;
+    assert!(sink.read().await.0.is_none());
+    assert_eq!(projection.counters().generation_rebuilds, 1);
+
+    let entry = |ip, bits| {
+        (
+            maps::lpm_key_bytes(&maps::ip_addr_to_lpm_key(ip)),
+            honk_ebpf_common::DomainRouting {
+                bitmap: [bits, 0, 0, 0, 0, 0, 0, 0],
+            },
+        )
+    };
+    worker::flush_for_test(&projection, &sink).await;
+    assert_eq!(sink.read().await.0, Some(entry(a, 4)));
+    projection.submit(scope, Arc::clone(&next), positive("b.test", &[b], expires));
+    worker::flush_for_test(&projection, &sink).await;
+    assert_eq!(projection.counters().map_full, 1);
+    assert_eq!(projection.counters().write_failures, 1);
+    assert_eq!(sink.read().await.0, Some(entry(a, 4)));
+    projection.submit(scope, next, clear_v4("a.test"));
+    worker::flush_for_test(&projection, &sink).await;
+    assert!(sink.read().await.0.is_none());
+    tokio::time::advance(Duration::from_millis(100)).await;
+    worker::flush_for_test(&projection, &sink).await;
+    assert_eq!(sink.read().await.0, Some(entry(b, 8)));
+    assert!(projection.state.lock().dirty_ips.is_empty());
 }

@@ -31,3 +31,4 @@ Hysteria2/TUIC/Juicity reap locally unused connections after 120 s of inactivity
 - Check the last application reply and the terminal outcome, not only upload counters or carrier liveness.
 - Tell timer expiry apart from [outbound health gating](../design/datapath.md#outbound-liveness) or capacity rejection.
 - Check external firewall/NAT and remote application idle policies separately.
+

@@ -1,4 +1,5 @@
 use super::*;
+use std::task::Poll;
 
 pub(in crate::control::udp_endpoint) enum SourceReplyTarget {
     Flow {
@@ -28,8 +29,18 @@ impl UdpEndpointPool {
         peer: SocketAddr,
     ) -> SourceReplyTarget {
         let key = match owner.scope.reply {
-            ReplyProjection::ActualPeer => EndpointKey::new(owner.scope.client, peer),
-            ReplyProjection::RewriteTo(original) => EndpointKey::new(owner.scope.client, original),
+            ReplyProjection::ActualPeer => EndpointKey::new(
+                owner.scope.domain,
+                owner.scope.client,
+                peer,
+                owner.scope.packet_source.map(|source| source.lineage),
+            ),
+            ReplyProjection::RewriteTo(original) => EndpointKey::new(
+                owner.scope.domain,
+                owner.scope.client,
+                original,
+                owner.scope.packet_source.map(|source| source.lineage),
+            ),
         };
         let Some(entry) = self.endpoints.get(&key) else {
             return match owner.scope.reply {
@@ -79,9 +90,12 @@ impl UdpEndpointPool {
         {
             return None;
         }
-        let entry = self
-            .endpoints
-            .entry(EndpointKey::new(owner.scope.client, peer));
+        let entry = self.endpoints.entry(EndpointKey::new(
+            owner.scope.domain,
+            owner.scope.client,
+            peer,
+            owner.scope.packet_source.map(|source| source.lineage),
+        ));
         if !matches!(entry, dashmap::mapref::entry::Entry::Vacant(_)) {
             return None;
         }
@@ -105,18 +119,60 @@ pub(super) enum SourceReplyDisposition {
     Drop,
 }
 
-/// Sends one reply within `TRANSPORT_SEND_TIMEOUT`. An immediately writable
-/// socket completes synchronously, so the timer is armed only when the send
-/// would block.
-async fn send_reply(socket: &UdpSocket, data: &[u8], client: SocketAddr) -> bool {
-    match socket.try_send_to(data, client) {
-        Ok(_) => true,
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => matches!(
-            tokio::time::timeout(TRANSPORT_SEND_TIMEOUT, socket.send_to(data, client)).await,
-            Ok(Ok(_))
-        ),
-        Err(_) => false,
+async fn send_reply(
+    socket: &ReplySocket,
+    data: &[u8],
+    client: SocketAddr,
+) -> SourceReplyDisposition {
+    let send = socket.send_to(data, client);
+    tokio::pin!(send);
+    let sent = match std::future::poll_fn(|cx| Poll::Ready(send.as_mut().poll(cx))).await {
+        Poll::Ready(result) => result,
+        Poll::Pending => match tokio::time::timeout(TRANSPORT_SEND_TIMEOUT, send).await {
+            Ok(result) => result,
+            Err(_) => return SourceReplyDisposition::Observed,
+        },
+    };
+    match sent {
+        Ok(_) => SourceReplyDisposition::Delivered,
+        Err(error) if is_auxiliary_retirement(&error) => SourceReplyDisposition::Drop,
+        Err(_) => SourceReplyDisposition::Observed,
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[tokio::test]
+async fn source_reply_distinguishes_retired_binding_from_failed_delivery() {
+    let root = honk_netstack::MemoryBudget::new(4 << 20);
+    let (scope, owner) = crate::control::netstack::auxiliary_scope(1500, &root).unwrap();
+    let mut driver = owner.hand_off();
+    driver.resume_auxiliary(1500, || true).unwrap();
+    let source = "198.51.100.1:4000".parse().unwrap();
+    let client = "192.0.2.1:5000".parse().unwrap();
+    let socket = ReplySocket {
+        scope: scope.scope(),
+        packet_source: None,
+        socket: ReplySocketFd::Packet(scope.datagram_sender(source)),
+        _permit: None,
+    };
+    assert!(matches!(
+        send_reply(&socket, b"live", client).await,
+        SourceReplyDisposition::Delivered
+    ));
+    assert!(matches!(
+        send_reply(
+            &socket,
+            b"wrong family",
+            "[2001:db8::1]:5000".parse().unwrap()
+        )
+        .await,
+        SourceReplyDisposition::Observed
+    ));
+    driver.begin_auxiliary_pause().unwrap();
+    assert!(matches!(
+        send_reply(&socket, b"old", client).await,
+        SourceReplyDisposition::Drop
+    ));
 }
 
 pub(super) async fn deliver_source_reply(
@@ -142,12 +198,16 @@ pub(super) async fn deliver_source_reply(
                     hook.release.notified().await;
                 }
             }
-            if !send_reply(endpoint.source_reply_socket(), data, owner.scope.client).await {
-                endpoint
-                    .native
-                    .dropped("client_delivery_failed", Some("client_send_failed"));
-                debug!("UDP source reply delivery failed");
-                return SourceReplyDisposition::Observed;
+            match send_reply(endpoint.source_reply_socket(), data, owner.scope.client).await {
+                SourceReplyDisposition::Delivered => {}
+                SourceReplyDisposition::Drop => return SourceReplyDisposition::Drop,
+                SourceReplyDisposition::Observed => {
+                    endpoint
+                        .native
+                        .dropped("client_delivery_failed", Some("client_send_failed"));
+                    debug!("UDP source reply delivery failed");
+                    return SourceReplyDisposition::Observed;
+                }
             }
             endpoint.mark_reply();
             if let Some(elapsed) = endpoint.take_first_reply_metric() {
@@ -160,8 +220,15 @@ pub(super) async fn deliver_source_reply(
             if source.is_ipv4() != owner.scope.client.is_ipv4() {
                 return SourceReplyDisposition::Drop;
             }
-            let socket = match pool.foreign_replies.get(source) {
+            let socket = match pool.foreign_replies.get(
+                owner.scope.domain,
+                source,
+                owner.packet_source.as_ref(),
+            ) {
                 Ok(socket) => socket,
+                Err(error) if is_auxiliary_retirement(&error) => {
+                    return SourceReplyDisposition::Drop;
+                }
                 Err(error) => {
                     debug!("UDP foreign reply socket creation failed: {}", error);
                     return SourceReplyDisposition::Observed;
@@ -178,13 +245,15 @@ pub(super) async fn deliver_source_reply(
                     hook.release.notified().await;
                 }
             }
-            if !send_reply(&socket, data, owner.scope.client).await {
-                debug!("UDP foreign reply delivery failed");
-                SourceReplyDisposition::Observed
-            } else {
-                owner.node_tracker.add_bytes(0, data.len() as u64);
-                SourceReplyDisposition::Delivered
+            let disposition = send_reply(&socket, data, owner.scope.client).await;
+            match disposition {
+                SourceReplyDisposition::Delivered => {
+                    owner.node_tracker.add_bytes(0, data.len() as u64);
+                }
+                SourceReplyDisposition::Observed => debug!("UDP foreign reply delivery failed"),
+                SourceReplyDisposition::Drop => {}
             }
+            disposition
         }
         SourceReplyTarget::Drop => SourceReplyDisposition::Drop,
     }

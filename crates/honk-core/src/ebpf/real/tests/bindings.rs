@@ -9,11 +9,11 @@
 
 use super::super::bindings as owner;
 use super::*;
-use crate::ebpf::EbpfBackend;
 use crate::ebpf::interface::{
     Binding, BindingSnapshot, Direction, InterfacePlan, TcProgram, Topology,
     plan as plan_interfaces, read_topology,
 };
+use crate::ebpf::{EbpfBackend, PolicyBackend};
 use crate::netlink::NlSock;
 use aya_obj::generated::{
     BPF_F_AFTER, bpf_attach_type, bpf_attr, bpf_cmd, bpf_prog_info, bpf_prog_type,
@@ -75,7 +75,7 @@ fn foreign_link(ifindex: u32, direction: Direction) -> io::Result<Foreign> {
     load.__bindgen_anon_3.insn_cnt = 2;
     load.__bindgen_anon_3.insns = insns.as_ptr() as u64;
     load.__bindgen_anon_3.license = c"GPL".as_ptr() as u64;
-    let program = unsafe { syscall::bpf_syscall(bpf_cmd::BPF_PROG_LOAD as _, &mut load) }
+    let program = unsafe { bpf_syscall(bpf_cmd::BPF_PROG_LOAD as _, &mut load) }
         .map_err(|errno| io::Error::from_raw_os_error(errno as i32))?;
     let program = unsafe { OwnedFd::from_raw_fd(program as i32) };
     let mut create: bpf_attr = unsafe { core::mem::zeroed() };
@@ -83,7 +83,7 @@ fn foreign_link(ifindex: u32, direction: Direction) -> io::Result<Foreign> {
     create.link_create.__bindgen_anon_2.target_ifindex = ifindex;
     create.link_create.attach_type = attach_type(direction);
     create.link_create.flags = BPF_F_AFTER;
-    let link = unsafe { syscall::bpf_syscall(bpf_cmd::BPF_LINK_CREATE as _, &mut create) }
+    let link = unsafe { bpf_syscall(bpf_cmd::BPF_LINK_CREATE as _, &mut create) }
         .map_err(|errno| io::Error::from_raw_os_error(errno as i32))?;
     let link = unsafe { OwnedFd::from_raw_fd(link as i32) };
     let id = owner::link_info(link.as_raw_fd())?.id;
@@ -305,8 +305,14 @@ fn held_program_ids(snapshot: &BindingSnapshot) -> BTreeMap<TcProgram, u32> {
 }
 
 /// `held_of` for a backend behind the daemon's lock, proven against the kernel.
-async fn kernel_held(ebpf: &RwLock<Box<dyn EbpfBackend>>) -> Vec<Held> {
-    let snapshot = ebpf.read().await.interface_binding_snapshot().unwrap();
+async fn kernel_held(ebpf: &RwLock<Box<dyn crate::ebpf::PolicyBackend>>) -> Vec<Held> {
+    let snapshot = ebpf
+        .read()
+        .await
+        .tc()
+        .unwrap()
+        .interface_binding_snapshot()
+        .unwrap();
     let programs = held_program_ids(&snapshot);
     let held = held_of(snapshot);
     assert_truthful(&held, &programs);

@@ -1,0 +1,674 @@
+# Userspace network stack and WireGuard tunnel
+
+`honk-netstack` is a sans-I/O IPv4/IPv6 TCP/UDP stack. `Mode::Endpoint` remains the default WireGuard client behavior. `Mode::Transparent` provides passive TCP, stateless UDP, bounded reassembly and ICMP generation. Core's packet embedding and explicitly configured [XDP](./datapath.md#full-xdp-startup)/[TUN Endpoint](./datapath.md#linux-tun-endpoint) consume it; the Stack API itself grants no capture authority. Unless stated otherwise, this page describes unchanged Endpoint behavior. Like the other userspace subsystems, this code is largely AI-authored and requires maintainer review.
+
+The outbound-side behavior (registry, flows, failure provenance) is summarized from the stack's point of view below and specified in [Outbound design](./outbound.md#wireguard-tunnel). Node fields and share links are in the [node reference](../reference/nodes.md).
+
+## Crate boundary
+
+```mermaid
+flowchart LR
+  OUT[honk-outbound<br/>proxy/wireguard] --> NS[honk-netstack]
+  OUT --> BT[boringtun 0.7.1]
+  NS --> B3[blake3]
+```
+
+- `honk-netstack` depends only on `blake3` and `thiserror`, is `publish = false`, and forbids `unsafe`. Outbound, datapath and core depend on it; it knows nothing about nodes, Tokio or sockets. `smoltcp` is a pinned development-only baseline.
+- It never reads a clock, an environment variable or a configuration file. The caller supplies `Instant`s, the interface addresses and MTU, a 32-byte private secret and the memory limits (`Config`). Defaults: MTU 1420, 4096 flows, 256 MiB memory, 8 MiB receive and 6 MiB send buffer per flow, `Mode::Endpoint`; the transparent-mode fields are listed under [Configuration and counters](#configuration-and-counters).
+- `wire` exposes IPv4/IPv6/TCP/UDP/ICMP codecs and checksums. `transit` narrowly exposes the existing funded reassembler and suppressed/rate-limited ICMP generator for routers; it never creates a TCP or UDP endpoint.
+
+## Programming model
+
+The stack is driven by exactly one owner through `&mut Stack`. It has no locks or unbounded queues. TCP output obligations stay on the flow until pulled; bounded control replies and fragment queues have the limits described below. Packets are materialized only when the owner pulls them (the quinn-proto model).
+
+| Call | Contract |
+| --- | --- |
+| `receive(now, packet) -> Rx` | Borrows one complete IP packet and verifies its checksums (`RxMeta::VERIFY`). Retained TCP bytes are copied into stack-owned rings. UDP returns `Rx::Datagram` (Endpoint) or `Rx::Transparent` (transparent mode): **the returned range is valid only until the caller reuses or recycles the input buffer**. `Rx::TransparentOwned` owns a reassembled packet. `Rx::Dropped(reason)` is counted. |
+| `receive_reported(packet, options, on_source) -> (Rx, ReceiveReport)` | `ReceiveOptions::new(ingress_at, meta)` supplies the ingress time and driver metadata. The source gate runs after checksum validation and before protocol mutation. The report separates the verified source from protocol acceptance and identifies a new passive TCP flow by its exact `FlowId`. `with_context` requires prepared source storage. `with_realm` also supplies the half-open gate and restores the service clock after receive. |
+| `try_receive_realm_tcp(ingress_at, service_at, packet, on_source)` | A fallible source gate can defer a verified complete TCP packet on a stack without source storage. On `Err` the clock and input/drop accounting retain their previous values. |
+| `reassemble_for_dispatch(ingress_at, service_at, packet)` | Owner zero reassembles fragments before choosing a transport owner. Completed packet storage retains its budget charge. |
+| `poll_transmit(now, out) -> Option<usize>` | Writes one complete IP packet to `out[..n]`. A too-small `out` returns `None` without losing the packet. `None` also means nothing is currently allowed by cwnd, rwnd or pacing. |
+| `poll_transmit_with(now, out, TxCaps) -> Option<Transmit>` | Same scheduler with optional TCP segmentation offload in transparent mode; returns `len`, `gso`, `csum` and the original known-TCP `flow` handle, or `None` for stateless/unknown-flow output. Endpoint mode ignores offload capabilities. `poll_transmit` is the plain-packet wrapper with `TxCaps::NONE` and discards metadata. |
+| `poll_control_transmit(now, out)` | Shares the TCP emitter without TCP/UDP payload. Preserves ordinary readiness, DRR and payload TLP work while emitting eligible ACK/RST/SYN/FIN/probes, TIME_WAIT ACKs and ICMP. Reserve control frame/descriptor credit before calling. |
+| `poll_transmit_iov` | Offers one IP/transport header and up to 18 payload slices synchronously. Acceptance commits the packet. A rejected write preserves queue position, protocol state and credit. `Progress` completes a bounded preparation or cleanup step and asks the caller to poll again. |
+| `poll_timeout()` / `handle_timeout(now)` | Earliest flow or reassembly deadline; entries may be stale, so an early wakeup is legal. |
+| `poll_event()` | Coalesced `Ready` bits (`CONNECTED`, `READABLE`, `WRITABLE`, `READ_CLOSED`, `ERROR`); a flow appears on the event list at most once. |
+| `tcp_retained(id)` | True while the original TCP handle still owns application/protocol state, compact TIME_WAIT or a queued control response in this Stack. Does not include packets already returned to the driver. |
+| `take_tx_wakeup()` | Set by `tcp_write`, `tcp_shutdown`, `tcp_close`, `tcp_abort`, `tcp_connect`, `tcp_accept`, `tcp_complete`, `tcp_refuse`, by a `tcp_read` that creates an ACK obligation and by a `udp_send_from` that leaves fragments queued. The caller must wake its owner when it returns true. |
+| `tcp_*`, `udp_*` | `write(2)`-like semantics: `WouldBlock` instead of blocking, `Ok(0)` from `tcp_read` is EOF, terminal errors are sticky and returned after buffered data has been read. `FlowId` carries a generation, so a stale id returns `Stale` and never reaches a new occupant. |
+
+Callers pass the same ingress timestamp to every `receive` of one receive batch (at most 64 packets) so RTT, RACK and autotuning do not measure processing delay.
+
+### Output scheduling
+
+`poll_transmit` serves five classes in rotation and remembers the rotation point across calls, so no class starves another:
+
+1. **Control replies** to packets for unknown flows (RST). The queue holds 128 entries; when full the reply is dropped and counted (`control_dropped`), which is equivalent to link loss. In transparent mode the ICMP errors of refused SYNs share this queue.
+2. **TIME_WAIT replies** (ACK of a retransmitted FIN or of old duplicate data), merged by bit per entry so none is lost.
+3. **Ready TCP flows**, served by deficit round robin with a quantum of one MTU. Within a flow an ACK or retransmission goes before new data.
+4. **Queued UDP fragments** of an oversized `udp_send_from` (transparent mode), in FIFO order.
+5. **ICMP Time Exceeded** for timed-out reassemblies (transparent mode).
+
+A flow's reply obligations are bits (`DATA`, `OOO`, `WINDOW_UPDATE`, `PROBE_RESPONSE`, `CHALLENGE`, `FIN_ACK`), not an inferred "`rcv_nxt` moved" test, because window updates, zero-window probe responses and challenge ACKs do not advance `rcv_nxt`. A caller that stops pulling therefore loses nothing; it is the back-pressure.
+
+Control-only pulls use a separate, lazily allocated ready queue and class cursor; they cannot rotate ordinary readiness or consume its DRR credit. An adapter must also offer ordinary pulls for payload progress. The explicit core packet runtime alternates the first output class while reserving each class's frame and descriptor before pulling. Callers that never use control-only pulls, including WireGuard, allocate no control-only queue.
+
+An unfunded RACK bookkeeping expansion defers only that flow: pending retransmission and its existing DRR credit survive, while other funded TCP flows and queued UDP fragments remain eligible. A too-small output buffer remains a distinct blocked-output result. Accounted shard pulls report `BufferTooSmall` after trying other eligible output with the supplied frame. A short ICMP retry keeps the original quote and leaves the shared limiter untouched. Globally rate-limited errors do not refresh per-target recency.
+
+### Timers
+
+Each flow exposes the minimum of its RTO/persist, delayed-ACK, tail-loss-probe, RACK reorder, pacing and close deadlines. A global min-heap holds at most one live entry per flow: a deadline is pushed only when it moves earlier. A later deadline reuses the old entry and is rechecked when popped. Calls that change a flow coalesce its heap refresh in a marked list (at most 64 distinct slots), flushed before processing timers or admitting another slot to a full list. `poll_timeout` also computes the marked flows' deadlines directly, so it cannot oversleep while refresh is deferred. When the heap exceeds twice the flow slab (at least 32 entries) it is rebuilt; the bound follows the slab because a rebuild walks every slot. TIME_WAIT expiry uses the same heap.
+
+## Packet handling
+
+- IPv4 headers with options are parsed; IPv6 extension headers (hop-by-hop, routing, destination options, at most eight) are skipped; a routing header with segments left is `Unsupported`. Jumbograms, ESP/AH and unknown protocols are `Unsupported`. IPv4 and IPv6 fragments are dropped (`Fragment`) after the header checksum in Endpoint mode: **there is no reassembly and no fragmentation**; transparent mode reassembles them and fragments large UDP replies (see [Reassembly](#reassembly)). Link padding past the IP length is ignored.
+- Ordinary transmitted IPv4 packets have DF set, TTL/hop limit 64 and no options; transparent `udp_send_from`/`udp_send_gso_from` do not set DF, and IPv6 UDP fragmentation adds a Fragment header.
+- In Endpoint mode a packet for an address that is not the configured local address of its family is `NotForUs`. A family without a local address cannot be used at all (`NoLocalAddress`). Transparent mode accepts any unicast destination instead (see [Scope and addressing](#scope-and-addressing)).
+- Drop reasons are counted per reason in `StackStats`: `Malformed`, `Checksum`, `Fragment`, `NotForUs`, `NoFlow`, `Unsupported`, and in transparent mode `HalfOpen` and `Capacity`. (`Stale` is defined but never produced.)
+- **Ordinary receive verifies checksums in both modes** (IPv4 header, TCP, UDP, ICMP) before changing flow state. IPv4 UDP checksum zero means none; IPv6 UDP zero is invalid on the verification path. Only transparent `receive_reported` can trust the driver's TCP/UDP `Csum::Valid`/`Partial`; IPv4 headers, ICMP and reassembled datagrams are still verified. Endpoint mode rejects such metadata, so WireGuard always verifies its inner packets: it authenticates the tunnel peer, not the sender's inner checksum. Full transmit output copies the payload and then computes its checksum using native-endian accumulation lanes; offloaded output carries a partial checksum instead (see [Checksum trust](#checksum-trust)).
+- UDP verification uses its declared length, which may be shorter than the IP payload. Trailing IP bytes are not UDP data or part of its checksum; Core forwarding preserves those IP bytes. Contiguous and scatter/gather validation use the same boundary.
+- **ICMP is consumed in both modes and emitted only in transparent mode.** A packet-too-big (RFC 1191/8201) or destination-unreachable message is honored only for a TCP flow of the message's own address family whose quoted sequence is inside the outstanding window; PTB lowers the flow's path MTU (never raises it) and makes every now-oversize segment sendable again, including one already retransmitted at the old size, unreachable on a `SYN_SENT` flow fails the connect with `Unreachable`. Legacy PTB without an MTU uses the RFC 1191 plateau table. ICMP echo and all other ICMP are ignored. In Endpoint mode the stack never generates ICMP; generation is described in [ICMP generation](#icmp-generation).
+- **UDP in Endpoint mode** has no receive queue and no send queue. A datagram for an unbound port is `NoFlow` (no ICMP error). `udp_send` serializes directly into the caller's buffer as one IP packet; a datagram larger than the MTU is `TooLarge`. Transparent UDP is stateless and is described in [Transparent UDP](#transparent-udp).
+
+## TCP
+
+### Connection model
+
+Endpoint mode is active open only: `tcp_connect` picks a source port with RFC 6056 algorithm 3 (a keyed hash of local/remote address and remote port plus a per-bucket counter, in 32768..65535), an ISN from a keyed hash (RFC 6528) plus a 4 µs clock, and a stable per-address-pair timestamp offset (RFC 6191). The secret is `Config::secret` (blake3 keyed hash). In Endpoint mode there is **no listen API**; a SYN for an unknown tuple gets an RST, simultaneous open is handled. Passive open exists only in transparent mode ([TCP admission](#tcp-admission)).
+
+Every SYN offers MSS (MTU − 40/60), window scaling (the shift is chosen once from `tcp_rcv_buf_max`, up to 14), SACK-permitted and timestamps; each is used only if the peer echoes it. The peer MSS defaults to 536 (IPv4) or 1220 (IPv6) when absent and is raised to at least 48 (Linux `tcp_min_snd_mss`), so a hostile server cannot buy one packet per byte. Each wire data segment carries at most `min(peer MSS, PMTU − IP header − that segment's TCP header)`, computed per packet because timestamps plus SACK blocks can grow the header to 60 bytes; a TSO super-packet aggregates several such segments behind one header.
+
+Validation: RFC 5961 (RST only at exactly `rcv_nxt`, otherwise a challenge ACK, SYN in a synchronized state answers a challenge ACK, challenge ACKs limited to one per flow per 100 ms), PAWS with a 24-day cutoff, acceptable-ACK window checks.
+
+### Closing and lifecycle
+
+- `tcp_shutdown` closes the write half only. `tcp_close` releases the application handle at once and lets the protocol finish (FIN after queued data); **closing with unread data, or while `SYN_RECEIVED`, sends RST** as Linux does. A flow that was closed from `FIN_WAIT_2` has a 60 s orphan timeout.
+- TIME_WAIT is kept separate from the application handle. A flow stays on its slot (ring, ready bits) until the application has read everything and closed the handle and the last ACK has been sent; only then does it compact into a small table entry `{tuple, snd_nxt, rcv_nxt, ts_recent, expiry, ack_due}` that holds no chunks, for 60 s. A valid retransmitted FIN is answered with an ACK and restarts the timer; an old duplicate data segment is answered with an ACK only ([Close semantics](#close-semantics)). A new connection to the same tuple may reuse the entry only when RFC 6191 timestamp and sequence comparisons prove the peer can tell the incarnations apart; otherwise the port search continues (up to 32768 candidates, then `AddrInUse`). Which side keeps TIME_WAIT, and how a transparent SYN reopens a tuple, is in [Close semantics](#close-semantics).
+- Terminal errors: `Reset`, `TimedOut` (six SYN retransmissions, fifteen consecutive RTO backoffs, fifteen zero-window probes in a row that no ACK answers, the orphan timeout, or, for accepted transparent flows with keepalive enabled, unanswered keepalive probes) and `Unreachable`. TCP keepalive is off unless `AcceptOpts::keepalive` sets it ([Keepalive](#keepalive)).
+
+`tcp_state(id) == None` only describes application visibility, not retirement. The read-only `tcp_retained(id)` query uses the original handle across compaction and retains queued RST/ICMP refusals after their TCB disappears. A driver saves each returned `Transmit::flow` before checking retention, so a final packet cannot be reattributed to a reused tuple. A false query still requires the adapter to settle its device buffers, producers, tasks and scoped incarnation before releasing delivery state. Neither a `FlowId` from another Stack nor a CQ completion supplies that proof. An exhausted handle generation permanently removes its slot from reuse rather than wrapping.
+
+### Receive side
+
+- **SACK/DSACK.** Out-of-order data is written directly to its offset in the receive ring. A table of at most 32 ranges records what has arrived; a segment that would create a 33rd range is dropped and counted (`ooo_drops`). ACKs carry up to three SACK blocks with timestamps (four without), most recently changed block first and the rest rotated; the first block is a DSACK when duplicate data arrived. Without negotiated SACK, every out-of-order segment gets its own duplicate ACK.
+- **ACK policy.** The first 16 segments after the start or an idle period of more than one RTO are acknowledged at once (quickack); afterwards an ACK is sent when two full-sized segments are unacknowledged, on out-of-order data or a gap fill, on window updates and FIN. Otherwise a 40 ms delayed-ACK timer runs. A window update is sent when a read reopens a zero window or advances the right edge by at least 2 MSS. A TCP GRO run advances this cadence by its represented frames but creates only a cumulative ACK obligation, not one replayed ACK per segment ([Segmentation offload](#segmentation-offload)).
+- **Window autotuning (DRS).** Per measured receive RTT the target window becomes `2 × bytes read by the application + 16 × MSS`, never shrinking and capped at `tcp_rcv_buf_max`. Growth is committed from the memory pool before it is advertised (next section).
+
+### Send side
+
+- **Loss detection:** RACK-TLP (RFC 8985) for SACK peers: send-time ordered detection with a cursor over never-retransmitted descriptors and a lazy FIFO for retransmissions, adaptive reorder window from min RTT/4 that grows with reordering and decays, reorder timer, tail loss probe at about 2·SRTT (plus 200 ms for a lone segment). Peers without SACK use NewReno (RFC 6582). Loss of data sent during a recovery, still lost when the recovery ends, starts a new episode (Linux `tcp_time_to_recover`).
+- **Reduction and undo:** PRR (RFC 6937, SSRB variant); spurious recoveries are undone by DSACK, timestamp echo (Eifel) or F-RTO.
+- **RTO:** RFC 6298 estimator in microseconds with a 200 ms floor (a deliberate deviation shared with Linux), 120 s ceiling, 1 s initial value, exponential backoff that SYN retransmissions do not carry into the first data timeout. A timeout keeps SACKed data delivered and marks only the rest lost, unless the head itself is SACKed (reneging), which discards all SACK state; F-RTO therefore undoes only a timeout whose never-SACKed, never-retransmitted data was acknowledged, and falls back to ordinary recovery when no new data can go out. A zero window with data in flight still retransmits the head on timeout; persist probes run only when nothing is outstanding.
+- **Congestion control:** CUBIC (RFC 9438) in fixed point — no floating point — with HyStart++ (RFC 9406). Initial window `min(10·MSS, max(2·MSS, 14600))`, restored (with HyStart++ state) when a flow resumes after a data-free RTO measured from its last data segment. The controller sits behind a `Cc` enum; a Reno variant exists only for reference tests.
+- **Pacing:** token bucket at 2.0 × cwnd/SRTT in slow start and 1.2 × afterwards; ordinarily bursts of 10 segments, capped to 2 ms of traffic, always at least one segment. TSO can enlarge the segment count of the bucket, still subject to the 2 ms cap. The next release time is a flow deadline.
+- **Scoreboard:** one descriptor per sent segment (end sequence, transmit time, SACKED/LOST/RETRANS flags, delivery-rate fields). `packets_out`, `sacked`, `lost` and `retrans` byte counters are maintained incrementally and checked against a from-scratch recount in debug builds. Delivery rate is sampled per ACK (draft-cheng-iccrg) with app-limited tracking and is reported in `TcpStats`.
+- **Send buffer.** `tcp_write` copies into the send ring; accepted bytes belong to the stack until cumulatively ACKed (SACKed data is never freed, since the peer may renege). With `chunk = Config::chunk()`, the buffer limit follows the window: `min(max(2 × cwnd, 4 × chunk), clamped tcp_snd_buf_max)`, and `WRITABLE` is reported when at least `min(chunk, half the limit)` of room exists and the pool or tail has room. At Endpoint's default 16 KiB chunk these are the previous 64 KiB minimum and 16 KiB readiness threshold.
+
+Zero-window handling (persist probes), window-update recovery and `snd_wl1/snd_wl2` window tracking follow RFC 9293. The probe interval doubles up to 120 s and resets only when the window opens; an ACK that keeps the window closed resets the retry count (unanswered probes still fail the flow after fifteen) but not the interval. Segments are accepted when they overlap the receive window, and nothing after a recorded FIN is accepted.
+
+ACK progress cancels both the old PTO deadline and an expired probe that has not yet been materialized. A later flight starts with its own PTO; a control-only pull without ACK progress preserves a due payload probe. This does not retract packets already returned to a driver: their immutable bytes, metadata and original `FlowId` remain owned until actual submission or disposal.
+
+## Memory model
+
+Payload storage is a pool of chunks organized in two rings per TCP flow (send, receive), plus the send descriptors. `Config::tcp_chunk` defaults to `None`: 16 KiB in Endpoint mode and 4 KiB in transparent mode. An explicit size is clamped to 4..=64 KiB; `Config::chunk()` reports the effective size.
+
+- **Progress floor.** Every admitted TCP flow is entitled to one send chunk, one receive chunk and 16 descriptor slots whatever the global pressure. The floors are reserved up front: `floor_flows = min(max_flows, memory_limit / floor)` and the remaining `memory_limit − floors` is the shared pool. `tcp_connect` fails with `Memory` when no floor is left and with `FlowLimit` at `max_flows`; `max_flows` also counts UDP associations. The floor prevents the deadlock where a window that consumes the whole pool leaves `tcp_write` with no room while the peer waits for that very request.
+- **Commitment.** Receive-window space beyond the floor is *committed* from the shared pool before it is advertised, while chunks are allocated lazily when data arrives. Therefore in-window data is not dropped for lack of memory. The highest advertised right edge is remembered and never withdrawn; window-scale rounding only rounds the wire value down and never above the commitment. The initial receive target is `min(65535, clamped tcp_rcv_buf_max)`, not one chunk: when shared space is available the advertised window commits more than the floor, even if the flow is idle and holds no resident payload chunks.
+- **Honest accounting.** The budget is charged for chunk capacity (and descriptor storage), not for logical bytes. `StackStats.memory_committed` is floors in use plus shared TCP commitment; `memory_allocated` is the chunks and descriptor storage actually resident plus the pool's cached free chunks. The cache holds up to 64 chunks while any chunk is in use (a burst of writes and its ACK refills from it instead of the allocator) and a single spare once none is, so `memory_allocated` of an idle stack is one chunk at most. These gauges cover the TCP pool, not reassembly or queued UDP; `MemoryBudget::used()` also includes reassembly, queued timeout quotes and pending UDP datagram capacities when a shared budget is configured.
+- **Idle flows.** The floors are accounting guarantees, not resident memory. A ring that becomes empty (receive ring fully read with nothing out of order, send ring fully acknowledged) gives every chunk back to the pool, and the descriptor storage (floor included) is released when nothing is in flight; the next write or segment allocates again from the pool's cache, so the floor can never fail to materialize. The out-of-order range table, the chunk-list stubs and the timer heap likewise shrink when empty or sparse. An idle established flow retains its `Tcb` (size-asserted at most 1 KiB), slab slot, flow-table bucket, timer entry and chunk-list stubs. `tests/idle_footprint.rs` counts allocator-rounded heap over 1000 established flows after repeated request/response exchanges and requires at most one shared cached chunk and 1.5 KiB per flow. A compact TIME_WAIT entry holds no chunk.
+- **Process-shared budget.** `Config::shared_budget` (`Option<Arc<MemoryBudget>>`, `MemoryBudget::new(limit_bytes)`, `limit()`, `used()`) lets several stacks draw from one limit on top of their own `memory_limit`. Floors are charged at admission (`tcp_connect` returns `Memory` when the budget cannot fund one) and again for every shared chunk or descriptor commitment, on the same paths that charge the stack's pool; a retired flow refunds its floor, and dropping a `Stack` refunds all it still holds. A flow admitted under the budget keeps its floor, so it progresses even when the budget is exhausted. The budget is lock-free (one atomic update per chunk-sized charge) and does no I/O.
+- Per-flow buffer maxima are clamped to between one chunk and 1 GiB so sequence arithmetic stays modular-safe.
+
+### Accounted construction and retained packets
+
+`Stack::new_accounted(cfg, now, max_slots)` requires `cfg.shared_budget` and reserves a conservative capacity bound before construction. Missing budget, overflow and insufficient capacity are distinct `ConstructionError`s. `max_slots` includes live, free, TIME_WAIT and exhausted slots; it does not permit failed admission to discard an old tombstone. `set_accepting(false)` closes only new passive admission, including SYNs emerging from reassembly, while existing flows and protocol output continue.
+
+`overhead_reserved()` is reserved capacity, not measured resident bytes or RSS. It funds metadata, collection growth/rehash peaks and retained cache/scratch capacity; dynamic payload, ring-index and RACK commitments use the same budget. Accounted scopes need room for this reserve **and** admitted payload commitments; ordinary `Stack::new` and WireGuard defaults are unchanged.
+
+`MemoryBudget::reserve` returns a non-cloneable `MemoryReservation`. Completed/atomic reassembly reserves destination storage while source storage is still charged; `OwnedPacket` keeps bytes and their charge together through consumer release, even after Stack drop. Capacity refusal drops that datagram, not an established flow's ownership evidence. Borrowed UDP ranges still require consumption/copy before input recycling.
+
+## Core packet-endpoint embedding
+
+`honk-datapath` supplies nonwrapping `ScopeId` and a fixed frame/descriptor ledger; it grants no capture or routing authority. `control::netstack::PacketScope` owns one accounted Stack, one mutex, bounded frames/waiters and an externally joined owner obligation. Output owners retain original TCP `FlowId` and credit until actual consumer release; public `OutputLease` remains a real CPU-packet capability, while crate-private `OutputOwner` can retain generated output without CPU bytes. Local release is not a NIC CQ, and a CQ address has no fabricated generation. Control and bulk reserves are separate.
+
+Ordinary embeddings run `PacketOwner`; XDP and TUN transfer driving rights to one non-cloneable `PacketDriver` per scope in their device runtime. The original funded owner task stays parked, then runs and joins actual finish or abandoned-driver cleanup. App/output mutations wake the active driver; its own scans and exports do not self-notify. The shared mutex and unlocked retirement callbacks remain. Returning driving rights is neither completion nor a CQ, and device owners must keep servicing the driver while waiting for readiness or joined cleanup.
+
+TCP read/write readiness is delivered after releasing the scope mutex, in batches of at most 64 registrations. A generated-output turn can defer its device wake until its last check; a later producer or an interrupted turn must still schedule the driver. Graceful scope shutdown preserves that wake so output accepted after the last check can drain without new ingress.
+
+TCP retirement observers and blocked UDP senders share the scope's bounded waiter table. Each retirement observer wakes after the original `FlowId` has released its application, protocol and output references and its callback has returned or unwound. Polling or cancelling a retirement wait leaves the packet driver asleep. UDP credit waits and blocked TCP writers can arm the 100 ms readiness fallback.
+
+Scope-task admission takes an original owner only after funding succeeds. On refusal, the already-funded supervisor retains unspawned owners and completes their real cleanup after producer, application and retirement teardown; readiness cannot finish while any exported output remains. Panic payloads stay retained until all original owners and admitted tasks have joined.
+
+For admitted XDP realms, generated Endpoint output uses one final UMEM frame only when the checked full extent `14 + 4 * vlan_count + logical_mtu.max(1280)` fits `FRAME_SIZE`; the existing physical-port maximum remains enforced. The full scope L3 capacity is offered with `TxCaps::NONE`, never shortened to force eligibility. Eligible drivers disable only CPU pulling: timers, pending closes, events, wake registration, retirement and real finish still run. Final deadline/event/reap/finish state is refreshed after the bounded generated turn, including no-output and locally disposed outcomes. Ordinary owners, explicit-clock CPU driving and ineligible/jumbo realms keep CPU materialization, including control output and SG submission.
+
+Application UDP still produces a funded CPU first packet or fragment, including unfragmented and zero-length datagrams and controller DNS replies. Within a class, saved pending output and already-exported CPU packets go first. A physical driver without a pending head can try direct emission immediately: under the scope mutex it checks for older CPU output before polling Stack. If found, it sends that output first. A blocked prefix blocks only its class.
+
+The Port and scope reserve frame and descriptor credit before Stack emits. Unpublished reservations are cancelled on no output, error or unwind. Under the scope lock the driver installs the original `Transmit::flow`, peer and slot ownership, and snapshots the retained physical return path and IP family. The same callback then validates the device and VLAN and fills the Ethernet header outside the lock, without awaiting or servicing RX. Missing peer ownership disposes the output without replay; an inconsistent header or extent is an error. Later QoS changes cannot alter published bytes.
+
+CPU and generated output share `Retained::Endpoint(OutputOwner)` and the same exact-scope mixed CQ batch return. TCP's retransmission ring and ACK lifetime remain separate from UMEM/CQ: ACK cannot release outstanding DMA ownership, and CQ cannot acknowledge TCP. Existing CPU backing and process-lifetime UMEM remain fully charged. This removes only one intermediate Endpoint CPU-IP-frame-to-UMEM copy for eligible generated output; TCP payload copying/checksums and socket/relay copies remain. It is not payload-copy-free TCP, universal UDP zero-copy, lower resident memory or a measured performance gain. The existing E3.1 driver handoff is unchanged.
+
+During physical XDP shutdown the driver discards queued, unpublished CPU output without filling the device. Published descriptors keep their original owners until a real completion; stopping a worker is not a substitute.
+
+Each physical XDP logical ingress uses one `PacketRealm` with one or two independent Stack owners.
+Queues belong permanently to `queue_id % workers`. With two owners and one physical member, new TCP flows prefer the receiving queue. A queue change does not move a live flow, its `TIME_WAIT` state or its exported output: the scalar path checks for the retained owner before passing the packet to either Stack. Concurrent dispatches of one tuple share a bounded, temporary claim. Multi-member realms still hash the TCP tuple; UDP hashes the canonical client IP and source port. The same client socket keeps one worker across destinations. Peer, DNS and UDP source identity
+remain realm-scoped, while application, retirement and CQ retain the exact owner
+and FlowId. Cross-worker handoff has 64 funded cells overall and 32 queued entries
+per destination; borrowed RX never escapes its callback. Core and Host coordination
+stay on worker 0. Drain acknowledgements identify the epoch observed before the
+pass, not a later barrier.
+
+Physical Endpoint RX can process up to the queue's remaining allowance (at most 32 packets) under one scope lock. Each established TCP packet still goes through header and checksum validation, source admission and the Stack's verdict for its original FlowId. For a pinned peer with the same complete return path and ingress timestamp, the first validated packet updates `last_seen = max(last_seen, ingress_at)`. Repeating that update with the same timestamp gives the same result. Each subsequent validated source checks the peer authority's revision before reusing the observation. Path or conflict changes force a locked recheck, and revision saturation makes every check take the lock. No path is written back at batch end, so a later member or VLAN priority update survives.
+
+Both single-owner and sharded physical realms can batch established TCP on the currently learned return path while output is exported. Each lease keeps its original flow and path until return. Queued CPU output requires scalar receive. If another shard changes the authoritative path, the locked recheck leaves the packet and path untouched. After releasing the batch and resolving the owner again, scalar receive checks pending output even when the incoming path matches the local snapshot.
+
+Both workers preserve each packet’s original ingress time. Worker 0 samples the service clock once for an ordinary local packet before waiting for the scope lock. TCP processing, deadline checks and scalar fallback use that same timestamp. Worker 1 uses its existing turn timestamp. A due deadline ends the preceding batch so timers run before the next packet. Under the scope lock, each candidate checks whether admission is closing or a completed UDP task may still hold shared memory. Either condition sends the packet through scalar receive after unlocking. Completed UDP tasks are joined before receive admission and before the TCP supervisor funds a stream task. Periodic maintenance and shutdown reclaim completed work even when no further packet arrives.
+
+Reassembly keeps a local nonwrapping incarnation through completion and timeout
+output. Its earliest input time controls the original fragment deadline and return
+snapshot; the latest actual fragment input time starts complete-datagram protocol
+processing and the existing two-second Core route wait. Queue service never restarts
+either deadline. Realm-wide half-open, UDP and ICMP limits remain shared. Flow slots, Stack memory and waiters are split between the owners. Control and bulk output windows use the capture-budget rule below.
+
+The XDP owner arms readiness before rechecking device and output state, then waits for the earliest actual obligation computed after service. Unreturned CQ, delayed TX-consumer visibility and unread/incomplete RX retain a conditional 1ms retry; posted FILL alone does not. Metadata-required devices retain their one-second failure monitor, and retained Core/firewall history keeps bounded maintenance. A blocked scope keeps its existing 100ms shared-budget fallback, armed until serviced rather than postponed by unrelated polls. Shutdown intent wakes capture before blocked command processing completes. This does not promise zero whole-process wakeups.
+
+AF_XDP TX still publishes each packet immediately. A concrete synchronous device turn may defer only its per-packet NEED_WAKEUP check until the turn exits; standalone sends still kick immediately. Every normal exit preserves both work and final-kick errors, and no batch spans an await. Panic closes admission without issuing I/O or releasing published owners; only real CQ can return those owners.
+
+Class output export fills at most 64 caller-owned empty lease cells, preserving FIFO order within each class without copying payloads. The XDP daemon considers at most 32 outputs per class and realm per turn, sharing that cap across saved/exported CPU output, generated packets and emitted-but-disposed packets. Actual port MTU, class credit and TX-ring space remain authoritative; CPU batches retain the singleton short-packet fallback. A blocked class does not suppress the other class, and no-output or failed capacity probes are not progress or permission to busy-poll. CQ service validates at most 64 descriptors and lends only fully completed packet owners for grouped scope release. A valid completed prefix is released even if a later CQ is invalid; partial SG owners remain retained. Retirement callbacks and non-Endpoint sidecar destruction run after unlocking, and TCP ACK ownership remains independent of device completion.
+
+`control::packet_endpoint::PacketEndpoints` consumes an unstarted control plane and explicit scopes sharing one budget. Its supervisor joins scope, TCP, UDP and retirement work; cancelling a shutdown waiter does not cancel admitted cleanup. TCP uses the existing routing/dial/Score path with copy relay, not kernel adoption or splice. UDP reuses the one endpoint/source pool and captured packet reply sender, with no reply FD. Endpoint/source/foreign-reply/sniffer keys include scope; packet retirement cannot mutate coincident kernel state. DNS still follows traffic policy before controller admission, and must/Block remain final.
+
+For physical XDP `direct: endpoint` with a single device and exactly one queue per worker (one or two workers), each queue owner drives its own Stack. Routing, dialing, Score and tracking use the shared runtime. Only a selected stock Direct connector with no proxy route can hand its connected plain socket to that owner. The reactor writes the sniffed prefix once. Socket reads commit only the bytes received into the Stack's send ring, and writes consume only the accepted receive prefix. Proxy chains keep all selected hops.
+
+Remote TCP has one single-producer/single-consumer ring per direction, with 32 occupied chunks at most. Each shard shares one cache across its flows. Only fully funded 16 KiB chunks can be cached. A shard can retain at most 64 chunks and its share of one sixteenth of the root capture budget across all eligible shards. Small 4 KiB chunks return their credit on consumption. When a reservation fails, the owner releases cached chunks before retrying once. Closing the shard also releases the cache, including blocks returned by late readers.
+
+Worker Remote TCP borrows the current upload chunk until the outbound accepts its bytes. A short write consumes only that prefix. The download copy buffer grows from 8,192 to 65,535 bytes and shrinks after an idle window. Both Worker admission and Direct fallback reserve 73,727 bytes for the copy buffer and its idle timer.
+
+Worker epoll multiplexes queue, socket and wake descriptors. Software Direct handles validate the socket slot and generation. A reopened TCP flow can share a slab index with an older generation whose original output is still outstanding. The retirement callback runs after application close, protocol retirement (including TIME_WAIT), and return of that generation's last output.
+
+The coordinator retains both workers' relay fences before opening capture admission. On failure, both stop accepting relay work and their runtimes continue driving actual task joins. This does not release outstanding NIC descriptors or turn a retained worker into a joined thread.
+
+Before admitting the optional relay task on the shared runtime, the supervisor reserves the original packet flow's retirement callback. If the callback and the optional task do not both fit, the smaller ordinary task can still serve that same flow. Once installed, the callback keeps its reservation through actual flow retirement.
+
+Accepted packet DNS answers populate the same scope's canonical [routing projection](./dns.md#routing-projection), which fresh numeric TCP/UDP flows consume without requiring a sniffed name. These facts grant no HOST/kernel projection authority.
+
+Capture retirement uses `PacketEndpoints::retains`, including real controller-DNS `SourceWork` until its query/output tail drops. The existing driver, source pool and output/CQ owners keep execution exclusive.
+
+Normal close closes admission and publishes the same control-plane shutdown signal before protocol abort and before waiting for an active selector's exact retirement. It still waits for application closure and actual release of exported/CQ-held output; neither command completion nor an empty scope-owner join fabricates that release.
+
+TUN passes retained DNS bind candidates and an explicit plain standalone DNS scope to the driven supervisor. TUN shards share the plain DNS scope. Single-queue HostFacts adds a separate Host scope. XDP and ordinary embeddings retain HOST standalone DNS. Both configured packet backends retain the common supervisor and Router.
+
+`control::netstack::capture_scope(mtu, realms, bulk_frames, &budget)` and `CAPTURE_MEMORY` share one 384 MiB capture budget between XDP or TUN scopes and their device/runtime storage. With `R` admitted realms, each Stack has a `192 MiB / R` limit and `min(4096 / R, 1024)` flow/slot ceiling; each scope has 32 control frames and 256 waiters. The caller selects bulk capacity. Default CPU backing is charged before allocation at `(32 + bulk_frames) * mtu.max(1280)` bytes per scope: 160 frames for bulk 128 or 288 frames for bulk 256. The internal `capture_scope_with_output` can select separately funded output capacity and capabilities without changing logical MTU. Metadata and Stack storage remain charged within the same shared budget. Both helpers select `Mode::Transparent { exclude: Default::default() }`; the Direct **Endpoint execution profile** is not WireGuard's `Mode::Endpoint`. Original manual embedding and WireGuard defaults remain unchanged, and the progress floor is not total accepted-flow commitment.
+
+XDP sizes each physical Port at startup. A device qualifies for single-frame TX when `physical_mtu + 22` does not overflow and fits in 4096 bytes (Ethernet plus up to two VLAN tags). This does not prove single-frame RX; scatter/gather and bind checks still apply.
+
+| Physical Port | RX / control / bulk frames | Entries per AF_XDP ring | UMEM per queue | Base bulk frames per realm |
+|---|---:|---:|---:|---:|
+| Single-frame, larger RX tier | 512 / 32 / 480 | 1024 | 4 MiB | 256 |
+| Other single-frame | 256 / 32 / 480 | 512 | 3 MiB | 256 |
+| Above the MTU bound, even with a smaller logical realm | 256 / 32 / 224 | 256 | 2 MiB | 128 |
+
+For a single-member, two-owner realm with a base of 256 bulk frames, startup first funds 128 bulk and 16 control frames per owner. Before admission opens, both windows may grow to 256 bulk and 32 control frames each if the shared budget can fund the extra frames, both ledgers and the peak array storage. Otherwise both keep the smaller windows. Neither path increases the Stack memory or flow limit.
+
+The larger RX tier requires a `direct: endpoint` gateway with one physical member, one logical realm, forced ZeroCopy (not Auto), and 1–8 queues. Host reservations are deducted first. After setting aside half the 384 MiB capture budget for the stack, at least 8 MiB per queue must remain. This is a startup screen, not an 8 MiB UMEM allocation: each Port reserves its actual UMEM, metadata and rings separately. Sizing is re-evaluated before opening the device, not while it is running. UMEM is retained until process exit. NIC rings and the 32-output class/realm turn limit are unchanged. A sole single-frame scope's 256 bulk owners leave 224 Port bulk frames; other realms and Core output can use that headroom. No throughput or fairness guarantee follows.
+
+The larger optimized Port and scope reservations reduce startup headroom for many selected queues/realms under the 384 MiB budget. Successfully mapped UMEM remains charged until process exit, including after a later startup failure, and also counts against the unchanged 512 MiB process-wide retained-UMEM ceiling. Restarting capture in the same process does not reclaim it.
+
+Each configured `l3_lan` reserves a separate 4 MiB slice of the same capture budget, even while it waits for its device. Its Stack has 16 TCP slots (including retained TIME_WAIT), a 512 KiB TCP pool, 2 control and 6 bulk CPU frames, and 32 waiters. The full TUN receive record and pending output array consume this slice. Device maps, links and program generations are charged separately to the shared root. These are capacity limits, not throughput claims or a measurement of kernel RSS.
+
+Single-queue TUN selects bulk 128 and its configured logical MTU (default 1500). It uses a plain realm and, with HostFacts, a separate Host realm. Each scope funds 160 CPU frames of 65,535 bytes (10,485,600 bytes). With 2–8 queues, a single nonphysical realm partitions Stack and output capacity among its owners. Half-open TCP, pending UDP and ICMP limits are shared within the realm. Each worker's RX buffer and bounded FIFO are prepaid from the same 384 MiB capture budget. FIFO slots are sized for maximum IP records plus metadata. MSS/PMTU and ordinary UDP MTU are unchanged.
+
+The [TUN owner](./datapath.md#fd-packet-pipeline) drains queued CPU frames first within each class, then borrows protocol headers and payload slices for one `writev`. Setup selects and reads back a 10-byte little-endian vnet header on each queue FD and enables only `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`; unsupported setup fails explicitly. Each queue reserves 65,586 bytes: 10 vnet bytes, the 65,575-byte maximum ordinary IPv6 packet, and one truncation sentinel. It rejects full-buffer reads, incomplete/padded IP records, unknown flags, unsupported GSO types/families and invalid header/checksum extents before the combined metadata/source/admission path. GSO `hdr_len` is Linux's linear-head hint and may include payload; it must cover the parsed TCP header and stay inside the IP record. Ordinary UDP `CHECKSUM_PARTIAL` is accepted without USO. Borrowed UDP is accepted/copied before recycling the sole RX buffer.
+
+Each scope/class processes up to 32 sends or maintenance steps per turn. A complete record write commits protocol state. EAGAIN preserves the pending packet and rearms writability. EINTR retries within the turn budget. A short or zero write terminates the device. All drivers continue through readiness and joined close. Standalone DNS learns in the plain scope; transparent DNS learns in the packet's own scope. Neither borrows HOST facts. Socket HostFacts retain original source expiry and ownership; plain input grants no process authority. Direct creates a new dial and does not preserve the original socket operation or pre-NAT/TTL behavior.
+
+Each [Host egress](./datapath.md#host-source-custody) uses the same 4 MiB private TUN/Stack partition as an auxiliary LAN, not a Copy Port. Metadata, device objects, programs and overlapping reload generations are charged to the same 384 MiB root. The kernel allocates the two socket-storage elements against live sockets; these dynamic charges and future externally created cgroups are not a process-wide memory bound. A flow's PID and normalized name come from its exact Endpoint ownership record, not from the most recent sender or a TUN HostFacts receipt.
+
+Within each Host interface's 4 MiB partition, 1 MiB + 4 KiB is reserved for the private TUN queue and read ring across rebinds. This funds two FIFO slots on 4 KiB and 64 KiB pages. The remaining capacity funds packet buffers, the rebuilt Stack and live traffic.
+
+`PacketScope::receive_with_source` invokes the source callback under the existing
+output mutex; it must not re-enter the scope or block on I/O. A device can install
+the current packet's reverse L2 association before any output consumer proceeds,
+or refuse a conflicting association before protocol state changes. Source-aware scope
+and `PacketEndpoints` receives return `PacketReceive { source, qualified_rx }` (alongside
+`Rx` at the scope). The receipt remains validity-only, including on refusal. TCP's
+qualification is completed under that same mutex against the exact original FlowSlot.
+Only the actual successful non-Block winning stream calls `FlowIo::mark_rx_admitted`;
+pending routing, sniffing, task enqueue, failed dial and controller DNS do not set it.
+Later protocol-accepted input may qualify; a stale or closing marker cannot admit a
+successor. Captured route metadata still binds to the exact `TcpNew` id, not an older
+`poll_accept` occupant. New asynchronous SYNs are always unqualified: `accept_ready`
+only queues work, with no deferred token or retroactive credit.
+
+UDP qualifies only when the existing Ready-owner fast path returns `Enqueued`, including
+a zero-length datagram. Initializing/slow-path enqueues, unknown per-query DNS outcomes
+and successful refusal/no-op paths remain false; `Some(QueueFull/Closed/CapacityRejected/
+IdentityMismatch)` is not enqueue success. Ordinary, owned-reassembly and split payloads
+retain their dispatch and pressure semantics; a split input qualifies only if every
+chunk is Ready-enqueued. Existing queue/memory errors remain errors. Ordinary receive
+APIs use a compile-time reporting-disabled path, with no reporting allocation, extra
+parser, clock read or mutable cross-call “last packet” state.
+
+`PacketEndpoints` checks the passive accept queue under the existing scope mutex before reserving TCP/channel permits. Empty probes neither scan flow slots nor notify the owner. A queued SYN still reaches the existing immediate post-receive admission loop, including retries triggered by unrelated ingress after capacity returns; acceptance is not deferred to the batch tail. The query is only a negative hint: stale queued handles can still yield no accepted flow.
+
+Startup opens scope admission before reporting Endpoint supervisor readiness; ordinary embeddings retain native `Running` at that commit. Configured XDP/TUN call `PacketEndpoints::capture_ready()` only after real capture gates activate; the same supervisor defers native `Running` until that notification. Startup errors wait for supervisor cleanup before returning. Shutdown keeps the first UDP drain result, so forced cancellation is not graceful success. A five-second warning neither releases ownership nor imposes a completion deadline. Entry metadata stays charged through exact retirement, task allocation/buffer credit through join; completed UDP tasks are reaped before the next ingress copy is charged. Health callbacks observe the UDP pool without extending its lifetime.
+
+A connection-task panic terminates only that TCP flow, not other packet service. TCP task admission reaps completed work and explicitly resets a genuinely refused flow. Periodic UDP maintenance also returns joined task credit during idle periods. Closing ingress waits for already-reserved producer permits and disposes their late messages before joining scope owners; receiver closure alone is not proof that no `FlowIo` can still arrive.
+
+Readiness commits atomically against cancellation; a close that wins before that commit cannot activate native `Running`, and scope gates cannot reopen after close. The task registry funds the elastic admission ceiling, not only its initial floor. An abnormal registry drop transfers its children and reservations to a pre-funded reaper on their owning runtime; even a blocking destructor or a panicking error payload cannot release another live task's credit early. The embedding must keep that runtime alive through cleanup.
+
+Packet TCP write shutdown waits for handshake completion instead of turning temporary `WouldBlock` into reset. Flush remains a local no-op, not an ACK/delivery promise, but explicit scope abort makes it fail. Raw/non-DNS UDP/53 endpoint identity includes the initial outbound/mark and finality: a changed decision cannot reuse the old transport, while non-final fallback still permits configured sniffing. Valid non-must DNS continues through the controller; must remains raw and fixed.
+
+The supplied budget accounts packet storage/reservations, not whole-process RSS or every pre-existing outbound runtime allocation. Kernel socket buffers remain separate. This embedding is an explicit Endpoint path, not kernel forwarding, capture metadata validation or a performance result.
+
+### Experimental AF_XDP consumer
+
+`honk-xsk` provides Linux XDP link/program and AF_XDP ring primitives. The
+`honk-core` example `xsk_endpoint` connects them to `PacketEndpoints`; it is not
+a daemon backend or a production configuration option. Its frozen fixture uses
+one IPv4 TCP or UDP tuple, one discovered queue, untagged Ethernet and MTU 1500.
+DISCOVER drops test traffic; DATA redirects with a DROP fallback. Fragments and
+IPv4 options are dropped across the declared address/protocol domain, which
+must be exclusive to the experiment. Direct remains a real socket relay that creates
+a new dial; it does not preserve the original operation or pre-NAT/TTL behavior. PF0 requires zero-copy; explicit copy mode is restricted
+to the `dut0` virtual-interface fixture in a virtme guest, never an automatic fallback.
+
+The device owner observes FILL consumption before RX, consumes borrowed IP bytes
+before recycling the frame, and retains each core output lease through its actual
+CQ return. `PacketScope::poll_output_class` lets control output pass queued bulk
+when only control credit is available, preserving order within each class.
+Ethernet padding is excluded from received IP slices and funded separately on TX.
+Core shutdown runs concurrently with device draining; CQ returns resources, not
+proof of peer delivery. The supervisor must retain the native link and stop the
+independent upstream before detaching, including on consumer failure.
+
+UMEM mappings and their budget charges remain retained until process exit.
+Neither socket close nor empty rings prove deferred pool release or DMA quiescence;
+this is not a production release fence or a zero-resident in-process close.
+Hardware zero-copy, full X0 acceptance, TC A/B, multi-queue and SG/offload require separate execution evidence.
+
+### Explicit routed-only CoreForward
+
+`honk-datapath::forward::CoreForward` is a safe, sans-I/O transit owner, not
+`Stack::receive` or a Direct socket relay. `honk-core::control::core_forward::RoutedCore`
+joins it to the canonical Router and the existing router/config publication barrier.
+The routed-only fixture selects `execution: "routed-only"` and `nat: false`; the
+daemon selects `MixedEndpoints` and may enable the separately compiled firewall/NAT.
+Required kernel firewall/qdisc processing and skb classification remain unsupported requirements. Routed-only policy uses `dial_mode: ip` and unmarked
+`direct`/`block` actions. Incompatible reloads preserve the previous generation.
+
+`ControlPlane::core_forward_policy(Execution)` returns a narrow registered
+`RoutingAuthority` before `PacketEndpoints` consumes the plane; both retain the
+same published router/config, never separate policy owners. The explicit
+`MixedEndpoints` profile requires IP-mode policy and rejects process-name, MAC and
+mark dependencies. Domain predicates consume only learned DNS facts from the exact
+registered non-HOST ingress scope, never HOST facts or a synthesized hostname.
+Its ordinary final Direct action is Core transit; non-must DNS53 and group actions
+return the original funded packet to Endpoint, while Block remains terminal.
+Routed-only embeddings have no packet fact scope and reject domain predicates at registration and reload;
+sniff-dependent execution requires Endpoint rather than a hidden Core-to-relay fallback.
+
+Core and Endpoint share the existing Rule/Global/Direct mode override, including
+typed native targets and final must/Block precedence. A Core `PolicyGeneration`
+captures both routing generation and the nonwrapping mode revision; submission
+holds the router/config/mode readers through the actual writer. A mode ABA change
+cannot revive queued output, and rejected output is disposed without replay.
+
+`RoutingAuthority::read_policy` supplies the real router/config guards. The XDP owner keeps a pending acquisition beside device, timer, shutdown and supervisor service, then resolves a bounded Core turn synchronously under those guards. A foreign registration's reader is refused; no scope mutex crosses an await.
+
+Scoped fact lookup retains a nonwrapping scope revision and its original expiry. Same-generation withdrawal, owner replacement, expiry or a shorter TTL can invalidate prepared work even when its bitmap is unchanged. Cached forwarding serializes fact lookup through its actual writer; prepared output rechecks its stamp under the same fact mutex through publication, and Endpoint handoff rechecks before committing its decision. Stale prepared work is not replayed or authorized by a later TTL extension.
+
+Ordinary Global decisions on the borrowed cached path return Cold rather than
+inventing an Endpoint handoff without owning its decision. An existing unbound
+Core transport keeps its execution owner across traffic-class changes and exact
+registered reverse ingress, but that retention never overrides a current Block.
+Firewall bindings retain their independent security/address authority. Route/mode
+changes do not replay admitted transit bytes through a fresh Stack.
+
+`Decision::Endpoint` carries an accounted `EndpointAdmission` containing the
+actual routed action, config, group/runtime handles and effective mode decision.
+The capture consumer passes it to `PacketEndpoints::receive_admitted_with_source`.
+UDP queues that same authority with its datagram. TCP binds it under the scope
+mutex to the new `FlowId` returned by `Stack::receive_reported`, before
+output wakes; retransmits retain the original authority and `poll_accept` only
+transfers its exact stored incarnation. Delayed dispatch does not reroute under a
+new config or reapply a newer mode. Pending snapshots retain budget charges until
+consumption or exact flow disposal; there is no cross-call last-packet snapshot.
+
+The capture consumer checks `PacketEndpoints::retains(scope, source, destination,
+protocol)` before selecting Core, including on completed reassembly. This is
+read-only classification, not checksum validation. Existing Stack TCP tuples,
+TIME_WAIT, flow-owned controls and queued/exported packet-runtime outputs retain
+Endpoint execution. ICMP errors are classified by their quoted TCP owner before
+Core selection; Stack still validates checksum, family and outstanding sequence.
+Ordinary non-53 UDP reserves its Initializing owner before publishing on a separate
+bounded initializer channel. Runtime-mutating commands drain cancelled leases from
+that channel while awaiting reload; unrelated TCP and DNS work retain their FIFO.
+Initializing, Ready and Retiring entries retain their scoped tuple, so mode changes
+cannot create a second Core owner.
+
+Controller DNS53 remains per-query, not a transport flow: each queued/admitted
+query retains its captured decision while a later must/direct query may select
+Core. Raw/group/must DNS53 that actually reserves a UDP transport instead uses
+that pool entry's normal retained ownership. Controller queries are not collapsed
+into one transport lease or represented by another conntrack table.
+
+Reply-path retention also includes pending DNS work, shared-source receiver tails,
+Stack controls/fragments and queued/exported output. The source callback may inspect
+pending CPU output under its existing scope mutex; it must not re-enter that scope.
+Exported packets snapshot their complete VLAN TCI rather than rereading a later peer
+priority. Normal command replies remain real outcomes; fatal device failure closes
+external acknowledgements independently of retained in-flight work and CQ resources.
+Losing an accepted reload's supervisor handoff remains fail-closed, not successful
+HTTP request cancellation or a reason to silently replay configuration work.
+
+
+One Core owner covers the namespace/routing domain and all registered logical
+ingresses. All queues of one logical ingress share its existing reassembler;
+input identity retains actual logical ifindex and attachment rather than just a
+shared ScopeId. The flow directory and memory budget are shared across inputs.
+`Packet::rewrite` retains funded storage and forbids submission after a failed
+translation/checksum validation. It refreshes tuple metadata only on success.
+
+The cached path accepts borrowed `wire::PacketView` segments and uses the shared
+IP/transport codecs and streaming checksum. Only bounded headers are staged.
+`ForwardView` and owned `ForwardPacket` share one writer: the adapter reserves the
+entire TX chain first, then `write_next_segments` copies directly into those
+segments, including caller-supplied L2 framing. A borrowed-path CQ lease retains
+the slow-flow owner without allocating a full staging Packet. Cold FIB waits or
+fragment storage may retain a funded copy; no hot-path convenience linearization
+or second reassembler is introduced. The frozen example below remains untagged
+IPv4; SG device evidence belongs to the full-XDP consumer, not this fixture.
+
+Ingress carries separate scope, actual socket namespace cookie, logical ifindex,
+attachment identity and mark provenance. Unknown marks are refused, not converted
+to zero. `BeforeSkb` explicitly selects a deployment with no required skb classifiers.
+The namespace-bound provider subscribes before bounded route/rule/link/address/
+neighbor/nexthop/netconf dumps. It sends real input `RTM_GETROUTE` requests with
+`RTA_IIF`, source/destination, TOS, protocol, ports and the proven mark, leaving
+transit UID absent. The kernel executes RPDB; no rules are mirrored. Link MTU,
+kernel forwarding permission and usable neighbor MACs come from kernel replies;
+missing neighbors request native ARP/ND through `NTF_USE`, never a fabricated MAC.
+Notifications invalidate all route leases. Interrupted baseline dumps retry within three synchronization rounds; ENOBUFS, truncated/malformed messages, late replies or synchronization-bound exhaustion close the provider. A one-second lease horizon also forces resynchronization; no indefinite
+authorization cache exists. Cold misses perform bounded synchronous work and must
+run on a dedicated owner, not the packet hot path. Submission rechecks the provider
+and policy generation under the existing publication readers.
+Multicast notifications are identified by `NETLINK_PKTINFO` rather than a zero
+sequence number. Valid blackhole results drop only their packet, as do routes through
+an unavailable logical link and encapsulated or multipath execution that Core cannot
+perform; these refusals do not desynchronize the provider. A lost route lease
+retries or suppresses only the dependent work. Duplicate IPv6 preferred-source
+attributes are accepted only when they agree. Address epochs are independent of
+route/neighbor refresh, so routine resynchronization does not revoke MASQUERADE.
+
+
+Both IP families validate packet/transport checksums before flow admission, reuse
+the funded reassembler, preserve original TCP/UDP/ICMP bytes and decrement TTL/hop
+limit exactly once in the materialized output. IPv4 without DF is fragmented for
+the egress MTU; IPv4 DF and ordinary IPv6 produce fragmentation-needed/PTB.
+Completed IPv6 reassembly retains its original fragment ID and maximum received
+fragment size. If that maximum fits the egress, Core restores aligned fragments,
+using the Linux minimum-1280 target capped by egress MTU; otherwise it emits PTB.
+Unfragmented IPv6 never acquires fragmentation provenance.
+TTL errors use code 0, while exposed reassembly-timeout quotes use code 1. ICMP uses a real local
+router address, shared suppression/rate limits and a separate native local-output
+route query. LocalInput is distinct and dropped by the example. Core TCP execution
+is retained for 7440 seconds idle, UDP for 120 seconds, other traffic for 60 seconds,
+and longer while output leases remain. Unverified FIN/RST cannot shorten that
+protection. An expired non-SYN TCP packet cannot create a fresh Endpoint or a forged
+reverse reset; a fresh initial SYN may create a new incarnation. FIB changes never
+promote Core owners to native forwarding. Queued packets have a two-second deadline.
+Lookup and claim check the same idle horizon before refreshing an unleased entry; slower physical maintenance cannot keep an expired execution owner authoritative. Actual retained output continues to preserve its original owner.
+
+Route authority and MTU are available before forward-neighbor resolution, so a
+known hop-limit or oversized-packet error does not wait for that unused neighbor.
+Generated errors still require their own local-output route and return neighbor,
+with a same-family transit-unicast `RTA_PREFSRC` from the synchronized local-address
+snapshot. Invalid or absent source proof suppresses only that error. Input FIB
+prohibit can authorize AdminProhibited, but LocalInput/blackhole do not grant
+forwarding authority. TCP RST and ICMP errors cannot trigger another refusal.
+
+The device timer drains `poll_reassembly_error(now, out)` using funded control
+storage of at least 1280 bytes. It returns `GeneratedError` with the real return
+route, policy generation and emitted length; keep that owner through CQ or
+explicit local disposal, not merely until submission. Exported timeout quotes
+retain only matching scoped NAT/native-history domains, never a global reclamation
+freeze. One unresolved neighbor quote can wait two seconds on its original deadline;
+up to 64 suppressed/denied quotes retire per call. A firewall-enabled timeout requires
+actual quoted ports, a trusted
+ingress role and an original-chain Allow; a truncated quote never creates or
+refreshes conntrack state. Input unicast/source FIB proof precedes the separate
+local-output return lookup. Core quotes retain up to 20 **contiguous** upper-layer
+bytes so TCP RST flags are known; holes are never quoted as zeroes, and missing
+flags suppress the error. Ordinary Stack timeout quotes remain eight bytes.
+
+Core execution rejects router-processed IPv4 options, unsupported IPv6 extension
+semantics, nonzero IPv6 flow labels, bridge/VRF/bond execution and route encapsulation.
+These checks run after disposition but before FIB/NAT/Reject work; Endpoint does not
+inherit Core-only restrictions. Linux 6.12's [IPv6 getroute implementation](https://github.com/torvalds/linux/blob/v6.12/net/ipv6/route.c#L6030-L6095)
+cannot represent a nonzero input flow label, so Core never queries a different flow.
+Plain Ethernet and up to two configured 802.1Q/802.1ad VLAN layers retain logical
+iif and physical egress separately. Unsupported VLAN QoS/binding semantics and
+unrecoverable RX stripping fail admission. The narrow example remains untagged;
+the daemon is the general device consumer, not evidence of X1 or DMA release.
+
+#### Isolated-VM smoke entry (not executed here)
+
+Build `cargo build -p honk-core --example xsk_core_forward` and run the resulting
+binary **only in a fresh network namespace in the provisioned virtme guest** as
+`xsk_core_forward run.json`. The external supervisor owns a client–DUT–server
+topology, addresses, forwarding sysctls, routes, two single-RX-queue veths named
+`dut0`/`dut1`, and both independent TCP/UDP peers. Use MTU 1500, untagged Ethernet,
+no required firewall/qdisc/NAT semantics, and ordinary unmarked input routes.
+It must retain duplicate FDs for both emitted `attached` links before sending the
+plain line `armed`. Only `ready` permits peer traffic. Stop both generators before
+`close`; require `closed`, CQ counts drained and end-to-end peer evidence before
+`exit`. On failure, stop peers before releasing the retained links or destroying
+the namespace. UMEM remains charged until process exit, as for `xsk_endpoint`.
+
+The strict JSON supplies `requirements` (all six fields above), `policy` (a dae
+file), `root_netns_inode` (the supervisor's root namespace), `devices` (exactly two
+objects with `ifname`, `ifindex`, six-byte integer arrays `mac`/`peer_mac`),
+`client`/`service` (`IPv4:port`), `protocol` (`tcp` or `udp`), and `budget_bytes`
+(for example 67108864). The consumer uses real XSK RX/TX and the native FIB in
+both directions; MockEbpfBackend only avoids starting the unrelated TC relay.
+
+Required evidence: independent payload exchange and preserved tuple, one TTL
+decrement, correct Ethernet next-hop, TTL=1 ICMP, smaller egress MTU with DF on/off,
+empty-neighbor ARP resolution, route/rule/link/address/MTU/neighbor changes while
+output is queued, unsupported deployment rejection, previous-generation retention
+on incompatible reload, and fail-closed receive-loss/dump/late-response injection.
+Pure regressions are `cargo test -p honk-datapath --test forward`; also run
+`cargo test -p honk-core core_forward`, `cargo test -p honk-core netlink::fib`,
+`cargo test -p honk-netstack`, `just outbound-ci`, and the isolated real-kernel gate.
+The fixture's IPv4-only capture does not verify IPv6 device ingress/egress.
+
+
+
+
+## Transparent termination
+
+`Config::mode = Mode::Transparent { exclude }` makes the stack the TCP/UDP endpoint of the client's destination. Packet scripts, simulation, fuzzing, the core embedding and configured XDP/TUN consume it. WireGuard keeps default `Mode::Endpoint`. The same memory, congestion, recovery and single-owner rules apply. No transparent-mode performance gate or throughput number is claimed.
+
+### Scope and addressing
+
+- A flow's local end is the packet's original destination, so every reply (SYN-ACK, data, RST, ICMP error, UDP) is sourced from it. Incoming packets are not matched against `local_v4`/`local_v6`, and the stack raises the MTU to at least 1280.
+- `ExcludeSet` (`insert(addr, prefix_len)`) lists destination prefixes the stack refuses as `NotForUs`. It is a backstop only: the classifier/capture backend in front of the driver is the real gate, and a packet dropped here is a black hole for that client.
+- Multicast, limited broadcast and unspecified destinations (the tun device's own router solicitation, MLD and DAD) are dropped silently as `Unsupported`.
+- IPv4-mapped IPv6 source or destination addresses are not valid transparent wire endpoints. They are rejected as `Unsupported` before reassembly admission as well as on complete packets, so they cannot evict valid fragment state.
+- A SYN whose source is not unicast, whose source and destination addresses are equal, or whose port is 0 opens no flow and is answered like any stray segment (RST).
+
+### TCP admission
+
+A plain SYN for an unknown tuple creates a pending flow in `SYN_RECEIVED` and sends nothing; while the flow is undecided or deferred it ignores all input, so retransmitted SYNs are absorbed without a second flow or a second report. The pending flow holds its memory floor but has committed no receive window yet; the window is committed by `tcp_accept`.
+
+| Call | Contract |
+| --- | --- |
+| `poll_accept() -> Option<SynInfo>` | Reports each new flow once: `id`, `client`, `original_dst`, the client's `mss` (536 or 1220 when absent, at least 48), `wscale`, `sack`, `timestamps`. |
+| `tcp_accept(id, AcceptOpts)` | `when: AcceptWhen::Now` queues the SYN-ACK; `AcceptWhen::Deferred { deadline }` holds it until `tcp_complete` (after an upstream dial); if `deadline` passes first the flow fails with `TimedOut` and sends nothing. `max_mss` clamps the MSS in both directions (floor 48); use the client's real egress MTU, the tun MTU says nothing about it. `keepalive` arms [Keepalive](#keepalive). Defaults (`AcceptOpts::default()`): `Now`, no clamp, no keepalive. Returns the flow's error if it already died (for example `TimedOut`), `Closed` if it was already decided, `Stale` for an old handle. |
+| `tcp_complete(id)` | Releases the SYN-ACK of a deferred flow. `Closed` if the flow is not held. |
+| `tcp_refuse(id, Refuse)` | Only before `poll_transmit` actually emits the passive SYN-ACK, including after `tcp_accept(Now)` or `tcp_complete` and after a blocked short-buffer pull (ignored after emission and for active opens; use `tcp_abort`). Forgets the flow and releases the handle. `Refuse::Rst` answers RST\|ACK, `Drop` answers nothing, `IcmpUnreachable` host unreachable, `IcmpAdminProhibited` administratively prohibited (see [ICMP generation](#icmp-generation)). RST and ICMP replies travel through the 128-entry control queue. |
+
+`MAX_DEFERRED` is 25 s, chosen so that the stack gives up before the edge classifier's own 30 s handoff expires. A SYN that `poll_accept` never reported is forgotten silently 25 s after it arrived (the client retries); a reported or deferred flow that nobody has accepted or completed by its deadline (never later than 25 s after the SYN) fails with `TimedOut` without sending anything, surfaces `ERROR`, and the application must still close its handle.
+
+Admission limits:
+
+- **Half-open caps.** A flow is half-open from the SYN until the handshake completes or the flow dies. `Config::half_open_max` (default 1024) bounds them in total and `Config::half_open_per_source` (default 128) per client address. A SYN beyond a cap is dropped and counted (`DropReason::HalfOpen`): never answered with RST or ICMP, and there are no SYN cookies. Because every pending flow already holds a floor, the caps also bound the memory a SYN flood can pin.
+- **Flow and memory limits.** A SYN that the flow table (`max_flows`), the floor cap or the memory floor and shared budget cannot admit is dropped and counted (`DropReason::Capacity`), not answered. The client retries.
+
+### Close semantics
+
+- The side that closes first (active close, simultaneous close included) goes through `FIN_WAIT_1`/`FIN_WAIT_2`/`CLOSING` into TIME_WAIT and keeps a compact tombstone for 60 s (RFC 9293). The side that closes second goes `LAST_ACK` to `CLOSED` and keeps nothing. Because the first closer always keeps TIME_WAIT, a server-side TIME_WAIT is never skipped.
+- A tombstone answers a valid retransmitted FIN with an ACK and restarts its 60 s timer. A data segment lying wholly before the consumed FIN (ACK set, PSH allowed, no SYN/RST/FIN, ACK number and timestamp passing the same checks as the FIN) can be the peer retransmitting its unacknowledged tail after our final ACK was lost: it earns one coalesced ACK, which lets the peer leave `CLOSING`. Receiving that data does not reset the expiry or update `ts_recent`. The existing pending-output rule still applies: if an ACK has not been drained when expiry is processed, the timer re-arms for 60 s rather than discarding that output, so the driver must keep pulling. Everything else is ignored. A new SYN for the tuple replaces the tombstone only when the RFC 6191 check passes: its timestamp is newer than the last one seen, or, without usable timestamps, its sequence number lies beyond the old `rcv_nxt`; a SYN with an older timestamp is treated as a stray duplicate and ignored. The new flow's ISS is forced beyond the old `snd_nxt`.
+- **Driver contract.** The entry lives inside the stack for at least 60 s after the last FIN exchange. For that long the driver must keep delivering packets of that tuple to `receive`: any delivery state in front of the stack (an eBPF redirect entry, a flow table) must outlive the flow, otherwise the client's retransmitted FIN reaches the real server instead of the tombstone and is answered with RST. `StackStats::timewait_entries` counts live tombstones.
+
+The TUN smoke gate proves close through the original client socket's successful `SHUT_WR`, exact retained tail length/digest, EOF and zero `SO_ERROR`, correlated by the original tuple and payload with the independent far socket's request EOF, successful tail send and `SHUT_WR`. Its later `echo-closed` event records cleanup only; the successful `close-tail` event supplies the peer close evidence. External Linux TIME_WAIT persistence is not a honk guarantee: with `tcp_rfc1337=0`, a delayed duplicate can be ACKed after the passive closer has retired, whose required CLOSED-state RST then removes the Linux peer's TIME_WAIT ([RFC 1337, Figure 1](https://www.rfc-editor.org/rfc/rfc1337.html), [RFC 9293 §3.10.7.1](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.10.7.1)). Optional `ss`/`TCP_INFO` snapshots and captures remain diagnostic evidence. The smoke check does not claim that every legal late duplicate/RST disappears, or that socket EOF proves device-output retirement; the IPv4/IPv6 core regression separately retains a materialized tail+FIN probe across the original FIN's ACK and requires actual output release before retirement.
+
+
+### Transparent UDP
+
+- `receive` returns `Rx::Transparent { src, dst, payload }` for a datagram: no flow, no bind, both addresses present. `payload` is a range of the input packet.
+- `Rx::TransparentOwned { src, dst, packet, payload }` is the same for a datagram reassembled from fragments: the result owns `packet` and `payload` indexes it.
+- `receive_reported` returns `Rx::TransparentSplit { src, dst, payload, size }` for a UDP super-packet containing more than one datagram. Iterate `packet[payload].chunks(usize::from(size))`: each chunk is one datagram, the last may be shorter, and the boundaries must be preserved. At most 128 datagrams are accepted (`MAX_USO_RX`); exceeding that is `Malformed`. A run with at most one datagram returns `Rx::Transparent` instead.
+- **Borrowed-payload lifetime.** `Rx::Datagram`, `Rx::Transparent` and `Rx::TransparentSplit` ranges last only until the caller recycles/reuses input. TUN read buffers and AF_XDP UMEM frames must have every payload consumed or copied before the next read or FILL return. `TransparentOwned` owns its bytes.
+- `udp_send_from(src, dst, payload, out)` is stateless and may use any source address (a reply comes from the datagram's original destination). A datagram that fits the MTU is written to `out` as one packet (no DF, identification set). A larger one, up to 65535 bytes of UDP length (IPv4 total length too; beyond that `TooLarge`), is fragmented: the first fragment is written to `out`, the rest is stack state (the checksummed datagram, copied once) and leaves through `poll_transmit`, one fragment per call in FIFO order; `take_tx_wakeup()` is set while fragments are pending. The pending datagram capacities are bounded at 512 KiB and charged to `Config::shared_budget`, including the first queued datagram. A send that would exceed either limit returns `Busy` before writing its first fragment. The capacity stays charged across short output buffers until the last fragment is emitted or the stack is dropped; a too-small initial `out` returns `BufferTooSmall` without a charge. Mixed address families are `FamilyMismatch`.
+- `udp_send_gso_from((src, dst), payload, size, caps, out)` sends a run of datagrams with UDP segmentation offload, not IP fragmentation. It returns `Transmit`; its limits and the driver contract are in [Segmentation offload](#segmentation-offload).
+- `udp_refuse(now, UdpRefuse, original, out)` answers a refused datagram with ICMP (`PortUnreachable`, `HostUnreachable`, `AdminProhibited`); `original` is the datagram's IP packet. `Ok(None)` means the error was suppressed or rate limited.
+
+### Reassembly
+
+Transparent mode reassembles IPv4 and IPv6 fragments of any protocol; Endpoint mode still drops them. Destination exclusions and special-address checks apply before any fragment acquires an entry or budget, so excluded fragments cannot produce timeout replies. The completed datagram re-enters the normal receive path, so the destination filter and checksums apply to it too. A completed IPv6 datagram that still contains a Fragment header, including behind other extension headers, is dropped as `Fragment`, never reassembled again.
+
+- `FragmentLimits` (`Config::fragment_limits`) defaults: `max_entries` 64, `max_bytes` 4 MiB (retained capacities of payload storage, fragment 0's saved headers, the range table and queued timeout quotes, plus 256 B of fixed bookkeeping per datagram), `max_holes` 32, `timeout` 30 s counted from a datagram's first fragment.
+- An overlapping fragment (an exact duplicate too) kills the datagram (RFC 5722, RFC 8200 section 4.5): the buffer is freed at once and a bufferless tombstone absorbs the remaining fragments (`Fragment`) until the timeout. More than `max_holes` gaps, or inconsistent lengths, kill it as well. Empty fragments, a non-final fragment whose length is not a multiple of 8 and a datagram beyond 64 KiB are `Malformed`. An atomic fragment is delivered as a whole datagram (RFC 6946).
+- Reassembly preserves CE from any fragment and rejects mixtures of Not-ECT with ECN-capable fragments into the ordinary tombstone. Fragment zero supplies DSCP and, without CE, the ECN codepoint; IPv6 flow labels remain unchanged. Atomic IPv6 fragments retain their own header independently.
+- `Transit::reassemble` enforces the original reassembly deadline on receive even if the caller has not polled its timer. A fragment at or after that deadline cannot complete the old datagram; retained timeout quotes keep their own ownership.
+- When the table or `max_bytes` is exhausted the oldest datagram is evicted silently, so a flood of first fragments cannot starve a burst that completes.
+- A timeout answers with ICMP Time Exceeded (IPv4 type 11 code 1, IPv6 type 3 code 1) only if fragment 0 arrived; the quote is the saved headers plus up to 8 bytes, truncated before queueing to 548 bytes (IPv4) or 1232 bytes (IPv6). At most 16 such errors wait for `poll_transmit`; `poll_timeout` and `handle_timeout` cover the reassembly deadlines.
+- **Shared budget.** Reassembly bytes are charged to `Config::shared_budget` (not to the stack's own `memory_limit`; without a budget only `FragmentLimits` bound them). A refused charge evicts the oldest datagram and retries; when nothing is left to evict the fragment is dropped, as `DropReason::Capacity` if it would start a datagram, or by killing the datagram (`Fragment`) if it is the only one left and cannot grow. Completion, eviction, kill and stack drop refund storage; expiry transfers the retained quote's actual capacity charge to the pending queue until it is sent, suppressed, rate limited or dropped. A short output buffer keeps that charge. A fragment flood can therefore occupy up to `FragmentLimits::max_bytes` of the shared budget, and new flows are admitted against the same budget: size it with that headroom, or SYNs are dropped as `Capacity` during the flood.
+
+### ICMP generation
+
+Errors are generated only by transparent-mode paths: `Refuse::IcmpUnreachable`/`IcmpAdminProhibited`, `udp_refuse`, `packet_too_big(now, mtu, original, out)` and reassembly timeout. The stack never generates ICMP on its own in Endpoint mode. (`udp_refuse` and `packet_too_big` do not check the mode; they exist for the transparent driver.) An error is sourced from the original destination and sent to the original source.
+
+| Reject | IPv4 (type/code) | IPv6 (type/code) |
+| --- | --- | --- |
+| `UdpRefuse::PortUnreachable` | 3/3 | 1/4 |
+| host unreachable (`Refuse::IcmpUnreachable`, `UdpRefuse::HostUnreachable`) | 3/1 | 1/3 |
+| administratively prohibited (`Refuse::IcmpAdminProhibited`, `UdpRefuse::AdminProhibited`) | 3/13 | 1/1 (RFC 4443 section 3.1) |
+| reassembly timeout | 11/1 | 3/1 |
+| `packet_too_big` | 3/4 (MTU in the low 16 bits, capped at 65535) | 2/0 |
+
+- **Suppression** (no error, no rate-limit charge): the original is a non-first fragment, its source or destination is unspecified, multicast or broadcast, it is itself an ICMP error (IPv4 types 3, 4, 5, 11, 12 and above 18; IPv6 types below 128) or an ICMP packet with no type byte, or the quote cannot be parsed. IPv6 inspection continues through extension headers after the first Fragment header; another Fragment header or truncation before the upper-layer protocol/type can be inspected suppresses the error too.
+- **Size.** The whole error stays within 576 bytes (IPv4) or 1280 bytes (IPv6); the quote of the original is truncated to fit.
+- **Rate limits** (`IcmpLimits`, Linux-style): a global bucket of `per_sec` 1000 messages per second with `burst` 50, and a per-target bucket keyed by the original source address of one message per `target_interval` (1 s) with `target_burst` 6 intervals of burst, remembering `max_targets` 128 targets (least recently used replaced). Both must agree before either is charged. Packet-too-big is exempt, as on Linux.
+- A too-small output buffer leaves every limiter untouched so the call can be retried.
+
+### Keepalive
+
+`Keepalive { idle, interval, probes }` is set per flow through `AcceptOpts::keepalive` and is off by default; active-open flows have no API for it. It arms when the handshake completes. Every accepted segment from the peer restarts the idle period and the probe count. After `idle` of silence the stack sends an empty ACK at `snd_una - 1` every `interval`; when `probes` (at least 1) probes in a row go unanswered, one `interval` after the last, the flow fails with `TimedOut`. It is disarmed in `SYN_RECEIVED`, `TIME_WAIT` and `CLOSED` and by failure or abort.
+
+### Checksum trust
+
+`receive(now, packet)` is the verification-only entry point in every mode. `receive_reported` accepts `RxMeta { csum, gso }` from a driver that owns a local device only in `Mode::Transparent`. In `Mode::Endpoint`, any metadata other than `RxMeta::VERIFY` is dropped as `Unsupported` before processing the packet: WireGuard cannot select a trusted checksum or a super-packet, because its inner packets come from the network.
+
+- `Csum::Verify` verifies the TCP/UDP checksum normally. `Csum::Valid` trusts that the device already verified it. `Csum::Partial { start, offset }` accepts a local `CHECKSUM_PARTIAL` packet whose field contains only the pseudo-header sum, so there is no final checksum to verify; `start` must be the L4 header offset and `offset` must identify its checksum field (TCP 16, UDP 6), otherwise the packet is `Malformed`.
+- The IPv4 header checksum and every ICMP checksum are always verified. Fragment metadata does not vouch for the reassembled datagram: completion re-enters receive with `RxMeta::VERIFY`. GSO metadata on a fragment or an ICMP packet is `Malformed`.
+- `gso: Some(GsoRx { kind, size })` describes one header followed by `size`-byte payload segments (last possibly shorter). `size` must be nonzero and `GsoKind::Tcp`/`UdpL4` must match the packet's protocol, otherwise it is `Malformed`.
+
+### Segmentation offload
+
+- **TCP RX (GRO).** `receive_reported` ingests a TCP super-packet as one contiguous segment. The delayed-ACK and quickack cadence counts `ceil(accepted_payload_len / size)` represented frames; it does not replay the header as separate TCP inputs. The run creates one cumulative ACK obligation, subject to normal ACK timing, not a train of duplicate ACKs that could trigger spurious loss recovery. UDP RX instead exposes the datagram boundaries through `Rx::TransparentSplit` ([Transparent UDP](#transparent-udp)).
+- **TCP TX (TSO).** `poll_transmit_with(now, out, caps)` uses the family-specific `tso4`/`tso6` capability only in transparent mode. TCP data may leave as a `GsoKind::Tcp` super-packet of MSS/PMTU-sized segments, last possibly shorter. The current emitter caps the aggregate at 65535 bytes including headers and at `out.len()`; congestion and receive windows, descriptor space, pacing tokens and roughly 1 ms of pacing-rate autosizing bound it further. The pacing burst remains capped to 2 ms of traffic (at least one segment). Each represented segment keeps its own send descriptor; a run of lost segments can be retransmitted as one TSO packet. Small output buffers degrade to ordinary packets; SYNs, ACK-only packets, controls, TIME_WAIT replies, ICMP and queued UDP IP fragments remain ordinary packets. Endpoint mode ignores all `TxCaps`; `TxCaps::NONE` (also the default) gives the same output as `poll_transmit`.
+- **UDP TX (USO).** `udp_send_gso_from((src, dst), payload, size, caps, out)` treats `payload` as concatenated datagrams, using the family's `uso4`/`uso6` capability in transparent mode. At most 64 datagrams (`MAX_USO_TX`) fit a super-packet; each `size`-byte datagram plus IP/UDP headers must fit the MTU, and the aggregate UDP length (IPv4 total length too) must fit 65535. A zero size or an exceeded size/count limit is `TooLarge`; mixed address families are `FamilyMismatch`; a multi-datagram run without transparent mode or the capability is `Offload`. A payload of at most `size` bytes uses ordinary `udp_send_from` even without the capability, including its fragmentation and wakeup behavior. The whole super-packet is written directly to `out`, not queued; a too-small buffer is `BufferTooSmall`, and errors consume nothing.
+- **TX descriptor and driver contract.** `Transmit { len, gso, csum, flow }` describes `out[..len]`; `flow` has the Stack-local lifetime above. Single packets have `gso: None`. TCP uses `TxCsum::Full` by default. A transparent driver can enable `csum4` or `csum6` independently of segmentation to receive a partial TCP checksum for that family. Offloaded packets carry `GsoTx { kind, size, hdr_len }` and `TxCsum::Partial { start, offset }`, with the non-complemented pseudo-header sum over aggregate L4 length. Linux TUN consumes TCPv4/TCPv6 GSO and supplies TSO output through the retained descriptor; the kernel must segment and finish headers/checksums. TUN does not advertise UFO, USO or `TUN_F_TSO_ECN`; the stack's UDP offload API remains available to explicit capable embeddings. AF_XDP uses plain generated output and performs no software GRO. An aggregate cannot be sent as a plain wire packet.
+
+### Memory and chunk size
+
+`Config::tcp_chunk: Option<usize>` selects the TCP pool's chunk size. `None` means 16 KiB in `Mode::Endpoint` and 4 KiB in `Mode::Transparent`; explicit values are clamped to 4096..=65536 bytes by `Config::chunk()`. The floor is `2 × chunk + 16 × size_of::<Descriptor>()` (about 33 KiB at Endpoint's default, about 9 KiB at the transparent default). Chunk-sized commitment, the never-retreating advertised right edge and idle release otherwise follow [Memory model](#memory-model).
+
+**The floor is not total idle commitment.** A SYN-only pending flow reserves just its floor; `tcp_accept`, including a deferred accept, then commits its initial receive window. The target starts at `min(65535, clamped tcp_rcv_buf_max)` and is funded, up to available shared space, in whole chunks beyond the floor's RX chunk. For example a 1 MiB receive-buffer maximum still starts with a 65535-byte target, not a 4 KiB target. An accepted idle flow can therefore retain substantially more budget commitment than its roughly 9 KiB admission floor while owning no resident payload chunks. Do not size a process budget or promise a flow count by dividing it by the floor alone: allow for receive-window commitments, TX/descriptors and reassembly, and inspect `StackStats` and `MemoryBudget::used()`.
+
+### Configuration and counters
+
+| `Config` field | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `Mode::Endpoint` | Whom the stack answers for. |
+| `half_open_max` | 1024 | Transparent: half-open flows in total. |
+| `half_open_per_source` | 128 | Transparent: half-open flows per client address. |
+| `icmp_limits` | `IcmpLimits::default()` | Transparent: ICMP generation limits. |
+| `fragment_limits` | `FragmentLimits::default()` | Transparent: reassembly limits. |
+| `shared_budget` | `None` | All modes; transparent reassembly is charged to it as well. |
+| `tcp_chunk` | `None` | Both modes: 16 KiB Endpoint / 4 KiB transparent by default; explicit 4..=64 KiB; `Config::chunk()` reports the effective size. |
+
+`StackStats` carries `drops` (per `DropReason`, now including `HalfOpen` and `Capacity`), `half_open` (flows between SYN and the end of the handshake), `timewait_entries`, `control_dropped`, `rx_packets`, `tx_packets`, `flows`, `memory_committed` and `memory_allocated`. RX/TX packet counters count supplied/emitted packets, including one for a super-packet, not its represented wire segments. The reassembly and ICMP counters are internal and not exported.
+
+## Not implemented yet
+
+Everything below is absent from `crates/honk-netstack/src` or from the repository today; the list is the boundary of this page's claims.
+
+- Netmap, Windows and original-operation custody remain absent. TUN optionally supplies socket HostFacts; Direct creates a new dial without original-operation or pre-NAT/TTL equivalence. Implementation is not empirical VM, production or hardware acceptance.
+- The eBPF/TC side: the classifier delivery bit, steering of flows to the stack, the delivery state that must outlive TIME_WAIT ([Close semantics](#close-semantics)), and proxying of non-first fragments at the TC layer.
+- ICMP proxying: relaying echo or errors between the client and a real upstream. The stack only consumes ICMP for outstanding TCP sequences and generates the errors listed above.
+- Any performance gate or measured number for transparent mode.
+
+## Driver contract (WireGuard)
+
+The driver lives in `honk-outbound/src/proxy/wireguard/`; [Outbound design](./outbound.md#wireguard-tunnel) is the specification and this is the part that constrains the stack.
+
+- **Ownership.** One `Mutex<Inner { Stack, Tunn, .. }>` per tunnel. Application flows (`FlowIo` for TCP, `WgUdpTransport` for UDP) lock it directly for `tcp_read`/`tcp_write`/`udp_send`; the single owner task does everything else (outer receive, decryption, `receive`, `poll_transmit`, encryption, outer send, timers). After every application call `take_tx_wakeup()` decides whether the owner is notified through `Notify`, which stores a permit, so a notification sent before the owner waits is not lost. A reader that finds no data registers its waker under the same lock the owner holds when publishing readiness, so a wake-up cannot be lost in between.
+- **Batching.** The owner holds the lock for at most 64 packets per pass in either direction, taking one `Instant` per lock hold (per ≤64-packet chunk of a received batch) for all `receive` calls in it; it pulls at most 64 packets per transmit pass and encrypts them into one buffer holding up to 256 datagrams. The outer socket uses `recvmmsg` with GRO and sends GSO runs of equal-size ciphertexts.
+- **Copies.** A full-sized segment is copied three times on each path (application ↔ ring, ring ↔ plaintext buffer, boringtun's own `src → dst`). Steady-state operation allocates nothing per packet (`tests/alloc_free.rs` counts allocations over bulk send and receive); scratch, output and receive buffers are reused. A flow whose flight fully drains releases its descriptor storage, so the next burst regrows it with a few allocations per burst, not per packet.
+- **Registry and idle teardown.** A tunnel registry keeps exactly one live tunnel per (our private key, peer public key, endpoint host, endpoint port) because two sessions with the same keys to the same peer invalidate each other's handshakes; key pairs shared across different endpoints get separate tunnels. The registry belongs to one control plane's runtime generations (reload successors, DNS forks and cold probes inherit it), so two planes in a process never share or close each other's tunnels; dials with no runtime use a separate process-wide registry nothing closes. A runtime with identical tunnel settings shares the live tunnel; different settings for the same key and endpoint replace it and close its flows with `RuntimeClosed` (not a node failure). The owner task belongs to the registry, not to a node's task owner, and ends on failure, replacement, the plane's `shutdown_wireguard_tunnels` (its terminal teardown joins it), immediately when the last runtime using it closes with nothing left that can carry data, or after 120 s with no flow and no warm owner. Warm retention holds the tunnel (counted, so re-installing the same tunnel keeps the pin); the last release drops the hold without cutting flows. The process memory share is divided into fixed per-tunnel slices with a cap on live tunnels (see Scale).
+- **DNS-fork sharing (deviation).** DNS-fork runtimes normally own fresh protocol state. For WireGuard they share the business runtime's tunnel (the plane's registry) because a second session would knock it over. A runtime closing fails only the flows it opened (`RuntimeClosed`).
+- **Reserved bytes.** WARP-style reserved bytes are written into bytes 1–3 of every outgoing datagram after encryption and zeroed on every incoming datagram before decryption; the Noise MACs never cover them.
+- **Allowed IPs (single peer).** A dial or UDP association to a target outside `wg_allowed_ips` (or in a family without a tunnel address) is refused before any packet is sent; a later UDP send to another disallowed destination is a `Policy` rejection; an inbound inner packet whose source is outside them is dropped before the stack sees it. The list is aggregated into sorted disjoint networks and binary-searched. The target is always the numeric address; a target domain is never resolved remotely. Allowed IPs are not used to choose between peers, because there is exactly one.
+- **Endpoint.** Every resolved address is a candidate (families alternate; a dual-stack IPv6 socket carries IPv4 peers mapped). Before a session exists the initiation is resent after 1 s and 2 s (a deliberate deviation from boringtun's first retry at 5 s, so a single lost datagram does not fail a 3 s dial), each time to the next candidate, then boringtun's 5 s cadence continues. A handshake attempt that timed out makes the next acquire re-resolve the name. An authenticated datagram from a new source address moves the outer endpoint (roaming); a cookie reply is not authentication.
+- **UDP.** One stack socket per prepared source serves every destination (a `MultiTargetTransport`); received datagrams are copied into a bounded queue of 256 datagrams and overflow is dropped like a socket buffer. A confirmed send resolves only after the owner has handed the datagram to the socket.
+- **Error provenance.** An inner RST or ICMP unreachable in answer to a SYN, and and a target outside the allowed IPs or in a family without a tunnel address (TCP dial or UDP association open, refused before any handshake), are target failures. A SYN that times out is a target failure only if the peer delivered other inner packets during the dial; otherwise it stays an untyped timeout that Score treats node-conservatively. A waiter whose handshake budget runs out gets a node failure shared by the waiters of the same attempt, without failing the tunnel; boringtun session expiry while flows exist and any unexpected end of the owner task fail the tunnel once for every waiter (one shared node-failure episode). Datagrams that fail authentication are dropped silently (no failure threshold: the source address is spoofable). Local exhaustion (`FlowLimit`, `Memory`, `AddrInUse`) is a `Capacity` rejection. A tunnel closed by its owner (runtime close, replaced settings, process shutdown) fails flows with `RuntimeClosed`, which is not a node failure. Handlers report no Score or health themselves.
+
+## Validation
+
+- Unit tests sit beside the code in `honk-netstack/src/`. `tests/tcp_receive.rs`, `tcp_send.rs` and `tcp_recovery.rs` are deterministic packet scripts that drive only the public API against a scripted peer and compare exact output segments.
+- `tests/sim/` is a deterministic link simulator (seeded delay, iid and Gilbert-Elliott loss, reordering, duplication, rate limiting and drop-tail queues) connecting honk to honk or to a pinned smoltcp 0.14.0. `sim_honk.rs` checks exactly-once in-order delivery and completion through 1% loss, IPv6 and many flows, a one-packet pull budget delivering the same streams as an unlimited one, undo of reordering-induced spurious recoveries, and repair of a peer with neither SACK nor reassembly; `sim_baseline.rs` characterizes smoltcp and tests the simulator itself (including pull-budget resume). The scoreboard is recounted in debug builds after every mutation (counters, descriptor order, cursors and the remembered SACK runs), and `Tcb::check` ties it to `snd_una`/`snd_nxt` after every call. Two `#[ignore]` grids print comparison tables (`cargo test -p honk-netstack --test sim_honk -- --ignored --nocapture`).
+  Honk adapters dispatch application work from coalesced per-flow Stack readiness and drain newly queued events, including writer wakeups after shared memory becomes available. Smoltcp and direct application-driver checks retain whole-sweep polling.
+- Transparent mode: `tests/transparent_tcp.rs` is the packet-script suite (admission, deferred accept and its 25 s expiry, retransmitted SYNs, refusals and their ICMP codes, half-open and capacity drops, MSS clamp, keepalive, active against passive close, a late FIN at the tombstone, RFC 6191 reopen, scope and exclusion, UDP and fragments). `tests/sim_transparent.rs` runs honk and smoltcp clients against a honk terminator (`tests/sim/honk_server.rs`) in virtual time through loss, IPv6, many flows and SYN retransmissions during a deferred accept. `tests/sim_termination.rs` adds the honk-to-honk end-to-end cases: the close-order matrix, a late FIN at the tombstone, and many flows and soak runs under a small shared budget; the transparent simulator tests assert that every flow, tombstone, half-open and memory charge returns to zero. `benches/stack.rs` transparent cases report per-packet cost beside the endpoint ones.
+- Offload: `tests/offload_rx.rs` covers checksum provenance, Endpoint isolation, TCP GRO ACK cadence/OOO/SACK/PAWS and UDP splitting; `offload_tx.rs` checks TSO/USO segmentation and partial checksums against an independent kernel model, window/pacing/descriptor bounds, retransmission and plain-output equivalence; `offload_memory.rs` covers per-mode chunks, floors, commitment and idle release; `offload_e2e.rs` connects the TX and RX offload paths with and without loss. `benches/stack.rs` has an `OFFLOAD` switch (false by default) for transparent TCP GRO/TSO; its throughput units still count represented wire segments, not super-packets. These are in-process tests and microbenchmarks, not device or lab evidence.
+- `honk-outbound/src/proxy/wireguard/tests/` runs the driver against an independent in-process peer (a boringtun `Tunn` on loopback UDP with a smoltcp interface behind it).
+- `fuzz/` holds three libFuzzer targets, `netstack_packet` (arbitrary bytes, optionally with repaired lengths and checksums, into `receive` on a stack with flows in seven states), `netstack_schedule` (a byte-decoded sequence of crafted peer segments, application calls, time steps, pull budgets 0/1/N and ICMP) and `netstack_transparent` (SYNs and retransmitted SYNs, immediate and deferred accept, refusal, handshake ACKs, data, FIN/RST, keepalive, time and raw/UDP packets on a transparent stack). All come from the `fuzz-checks` feature of `honk-netstack` and also run as `tests/fuzz_replay.rs` on stable over the committed seeds and saved crash artifacts. They assert no panic, bounded and well-formed output, a whole-stack recount after every operation (`Stack::check`), that timers never leave an expired deadline behind, and that closing everything returns every pool charge and ends every flow. `cargo bench -p honk-netstack --bench stack` reports ns per packet for receive+ACK, bulk transmit, SACK processing and the transparent cases.
+- Real-network lab tooling and results live only on the `bench` branch. As of this writing no honk-arm result is recorded on `main`, so no throughput, loss-recovery or CPU claim in this page is a measurement.
+
+## Known limits and gaps
+
+| Area | Limit |
+| --- | --- |
+| IP | Endpoint mode: no fragmentation or reassembly (fragments are dropped, oversize UDP is `TooLarge`) and no ICMP generation. Transparent mode reassembles within `FragmentLimits`, preserving IP ECN, and fragments UDP replies up to 64 KiB. No IPv4 options on transmit. |
+| TCP | Listen/accept only in transparent mode, used by configured XDP/TUN. Accepted-flow keepalive is opt-in; no urgent-data API, TCP Fast Open, ECN negotiation or PLPMTUD; CUBIC only. Unknown TCP options are ignored; malformed lengths stop parsing. |
+| Receive | At most 32 out-of-order ranges per flow; ACK stretching limited by the 64-packet receive batch. |
+| Scale | An idle established flow costs about 1.4 KiB of heap (no chunks); per tunnel 4096 flows, each admitted flow reserving a floor of about 33 KiB from the process budget (the share: 256 MiB by default, one eighth of RAM within 64 MiB..4 GiB in honk) that all tunnel stacks draw from together, so about 2,000 / 8,000 / 32,000 floor-only flows fit at 64 MiB / 256 MiB / 1 GiB; live tunnels are bounded by their fixed cost, `share / 4 MiB` within 1..128; `max_flows` counts UDP associations; one lock and one owner task per tunnel, so one tunnel is limited to one core. |
+| WireGuard | Exactly one peer per tunnel; no inbound connections; IPv4 and IPv6 each need a configured tunnel address; the endpoint name is re-resolved only on the next acquire after a handshake attempt timed out, and the endpoint set is fixed while a session exists; one tunnel per (key pair, endpoint) per control plane (runtime-less dials share a separate process-wide registry), at most `share / 4 MiB` (1..128) tunnels live per registry (see Scale); nodes that share a key pair and endpoint must share every tunnel setting or they replace each other, and a hostname and an IP literal of one endpoint are separate tunnels; inner MTU at most 65472 so an outer datagram fits one UDP payload. |
+| Transparent | Core packet embedding and Linux XDP/TUN Endpoint backends. Netmap, Windows and Android/VpnService are unavailable. TUN supports 1–8 queues with checksum/TCP offload and limits socket HostFacts to one queue. Setup uses only daemon-owned nonpersistent FDs. Direct opens a new outbound socket with new operation and routing semantics. Stage 2 requires disposable VM evidence of actual Linux device behavior and 1/2/4/8-queue scaling. |
+| Verification | No interop run against non-Linux TCP implementations, no ARM run and no `test-routing`/`test-netns` VM gate. The design thresholds were measured on one x86-64 4-vCPU VM against kernel WireGuard + kernel TCP (not the design's same-engine TUN arm, with an extra loopback relay hop on the honk side): G1–G4 pass, G5 download fairness passes on the median, and G5 idle memory (about 4 KiB per flow including driver and relay state) misses its 1 KiB target; evidence lives on the `bench` branch under `bench/netstack/results/`. |
+
+## Design validation (P1)
+
+`tests/sim_termination.rs` has nine top-level cases: the honk-to-honk close-order matrix (client first, server first, simultaneous, each over IPv4/IPv6: six combinations), the same six combinations with smoltcp clients, three flows sending 2 MiB in each direction through 1% loss / 3% reordering / 0.5% duplication, two half-close directions, an audited late FIN reaching a compact TIME_WAIT tombstone after the final ACK was lost, 400 flows with a 1500 ms deferred accept, and the three admission/soak cases below. Drivers compare every byte for exactly-once ordered delivery and audit replies against the accepted original destination.
+
+Reported observations with the **current 4 KiB transparent default**, for these deterministic simulator configurations only (elapsed times are virtual time, not real-network performance or admission guarantees):
+
+| Admission/soak scenario | Shared budget | Reported observation |
+| --- | --- | --- |
+| 320 flows, 40 sources × 8 flows, sources arriving 60 ms apart | 1.5 MiB | Peak charged 1,572,864 B; 338 capacity-dropped SYNs; all completed in 8.465667209 s; maximum per-source duration 7.145667209 s. |
+| 120-flow instantaneous herd, 15 sources × 8 flows | 3 MiB | Peak charged 3,145,728 B; 105 capacity-dropped SYNs; all completed in 3.224096304 s. |
+| One greedy source with 120 flows, twenty polite sources with 4 each, all at once | 3 MiB | 350 capacity-dropped SYNs; all completed in 15.489163696 s; every polite source completed within 2.406434511 s of arrival. |
+
+The drop counts are SYN packets, including retries, not lost application bytes or permanently rejected flows. The spaced-arrival case asserts every source completes in under 10 s; the greedy-source case asserts each polite source completes in under 10 s and before the greedy one. These workload-specific checks are not a Jain-index, performance-fairness or general admission gate. Microbenchmark measurements are reported separately; no lab performance gate or number is claimed here.
+
+**Historical 16 KiB observation, before the 4 KiB import:** a separate instantaneous 320-flow herd at a 3 MiB shared budget admitted only 266 flows across the initial SYN and six retry waves (38 per wave); the remaining 54 clients timed out at about 127 s, although the budget was idle between waves. This is not a result for the current 4 KiB default. It exposes an admission caveat, not a failure of an admitted flow's progress floor: silent SYN drops alone do not guarantee bounded admission. Backend/driver admission, backpressure and per-source policy must account for bursts; a smaller floor is not a general admission guarantee ([Memory and chunk size](#memory-and-chunk-size)).
+
+After handles close and TIME_WAIT drains, the tests assert zero flows, TIME_WAIT entries, half-open flows and committed TCP memory; the soak also asserts `MemoryBudget::used() == 0`. A stack may still cache one **uncommitted** spare payload chunk (4 KiB transparent / 16 KiB Endpoint by default) until the `Stack` is dropped; zero commitment does not mean zero resident cache. Reassembly accounting separately includes retained data/header/range capacities and fixed per-entry bookkeeping ([Reassembly](#reassembly)).
+
+## Related docs
+
+- [Outbound design: WireGuard tunnel](./outbound.md#wireguard-tunnel)
+- [Node reference: WireGuard fields and share links](../reference/nodes.md)
+- [Architecture overview](./overview.md)

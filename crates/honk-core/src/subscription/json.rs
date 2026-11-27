@@ -50,34 +50,49 @@ pub(super) fn emit_json_subscription(
         ),
         Value::Mapping(mut root) => {
             let outbounds = root.remove("outbounds");
+            let endpoints = root.remove("endpoints");
             let servers = root.remove("servers");
-            match (outbounds, servers) {
-                (Some(_), Some(_)) => anyhow::bail!("ambiguous JSON subscription wrapper"),
-                (Some(Value::Sequence(outbounds)), None) => parse_entries(
-                    outbounds,
-                    subscription_id,
-                    sing_box::normalize,
-                    "outbounds",
-                    &mut emit,
-                ),
-                (Some(_), None) => anyhow::bail!("sing-box 'outbounds' must be an array"),
-                (None, Some(Value::Sequence(servers))) => {
-                    if let Some(version) = root.remove("version")
-                        && !matches!(version.as_u64(), Some(1 | 2))
-                    {
-                        anyhow::bail!("unsupported SIP008 version");
-                    }
-                    parse_entries(
-                        servers,
-                        subscription_id,
-                        normalize_sip008,
-                        "servers",
-                        &mut emit,
-                    )
-                }
-                (None, Some(_)) => anyhow::bail!("SIP008 'servers' must be an array"),
-                (None, None) => anyhow::bail!("unsupported JSON subscription wrapper"),
+            if servers.is_some() && (outbounds.is_some() || endpoints.is_some()) {
+                anyhow::bail!("ambiguous JSON subscription wrapper");
             }
+            if let Some(servers) = servers {
+                let Value::Sequence(servers) = servers else {
+                    anyhow::bail!("SIP008 'servers' must be an array");
+                };
+                if let Some(version) = root.remove("version")
+                    && !matches!(version.as_u64(), Some(1 | 2))
+                {
+                    anyhow::bail!("unsupported SIP008 version");
+                }
+                return parse_entries(
+                    servers,
+                    subscription_id,
+                    normalize_sip008,
+                    "servers",
+                    &mut emit,
+                );
+            }
+            if outbounds.is_none() && endpoints.is_none() {
+                anyhow::bail!("unsupported JSON subscription wrapper");
+            }
+            let lists = [("outbounds", outbounds), ("endpoints", endpoints)];
+            for (path, list) in &lists {
+                if list.as_ref().is_some_and(|list| !list.is_sequence()) {
+                    anyhow::bail!("sing-box '{path}' must be an array");
+                }
+            }
+            for (path, list) in lists {
+                if let Some(Value::Sequence(entries)) = list {
+                    parse_entries(
+                        entries,
+                        subscription_id,
+                        sing_box::normalize,
+                        path,
+                        &mut emit,
+                    )?;
+                }
+            }
+            Ok(())
         }
         _ => anyhow::bail!("JSON subscription root must be an object or array"),
     }

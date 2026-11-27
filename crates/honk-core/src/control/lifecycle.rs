@@ -4,10 +4,12 @@ use super::runtime::{
 use super::udp_ingress::{UdpLoopState, udp_listener_loop};
 use super::*;
 use std::collections::HashSet;
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
+mod tc;
 mod teardown;
 
 /// Bound for shutdown stages that have no natural deadline (watcher join,
@@ -37,7 +39,7 @@ pub(super) struct RuntimeEpoch {
     removal_errors: mpsc::UnboundedReceiver<anyhow::Error>,
     critical_errors: mpsc::UnboundedReceiver<anyhow::Error>,
     health_updates: Option<HealthUpdates>,
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     queue: Option<NfqueueRuntime>,
 }
 
@@ -121,115 +123,7 @@ impl HealthUpdates {
 }
 
 impl ControlPlane {
-    async fn bind_runtime_listeners(&self) -> anyhow::Result<BoundListeners> {
-        let config = self.config.read().await;
-        let tproxy_port = config.global.tproxy_port;
-        let tproxy_mark = config.global.tproxy_mark;
-        let udp_nfqueue_enabled = config.global.nfqueue_enable
-            && self.ebpf.read().await.observe_datapath().kind == crate::ebpf::DatapathKind::Real;
-        let dns_bind_endpoint = config
-            .dns
-            .bind_endpoint()
-            .map_err(|error| anyhow::anyhow!("invalid dns.bind: {error}"))?;
-        drop(config);
-        #[cfg(feature = "ebpf")]
-        {
-            let _reload = self.reload_lock.lock().await;
-            self.warn_lan_self_protection().await;
-        }
-        let bound_dns_listener = dns_bind_endpoint
-            .as_ref()
-            .map(dns_listener::BoundDnsListener::bind)
-            .transpose()
-            .map_err(|error| anyhow::anyhow!("bind dns.bind listener: {error}"))?;
-        let tcp4_addr = SocketAddr::new("0.0.0.0".parse()?, tproxy_port);
-        let tcp6_addr = SocketAddr::new("::".parse()?, tproxy_port);
-        let udp4_addr = tcp4_addr;
-        let udp6_addr = tcp6_addr;
-
-        let tcp4_listener = unsafe {
-            tokio::io::unix::AsyncFd::register(bind_tproxy_tcp(tcp4_addr, tproxy_mark)?)
-        }?;
-        info!("Control plane listening for TPROXY TCPv4 on {}", tcp4_addr);
-
-        let tcp6_listener = match bind_tproxy_tcp(tcp6_addr, tproxy_mark).and_then(|listener| {
-            unsafe { tokio::io::unix::AsyncFd::register(listener) }.map_err(anyhow::Error::from)
-        }) {
-            Ok(l) => {
-                info!("Control plane listening for TPROXY TCPv6 on {}", tcp6_addr);
-                Some(l)
-            }
-            Err(e) => {
-                // Only a host without an IPv6 stack may leave this slot empty.
-                let no_ipv6 = e
-                    .downcast_ref::<io::Error>()
-                    .and_then(|error| error.raw_os_error())
-                    == Some(libc::EAFNOSUPPORT);
-                if no_ipv6 {
-                    warn!("TPROXY TCPv6 listener unavailable: {}", e);
-                    None
-                } else {
-                    return Err(e.context("bind TPROXY TCPv6 listener"));
-                }
-            }
-        };
-
-        // Parallel UDP listeners: the eBPF datapath hashes each flow's tuple
-        // into one of UDP_LISTENER_COUNT sockets per family (sk_lookup.rs);
-        // each socket gets its own receive loop task below, so flows drain
-        // in parallel across runtime workers.
-        const UDP_LISTENER_COUNT: usize = 4;
-        let udp4_sockets: Vec<Arc<UdpSocket>> =
-            bind_tproxy_udp_listeners(udp4_addr, UDP_LISTENER_COUNT)?
-                .into_iter()
-                .map(Arc::new)
-                .collect();
-        info!(
-            "Control plane listening for TPROXY UDPv4 x{} on {}",
-            udp4_sockets.len(),
-            udp4_addr
-        );
-
-        let udp6_sockets: Vec<Arc<UdpSocket>> =
-            match bind_tproxy_udp_listeners(udp6_addr, UDP_LISTENER_COUNT) {
-                Ok(sockets) => {
-                    let sockets: Vec<Arc<UdpSocket>> = sockets.into_iter().map(Arc::new).collect();
-                    info!(
-                        "Control plane listening for TPROXY UDPv6 x{} on {}",
-                        sockets.len(),
-                        udp6_addr
-                    );
-                    sockets
-                }
-                Err(e) => {
-                    // Only a host without an IPv6 stack may run with empty
-                    // sk_lookup slots; any other failure would black-hole
-                    // proxied IPv6 UDP until restart (slots are published
-                    // once), so fail startup and let the supervisor retry.
-                    let no_ipv6 = e
-                        .downcast_ref::<io::Error>()
-                        .and_then(|error| error.raw_os_error())
-                        == Some(libc::EAFNOSUPPORT);
-                    if no_ipv6 {
-                        warn!("TPROXY UDPv6 listener unavailable: {}", e);
-                        Vec::new()
-                    } else {
-                        return Err(e.context("bind TPROXY UDPv6 listener group"));
-                    }
-                }
-            };
-
-        Ok(BoundListeners {
-            tcp4: tcp4_listener,
-            tcp6: tcp6_listener,
-            udp4: udp4_sockets,
-            udp6: udp6_sockets,
-            dns: bound_dns_listener,
-            nfqueue_enabled: udp_nfqueue_enabled,
-        })
-    }
-
-    async fn configure_health_loop(&mut self) {
+    pub(in crate::control) async fn configure_health_loop(&mut self) {
         let alive_set = self.alive_set.clone();
         let interval_secs = {
             let c = self.config.read().await;
@@ -299,13 +193,15 @@ impl ControlPlane {
             };
             let quic_url = super::probers::quic_probe_url(&*self.config.read().await);
             let resolver: crate::outbound::ResolveHook = {
-                let controller = self.dns_controller.clone();
+                let service = self.dns_controller.dns_service();
                 Arc::new(move |host: String, port: u16| {
-                    let controller = controller.clone();
+                    let service = service.clone();
                     Box::pin(async move {
-                        controller.resolve_domain(&host).await.map(|addresses| {
+                        service.resolve_name(&host).await.map(|addresses| {
                             addresses
+                                .ipv4
                                 .into_iter()
+                                .chain(addresses.ipv6)
                                 .map(|ip| std::net::SocketAddr::new(ip, port))
                                 .collect()
                         })
@@ -344,217 +240,16 @@ impl ControlPlane {
         self.health_task = Some(alive_set.spawn_health_check_loop(period, check_timeout));
     }
 
-    async fn prepare_epoch(&mut self, listeners: BoundListeners) -> anyhow::Result<RuntimeEpoch> {
-        use std::os::fd::AsRawFd;
-        let tcp4 = listeners.tcp4.as_raw_fd();
-        let tcp6 = listeners.tcp6.as_ref().map(AsRawFd::as_raw_fd);
-        let udp4: Vec<_> = listeners
-            .udp4
-            .iter()
-            .map(|socket| socket.as_raw_fd())
-            .collect();
-        let udp6: Vec<_> = listeners
-            .udp6
-            .iter()
-            .map(|socket| socket.as_raw_fd())
-            .collect();
-        self.ebpf
-            .write()
-            .await
-            .publish_listener_sockets(tcp4, tcp6, &udp4, &udp6)?;
-        let (critical_tx, critical_errors) = mpsc::unbounded_channel();
-        let (removal_tx, removal_errors) = mpsc::unbounded_channel();
-        let (stop, _) = watch::channel(false);
-        let mut epoch = RuntimeEpoch {
-            dns: None,
-            listeners,
-            stop,
-            ingress: JoinSet::new(),
-            tcp: JoinSet::new(),
-            maintenance: OwnedTasks::default(),
-            janitor: None,
-            removals: None,
-            removal_errors,
-            critical_errors,
-            health_updates: None,
-            #[cfg(feature = "ebpf")]
-            queue: None,
-        };
-        let prepared = async {
-            if let Some(bound) = epoch.listeners.dns.take() {
-                epoch.dns = Some(bound.spawn(
-                    self.dns_controller.clone(),
-                    self.concurrency_limit.clone(),
-                    self.stats.clone(),
-                    self.drain_tracker.clone(),
-                    self.native.clone(),
-                    self.diagnostics.clone(),
-                )?);
-            }
-            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
-            let record_flows = self.native.is_some()
-                && self
-                    .config
-                    .read()
-                    .await
-                    .experimental
-                    .native_api
-                    .record_flows;
-            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
-            let mut trace_error = None;
-            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
-            let mut trace_unavailable = [false; 2];
-            let state = UdpLoopState::new(self, daens_netns_exists());
-            for (socket, family) in epoch
-                .listeners
-                .udp4
-                .iter()
-                .map(|socket| (socket, "v4"))
-                .chain(epoch.listeners.udp6.iter().map(|socket| (socket, "v6")))
-            {
-                let state = state.clone();
-                let socket = Arc::clone(socket);
-                let batch = sockets::UdpRecvBatch::new()?;
-                #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
-                let mut batch = batch;
-                #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
-                if record_flows
-                    && let Err(error) = enable_receive_trace(&self.ebpf, &mut batch, &socket).await
-                {
-                    trace_error.get_or_insert(error);
-                    trace_unavailable[usize::from(family == "v6")] = true;
-                }
-                let mut stopping = epoch.stop.subscribe();
-                let mut exit = CriticalTaskExit {
-                    name: "udp_listener_loop",
-                    fatal_tx: critical_tx.clone(),
-                    expected: false,
-                };
-                epoch.ingress.spawn(async move {
-                    tokio::select! {
-                        biased;
-                        _ = stopping.changed() => exit.expected_stop(),
-                        _ = udp_listener_loop(state, socket, family, batch) => {},
-                    }
-                });
-            }
-            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
-            let trace_degraded = record_udp_trace(&self.degradations, trace_unavailable);
-            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
-            if trace_degraded && let Some(error) = &trace_error {
-                warn!(
-                    %error,
-                    ipv4_unavailable = trace_unavailable[0],
-                    ipv6_unavailable = trace_unavailable[1],
-                    "UDP receive trace unavailable"
-                );
-            }
-            epoch.removals = Some(spawn_retirement_worker(
-                self.udp_pool.clone(),
-                self.ebpf.clone(),
-                self.connection_tracker.clone(),
-                removal_tx,
-                self.tcp_flow_pins.clone(),
-                Arc::clone(&self.retirement),
-            ));
-            epoch.janitor = Some(
-                BpfJanitor::new(self.ebpf.clone(), self.tcp_flow_pins.clone())
-                    .with_udp_pool(self.udp_pool.clone())
-                    .spawn_supervised(
-                        CriticalTaskExit {
-                            name: "bpf_janitor",
-                            fatal_tx: critical_tx,
-                            expected: false,
-                        },
-                        epoch.stop.subscribe(),
-                    ),
-            );
-            epoch.health_updates = Some(HealthUpdates::start(self));
-            // Persisted Selector choices can change after ControlPlane construction.
-            // Publish their slots before the candidate epoch opens admission.
-            {
-                let _config = self.config.read().await;
-                let mut ebpf = self.ebpf.write().await;
-                let manager = self.group_manager.read();
-                let snapshot =
-                    initial_route_connectivity(&self.active_routing_plan.read().plan, &manager);
-                publish_group_connectivity(ebpf.as_mut(), &snapshot)?;
-            }
-            #[cfg(feature = "ebpf")]
-            {
-                let sequence_ready = if epoch.listeners.nfqueue_enabled {
-                    self.rotate_udp_decision_generation().await?
-                } else {
-                    false
-                };
-                match self
-                    .start_nfqueue_runtime(epoch.listeners.nfqueue_enabled, sequence_ready)
-                    .await
-                {
-                    Ok(queue) => epoch.queue = queue,
-                    Err(error) => {
-                        self.degrade_nfqueue_startup(&mut epoch.listeners.nfqueue_enabled, error)
-                            .await
-                    }
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-        .await;
-        if let Err(error) = prepared {
-            // Preparation has not opened admission. Cleanup must not borrow the
-            // terminal process shutdown path or discard retained API owners.
-            let mut cleanup = None;
-            retain_error(&mut cleanup, self.quiesce_udp_epoch(Some(&mut epoch)).await);
-            retain_error(
-                &mut cleanup,
-                self.stop_network_epoch(Some(&mut epoch)).await,
-            );
-            if let Some(cleanup) = cleanup {
-                return Err(cleanup
-                    .context("runtime candidate cleanup failed")
-                    .context(error));
-            }
-            return Err(error);
-        }
-        Ok(epoch)
-    }
-
-    async fn open_epoch(&mut self, epoch: &mut RuntimeEpoch) -> anyhow::Result<()> {
-        #[cfg(feature = "ebpf")]
-        if let Some(queue) = epoch.queue.as_mut()
-            && let Err(error) = queue.check_startup_health().await
-        {
-            self.cleanup_nfqueue_startup_failure(&mut epoch.queue).await;
-            epoch.queue = None;
-            self.degrade_nfqueue_startup(&mut epoch.listeners.nfqueue_enabled, error.into())
-                .await;
-        }
-        #[cfg(feature = "ebpf")]
-        let queue_ready = epoch
-            .queue
-            .as_ref()
-            .is_some_and(|queue| queue.sequence_ready);
-        #[cfg(not(feature = "ebpf"))]
-        let queue_ready = false;
-        self.initialize_datapath_flags(epoch.listeners.nfqueue_enabled, queue_ready)
-            .await?;
-        #[cfg(feature = "ebpf")]
-        if let Some(queue) = epoch.queue.as_ref()
-            && queue.sequence_ready
-        {
-            queue.pending.open_admission();
-        }
-        self.ebpf.write().await.set_datapath_ready(true)?;
-        self.drain_tracker.stop_rejecting();
-        Ok(())
-    }
-
     async fn start_epoch_maintenance(&self, epoch: &mut RuntimeEpoch) {
+        epoch.maintenance = self.start_userspace_maintenance().await;
+    }
+
+    pub(in crate::control) async fn start_userspace_maintenance(&self) -> OwnedTasks {
+        let mut maintenance = OwnedTasks::default();
         let registry = self.runtime_registry.clone();
         let dns = self.dns_controller.runtime_provider();
         let groups = self.group_manager.clone();
-        let tasks = &mut epoch.maintenance.0;
+        let tasks = &mut maintenance.0;
         tasks.push(self.udp_pool.spawn_janitor());
         tasks.push(self.sniffer_pool.spawn_janitor());
         tasks.push(super::tcp_sniff::spawn_sniff_neg_cache_janitor(
@@ -589,54 +284,8 @@ impl ControlPlane {
         let generation = self.runtime_registry.read().clone();
         self.start_udp_warm_coordinator(generation.clone()).await;
         self.start_selector_warm_coordinator(generation).await;
+        maintenance
     }
-}
-
-/// Whether `socket` records kernel UDP receive traces: `SO_RCVPRIORITY` where
-/// the kernel has it, otherwise the eBPF receive trace.
-#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
-async fn enable_receive_trace(
-    ebpf: &RwLock<Box<dyn EbpfBackend>>,
-    batch: &mut sockets::UdpRecvBatch,
-    socket: &tokio::net::UdpSocket,
-) -> std::io::Result<()> {
-    if batch.enable_trace(socket, None).is_ok() {
-        return Ok(());
-    }
-    let prepare = ebpf.read().await.prepare_receive_trace();
-    let trace = match prepare {
-        Some(prepare) => tokio::task::spawn_blocking(prepare)
-            .await
-            .map_err(std::io::Error::other)?,
-        None => None,
-    };
-    batch.enable_trace(socket, trace)
-}
-
-/// Kernel UDP receive tracing is only needed while flows are recorded.
-#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
-fn record_udp_trace(
-    degradations: &crate::degradations::Degradations,
-    unavailable: [bool; 2],
-) -> bool {
-    let component = crate::degradations::Component::UdpTrace;
-    let reason = match unavailable {
-        [true, false] => "ipv4_unavailable",
-        [false, true] => "ipv6_unavailable",
-        [true, true] => "unavailable",
-        [false, false] => {
-            degradations.clear(component);
-            return false;
-        }
-    };
-    let issue = crate::degradations::Issue {
-        code: "udp_trace_unavailable",
-        message: "Kernel UDP receive tracing is unavailable for at least one listener family; recorded UDP flows may lack kernel route evidence.",
-        reason,
-    };
-    let entered = degradations.get(component) != Some(issue);
-    degradations.set(component, issue);
-    entered
 }
 
 async fn cleanup_stage<T>(future: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
@@ -725,7 +374,10 @@ impl Drop for OwnedTasks {
     }
 }
 
-fn retain_error(target: &mut Option<anyhow::Error>, result: anyhow::Result<()>) {
+pub(in crate::control) fn retain_error(
+    target: &mut Option<anyhow::Error>,
+    result: anyhow::Result<()>,
+) {
     if let Err(error) = result {
         target.get_or_insert(error);
     }
@@ -742,7 +394,7 @@ enum EpochEvent {
         )>,
     ),
     Fatal(anyhow::Error),
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     TokenExhausted,
     Reaped,
 }
@@ -758,12 +410,12 @@ impl RuntimeEpoch {
             error = self.removal_errors.recv() => EpochEvent::Fatal(error.unwrap_or_else(|| anyhow::anyhow!("UDP removal owner stopped"))),
             error = self.critical_errors.recv() => EpochEvent::Fatal(error.unwrap_or_else(|| anyhow::anyhow!("critical runtime owner stopped"))),
             event = async {
-                #[cfg(feature = "ebpf")]
+                #[cfg(feature = "legacy-tc")]
                 { match wait_nfqueue_event(&mut self.queue, &plane.ebpf).await {
                     NfqueueRuntimeEvent::Fatal(error) => EpochEvent::Fatal(error),
                     NfqueueRuntimeEvent::TokenExhausted => EpochEvent::TokenExhausted,
                 } }
-                #[cfg(not(feature = "ebpf"))]
+                #[cfg(not(feature = "legacy-tc"))]
                 { std::future::pending::<EpochEvent>().await }
             } => event,
             command = commands.recv() => EpochEvent::Command(command),
@@ -830,7 +482,7 @@ impl ControlPlane {
             }
             // A persistent accept error repeats every iteration; warn once per episode.
             let mut accept_failing = false;
-            while fatal.is_none() && !self.shutdown_requested.load(Ordering::Acquire) {
+            while fatal.is_none() && !self.shutdown_requested.requested() {
                 match active.next(self, &mut commands).await {
                     EpochEvent::Command(command) => {
                         let Some(command) = command else {
@@ -845,7 +497,7 @@ impl ControlPlane {
                         }
                     }
                     EpochEvent::Fatal(error) => fatal = Some(error),
-                    #[cfg(feature = "ebpf")]
+                    #[cfg(feature = "legacy-tc")]
                     EpochEvent::TokenExhausted => {
                         if let Some(queue) = active.queue.as_mut()
                             && let Err(error) = self.recover_nfqueue_token_exhaustion(queue).await
@@ -1366,6 +1018,59 @@ mod reap_tests {
         let cancelled = tasks.join_next().await;
         assert!(matches!(&cancelled, Some(Err(error)) if error.is_cancelled()));
         assert!(matches!(reap_tcp(cancelled), EpochEvent::Reaped));
+    }
+}
+
+#[cfg(test)]
+mod policy_capability_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn software_policy_reloads_but_cannot_start_tc_listeners() -> anyhow::Result<()> {
+        let mut config = Config::default();
+        config.ensure_builtin_nodes();
+        config.routing.default_outbound = "direct".into();
+        config.global.nfqueue_enable = false;
+        config.global.preconnect_node_count = 0;
+        config.global.udp_warm_node_count = 0;
+        let admission = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut plane = ControlPlane::new(
+            config.clone(),
+            Box::new(crate::ebpf::userspace::UserspaceBackend::new(
+                Arc::clone(&admission),
+                Arc::new(parking_lot::RwLock::new(
+                    crate::ebpf::PnameSupport::Unavailable,
+                )),
+            )),
+            Router::new(&[], "direct")?,
+            Arc::new(ProxyRegistry::default_resolver()?),
+            DnsResolver::new(&config.dns)?,
+            crate::control::tests::support::test_dns_forwarder(),
+        )?;
+        assert!(plane.tc_kernel.is_none());
+        assert!(plane.spawn_handle().tc_kernel.is_none());
+        let generation = plane.ebpf.read().await.routing_policy_generation();
+        let error = plane
+            .bind_runtime_listeners()
+            .await
+            .err()
+            .expect("TC capability is required before binding");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::Unsupported
+        );
+        config.routing.default_outbound = "block".into();
+        assert!(
+            plane
+                .reload_runtime_config(config, Default::default())
+                .await
+        );
+        assert!(plane.ebpf.read().await.routing_policy_generation() > generation);
+        assert_eq!(plane.config.read().await.routing.default_outbound, "block");
+        plane.stop_packet_epoch().await?;
+        plane.finalize_shutdown().await?;
+        assert!(!admission.load(Ordering::Acquire));
+        Ok(())
     }
 }
 

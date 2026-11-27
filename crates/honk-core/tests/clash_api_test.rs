@@ -1017,6 +1017,78 @@ async fn test_put_and_patch_without_content_type() {
 }
 
 #[tokio::test]
+async fn test_configs_reports_accepted_tun_device_and_address_families() {
+    let app = spawn_app("", "").await;
+    for (addresses, capture, ipv6) in [
+        ("address4: 198.18.0.1/32", "0.0.0.0/0", false),
+        ("address6: fd00:686f:6e6b:100::1/128", "::/0", true),
+        (
+            "address4: 198.18.0.1/32\naddress6: fd00:686f:6e6b:100::1/128",
+            "0.0.0.0/0\n::/0",
+            true,
+        ),
+    ] {
+        let parsed = honk_config::parser::parse_dae_config(&format!(
+            "datapath {{\n backend: tun\n direct: endpoint\n tun {{\n\
+             name: honk-test\n mtu: 1420\n {addresses}\n table: 202\n\
+             rule_priority: 10000\n capture {{\n {capture}\n }}\n }}\n }}"
+        ))
+        .unwrap();
+        let mut config = app.state.config.read().await.as_ref().clone();
+        config.datapath = parsed.datapath;
+        config.validate_assembled().unwrap();
+        *app.state.config.write().await = Arc::new(config);
+
+        let body: serde_json::Value = http_client()
+            .get(app.url("/configs"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            body["tun"],
+            serde_json::json!({
+                "enable": true,
+                "device": "honk-test",
+                "mtu": 1420,
+                "stack": "honk",
+            })
+        );
+        assert_eq!(body["ipv6"], ipv6);
+    }
+    for backend in [None, Some("tc"), Some("xdp")] {
+        let mut config = app.state.config.read().await.as_ref().clone();
+        config.datapath = backend.map(|backend| {
+            let fields = if backend == "xdp" {
+                "direct: endpoint\n interface { eth-test: wan }"
+            } else {
+                ""
+            };
+            honk_config::parser::parse_dae_config(&format!(
+                "datapath {{\n backend: {backend}\n {fields}\n }}"
+            ))
+            .unwrap()
+            .datapath
+            .unwrap()
+        });
+        config.validate_assembled().unwrap();
+        *app.state.config.write().await = Arc::new(config);
+        let body: serde_json::Value = http_client()
+            .get(app.url("/configs"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["tun"], serde_json::json!({"enable": false}));
+        assert_eq!(body["ipv6"], false);
+    }
+}
+
+#[tokio::test]
 async fn test_configs_additive_safe_diagnostics_snapshot() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("private-input.dae");
@@ -1296,9 +1368,9 @@ async fn test_connections_snapshot_and_delete() {
     // Inject one tracked connection with process attribution (as the eBPF
     // handoff provides for locally-originated flows).
     let id = app.state.connection_tracker.register(ConnectionEntry {
-        id: "conn-1".into(),
-        source: "10.0.0.2:12345".into(),
-        destination: "142.250.72.14:443".into(),
+        id: uuid::uuid!("00000000-0000-0000-0000-000000000007"),
+        source: "10.0.0.2:12345".parse().unwrap(),
+        destination: "142.250.72.14:443".parse().unwrap(),
         proxy: "proxy".into(),
         #[cfg(feature = "native-api")]
         routed_outbound: None,
@@ -1311,15 +1383,15 @@ async fn test_connections_snapshot_and_delete() {
         download: std::sync::Arc::new(AtomicU64::new(200)),
         start_time: Instant::now(),
         domain: Some("example.com".into()),
-        network: "tcp".into(),
+        network: "tcp",
         process: Some("curl".into()),
         process_path: Some("/usr/bin/curl".into()),
     });
     // A LAN-forwarded flow carries no process attribution.
     app.state.connection_tracker.register(ConnectionEntry {
-        id: "conn-2".into(),
-        source: "[2001:db8::10]:4321".into(),
-        destination: "[2001:db8::20]:443".into(),
+        id: uuid::uuid!("00000000-0000-0000-0000-000000000008"),
+        source: "[2001:db8::10]:4321".parse().unwrap(),
+        destination: "[2001:db8::20]:443".parse().unwrap(),
         proxy: "proxy".into(),
         #[cfg(feature = "native-api")]
         routed_outbound: None,
@@ -1332,7 +1404,7 @@ async fn test_connections_snapshot_and_delete() {
         download: std::sync::Arc::new(AtomicU64::new(0)),
         start_time: Instant::now(),
         domain: None,
-        network: "udp".into(),
+        network: "udp",
         process: None,
         process_path: None,
     });
@@ -1347,7 +1419,7 @@ async fn test_connections_snapshot_and_delete() {
         .unwrap();
     let conns = body["connections"].as_array().unwrap();
     assert_eq!(conns.len(), 2);
-    let c = conns.iter().find(|c| c["id"] == id).unwrap();
+    let c = conns.iter().find(|c| c["id"] == id.to_string()).unwrap();
     assert_eq!(c["metadata"]["sourceIP"], "10.0.0.2");
     assert_eq!(c["metadata"]["destinationIP"], "142.250.72.14");
     assert_eq!(c["metadata"]["sourcePort"], "12345");
@@ -1368,7 +1440,10 @@ async fn test_connections_snapshot_and_delete() {
     assert!(chrono::DateTime::parse_from_rfc3339(start).is_ok());
     // A flow without process attribution emits both keys with empty values
     // (mihomo semantics; zashboard reads processPath unguarded).
-    let c2 = conns.iter().find(|c| c["id"] == "conn-2").unwrap();
+    let c2 = conns
+        .iter()
+        .find(|c| c["id"] == "00000000-0000-0000-0000-000000000008")
+        .unwrap();
     assert_eq!(c2["metadata"]["process"], "");
     assert_eq!(c2["metadata"]["processPath"], "");
     assert_eq!(c2["metadata"]["sourceIP"], "2001:db8::10");
@@ -1395,7 +1470,7 @@ async fn test_connections_snapshot_and_delete() {
         .unwrap();
     let remaining = body["connections"].as_array().unwrap();
     assert_eq!(remaining.len(), 2);
-    assert!(remaining.iter().any(|row| row["id"] == id));
+    assert!(remaining.iter().any(|row| row["id"] == id.to_string()));
 }
 
 /// Plaintext HTTP server answering 204 to everything.
@@ -2015,9 +2090,9 @@ async fn test_ws_token_percent_decoded() {
 async fn test_connections_ws_stream() {
     let app = spawn_app("", "").await;
     app.state.connection_tracker.register(ConnectionEntry {
-        id: "ws-conn".into(),
-        source: "10.0.0.3:5555".into(),
-        destination: "1.1.1.1:443".into(),
+        id: uuid::uuid!("00000000-0000-0000-0000-000000000009"),
+        source: "10.0.0.3:5555".parse().unwrap(),
+        destination: "1.1.1.1:443".parse().unwrap(),
         proxy: "proxy".into(),
         #[cfg(feature = "native-api")]
         routed_outbound: None,
@@ -2030,7 +2105,7 @@ async fn test_connections_ws_stream() {
         download: std::sync::Arc::new(AtomicU64::new(2)),
         start_time: Instant::now(),
         domain: None,
-        network: "tcp".into(),
+        network: "tcp",
         process: None,
         process_path: None,
     });
@@ -2047,7 +2122,7 @@ async fn test_connections_ws_stream() {
     let v: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
     let conns = v["connections"].as_array().unwrap();
     assert_eq!(conns.len(), 1);
-    assert_eq!(conns[0]["id"], "ws-conn");
+    assert_eq!(conns[0]["id"], "00000000-0000-0000-0000-000000000009");
 }
 
 /// Plain GET /traffic returns a chunked JSON stream with per-second frames.

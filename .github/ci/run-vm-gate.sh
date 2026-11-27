@@ -4,7 +4,10 @@ set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 cd "$repo"
 source .github/ci/pins.env
-lane=${1:?usage: run-vm-gate.sh <lane>}
+lane=${1:?usage: run-vm-gate.sh <floor|recent> [host-ct-reply|host-pname]}
+host_selection=${2:-all}
+[[ $# -le 2 && ( $lane == floor || $lane == recent ) ]]
+case $host_selection in all|host-ct-reply|host-pname) ;; *) exit 2 ;; esac
 prefix="KERNEL_${lane^^}"
 declare -n base="${prefix}_BASE" image="${prefix}_IMAGE" modules="${prefix}_MODULES"
 declare -n image_sha256="${prefix}_IMAGE_SHA256" modules_sha256="${prefix}_MODULES_SHA256"
@@ -12,11 +15,19 @@ declare -n release="${prefix}_RELEASE"
 kernel_dir="${RUNNER_TEMP:?}/kernel-$lane"
 log_dir="${GITHUB_WORKSPACE:?}/target/vm-tests/$lane"
 mkdir -p "$kernel_dir" "$log_dir"
+host_peers="$repo/.github/ci/host-daemon-peer.py"
+host_inputs="$log_dir/host-inputs.json"
+host_source=$(python3 -I -B "$host_peers" source "$repo")
 
+# Real-kernel fixtures bound busy polling to 1 ms intervals; on Linux 6.12 the unoptimized
+# test build never completed a round inside them, so the adaptive fixture counted no probe.
+export CARGO_PROFILE_DEV_OPT_LEVEL=2
 {
+  cargo build -p honk-core --features ebpf,native-api --bin honk-core --message-format=json
   cargo test -p honk-core --features ebpf,native-api --lib --test ebpf_datapath_test --no-run --message-format=json
   cargo test -p honk-nfqueue --lib --no-run --message-format=json
   cargo test -p honk-outbound --lib --no-run --message-format=json
+  cargo test -p honk-xsk --lib --no-run --message-format=json
 } | jq -sr '
   def executable($name):
     [.[] | select(.reason == "compiler-artifact" and .target.name == $name and .executable != null) | .executable]
@@ -24,7 +35,9 @@ mkdir -p "$kernel_dir" "$log_dir"
   "HONK_CORE_TEST_BIN=" + (executable("honk_core") | @sh),
   "HONK_DATAPATH_TEST_BIN=" + (executable("ebpf_datapath_test") | @sh),
   "HONK_NFQUEUE_TEST_BIN=" + (executable("honk_nfqueue") | @sh),
-  "HONK_OUTBOUND_TEST_BIN=" + (executable("honk_outbound") | @sh)
+  "HONK_OUTBOUND_TEST_BIN=" + (executable("honk_outbound") | @sh),
+  "HONK_XSK_TEST_BIN=" + (executable("honk_xsk") | @sh),
+  "HONK_XDP_DAEMON=" + (executable("honk-core") | @sh)
 ' > "$GITHUB_WORKSPACE/target/kernel-test-bins.env"
 
 if ! test -f "$kernel_dir/$image"; then
@@ -43,6 +56,11 @@ kvm_args=()
 if test "${HONK_CI_VNG_DISABLE_KVM:-0}" = 1; then
   kvm_args+=(--disable-kvm)
 fi
+host_uuid=$(</proc/sys/kernel/random/uuid)
+host_daemon=$(bash -c 'source "$1"; printf "%s" "$HONK_XDP_DAEMON"' _ "$GITHUB_WORKSPACE/target/kernel-test-bins.env")
+python3 -I -B "$host_peers" manifest "$repo" "$lane" "$release" "$host_uuid" \
+  "$host_daemon" "$host_source" "$host_selection" > "$host_inputs"
+host_inputs_sha=$(sha256sum "$host_inputs")
 # Only the workspace is writable in the guest; copy its summary back on failure too.
 status=0
 : > "$log_dir/summary.md"
@@ -52,6 +70,9 @@ vng -r "$kernel_dir/root/boot/vmlinuz-$release" \
   --rwdir "$GITHUB_WORKSPACE" \
   --cpus 2 \
   --memory 4G \
+  --disable-microvm \
+  --qemu-opts="-uuid $host_uuid" \
+  --append 'lsm=landlock,lockdown,yama,integrity,apparmor,bpf' \
   -- \
   env \
     GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
@@ -60,6 +81,9 @@ vng -r "$kernel_dir/root/boot/vmlinuz-$release" \
     RUST_BACKTRACE=1 \
     HONK_CI_VM_LANE="$lane" \
     HONK_CI_EXPECTED_KERNEL="$release" \
+    HONK_CI_HOST_INPUTS="$host_inputs" \
+    HONK_CI_HOST_INPUTS_SHA256="${host_inputs_sha%% *}" \
+    HONK_CI_HOST_SELECTION="$host_selection" \
     HONK_ROUTING_TEST_OBJECT="$GITHUB_WORKSPACE/target/honk-ebpf-routing-test/bpfel-unknown-none/release/honk-ebpf" \
     bash "$GITHUB_WORKSPACE/.github/ci/ebpf-vm-tests.sh" || status=$?
 if test -f "$log_dir/summary.md"; then

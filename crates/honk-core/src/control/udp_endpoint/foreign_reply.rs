@@ -1,14 +1,14 @@
-//! Process-wide anyfrom sockets for full-cone replies from peers other than a
-//! flow's own destination.
+//! Process-wide reply transports for full-cone replies from foreign peers.
 //!
-//! A reply socket is bound to the peer's address, not to a client, so every
-//! ordinary endpoint and shared-source receiver can reuse one socket per peer.
-//! Foreign sockets draw on the same descriptor budget as each endpoint's eager
-//! primary socket and yield to it: a primary that finds the budget full closes
-//! the least recently used foreign socket first.
+//! Transports share a scope, original packet snapshot and peer address. Kernel
+//! replies have no packet snapshot and share descriptor credit with eager
+//! primaries, yielding their least recently used cache entries under pressure.
 
 use super::*;
 use lru::LruCache;
+
+type CachedReply = (Arc<ReplySocket>, tokio::time::Instant);
+pub(super) type ReplyKey = (ScopeId, Option<SourceContext>, SocketAddr);
 
 pub(super) struct ForeignReplySockets {
     factory: Arc<dyn UdpReplySocketFactory>,
@@ -17,7 +17,7 @@ pub(super) struct ForeignReplySockets {
     slots: Arc<Semaphore>,
     /// Foreign sockets never exceed seven per endpoint of capacity.
     limit: usize,
-    cache: Mutex<LruCache<SocketAddr, (Arc<ReplySocket>, tokio::time::Instant)>>,
+    cache: Mutex<LruCache<ReplyKey, CachedReply>>,
 }
 
 impl ForeignReplySockets {
@@ -33,16 +33,35 @@ impl ForeignReplySockets {
     }
 
     /// The eager reply socket of one endpoint, bound to its original destination.
-    pub(super) fn create_primary(&self, source: SocketAddr) -> io::Result<ReplySocket> {
-        self.create_with_reclaim(source)
+    pub(super) fn create_primary(
+        &self,
+        scope: ScopeId,
+        source: SocketAddr,
+        packet_source: Option<&SourceWork>,
+    ) -> io::Result<ReplySocket> {
+        self.create_with_reclaim(scope, source, packet_source)
     }
 
     /// Evicts until creation succeeds or nothing cached remains. An evicted
     /// socket still sending holds its permit, so reclamation must not stop at it.
-    fn create_with_reclaim(&self, source: SocketAddr) -> io::Result<ReplySocket> {
+    fn create_with_reclaim(
+        &self,
+        scope: ScopeId,
+        source: SocketAddr,
+        packet_source: Option<&SourceWork>,
+    ) -> io::Result<ReplySocket> {
         loop {
-            match ReplySocket::create(self.factory.as_ref(), &self.slots, source) {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock && self.evict_one() => {}
+            match ReplySocket::create(
+                self.factory.as_ref(),
+                &self.slots,
+                scope,
+                source,
+                packet_source,
+            ) {
+                Err(error)
+                    if self.factory.uses_fd()
+                        && error.kind() == io::ErrorKind::WouldBlock
+                        && self.evict_one() => {}
                 created => return created,
             }
         }
@@ -50,21 +69,60 @@ impl ForeignReplySockets {
 
     /// Returns the socket for `source`, creating it when no endpoint has one.
     /// `WouldBlock` means every descriptor is held by primaries or in-flight sends.
-    pub(super) fn get(&self, source: SocketAddr) -> io::Result<Arc<ReplySocket>> {
+    pub(super) fn get(
+        &self,
+        scope: ScopeId,
+        source: SocketAddr,
+        packet_source: Option<&SourceWork>,
+    ) -> io::Result<Arc<ReplySocket>> {
+        let reply_source = packet_source.filter(|source| source.optional_context().is_some());
+        let key = (
+            scope,
+            reply_source.and_then(SourceWork::optional_context),
+            source,
+        );
         let now = tokio::time::Instant::now();
-        if let Some((socket, used)) = self.cache.lock().get_mut(&source) {
-            *used = now;
-            return Ok(Arc::clone(socket));
-        }
-        let created = self.create_with_reclaim(source)?;
-        let (socket, overflow) = {
+        {
             let mut cache = self.cache.lock();
-            let socket = Arc::clone(&cache.get_or_insert(source, || (Arc::new(created), now)).0);
+            if !packet_binding_active(packet_source) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    AuxiliaryBindingRetired,
+                ));
+            }
+            if let Some((socket, used)) = cache.get_mut(&key) {
+                *used = now;
+                return Ok(Arc::clone(socket));
+            }
+        }
+        let mut created = Some(Arc::new(self.create_with_reclaim(
+            scope,
+            source,
+            reply_source,
+        )?));
+        let (socket, displaced, overflow) = {
+            let mut cache = self.cache.lock();
+            if !packet_binding_active(packet_source) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    AuxiliaryBindingRetired,
+                ));
+            }
+            let (socket, displaced) = if let Some((socket, used)) = cache.get_mut(&key) {
+                *used = now;
+                (Arc::clone(socket), None)
+            } else {
+                let socket = created.take().expect("new reply socket");
+                let displaced = cache.push(key, (Arc::clone(&socket), now));
+                (socket, displaced)
+            };
             let overflow = (cache.len() > self.limit)
                 .then(|| cache.pop_lru())
                 .flatten();
-            (socket, overflow)
+            (socket, displaced, overflow)
         };
+        drop(created);
+        drop(displaced);
         if overflow.is_some() {
             crate::logging::warn_throttled!(
                 limit = self.limit,
@@ -102,8 +160,21 @@ impl ForeignReplySockets {
         expired.len()
     }
 
+    #[cfg(any(target_os = "linux", test))]
+    pub(super) fn clear_scope(&self, scope: ScopeId) {
+        let mut cache = self.cache.lock();
+        let keys: Vec<_> = cache
+            .iter()
+            .filter_map(|(key, _)| (key.0 == scope).then_some(*key))
+            .collect();
+        for key in keys {
+            cache.pop(&key);
+        }
+    }
+
     pub(super) fn clear(&self) {
-        self.cache.lock().clear();
+        let old = std::mem::replace(&mut *self.cache.lock(), LruCache::unbounded());
+        drop(old);
     }
 
     /// A one-endpoint pool for driver tests built without a `UdpEndpointPool`.
@@ -114,12 +185,12 @@ impl ForeignReplySockets {
 
     /// Cached peers, least recently used first.
     #[cfg(test)]
-    pub(super) fn cached(&self) -> Vec<SocketAddr> {
+    pub(super) fn cached(&self) -> Vec<(ScopeId, SocketAddr)> {
         self.cache
             .lock()
             .iter()
             .rev()
-            .map(|(peer, _)| *peer)
+            .map(|((scope, _, source), _)| (*scope, *source))
             .collect()
     }
 

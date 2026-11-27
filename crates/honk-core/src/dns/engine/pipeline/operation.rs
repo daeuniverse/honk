@@ -116,18 +116,10 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
         }
     };
 
-    let exact_cache_key = context.cache_key.clone();
-    let (expiry, _revision) = if strict_reusable {
-        cache::store(
-            context,
-            &exact_cache_key,
-            &mut response,
-            rejected_wire.as_deref(),
-            class,
-        )
-        .await
+    let (expiry, _revision, lifetime) = if strict_reusable {
+        cache::store(context, &mut response, rejected_wire.as_deref(), class).await
     } else {
-        (EffectiveExpiry::do_not_cache(), None)
+        (EffectiveExpiry::do_not_cache(), None, None)
     };
     #[cfg(feature = "native-api")]
     let entry_id = if cache::entry_id_demanded(context)
@@ -137,7 +129,7 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
             .forwarder
             .cache_service()
             .await
-            .entry_id_for_revision(&exact_cache_key, revision)
+            .entry_id_for_revision(&context.cache_key, revision)
     } else {
         None
     };
@@ -160,19 +152,22 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
             context.options,
         )
         .await?;
-    let outcome = context.forwarder.outcome_from_wire(
-        context.engine,
-        context.prepared,
-        response,
-        analyzed_answer_ips,
-        status,
-        Provenance::Upstream,
-        expiry,
-        Some(context.logical_upstream.as_str().to_owned()),
-        Some(upstream_name.as_str().to_owned()),
-        traversal_strings(&traversal),
-        context.mode,
-    )?;
+    let outcome = context
+        .forwarder
+        .outcome_from_wire(
+            context.engine,
+            context.prepared,
+            response,
+            analyzed_answer_ips,
+            status,
+            Provenance::Upstream,
+            expiry,
+            Some(context.logical_upstream.as_str().to_owned()),
+            Some(upstream_name.as_str().to_owned()),
+            traversal_strings(&traversal),
+            context.mode,
+        )?
+        .with_projection_lifetime(lifetime);
     #[cfg(feature = "native-api")]
     let outcome = outcome.with_cache_entry_id(entry_id);
     Ok(outcome)

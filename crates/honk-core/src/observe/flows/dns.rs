@@ -513,6 +513,7 @@ impl RuleCapture {
                 rules: self.rules,
                 outbound: outbound.map(bounded),
                 must: None,
+                mark_kind: None,
                 mark: None,
                 input: Some(self.input),
                 dns_action: Some(action),
@@ -736,7 +737,12 @@ pub(crate) fn route_upstream(
             rules,
             outbound: Some(bounded(outbound)),
             must: Some(action.must),
-            mark: Some(action.mark.map_or(0, honk_outbound::proxy::DirectMark::get)),
+            mark_kind: Some(if action.mark.is_some() {
+                honk_ebpf_common::ROUTING_MARK_SET
+            } else {
+                honk_ebpf_common::ROUTING_MARK_KEEP
+            }),
+            mark: Some(action.mark.unwrap_or(0)),
             input: Some(EvaluationInput::Traffic({
                 let mut traffic = super::record::RouteInput::from(input);
                 for text in [

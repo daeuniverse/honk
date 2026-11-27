@@ -78,3 +78,65 @@ async fn ineligible_queries_bypass_singleflight() {
 
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test(start_paused = true)]
+async fn expired_singleflight_waiter_keeps_successor_route() {
+    struct ChangingUpstream(AtomicUsize);
+    #[async_trait::async_trait]
+    impl DnsUpstreamPool for ChangingUpstream {
+        async fn query(&self, _: &str, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+            if first {
+                tokio::task::yield_now().await;
+            }
+            Ok(a_response(raw, [192, 0, 2, if first { 1 } else { 2 }]))
+        }
+    }
+
+    let upstream = Arc::new(ChangingUpstream(AtomicUsize::new(0)));
+    let forwarder = Arc::new(
+        DnsForwarder::new(
+            upstream.clone(),
+            Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(8))),
+            Arc::new(
+                crate::dns::routing::DnsRouter::new_from_dns_config(&Default::default()).unwrap(),
+            ),
+        )
+        .with_cache_enabled(false),
+    );
+    let (controller, _) = projection_controller(forwarder);
+    let snapshot = Arc::clone(controller.runtime_provider().current().routing_projection());
+    let query = query_with_txid("example.com", 1);
+    let answer = || {
+        controller.answer_query_for_test(&query, DnsRequestMeta::EMPTY, IngressProfile::Internal)
+    };
+    let ips = crate::dns::forwarder::extract_answer_ips;
+    let old = std::net::IpAddr::from([192, 0, 2, 1]);
+    let new = std::net::IpAddr::from([192, 0, 2, 2]);
+    let leader = answer();
+    let waiter = answer();
+    tokio::pin!(leader, waiter);
+    assert!(futures::poll!(leader.as_mut()).is_pending());
+    assert!(futures::poll!(waiter.as_mut()).is_pending());
+    assert_eq!(ips(&leader.await), [old]);
+    tokio::time::advance(Duration::from_secs(31)).await;
+    assert_eq!(ips(&answer().await), [new]);
+    assert_eq!(controller.project_routes(&snapshot)[0].0, new);
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(ips(&waiter.await), [old]);
+    assert_eq!(upstream.0.load(Ordering::SeqCst), 2);
+    let routes = controller.project_routes(&snapshot);
+    assert_eq!(
+        routes.iter().map(|(ip, _)| *ip).collect::<Vec<_>>(),
+        [new],
+        "expired waiter withdrew the successor route"
+    );
+    tokio::time::advance(Duration::from_secs(20)).await;
+    controller.routing_projection.submit(
+        ScopeId::HOST,
+        Arc::clone(&snapshot),
+        crate::dns::projection::ProjectionObservation::Retain,
+    );
+    assert!(controller.project_routes(&snapshot).is_empty());
+    controller.shutdown(Duration::from_secs(1)).await;
+}

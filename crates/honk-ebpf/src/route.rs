@@ -25,8 +25,8 @@ pub const OUTBOUND_DIRECT: u8 = 0x0;
 pub const OUTBOUND_BLOCK: u8 = 0x1;
 pub const OUTBOUND_CONTROL_PLANE_ROUTING: u8 = 0xFD;
 
-/// 32-bit words of the decision prefix and of the whole map-backed output.
-const DECISION_WORDS: usize = core::mem::size_of::<RoutingDecision>() / 4;
+/// 32-bit words through the canonical effect, and of the whole map-backed output.
+const EFFECT_WORDS: usize = core::mem::offset_of!(KernelRouteOutput, mark_kind) / 4 + 1;
 const OUTPUT_WORDS: usize = core::mem::size_of::<KernelRouteOutput>() / 4;
 
 /// Both extension targets share the documented two-pointer POD ABI. Generated
@@ -48,12 +48,12 @@ pub unsafe extern "C" fn honk_route_slot0(
         for word in 0..32 {
             let _ = core::ptr::read_volatile(_input.cast::<u32>().add(word));
         }
-        for word in 0..DECISION_WORDS {
+        for word in 0..EFFECT_WORDS {
             let pointer = _decision.cast::<u32>().add(word);
             core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
         }
         if core::ptr::read_volatile(core::ptr::addr_of!((*_decision).flags)) & 1 != 0 {
-            for word in DECISION_WORDS..OUTPUT_WORDS {
+            for word in EFFECT_WORDS..OUTPUT_WORDS {
                 let pointer = _decision.cast::<u32>().add(word);
                 core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
             }
@@ -77,12 +77,12 @@ pub unsafe extern "C" fn honk_route_slot1(
         for word in 0..32 {
             let _ = core::ptr::read_volatile(_input.cast::<u32>().add(word));
         }
-        for word in 0..DECISION_WORDS {
+        for word in 0..EFFECT_WORDS {
             let pointer = _decision.cast::<u32>().add(word);
             core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
         }
         if core::ptr::read_volatile(core::ptr::addr_of!((*_decision).flags)) & 1 != 0 {
-            for word in DECISION_WORDS..OUTPUT_WORDS {
+            for word in EFFECT_WORDS..OUTPUT_WORDS {
                 let pointer = _decision.cast::<u32>().add(word);
                 core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
             }
@@ -180,12 +180,12 @@ fn evaluate_policy(
     };
     // freplace writes are opaque to LLVM; retain the replacement's whole output.
     unsafe {
-        for word in 0..DECISION_WORDS {
+        for word in 0..EFFECT_WORDS {
             let pointer = core::ptr::from_mut(output).cast::<u32>().add(word);
             core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
         }
         if trace_enabled {
-            for word in DECISION_WORDS..OUTPUT_WORDS {
+            for word in EFFECT_WORDS..OUTPUT_WORDS {
                 let pointer = core::ptr::from_mut(output).cast::<u32>().add(word);
                 core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
             }

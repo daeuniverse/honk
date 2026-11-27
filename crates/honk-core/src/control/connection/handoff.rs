@@ -1,5 +1,5 @@
 #[cfg(feature = "native-api")]
-use super::observation::ConnectionObservation;
+use super::observation::{ConnectionObservation, PacketRouteSlot};
 use super::routing::RoutingDecision;
 use crate::control::*;
 use std::collections::HashMap;
@@ -39,7 +39,7 @@ pub(crate) fn build_tuples_key(
 }
 
 /// The original numeric owner survives sniffing and explicitly selected replacements.
-pub(super) struct UdpGroupProof {
+pub(in crate::control) struct UdpGroupProof {
     slot: u8,
     generation: u64,
     plan: Arc<routing_matcher::RoutingPushPlan>,
@@ -69,7 +69,7 @@ fn check_udp_group(
 }
 
 /// Result from the eBPF routing handoff map lookup.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(in crate::control) struct HandoffResult {
     pub(super) outbound: u8,
     pub(super) mark: u32,
@@ -83,10 +83,13 @@ pub(in crate::control) struct HandoffResult {
     #[cfg(feature = "native-api")]
     pub(super) trace_id: u32,
     #[cfg(feature = "native-api")]
-    pub(super) capture: Option<crate::observe::flows::kernel::CapturedKernelRoute>,
-    #[cfg(feature = "native-api")]
-    pub(super) capture_gap: Option<&'static str>,
+    pub(super) packet_route: PacketRouteSlot,
 }
+
+#[cfg(feature = "native-api")]
+const _: () = assert!(size_of::<HandoffResult>() <= 80);
+#[cfg(not(feature = "native-api"))]
+const _: () = assert!(size_of::<HandoffResult>() <= 48);
 
 impl From<RoutingHandoffEntry> for HandoffResult {
     fn from(entry: RoutingHandoffEntry) -> Self {
@@ -103,58 +106,58 @@ impl From<RoutingHandoffEntry> for HandoffResult {
             #[cfg(feature = "native-api")]
             trace_id: entry.trace_id,
             #[cfg(feature = "native-api")]
-            capture: None,
-            #[cfg(feature = "native-api")]
-            capture_gap: Some("kernel_trace_not_captured"),
+            packet_route: PacketRouteSlot::failed("kernel_trace_not_captured"),
         }
     }
 }
 
 impl HandoffResult {
-    fn captured(
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn captured(
         backend: &dyn crate::ebpf::EbpfBackend,
         key: &TuplesKey,
         entry: RoutingHandoffEntry,
-        #[cfg(feature = "native-api")] observation: &ConnectionObservation,
+        observation: &ConnectionObservation,
+        packet_trace_id: Option<u32>,
     ) -> Self {
-        let handoff = Self::from(entry);
-        #[cfg(feature = "native-api")]
+        let mut handoff = Self::from(entry);
+        if key.l4proto == 17
+            && handoff.decision_token == 0
+            && packet_trace_id != Some(handoff.trace_id)
+        {
+            // A queued socket datagram cannot identify a later token-zero tuple incarnation.
+            handoff.trace_id = 0;
+            handoff.packet_route = PacketRouteSlot::failed("kernel_handoff_ambiguous");
+            return handoff;
+        }
         if !observation.is_recording() {
             return handoff;
         }
-        #[cfg(feature = "native-api")]
-        let handoff = {
-            let mut handoff = handoff;
-            match backend.capture_kernel_route(key, (&entry).into()) {
-                Ok(mut capture) => {
-                    if key.dst_port != 53
-                        && !(key.l4proto == 17
-                            && honk_ebpf_common::conn::is_stateless_udp_ports(
-                                key.src_port,
-                                key.dst_port,
-                            ))
-                    {
-                        let state = backend.conn_state_lookup(key);
-                        if !state.ok().flatten().is_some_and(|state| {
-                            state.incarnation == entry.incarnation
-                                && state.trace_id == entry.trace_id
-                                && state.decision_token == entry.result.decision_token
-                        }) {
-                            capture.gap = Some("kernel_trace_conn_incarnation_mismatch");
-                            capture.ambiguous = true;
-                        }
+        match backend.capture_kernel_route(key, (&entry).into()) {
+            Ok(mut capture) => {
+                if key.dst_port != 53
+                    && !(key.l4proto == 17
+                        && honk_ebpf_common::conn::is_stateless_udp_ports(
+                            key.src_port,
+                            key.dst_port,
+                        ))
+                {
+                    let state = backend.conn_state_lookup(key);
+                    if !state.ok().flatten().is_some_and(|state| {
+                        state.incarnation == entry.incarnation
+                            && state.trace_id == entry.trace_id
+                            && state.decision_token == entry.result.decision_token
+                    }) {
+                        capture.gap = Some("kernel_trace_conn_incarnation_mismatch");
+                        capture.ambiguous = true;
                     }
-                    handoff.capture_gap = capture.gap;
-                    handoff.capture = Some(capture);
                 }
-                Err(gap) => {
-                    handoff.capture_gap = Some(gap);
-                }
+                handoff.packet_route = PacketRouteSlot::from_capture(Ok(capture));
             }
-            handoff
-        };
-        #[cfg(not(feature = "native-api"))]
-        let _ = (backend, key);
+            Err(gap) => {
+                handoff.packet_route = PacketRouteSlot::failed(gap);
+            }
+        }
         handoff
     }
     /// Convert the eBPF process name byte array to an optional string: bytes
@@ -173,11 +176,10 @@ impl HandoffResult {
     /// Resolve the process executable path from /proc. The process may have
     /// exited between the cgroup hook and now — any failure just omits the
     /// field. Off the runtime workers: even a /proc readlink is blocking I/O.
-    pub(super) async fn process_path(&self) -> Option<String> {
-        if self.pid == 0 {
+    pub(super) async fn process_path(pid: u32) -> Option<String> {
+        if pid == 0 {
             return None;
         }
-        let pid = self.pid;
         tokio::task::spawn_blocking(move || {
             std::fs::read_link(format!("/proc/{pid}/exe"))
                 .ok()
@@ -188,21 +190,8 @@ impl HandoffResult {
         .flatten()
     }
 
-    /// Convert the eBPF MAC address to canonical lower-case colon form.
-    pub(super) fn mac_address(&self) -> Option<String> {
-        use std::fmt::Write as _;
-
-        if self.mac == [0u8; 6] {
-            return None;
-        }
-        let mut mac = String::with_capacity(17);
-        write!(
-            mac,
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]
-        )
-        .expect("writing to a String cannot fail");
-        Some(mac)
+    pub(super) fn mac_address(&self) -> Option<[u8; 6]> {
+        (self.mac != [0; 6]).then_some(self.mac)
     }
 }
 
@@ -362,7 +351,7 @@ pub(in crate::control) struct TcpFlowGuard {
     pin: FlowPin,
     retirement: Arc<crate::control::retirement_worker::RetirementPort>,
     tracker: Arc<ConnectionTracker>,
-    tracker_id: Option<String>,
+    tracker_id: Option<uuid::Uuid>,
     ack: RetireAck,
 }
 
@@ -415,7 +404,7 @@ impl TcpFlowGuard {
         &mut self,
         make_entry: impl FnOnce() -> crate::connection_tracker::ConnectionEntry,
         owner: crate::connection_tracker::ConnectionOwner,
-    ) -> Option<String> {
+    ) -> Option<uuid::Uuid> {
         assert!(
             self.tracker_id.is_none(),
             "TCP flow tracker attached more than once"
@@ -424,7 +413,7 @@ impl TcpFlowGuard {
             return None;
         }
         let id = self.tracker.register_owned(make_entry(), owner);
-        self.tracker_id = Some(id.clone());
+        self.tracker_id = Some(id);
         Some(id)
     }
 
@@ -476,11 +465,12 @@ impl Drop for TcpFlowGuard {
     }
 }
 
-pub(super) struct ModeDecision {
-    pub(super) name: String,
-    pub(super) constraint: crate::control::reload::OutboundConstraint,
+#[derive(Clone, Debug)]
+pub(in crate::control) struct ModeDecision {
+    pub(in crate::control) name: String,
+    pub(in crate::control) constraint: crate::control::reload::OutboundConstraint,
     #[cfg(feature = "native-api")]
-    pub(super) group_id: Option<String>,
+    pub(in crate::control) group_id: Option<String>,
 }
 
 impl ControlPlaneHandle {
@@ -488,15 +478,15 @@ impl ControlPlaneHandle {
     /// delivery behind the blocking pool used to resolve it.
     pub(super) fn spawn_process_path_enrichment(
         &self,
-        conn_id: String,
+        conn_id: uuid::Uuid,
         handoff: Option<&HandoffResult>,
     ) {
-        let Some(handoff) = handoff.filter(|handoff| handoff.pid != 0).cloned() else {
+        let Some(pid) = handoff.map(|handoff| handoff.pid).filter(|pid| *pid != 0) else {
             return;
         };
         let tracker = Arc::clone(&self.connection_tracker);
         tokio::spawn(async move {
-            if let Some(process_path) = handoff.process_path().await {
+            if let Some(process_path) = HandoffResult::process_path(pid).await {
                 tracker.update_process_path(&conn_id, process_path);
             }
         });
@@ -513,12 +503,12 @@ impl ControlPlaneHandle {
     #[cfg(test)]
     pub(in crate::control) fn resolve_udp_handoff_group(
         &self,
-        backend: &dyn EbpfBackend,
+        backend: &dyn crate::ebpf::EbpfBackend,
         outbound: u8,
         supplied: u64,
     ) -> anyhow::Result<String> {
         Ok(self
-            .capture_udp_group(backend, outbound, supplied)?
+            .capture_udp_group(outbound, supplied, backend.routing_policy_generation())?
             .name()
             .to_owned())
     }
@@ -526,13 +516,13 @@ impl ControlPlaneHandle {
     /// Capture the original slot under the backend read that verified the UDP owner.
     pub(super) fn capture_udp_group(
         &self,
-        backend: &dyn EbpfBackend,
         slot: u8,
         generation: u64,
+        published: u64,
     ) -> anyhow::Result<UdpGroupProof> {
         let manager = self.group_manager.read();
         let routing = self.active_routing_plan.read();
-        if generation > backend.routing_policy_generation() {
+        if generation > published {
             return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
         }
         check_udp_group(&manager, &routing, slot, generation, None)?;
@@ -561,7 +551,7 @@ impl ControlPlaneHandle {
     }
 
     /// A staged node has no kernel group slot. Only a selected group can bind a user slot.
-    #[cfg(any(feature = "ebpf", test))]
+    #[cfg(any(feature = "legacy-tc", test))]
     pub(in crate::control) fn staged_udp_outbound(
         &self,
         config: &Config,
@@ -596,54 +586,25 @@ impl ControlPlaneHandle {
         }
     }
 
-    /// Read immutable UDP admission metadata without consuming tuple ownership.
-    /// The caller carries its original incarnation through deferred admission.
     pub(super) async fn lookup_udp_handoff(
         &self,
         tuples: &TuplesKey,
         owner: crate::ebpf::UdpFlowOwner,
         #[cfg(feature = "native-api")] observation: &ConnectionObservation,
+        #[cfg(feature = "native-api")] packet_trace_id: Option<u32>,
     ) -> anyhow::Result<(Option<HandoffResult>, Option<UdpGroupProof>)> {
-        let backend = self.ebpf.read().await;
-        let (entry, cached_group) = backend.verify_udp_admission(tuples, owner)?;
-        let entry = entry.filter(|entry| {
-            tuples.dst_port != 53
-                || owner.token != 0
-                || (entry.result.outbound == OutboundIndex::ControlPlaneRouting as u8
-                    && entry.result.must == 0)
-        });
-        let Some(entry) = entry else {
-            // No auxiliary record means no generation proof. Do not manufacture a handoff.
-            let group = cached_group
-                .map(|slot| self.capture_udp_group(backend.as_ref(), slot, 0))
-                .transpose()?;
-            return Ok((None, group));
-        };
-        let group = if (OutboundIndex::UserBase as u8..OutboundIndex::MustRules as u8)
-            .contains(&entry.result.outbound)
-        {
-            Some(self.capture_udp_group(
-                backend.as_ref(),
-                entry.result.outbound,
-                entry.routing_generation,
-            )?)
-        } else {
-            None
-        };
-        let handoff = HandoffResult::captured(
-            backend.as_ref(),
-            tuples,
-            entry,
-            #[cfg(feature = "native-api")]
-            observation,
-        );
-        Ok((Some(handoff), group))
+        TcKernelController::require(&self.tc_kernel)?
+            .verify_udp_handoff(
+                tuples,
+                owner,
+                |slot, generation, published| self.capture_udp_group(slot, generation, published),
+                #[cfg(feature = "native-api")]
+                observation,
+                #[cfg(feature = "native-api")]
+                packet_trace_id,
+            )
+            .await
     }
-
-    /// sock_ops publishes a child's proof after the kernel queued it; measured on x86 the gap is
-    /// under 20 us, so a few millisecond-granular retries cover it without delaying a real refusal.
-    const CHILD_PROOF_RETRIES: u32 = 3;
-    const CHILD_PROOF_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
 
     pub(in crate::control) async fn adopt_tcp_flow(
         &self,
@@ -651,43 +612,26 @@ impl ControlPlaneHandle {
         tuples: TuplesKey,
         #[cfg(feature = "native-api")] observation: &ConnectionObservation,
     ) -> anyhow::Result<(TcpFlowGuard, Option<HandoffResult>)> {
-        use std::os::fd::AsFd;
-        let mut retries = Self::CHILD_PROOF_RETRIES;
-        let (backend, adoption) = loop {
-            let backend = self.ebpf.read().await;
-            match backend.adopt_tcp(
-                stream.as_fd(),
-                &tuples,
-                Arc::clone(&self.retirement.pin_errors),
-            ) {
-                Err(error) if retries > 0 && error.is::<crate::ebpf::TcpChildProofPending>() => {
-                    retries -= 1;
-                    drop(backend);
-                    tokio::time::sleep(Self::CHILD_PROOF_RETRY_DELAY).await;
-                }
-                result => break (backend, result?),
-            }
-        };
-        // The local pin joins the native pin before releasing backendR.
-        let flow = TcpFlowGuard::new(
-            stream,
-            tuples,
-            adoption.incarnation,
-            Arc::clone(&self.tcp_flow_pins),
-            Arc::clone(&self.connection_tracker),
-            Arc::clone(&self.retirement),
-            adoption.pin,
-        );
-        let handoff = adoption.handoff.map(|entry| {
-            HandoffResult::captured(
-                backend.as_ref(),
-                &tuples,
-                entry,
+        TcKernelController::require(&self.tc_kernel)?
+            .adopt_tcp(
+                stream,
+                tuples,
+                &self.retirement.pin_errors,
+                |stream, incarnation, pin| {
+                    TcpFlowGuard::new(
+                        stream,
+                        tuples,
+                        incarnation,
+                        Arc::clone(&self.tcp_flow_pins),
+                        Arc::clone(&self.connection_tracker),
+                        Arc::clone(&self.retirement),
+                        pin,
+                    )
+                },
                 #[cfg(feature = "native-api")]
                 observation,
             )
-        });
-        Ok((flow, handoff))
+            .await
     }
 
     pub(super) async fn outbound_index_to_name(&self, index: u8) -> String {
@@ -816,6 +760,64 @@ impl ControlPlaneHandle {
     }
 }
 
+pub(in crate::control) fn mode_decision(
+    state: Option<&crate::mode::ModeState>,
+    config: &honk_config::Config,
+    #[cfg(feature = "native-api")] catalog: Option<&crate::observe::catalog::CatalogIdentity>,
+    outbound: String,
+    must: bool,
+) -> ModeDecision {
+    let mut result = ModeDecision {
+        name: outbound,
+        constraint: Default::default(),
+        #[cfg(feature = "native-api")]
+        group_id: None,
+    };
+    let Some(state) = state else {
+        return result;
+    };
+    if must || result.name == "block" {
+        return result;
+    }
+    #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
+    if state.is_native() {
+        let Some(catalog) = catalog else {
+            result.name = "block".into();
+            return result;
+        };
+        match state.native_override(&result.name, must, config, &catalog.groups) {
+            crate::mode::ModeOverride::Unchanged => {}
+            crate::mode::ModeOverride::Direct => result.name = "direct".into(),
+            crate::mode::ModeOverride::Block => result.name = "block".into(),
+            crate::mode::ModeOverride::Node(id) => {
+                result.name = config
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == id)
+                    .expect("validated mode target")
+                    .name
+                    .clone();
+                result.constraint = crate::control::reload::OutboundConstraint::Node(id);
+            }
+            crate::mode::ModeOverride::Group(name) => {
+                result.group_id = catalog.groups.get(&name).cloned();
+                result.name = name;
+            }
+        }
+        return result;
+    }
+    #[cfg(feature = "native-api")]
+    let _ = catalog;
+    let selection = state.global_selection();
+    let resolvable = state.is_global()
+        && !selection.is_empty()
+        && (matches!(selection, "direct" | "block")
+            || config.groups.iter().any(|group| group.name == selection)
+            || config.nodes.iter().any(|node| node.name == selection));
+    result.name = state.override_outbound(&result.name, must, resolvable);
+    result
+}
+
 #[cfg(test)]
 #[path = "tcp_flow_lifecycle_tests.rs"]
 mod tcp_flow_lifecycle_tests;
@@ -832,21 +834,36 @@ fn handoff_capture_follows_admission_without_changing_authority() {
             ..Default::default()
         },
         routing_generation: 9,
+        trace_id: 31,
         ..Default::default()
     };
-    for admitted in [false, true] {
+    for (admitted, l4proto, packet_trace_id, trace_id, gap) in [
+        (false, 6, None, 31, "kernel_trace_not_captured"),
+        (true, 6, None, 31, "kernel_trace_sidecar_missing"),
+        (true, 17, Some(30), 0, "kernel_handoff_ambiguous"),
+    ] {
         let native =
             crate::native_api::observation::NativeObservation::new(&honk_config::Config::default());
         native.core.flows.set_recording(admitted);
         let observation = ConnectionObservation::begin(
             Some(&native.core),
-            crate::observe::vocab::Network::Tcp,
+            if l4proto == 17 {
+                crate::observe::vocab::Network::Udp
+            } else {
+                crate::observe::vocab::Network::Tcp
+            },
             "127.0.0.1:31000".parse().unwrap(),
             "127.0.0.1:443".parse().unwrap(),
         );
         native.core.flows.set_recording(!admitted);
-        let result = HandoffResult::captured(&backend, &TuplesKey::default(), entry, &observation);
-        assert_eq!(result.capture_gap, Some("kernel_trace_not_captured"));
+        let key = TuplesKey {
+            l4proto,
+            ..Default::default()
+        };
+        let result = HandoffResult::captured(&backend, &key, entry, &observation, packet_trace_id);
+        assert_eq!(result.trace_id, trace_id);
+        assert!(result.packet_route.capture.is_none());
+        assert_eq!(result.packet_route.capture_gap, Some(gap));
         assert_eq!(
             (
                 result.outbound,

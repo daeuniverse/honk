@@ -1,9 +1,7 @@
 //! Bond coverage is on the logical device, after bonding's receive admission and
 //! before bonding chooses the transmit member. All traffic uses the real control plane.
 
-use super::support::netns::{
-    KernelTcpDial, enter_lab_namespaces, lab_config, pinned_map, run_isolated, tuples_key,
-};
+use super::support::netns::{KernelTcpDial, lab_config, pinned_map, run_isolated, tuples_key};
 use super::support::shared_udp::{SharedUdpMode, SharedUdpPeer};
 use super::{configure_test_edge, fresh_test_netns, in_test_netns, udp_test_forwarder};
 use crate::control::{ControlCommand, ControlPlane};
@@ -23,7 +21,6 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, UdpSocket};
@@ -49,7 +46,7 @@ const UDP_PORT: u16 = 41012;
 const TIMEOUT: Duration = Duration::from_secs(15);
 const BLOCK: usize = 1024;
 
-type Backend = Arc<RwLock<Box<dyn EbpfBackend>>>;
+type Backend = Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>;
 
 macro_rules! bond_case {
     ($name:ident, [$($case:literal),+]) => {
@@ -241,7 +238,7 @@ struct Scenario {
 fn run_child(case: &str) -> anyhow::Result<()> {
     let (kind, mode) = case.split_once('/').context("bond case")?;
     let (kind, mode) = (Kind::parse(kind)?, Mode::parse(mode)?);
-    enter_lab_namespaces()?;
+    crate::test_support::netns::enter_lab_namespaces()?;
     ip(None, &["link", "set", "lo", "up"])?;
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
     // Neither rp_filter nor an IPv4 Redirect may turn asymmetric bridge traffic into
@@ -354,7 +351,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                         outbound: RoutingOutbound::Simple("direct".into()),
                         priority: 0,
                         must: true,
-                        mark: 0,
+                        mark: None,
                     });
                 }
                 config
@@ -404,7 +401,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
             )));
             control.start_datapath_flags_coordinator()?;
             control.alive_set().shutdown_health_checks().await?;
-            let ebpf = control.ebpf_handle();
+            let ebpf = control.policy_backend_handle();
             control.set_iface_watcher(Some(IfaceWatcher::spawn(
                 ebpf.clone(),
                 control.config_handle(),
@@ -430,7 +427,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                 exercise(&scenario, &ebpf, &mut peer).await
             }
             .await;
-            shutdown.store(true, Ordering::Release);
+            shutdown.request();
             let sent = if task.is_finished() {
                 Ok(())
             } else {
@@ -491,7 +488,7 @@ async fn replies_follow(
 }
 
 async fn binding_snapshot(ebpf: &Backend) -> anyhow::Result<BindingSnapshot> {
-    ebpf.read().await.interface_binding_snapshot()
+    ebpf.read().await.tc().unwrap().interface_binding_snapshot()
 }
 
 fn hook_count(snapshot: &BindingSnapshot, device: &str) -> usize {
@@ -567,6 +564,8 @@ async fn redirected(
     let entry = ebpf
         .read()
         .await
+        .tc()
+        .unwrap()
         .redirect_track_lookup(&RedirectTuple::from_tuples(&tuples_key(
             source,
             destination,
@@ -814,6 +813,8 @@ async fn inactive(s: &Scenario, ebpf: &Backend, target: SocketAddr) -> anyhow::R
     ensure!(
         ebpf.read()
             .await
+            .tc()
+            .unwrap()
             .redirect_track_lookup(&RedirectTuple::from_tuples(&tuples_key(local, target, 6)))?
             .is_none(),
         "inactive frame published a redirect"
@@ -837,7 +838,8 @@ async fn bridge(
     udp.rounds(4).await?;
     let forward = tuples_key(udp.local, target, 17);
     let reverse = tuples_key(target, udp.local, 17);
-    let backend = ebpf.read().await;
+    let backend =
+        tokio::sync::RwLockReadGuard::map(ebpf.read().await, |backend| backend.tc().unwrap());
     let state = backend
         .conn_state_lookup(&reverse)?
         .context("bond port did not learn reverse UDP")?;
@@ -891,6 +893,8 @@ async fn bridge(
     let state = ebpf
         .read()
         .await
+        .tc()
+        .unwrap()
         .conn_state_lookup(&tuples_key(target, second.local, 17))?
         .context("hotplugged sibling reverse state")?;
     ensure!(state.is_wan_ingress_direction == 1);

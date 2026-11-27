@@ -157,27 +157,73 @@ fn vless_source_id_normalizes_client_and_partitions_scope() {
     let mapped = "[::ffff:192.0.2.1]:53000".parse().unwrap();
     let reply = "198.51.100.2:53".parse().unwrap();
     let id = runtime
-        .vless_source_id(ipv4, VlessUdpPath::Xudp, None)
+        .vless_source_id(0, ipv4, VlessUdpPath::Xudp, None, None)
         .unwrap();
     assert_ne!(id, [0; 8]);
 
     assert_eq!(
         id,
         runtime
-            .vless_source_id(mapped, VlessUdpPath::Xudp, None)
+            .vless_source_id(0, mapped, VlessUdpPath::Xudp, None, None)
             .unwrap()
     );
     assert_ne!(
         id,
         runtime
-            .vless_source_id(ipv4, VlessUdpPath::CoolShared, None)
+            .vless_source_id(0, ipv4, VlessUdpPath::CoolShared, None, None)
             .unwrap()
     );
     assert_ne!(
         id,
         runtime
-            .vless_source_id(ipv4, VlessUdpPath::Xudp, Some(reply))
+            .vless_source_id(0, ipv4, VlessUdpPath::Xudp, Some(reply), None)
             .unwrap()
+    );
+    assert_ne!(
+        id,
+        runtime
+            .vless_source_id(1, ipv4, VlessUdpPath::Xudp, None, None)
+            .unwrap()
+    );
+    assert_eq!(
+        runtime
+            .vless_source_id(1, ipv4, VlessUdpPath::Xudp, None, None)
+            .unwrap(),
+        runtime
+            .vless_source_id(1, mapped, VlessUdpPath::Xudp, None, None)
+            .unwrap(),
+    );
+    let packet_source = [7; 16];
+    let packet_id = runtime
+        .vless_source_id(0, ipv4, VlessUdpPath::Xudp, None, Some(packet_source))
+        .unwrap();
+    assert_ne!(id, packet_id);
+    assert_eq!(
+        packet_id,
+        runtime
+            .vless_source_id(0, mapped, VlessUdpPath::Xudp, None, Some(packet_source))
+            .unwrap(),
+    );
+    for changed in [0, 8] {
+        let mut other_source = packet_source;
+        other_source[changed] ^= 1;
+        assert_ne!(
+            packet_id,
+            runtime
+                .vless_source_id(0, ipv4, VlessUdpPath::Xudp, None, Some(other_source))
+                .unwrap(),
+        );
+    }
+    let successor = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+    assert_ne!(
+        runtime
+            .vless_source_id(1, ipv4, VlessUdpPath::Xudp, None, None)
+            .unwrap(),
+        successor
+            .get(&node.id)
+            .unwrap()
+            .vless_source_id(1, ipv4, VlessUdpPath::Xudp, None, None)
+            .unwrap(),
     );
 }
 

@@ -52,18 +52,19 @@ pub(crate) struct NativeOutboundCounters {
 }
 
 /// Per-outbound statistics tracked in user-space.
-#[derive(Debug, Clone, Default)]
+#[repr(align(64))]
+#[derive(Debug, Default)]
 pub struct OutboundTracker {
     /// Total connections through this outbound
-    pub total_connections: Arc<AtomicU64>,
+    pub total_connections: AtomicU64,
     /// Active connections currently open
-    pub active_connections: Arc<AtomicU64>,
+    pub active_connections: AtomicU64,
     /// Total bytes transferred (client → proxy)
-    pub tx_bytes: Arc<AtomicU64>,
+    pub tx_bytes: AtomicU64,
     /// Total bytes transferred (proxy → client)
-    pub rx_bytes: Arc<AtomicU64>,
+    pub rx_bytes: AtomicU64,
     /// Failed connection attempts
-    pub errors: Arc<AtomicU64>,
+    pub errors: AtomicU64,
 }
 
 impl OutboundTracker {
@@ -204,6 +205,16 @@ pub struct TcpStatsSnapshot {
     pub limit: u64,
     pub active_flows: u64,
     pub capacity_rejections: u64,
+}
+
+#[cfg(feature = "legacy-tc")]
+pub struct NfqueueServiceSample {
+    pub kernel_queue_depth: u64,
+    pub kernel_dropped: u64,
+    pub kernel_user_dropped: u64,
+    pub held_packets: usize,
+    pub held_peak: usize,
+    pub socket_receive_buffer_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -403,7 +414,7 @@ impl UdpStats {
 /// the guard only balances `active_connections`; explicit error paths remain
 /// responsible for recording errors themselves.
 pub struct ActiveConnectionGuard {
-    tracker: OutboundTracker,
+    tracker: Arc<OutboundTracker>,
 }
 
 impl Drop for ActiveConnectionGuard {
@@ -426,12 +437,553 @@ impl Drop for TcpFlowGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(any(feature = "native-api", feature = "clash-api", test)),
+    allow(dead_code)
+)]
+pub(crate) mod xdp {
+    use honk_ebpf_common::xdp_gateway::GatewayReason;
+    use honk_netstack::{MemoryBudget, MemoryReservation};
+    use honk_xsk::{GatewayMaps, RingSnapshot, SocketStats};
+    use parking_lot::Mutex;
+    use serde_json::{Value, json};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{io, sync::Arc, time::SystemTime};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Lifecycle {
+        Starting,
+        Active,
+        Closing,
+        Closed,
+        FailedRetained,
+    }
+
+    impl Lifecycle {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Starting => "starting",
+                Self::Active => "active",
+                Self::Closing => "closing",
+                Self::Closed => "closed",
+                Self::FailedRetained => "failed_retained",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct QueueObservation {
+        pub(crate) namespace: u64,
+        pub(crate) attachment: u64,
+        pub(crate) ifindex: u32,
+        pub(crate) queue: u32,
+        pub(crate) zero_copy: bool,
+        pub(crate) ring_capacity: u32,
+        pub(crate) rx_frames: usize,
+        pub(crate) control_frames: usize,
+        pub(crate) bulk_frames: usize,
+        pub(crate) sequence: u64,
+        pub(crate) attempted_at: Option<SystemTime>,
+        pub(crate) succeeded_at: Option<SystemTime>,
+        pub(crate) socket: Option<SocketStats>,
+        pub(crate) errno: Option<i32>,
+        pub(crate) read_errors: u64,
+        pub(crate) rings: Option<RingSnapshot>,
+    }
+
+    impl QueueObservation {
+        fn sample(&mut self, at: SystemTime, socket: io::Result<SocketStats>, rings: RingSnapshot) {
+            self.sequence = self.sequence.saturating_add(1);
+            self.attempted_at = Some(at);
+            self.rings = Some(rings);
+            match socket {
+                Ok(socket) => {
+                    self.socket = Some(socket);
+                    self.errno = None;
+                    self.succeeded_at = Some(at);
+                }
+                Err(error) => {
+                    self.socket = None;
+                    self.errno = error.raw_os_error();
+                    self.read_errors = self.read_errors.saturating_add(1);
+                }
+            }
+        }
+
+        fn json(self) -> Value {
+            let millis = |at: Option<SystemTime>| {
+                at.and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|elapsed| elapsed.as_millis().to_string())
+            };
+            json!({
+                "namespace_cookie": self.namespace.to_string(),
+                "attachment_generation": self.attachment.to_string(),
+                "ifindex": self.ifindex, "queue_id": self.queue,
+                "mode": if self.zero_copy { "zerocopy" } else { "copy" },
+                "ring_capacity": self.ring_capacity,
+                "frames": {"rx": self.rx_frames, "control": self.control_frames, "bulk": self.bulk_frames},
+                "sequence": self.sequence.to_string(),
+                "attempted_at_unix_ms": millis(self.attempted_at),
+                "last_success_at_unix_ms": millis(self.succeeded_at),
+                "socket_available": self.socket.is_some(),
+                "socket_error": (self.attempted_at.is_some() && self.socket.is_none()).then_some("statistics_unavailable"),
+                "socket_errno": self.errno,
+                "socket_read_errors": self.read_errors.to_string(),
+                "socket": self.socket.map(|socket| json!({
+                    "rx_dropped": socket.rx_dropped.to_string(),
+                    "rx_invalid_descs": socket.rx_invalid_descs.to_string(),
+                    "tx_invalid_descs": socket.tx_invalid_descs.to_string(),
+                    "rx_ring_full": socket.rx_ring_full.to_string(),
+                    "rx_fill_ring_empty_descs": socket.rx_fill_ring_empty_descs.to_string(),
+                    "tx_ring_empty_descs": socket.tx_ring_empty_descs.to_string(),
+                })),
+                "rings": self.rings.map(|rings| json!({
+                    "rx": {"producer": rings.rx_producer, "consumer": rings.rx_consumer},
+                    "tx": {"producer": rings.tx_producer, "consumer": rings.tx_consumer},
+                    "fill": {"producer": rings.fill_producer, "consumer": rings.fill_consumer},
+                    "cq": {"producer": rings.cq_producer, "consumer": rings.cq_consumer},
+                })),
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) enum DnsProjectionState {
+        #[default]
+        Disabled,
+        NoDomainRules,
+        Staged,
+        Active,
+        Closed,
+        Fallback(&'static str),
+    }
+
+    impl DnsProjectionState {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Disabled => "disabled_by_config",
+                Self::NoDomainRules => "inactive_no_domain_rules",
+                Self::Staged => "staged_closed",
+                Self::Active => "active_tcp_udp",
+                Self::Closed => "closed",
+                Self::Fallback(_) => "degraded_fallback",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct DnsObservation {
+        state: DnsProjectionState,
+        counters: Option<crate::xdp::gateway::dns::GatewayDnsCounters>,
+        would_pass: Option<u64>,
+    }
+
+    const DNS_DECISIONS: [(&str, GatewayReason); 12] = [
+        ("pass_dns_d1", GatewayReason::PassDnsD1),
+        (
+            "pass_dns_d1_pending_retry",
+            GatewayReason::PassDnsD1PendingRetry,
+        ),
+        (
+            "drop_native_pending_conflict",
+            GatewayReason::DropNativePendingConflict,
+        ),
+        (
+            "dns_native_pending_capped",
+            GatewayReason::DnsNativePendingCapped,
+        ),
+        ("drop_hold_contention", GatewayReason::DropHoldContention),
+        ("drop_hold_unavailable", GatewayReason::DropHoldUnavailable),
+        (
+            "hold_guard_release_failed",
+            GatewayReason::HoldGuardReleaseFailed,
+        ),
+        ("hold_retire_failed", GatewayReason::HoldRetireFailed),
+        (
+            "host_meta_insert_failed",
+            GatewayReason::HostMetaInsertFailed,
+        ),
+        (
+            "host_direct_unrecorded",
+            GatewayReason::HostDirectUnrecorded,
+        ),
+        ("host_late_packet", GatewayReason::HostLatePacket),
+        (
+            "host_direct_tcp_insert_failed",
+            GatewayReason::HostDirectTcpInsertFailed,
+        ),
+    ];
+
+    #[derive(Debug)]
+    struct State {
+        lifecycle: Lifecycle,
+        changed_at: SystemTime,
+        queues: Box<[QueueObservation]>,
+        dns: DnsObservation,
+        dns_decisions: Option<[Option<u64>; DNS_DECISIONS.len()]>,
+        dns_bank: std::sync::Weak<crate::xdp::gateway::dns::GatewayDnsBank>,
+    }
+
+    #[derive(Debug, Default)]
+    struct HandoffCounts {
+        packets: AtomicU64,
+        bytes: AtomicU64,
+        refused: AtomicU64,
+        refused_bytes: AtomicU64,
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct Diagnostics {
+        state: Mutex<State>,
+        count: usize,
+        handoffs: [[HandoffCounts; 2]; 2],
+        worker_pressure: [AtomicU64; 3],
+        pub(super) direct_attach_fallback: AtomicU64,
+        pub(super) direct_attach_fallback_failed: AtomicU64,
+        _memory: MemoryReservation,
+    }
+
+    impl Diagnostics {
+        pub(crate) fn new(
+            budget: &Arc<MemoryBudget>,
+            count: usize,
+            queues: impl Iterator<Item = QueueObservation>,
+        ) -> io::Result<Arc<Self>> {
+            let bytes = count
+                .checked_mul(size_of::<QueueObservation>())
+                .and_then(|bytes| bytes.checked_add(size_of::<Self>() + 2 * size_of::<usize>()))
+                .ok_or_else(|| io::Error::other("XDP diagnostics extent overflow"))?;
+            let memory = budget
+                .reserve(bytes)
+                .ok_or_else(|| io::Error::other("XDP diagnostics memory capacity"))?;
+            let mut storage = Vec::with_capacity(count);
+            for queue in queues {
+                if storage.len() == count {
+                    return Err(io::Error::other("XDP diagnostic queue count mismatch"));
+                }
+                storage.push(queue);
+            }
+            if storage.len() != count {
+                return Err(io::Error::other("XDP diagnostic queue count mismatch"));
+            }
+            Ok(Arc::new(Self {
+                state: Mutex::new(State {
+                    lifecycle: Lifecycle::Starting,
+                    changed_at: SystemTime::now(),
+                    queues: storage.into_boxed_slice(),
+                    dns: DnsObservation::default(),
+                    dns_decisions: None,
+                    dns_bank: std::sync::Weak::new(),
+                }),
+                count,
+                handoffs: Default::default(),
+                worker_pressure: Default::default(),
+                direct_attach_fallback: AtomicU64::new(0),
+                direct_attach_fallback_failed: AtomicU64::new(0),
+                _memory: memory,
+            }))
+        }
+
+        pub(crate) fn dns_state(&self, status: DnsProjectionState) {
+            let mut state = self.state.lock();
+            if state.dns.state != status && state.dns.state != DnsProjectionState::Closed {
+                state.dns = DnsObservation {
+                    state: status,
+                    ..Default::default()
+                };
+                state.dns_bank = std::sync::Weak::new();
+                if let DnsProjectionState::Fallback(reason) = status {
+                    tracing::warn!(
+                        reason,
+                        "XDP DNS direct routing unavailable; using static D1 and Endpoint"
+                    );
+                }
+            }
+        }
+
+        pub(crate) fn sample_dns(
+            &self,
+            bank: &Arc<crate::xdp::gateway::dns::GatewayDnsBank>,
+            would_pass: Option<u64>,
+        ) {
+            let counters = bank.stats();
+            let mut state = self.state.lock();
+            if state.dns.state == DnsProjectionState::Active {
+                state.dns.counters = Some(counters);
+                if !std::ptr::eq(state.dns_bank.as_ptr(), Arc::as_ptr(bank)) {
+                    state.dns_bank = Arc::downgrade(bank);
+                }
+                state.dns.would_pass = would_pass;
+            }
+        }
+
+        pub(crate) fn sample_dns_decisions(&self, maps: &GatewayMaps) {
+            let counts = DNS_DECISIONS.map(|(_, reason)| maps.reason_count(reason).ok());
+            self.state.lock().dns_decisions = Some(counts);
+        }
+
+        pub(crate) fn sample(
+            &self,
+            index: usize,
+            at: SystemTime,
+            socket: io::Result<SocketStats>,
+            rings: RingSnapshot,
+        ) {
+            self.state.lock().queues[index].sample(at, socket, rings);
+        }
+
+        pub(crate) fn sample_worker_pressure(&self, counters: [u64; 3]) {
+            for (counter, value) in self.worker_pressure.iter().zip(counters) {
+                counter.store(value, Ordering::Relaxed);
+            }
+        }
+
+        pub(crate) fn record_worker_handoff(
+            &self,
+            destination: usize,
+            endpoint: bool,
+            bytes: usize,
+            accepted: bool,
+        ) {
+            let counts = &self.handoffs[destination][usize::from(endpoint)];
+            let (packets, octets) = if accepted {
+                (&counts.packets, &counts.bytes)
+            } else {
+                (&counts.refused, &counts.refused_bytes)
+            };
+            let _ = packets.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1));
+            let _ = octets.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(bytes as u64))
+            });
+        }
+
+        pub(crate) fn lifecycle(&self, lifecycle: Lifecycle) {
+            let mut state = self.state.lock();
+            if !matches!(
+                state.lifecycle,
+                Lifecycle::Closed | Lifecycle::FailedRetained
+            ) {
+                state.lifecycle = lifecycle;
+                state.changed_at = SystemTime::now();
+            }
+        }
+
+        pub(crate) fn json(&self, full: bool) -> Value {
+            let (lifecycle, changed_at, dns, decisions, bank) = {
+                let state = self.state.lock();
+                (
+                    state.lifecycle,
+                    state.changed_at,
+                    state.dns,
+                    state.dns_decisions,
+                    full.then(|| state.dns_bank.upgrade()).flatten(),
+                )
+            };
+            let mut rows = Vec::new();
+            let mut remaining = 64 * 1024
+                - if bank.is_some() || decisions.is_some() {
+                    5120
+                } else {
+                    2048
+                };
+            if full {
+                let mut encoded = Vec::new();
+                for index in 0..self.count {
+                    let queue = self.state.lock().queues[index];
+                    let row = queue.json();
+                    encoded.clear();
+                    serde_json::to_writer(&mut encoded, &row)
+                        .expect("XDP numeric observation JSON");
+                    let bytes = encoded.len() + 1;
+                    if bytes > remaining {
+                        break;
+                    }
+                    remaining -= bytes;
+                    rows.push(row);
+                }
+            }
+            let mut total = 0u64;
+            let handoffs = self.handoffs.each_ref().map(|kinds| {
+                kinds.each_ref().map(|counts| {
+                    let packets = counts.packets.load(Ordering::Relaxed);
+                    total = total.saturating_add(packets);
+                    json!({
+                        "packets": packets.to_string(),
+                        "l3_bytes": counts.bytes.load(Ordering::Relaxed).to_string(),
+                        "refused": counts.refused.load(Ordering::Relaxed).to_string(),
+                        "refused_l3_bytes": counts.refused_bytes.load(Ordering::Relaxed).to_string(),
+                    })
+                })
+            });
+            let mut value = json!({
+                "state": lifecycle.as_str(), "queue_count": self.count,
+                "cross_worker_handoffs": total.to_string(), "handoffs": handoffs,
+                "ownership_dir_full": self.worker_pressure[0].load(Ordering::Relaxed).to_string(),
+                "udp_reply_queue_full": self.worker_pressure[1].load(Ordering::Relaxed).to_string(),
+                "remote_backpressure": self.worker_pressure[2].load(Ordering::Relaxed).to_string(),
+                "direct_attach_fallback": self.direct_attach_fallback.load(Ordering::Relaxed).to_string(),
+                "direct_attach_fallback_failed": self.direct_attach_fallback_failed.load(Ordering::Relaxed).to_string(),
+                "dns_projection_state": dns.state.label(),
+                "dns_projection_reason": if let DnsProjectionState::Fallback(reason) = dns.state { Some(reason) } else { None },
+                "dns_projection_counters": dns.counters,
+                "would_pass_dns": dns.would_pass.map(|v| v.to_string()),
+                "dns_decisions": decisions.map(|counts| DNS_DECISIONS.into_iter().zip(counts).map(|((name, _), n)| {
+                    (name.to_owned(), n.map_or(Value::Null, |n| Value::String(n.to_string())))
+                }).collect::<serde_json::Map<_, _>>()),
+                "state_changed_at_unix_ms": changed_at.duration_since(SystemTime::UNIX_EPOCH).ok().map(|at| at.as_millis().to_string()),
+            });
+            if full {
+                if let Some(bank) = bank {
+                    let mut realms = [(0u32, 0u64); 64];
+                    let count = bank.realm_revocations(&mut realms);
+                    value["dns_realm_revocations"] = json!(&realms[..count]);
+                }
+                value["truncated"] = json!(rows.len() != self.count);
+                value["queues"] = json!(rows);
+            }
+            value
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::stats::StatsManager;
+
+        fn queue() -> QueueObservation {
+            QueueObservation {
+                namespace: u64::MAX,
+                attachment: 7,
+                ifindex: 3,
+                queue: 1,
+                zero_copy: false,
+                ring_capacity: 256,
+                rx_frames: 256,
+                control_frames: 32,
+                bulk_frames: 256,
+                sequence: 0,
+                attempted_at: None,
+                succeeded_at: None,
+                socket: None,
+                errno: None,
+                read_errors: 0,
+                rings: None,
+            }
+        }
+
+        #[test]
+        fn error_recovery_passive_reads_and_terminal_state_preserve_evidence() {
+            let budget = MemoryBudget::new(1 << 20);
+            let diagnostics = Diagnostics::new(&budget, 1, std::iter::once(queue())).unwrap();
+            let stats = StatsManager::new();
+            assert!(stats.xdp_json(true).is_null());
+            stats.install_xdp(Arc::clone(&diagnostics));
+            assert_eq!(stats.xdp_json(false)["state"], "starting");
+            let first = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+            let second = first + std::time::Duration::from_secs(1);
+            let socket = SocketStats {
+                rx_dropped: u64::MAX,
+                ..SocketStats::default()
+            };
+            let rings = RingSnapshot {
+                rx_producer: 0,
+                rx_consumer: u32::MAX,
+                ..RingSnapshot::default()
+            };
+            diagnostics.lifecycle(Lifecycle::Active);
+            diagnostics.sample(0, first, Ok(socket), rings);
+            let good = stats.xdp_json(true);
+            assert_eq!(
+                good["queues"][0]["socket"]["rx_dropped"],
+                u64::MAX.to_string()
+            );
+            assert_eq!(good["queues"][0]["namespace_cookie"], u64::MAX.to_string());
+            assert_eq!(good["queues"][0]["rings"]["rx"]["consumer"], u32::MAX);
+            diagnostics.sample(0, second, Err(io::Error::other("private failure")), rings);
+            let failed = stats.xdp_json(true);
+            let row = &failed["queues"][0];
+            assert_eq!(row["socket_available"], false);
+            assert!(row["socket"].is_null());
+            assert!(row["socket_errno"].is_null());
+            assert_eq!(row["socket_error"], "statistics_unavailable");
+            assert_eq!(row["socket_read_errors"], "1");
+            assert_eq!(row["last_success_at_unix_ms"], "1000");
+            assert_eq!(row["attempted_at_unix_ms"], "2000");
+            assert_eq!(failed, stats.xdp_json(true));
+            assert!(!failed.to_string().contains("private failure"));
+            diagnostics.sample(0, second, Ok(socket), rings);
+            let recovered = stats.xdp_json(true);
+            assert_eq!(recovered["queues"][0]["socket_available"], true);
+            assert!(recovered["queues"][0]["socket_error"].is_null());
+            assert_eq!(recovered["queues"][0]["socket_read_errors"], "1");
+            assert_eq!(recovered["queues"][0]["sequence"], "3");
+            diagnostics.lifecycle(Lifecycle::Closing);
+            assert_eq!(stats.xdp_json(false)["state"], "closing");
+            diagnostics.lifecycle(Lifecycle::FailedRetained);
+            diagnostics.lifecycle(Lifecycle::Active);
+            diagnostics.lifecycle(Lifecycle::Closed);
+            assert_eq!(stats.xdp_json(false)["state"], "failed_retained");
+            drop(stats);
+            assert!(budget.used() > 0, "the reader still funds the observation");
+            drop(diagnostics);
+            assert_eq!(budget.used(), 0);
+        }
+
+        #[test]
+        fn allocation_admission_saturation_and_projection_are_bounded() {
+            let empty = MemoryBudget::new(0);
+            let mut consumed = 0;
+            assert!(
+                Diagnostics::new(
+                    &empty,
+                    1,
+                    std::iter::once_with(|| {
+                        consumed += 1;
+                        queue()
+                    })
+                )
+                .is_err()
+            );
+            assert_eq!(consumed, 0);
+            let budget = MemoryBudget::new(1 << 24);
+            let mut observation = queue();
+            observation.sequence = u64::MAX;
+            observation.read_errors = u64::MAX;
+            let diagnostics =
+                Diagnostics::new(&budget, 4096, std::iter::repeat_n(observation, 4096)).unwrap();
+            diagnostics.sample(
+                0,
+                SystemTime::UNIX_EPOCH,
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+                RingSnapshot::default(),
+            );
+            let full = diagnostics.json(true);
+            assert_eq!(full["queues"][0]["sequence"], u64::MAX.to_string());
+            assert_eq!(
+                full["queues"][0]["socket_read_errors"],
+                u64::MAX.to_string()
+            );
+            assert_eq!(full["queues"][0]["socket_errno"], libc::EIO);
+            assert_eq!(full["truncated"], true);
+            assert_eq!(full["queue_count"], 4096);
+            assert!(serde_json::to_vec(&full).unwrap().len() <= 64 * 1024);
+            assert!(diagnostics.json(false).get("queues").is_none());
+            diagnostics.lifecycle(Lifecycle::Closed);
+            diagnostics.lifecycle(Lifecycle::FailedRetained);
+            assert_eq!(diagnostics.json(false)["state"], "closed");
+        }
+    }
+}
+
 /// Statistics manager that tracks per-outbound metrics.
 #[derive(Debug)]
 pub struct StatsManager {
-    trackers: [DashMap<String, OutboundTracker>; 3],
+    trackers: [DashMap<String, Arc<OutboundTracker>>; 3],
     udp: UdpStats,
     tcp: TcpStats,
+    #[cfg(target_os = "linux")]
+    xdp: parking_lot::RwLock<Option<Arc<xdp::Diagnostics>>>,
     #[cfg(feature = "native-api")]
     counter_since: std::time::SystemTime,
     /// Warm-reason attribution bits per node id, pruned at snapshot time to
@@ -507,9 +1059,50 @@ impl StatsManager {
             trackers: std::array::from_fn(|_| DashMap::new()),
             udp: UdpStats::default(),
             tcp: TcpStats::default(),
+            #[cfg(target_os = "linux")]
+            xdp: parking_lot::RwLock::new(None),
             #[cfg(feature = "native-api")]
             counter_since: std::time::SystemTime::now(),
             warm_marks: DashMap::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn record_direct_attach_fallback(&self, remote_bound: bool) {
+        if let Some(state) = self.xdp.read().as_ref() {
+            let _ = state.direct_attach_fallback.try_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |n| n.checked_add(1),
+            );
+            if !remote_bound {
+                let _ = state.direct_attach_fallback_failed.try_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |n| n.checked_add(1),
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn install_xdp(&self, diagnostics: Arc<xdp::Diagnostics>) {
+        *self.xdp.write() = Some(diagnostics);
+    }
+
+    #[cfg(any(feature = "native-api", feature = "clash-api", test))]
+    pub(crate) fn xdp_json(&self, full: bool) -> serde_json::Value {
+        #[cfg(target_os = "linux")]
+        {
+            let diagnostics = self.xdp.read().clone();
+            diagnostics.map_or(serde_json::Value::Null, |diagnostics| {
+                diagnostics.json(full)
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = full;
+            serde_json::Value::Null
         }
     }
 
@@ -612,7 +1205,7 @@ impl StatsManager {
     /// Resolve an outbound tracker once for a long-lived data path. Callers
     /// that already retain the returned value avoid allocating an outbound
     /// name and taking a DashMap shard lock for every packet.
-    pub fn outbound_tracker(&self, outbound: &str, kind: OutboundKind) -> OutboundTracker {
+    pub fn outbound_tracker(&self, outbound: &str, kind: OutboundKind) -> Arc<OutboundTracker> {
         let trackers = &self.trackers[kind as usize];
         if let Some(tracker) = trackers.get(outbound) {
             return tracker.clone();
@@ -621,7 +1214,7 @@ impl StatsManager {
     }
 
     /// Track one connection using an already-resolved tracker.
-    pub fn track_outbound(&self, tracker: OutboundTracker) -> ActiveConnectionGuard {
+    pub fn track_outbound(&self, tracker: Arc<OutboundTracker>) -> ActiveConnectionGuard {
         tracker.increment_connections();
         ActiveConnectionGuard { tracker }
     }
@@ -749,24 +1342,29 @@ impl StatsManager {
     pub fn record_udp_slow_permit_closed(&self) {
         self.udp.slow_permit_closed.fetch_add(1, Ordering::Relaxed);
     }
-    #[cfg(feature = "ebpf")]
-    pub fn update_udp_nfqueue_local_stats(&self, stats: honk_nfqueue::QueueLocalStats) {
+    #[cfg(feature = "legacy-tc")]
+    pub fn update_udp_nfqueue_local_stats(
+        &self,
+        held_packets: usize,
+        held_peak: usize,
+        socket_receive_buffer_bytes: usize,
+    ) {
         self.udp
             .nfqueue
             .held_packets
-            .store(stats.held_packets as u64, Ordering::Relaxed);
+            .store(held_packets as u64, Ordering::Relaxed);
         self.udp
             .nfqueue
             .held_peak
-            .store(stats.held_peak as u64, Ordering::Relaxed);
+            .store(held_peak as u64, Ordering::Relaxed);
         self.udp
             .nfqueue
             .socket_receive_buffer_bytes
-            .store(stats.socket_receive_buffer_bytes as u64, Ordering::Relaxed);
+            .store(socket_receive_buffer_bytes as u64, Ordering::Relaxed);
     }
 
-    #[cfg(feature = "ebpf")]
-    pub fn update_udp_nfqueue_service_stats(&self, stats: honk_nfqueue::QueueStats) {
+    #[cfg(feature = "legacy-tc")]
+    pub fn update_udp_nfqueue_service_stats(&self, stats: NfqueueServiceSample) {
         self.udp
             .nfqueue
             .kernel_stats_available
@@ -783,14 +1381,14 @@ impl StatsManager {
             .nfqueue
             .kernel_user_dropped
             .store(stats.kernel_user_dropped, Ordering::Relaxed);
-        self.update_udp_nfqueue_local_stats(honk_nfqueue::QueueLocalStats {
-            held_packets: stats.held_packets,
-            held_peak: stats.held_peak,
-            socket_receive_buffer_bytes: stats.socket_receive_buffer_bytes,
-        });
+        self.update_udp_nfqueue_local_stats(
+            stats.held_packets,
+            stats.held_peak,
+            stats.socket_receive_buffer_bytes,
+        );
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub fn record_udp_nfqueue_service_stats_error(&self) {
         self.udp
             .nfqueue
@@ -802,7 +1400,7 @@ impl StatsManager {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub fn update_udp_nfqueue_actor_queue(
         &self,
         depth: usize,
@@ -823,7 +1421,7 @@ impl StatsManager {
         );
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub fn record_udp_nfqueue_actor_queue_full(&self) {
         self.udp
             .nfqueue
@@ -831,7 +1429,7 @@ impl StatsManager {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub fn record_udp_nfqueue_correlator_full(&self) {
         self.udp
             .nfqueue
@@ -943,19 +1541,6 @@ impl StatsManager {
             .entry(outbound.to_owned())
             .or_default()
             .add_bytes(tx, rx);
-    }
-
-    pub(crate) fn byte_counters(
-        &self,
-        outbound: &str,
-        kind: OutboundKind,
-    ) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
-        let trackers = &self.trackers[kind as usize];
-        if let Some(tracker) = trackers.get(outbound) {
-            return (Arc::clone(&tracker.tx_bytes), Arc::clone(&tracker.rx_bytes));
-        }
-        let tracker = trackers.entry(outbound.to_owned()).or_default();
-        (Arc::clone(&tracker.tx_bytes), Arc::clone(&tracker.rx_bytes))
     }
 
     #[cfg(feature = "native-api")]
@@ -1362,11 +1947,11 @@ mod tests {
         assert_eq!(settled.tuic_clients, 1);
         generation.shutdown().await;
     }
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     #[test]
     fn nfqueue_kernel_stats_failures_are_visible() {
         let stats = StatsManager::new();
-        stats.update_udp_nfqueue_service_stats(honk_nfqueue::QueueStats {
+        stats.update_udp_nfqueue_service_stats(NfqueueServiceSample {
             kernel_queue_depth: 7,
             kernel_dropped: 2,
             kernel_user_dropped: 3,
@@ -1377,13 +1962,14 @@ mod tests {
         let available = stats.udp_snapshot().nfqueue;
         assert!(available.kernel_stats_available);
         assert_eq!(available.kernel_queue_depth, 7);
+        assert_eq!(available.kernel_dropped, 2);
+        assert_eq!(available.kernel_user_dropped, 3);
+        assert_eq!(available.held_packets, 4);
+        assert_eq!(available.held_peak, 5);
+        assert_eq!(available.socket_receive_buffer_bytes, 6);
         assert_eq!(available.kernel_stats_read_errors, 0);
 
-        stats.update_udp_nfqueue_local_stats(honk_nfqueue::QueueLocalStats {
-            held_packets: 1,
-            held_peak: 6,
-            socket_receive_buffer_bytes: 8192,
-        });
+        stats.update_udp_nfqueue_local_stats(1, 6, 8192);
         stats.record_udp_nfqueue_service_stats_error();
         let unavailable = stats.udp_snapshot().nfqueue;
         assert!(!unavailable.kernel_stats_available);

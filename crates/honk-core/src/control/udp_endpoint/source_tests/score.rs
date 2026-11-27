@@ -31,7 +31,7 @@ impl ScoreSourceFixture {
             .map(|socket| socket.local_addr().unwrap());
         let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
             4,
-            Arc::new(SourceReplySocketFactory::new(sockets)),
+            Arc::new(SourceReplySocketFactory::new([ScopeId::HOST], sockets)),
         ));
         let stats = Arc::new(StatsManager::new());
         let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
@@ -125,7 +125,7 @@ impl ScoreSourceFixture {
         (
             endpoint,
             owner,
-            super::super::run_endpoint_driver(context, initial, ack_tx),
+            super::super::run_endpoint_driver(context, initial, |result| drop(ack_tx.send(result))),
             ack_rx,
         )
     }

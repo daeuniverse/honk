@@ -2,7 +2,7 @@ use super::*;
 use crate::connection_tracker::{CloseOutcome, ConnectionTracker};
 use crate::control::retirement_worker::{RetirementPort, spawn_retirement_worker};
 use crate::control::udp_endpoint::tests::closure::tracked_entry;
-use crate::ebpf::{EbpfBackend, mock::MockEbpfBackend};
+use crate::ebpf::mock::MockEbpfBackend;
 
 #[tokio::test(flavor = "current_thread")]
 async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
@@ -20,20 +20,23 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
         let target_b = raw_b.local_addr().unwrap();
         let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
             4,
-            Arc::new(SourceReplySocketFactory::new([raw_a, raw_b])),
+            Arc::new(SourceReplySocketFactory::new(
+                [ScopeId::HOST],
+                [raw_a, raw_b],
+            )),
         ));
         let stats = Arc::new(StatsManager::new());
         let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
         let tracker = Arc::new(ConnectionTracker::new());
         tracker.enable();
-        let backend: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+        let backend: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
             Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
         let (fatal, mut failures) = mpsc::unbounded_channel();
         let pins = Arc::new(crate::control::connection::handoff::TcpFlowPins::default());
         let port = Arc::new(RetirementPort::default());
         let worker = spawn_retirement_worker(
             Arc::clone(&pool),
-            backend,
+            crate::control::TcKernelController::for_test(backend),
             Arc::clone(&tracker),
             fatal,
             Arc::clone(&pins),
@@ -41,6 +44,7 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
         );
         let attach = async |target| {
             pool.prepare_source(
+                honk_datapath::ScopeId::HOST,
                 &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&generation),
                 Arc::clone(&runtime),
@@ -54,6 +58,7 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
                 Arc::clone(&stats),
                 honk_outbound::alive::IpVersion::V4,
                 false,
+                None,
             )
             .await
             .unwrap()
@@ -72,6 +77,7 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
         let endpoint_b = install_source(&pool, lease_b, attachment_b, target_b, &stats, node.id);
         let id = pool
             .register_ready_tracker(
+                honk_datapath::ScopeId::HOST,
                 client_addr,
                 target_a,
                 identity_a.0,
@@ -79,7 +85,13 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
                 &endpoint_a,
                 &tracker,
                 vec!["captured-group".into()],
-                || tracked_entry("source-view", client_addr, target_a),
+                || {
+                    tracked_entry(
+                        "00000000-0000-0000-0000-000000000012",
+                        client_addr,
+                        target_a,
+                    )
+                },
             )
             .unwrap()
             .unwrap();
@@ -103,7 +115,8 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
             .unwrap();
         let close = tracker.start_close(selected);
         drop(endpoint_a);
-        let mut duplicate = Box::pin(tracker.close_id(&id));
+        let wire_id = id.to_string();
+        let mut duplicate = Box::pin(tracker.close_id(&wire_id));
         assert!(futures::poll!(&mut duplicate).is_pending());
         admitted_send.await.unwrap();
         let frame = next_data_frame(&mut events, &mut replies).await;
@@ -152,7 +165,14 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
             &stats,
             node.id,
         );
-        assert!(!pool.close_exact(client_addr, target_a, identity_a.0, identity_a.1));
+        assert!(!pool.close_exact(
+            honk_datapath::ScopeId::HOST,
+            client_addr,
+            target_a,
+            identity_a.0,
+            identity_a.1,
+            None,
+        ));
         replacement
             .send_packet(b"replacement", false)
             .await

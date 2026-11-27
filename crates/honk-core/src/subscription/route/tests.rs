@@ -136,7 +136,7 @@ fn routing_via(target: &str, refuse: bool) -> (SharedOutbounds, Arc<AtomicUsize>
         outbound: RoutingOutbound::Simple(target.into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
     let dials = Arc::new(AtomicUsize::new(0));
     let mut proxy_registry = ProxyRegistry::new();

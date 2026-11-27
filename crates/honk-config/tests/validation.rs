@@ -874,7 +874,6 @@ mod routing_marks {
         let dir = tempfile::tempdir().unwrap();
         for statement in [
             "dport(443) -> direct(mark: 4294967296)",
-            "dport(443) -> direct(mark: 0x40000000)",
             "fallback: direct(mark: PRIVATE)",
         ] {
             let path = dir.path().join("config.dae");
@@ -891,6 +890,57 @@ mod routing_marks {
     }
 
     #[test]
+    fn parsed_reserved_marks_reject_at_legacy_consumer_admission() {
+        for mark in ["0x40000000", "0x80000000", "0xffffffff", "4294967295"] {
+            for (statement, setting) in [
+                (
+                    format!("dport(443) -> direct(mark: {mark})"),
+                    "routing.rules[1].mark",
+                ),
+                (
+                    format!("fallback: direct(mark: {mark})"),
+                    "routing.fallback",
+                ),
+            ] {
+                let config = parse_dae_config_with_detailed_diagnostics(
+                    &format!("routing {{\n {statement}\n}}"),
+                    &mut Vec::new(),
+                )
+                .unwrap();
+                let error = config.validate_detailed().unwrap_err();
+                assert_eq!(error.diagnostic.code, "invalid-config-value");
+                assert_eq!(error.diagnostic.setting.to_string(), setting);
+            }
+        }
+    }
+
+    #[test]
+    fn structured_roundtrips_preserve_keep_explicit_zero_and_full_marks() {
+        for (target, mark) in [
+            ("direct", None),
+            ("direct(mark: 0)", Some(0)),
+            ("direct(mark: 0xffffffff)", Some(u32::MAX)),
+        ] {
+            let config = parse_dae_config_with_detailed_diagnostics(
+                &format!("routing {{\n dport(443) -> {target}\n fallback: {target}\n}}"),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            for restored in [
+                serde_json::from_str::<Config>(&serde_json::to_string(&config).unwrap()).unwrap(),
+                serde_yaml::from_str::<Config>(&serde_yaml::to_string(&config).unwrap()).unwrap(),
+                toml::from_str::<Config>(&toml::to_string(&config).unwrap()).unwrap(),
+            ] {
+                assert_eq!(restored.routing.rules[0].mark, mark);
+                assert_eq!(restored.routing.default_mark, mark);
+                if mark != Some(u32::MAX) {
+                    restored.validate().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn reserved_marks_remain_invalid_after_structured_loading() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = parse_dae_config_with_detailed_diagnostics(
@@ -898,7 +948,7 @@ mod routing_marks {
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(config.routing.rules[0].mark, 512);
+        assert_eq!(config.routing.rules[0].mark, Some(512));
         for reserved in [0x4000_0000, 0x8000_0000, 0xc000_0000] {
             for setting in [
                 "routing.rules[1].mark",
@@ -906,9 +956,9 @@ mod routing_marks {
                 "routing.fallback",
             ] {
                 let value = |owner: &str| if setting == owner { reserved } else { 0 };
-                config.routing.rules[0].mark = value("routing.rules[1].mark");
+                config.routing.rules[0].mark = Some(value("routing.rules[1].mark"));
                 config.global.so_mark_from_dae = value("global.so_mark_from_dae");
-                config.routing.default_mark = value("routing.fallback");
+                config.routing.default_mark = Some(value("routing.fallback"));
                 for (extension, body) in [
                     ("json", serde_json::to_string(&config).unwrap()),
                     ("yaml", serde_yaml::to_string(&config).unwrap()),

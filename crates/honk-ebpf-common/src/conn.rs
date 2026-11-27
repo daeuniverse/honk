@@ -34,11 +34,11 @@ impl<T: Default> Default for FlowMapValue<T> {
 
 // SAFETY: Only these payloads have an audited padding-free wrapper layout.
 // A generic T: Pod could require alignment greater than the eight-byte prefix.
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for FlowMapValue<ConnState> {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for FlowMapValue<crate::RedirectEntry> {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for FlowMapValue<crate::RoutingHandoffEntry> {}
 
 /// Connection-state payload stored inside [`FlowMapValue`] in CONN_STATE_MAP.
@@ -386,17 +386,17 @@ const _: () = {
 // SAFETY: The sums above exclude implicit padding. RoutingMeta and In6Addr
 // recursively contain only full-width integer variants; all other leaves are
 // integer scalars/arrays. State and flag fields are integers, not Rust enums.
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for ConnState {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for UdpDecisionSequence {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for FlowIncarnationSequence {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for RetirementFence {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for FragmentKey {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for FragmentVerdict {}
 
 #[cfg(test)]

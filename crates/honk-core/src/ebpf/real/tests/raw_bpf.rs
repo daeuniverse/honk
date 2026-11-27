@@ -1,3 +1,4 @@
+use crate::ebpf::common::syscall::bpf_syscall;
 use aya_obj::generated::{
     bpf_attr,
     bpf_cmd::{BPF_OBJ_GET_INFO_BY_FD, BPF_PROG_LOAD},
@@ -31,7 +32,7 @@ pub(super) fn load_program(
     attr.__bindgen_anon_3.insn_cnt = (insns.len() / 8) as u32;
     attr.__bindgen_anon_3.insns = insns.as_ptr() as u64;
     attr.__bindgen_anon_3.license = c"GPL".as_ptr() as u64;
-    let fd = unsafe { super::syscall::bpf_syscall(BPF_PROG_LOAD as libc::c_long, &mut attr) }
+    let fd = unsafe { bpf_syscall(BPF_PROG_LOAD as libc::c_long, &mut attr) }
         .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
 }
@@ -41,7 +42,7 @@ pub(super) fn program_info(fd: RawFd, info: &mut bpf_prog_info) -> anyhow::Resul
     attr.info.bpf_fd = fd as u32;
     attr.info.info_len = core::mem::size_of::<bpf_prog_info>() as u32;
     attr.info.info = info as *mut bpf_prog_info as u64;
-    unsafe { super::syscall::bpf_syscall(BPF_OBJ_GET_INFO_BY_FD as _, &mut attr) }
+    unsafe { bpf_syscall(BPF_OBJ_GET_INFO_BY_FD as _, &mut attr) }
         .map(|_| ())
         .map_err(|errno| anyhow::anyhow!("BPF_OBJ_GET_INFO_BY_FD failed with errno {errno}"))
 }

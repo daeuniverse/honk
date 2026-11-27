@@ -18,8 +18,8 @@ honk 的 eBPF 数据面和配置语法参考 dae 的设计，出站组与 Clash 
 
 ## 功能概览
 
-- 透明 TCP/UDP：通过 TC eBPF、`dae0`/`daens` 和编译路由处理 LAN 转发及本机发起的流量。
-- 出站：SOCKS5、Shadowsocks/2022、Trojan、AnyTLS、Hysteria2、TUIC、Juicity、VMess、VLESS、`direct` 和 `block`。Trojan/VMess/VLESS 支持 H2 XHTTP（`packet-up`、`stream-up`、`stream-one`），VMess 仅支持 TCP。[链式节点](doc/zh/reference/nodes.md#链式节点)（`front -> land`）让 TCP 依次经过两到四个符合各跳限制的代理节点。用于 UDP 时，每跳（包括入口）都必须支持隧道 TCP，出口必须是合格的 Trojan 或原生 UDP VLESS 节点。详见[协议限制](doc/zh/reference/nodes.md)。
+- 透明 TCP/UDP：通过 TC eBPF、`dae0`/`daens` 和编译路由处理 LAN 转发及本机发起的流量。显式配置的 [XDP 后端](doc/zh/design/datapath.md#full-xdp-启动)提供 Endpoint/Core 执行，可选用 Core 防火墙/NAT，不会自动回退。
+- 出站：SOCKS5、Shadowsocks/2022、Trojan、AnyTLS、Hysteria2、TUIC、Juicity、VMess、VLESS、单 peer WireGuard、`direct` 和 `block`。Trojan/VMess/VLESS 支持 H2 XHTTP（`packet-up`、`stream-up`、`stream-one`），VMess 仅支持 TCP。[链式节点](doc/zh/reference/nodes.md#链式节点)（`front -> land`）让 TCP 依次经过两到四个符合各跳限制的代理节点。用于 UDP 时，每跳（包括入口）都必须支持隧道 TCP，出口必须是合格的 Trojan 或原生 UDP VLESS 节点。详见[协议限制](doc/zh/reference/nodes.md)。
 - 组策略：Selector（默认）、URLTest、LoadBalance、Fallback 和 Score。Score 使用业务观测与有界验证，详见[组策略参考](doc/zh/reference/groups.md#score-策略)。组的 [`exit`](doc/zh/reference/groups.md#出口) 把固定出口附加到选中的路径。多跳 UDP 的各跳要求与链式节点相同。
 - DNS：支持 UDP、TCP、DoT、DoH、DoQ、DoH3 上游，可经节点或组出站，并提供路由和缓存。
 - 配置与控制：dae 语法、订阅、重载、Clash 兼容 REST/WebSocket API，以及 `honk-tool` CLI 工具箱。
@@ -70,7 +70,7 @@ honk 可配合以下两类网页界面使用：
 
 ## 开发
 
-工作区包含配置、共享 eBPF 类型、NFQUEUE、出站、核心和工具 crate；`crates/honk-ebpf` 单独构建。详见 [Justfile](Justfile) 与[贡献政策](CONTRIBUTING.md)。
+工作区包含配置、共享 eBPF 类型、NFQUEUE、netstack、datapath、XSK、出站、核心和工具 crate；`crates/honk-ebpf` 单独构建。详见 [Justfile](Justfile) 与[贡献政策](CONTRIBUTING.md)。
 
 无 root 的用户态开发可使用 [mock 模式](doc/zh/how-to-start.md#无-root-开发)。`--mock-ebpf` 不会拦截流量，不能代替数据面测试。
 
@@ -81,6 +81,8 @@ honk 可配合以下两类网页界面使用：
 代理、路由和 DNS 问题请提交至 [honk issues](https://github.com/daeuniverse/honk/issues)；网页界面问题请提交至 [doona issues](https://github.com/Zakkaus/doona/issues)。
 
 安全漏洞请按 [SECURITY.md](.github/SECURITY.md) 报告。
+
+多数用户态子系统主要由 AI 编写，维护者只完成了部分审查，主要关注 eBPF。WireGuard、`honk-netstack` 和显式 XDP/Core 路径仍须维护者审查。自动化检查不能替代[人工审查与 AI 使用披露要求](CONTRIBUTING.md#5-responsibility-for-ai-assisted-work)。
 
 ## 致谢
 
@@ -103,7 +105,6 @@ Copyright (c) 2025, glassyiris <honk@catmint.cc> and honk contributors
 
 ## TODO
 
-- [ ] 评估 AF_XDP 与 XDP 路径以进一步提升性能
-- [ ] 在 Clash 兼容 API 之外添加 honk 专用 REST API
+- [ ] 在真实硬件上测量 AF_XDP/XDP 性能；后端已经实现不代表已通过硬件、ARM 或性能验收
 - [ ] 添加入站支持
 - [ ] 探索 macOS 与 Windows 支持；数据面基于 Linux eBPF，这两个平台需要另一种接管流量的方式

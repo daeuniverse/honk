@@ -44,7 +44,7 @@ const _: () = {
 
 // SAFETY: Packet and batch leaves are only integers. The field-size sums
 // include candidate and every packet, excluding implicit and nested padding.
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for ReceiveTracePacket {}
-#[cfg(not(target_arch = "bpf"))]
+#[cfg(all(not(target_arch = "bpf"), feature = "aya-pod"))]
 unsafe impl aya::Pod for ReceiveTraceBatch {}

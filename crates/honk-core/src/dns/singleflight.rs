@@ -81,6 +81,7 @@ struct CounterSet {
 
 pub(crate) struct FlightAnswer {
     pub(crate) template: ResponseTemplate,
+    pub(crate) projection_expires_at: Option<tokio::time::Instant>,
     pub(crate) provenance: Provenance,
     pub(crate) final_upstream: Option<String>,
 }

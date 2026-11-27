@@ -80,7 +80,7 @@ impl PendingUdpVerdicts {
                 continue;
             }
             let result = blocking_section(|| {
-                backend.commit_udp_decision(
+                backend.tc_mut()?.commit_udp_decision(
                     &identity.tuples(),
                     identity.owner.token,
                     UdpDecisionTransition::ActivateDirect(direct_rule_mark),
@@ -199,6 +199,7 @@ impl PendingUdpVerdicts {
         cell.changed.notify_waiters();
         self.drop_many(verdicts, DropOutcome::Cancel);
         self.endpoints.retire_staged_identity(
+            identity.scope,
             identity.client(),
             identity.destination(),
             identity.owner.token,
@@ -274,6 +275,7 @@ impl PendingUdpVerdicts {
         cell.changed.notify_waiters();
         self.drop_many(verdicts, DropOutcome::Cancel);
         self.endpoints.retire_staged_identity(
+            identity.scope,
             identity.client(),
             identity.destination(),
             identity.owner.token,

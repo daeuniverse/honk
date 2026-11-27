@@ -338,7 +338,7 @@ fn large_config(hosts_path: String) -> Config {
                 outbound: RoutingOutbound::Simple("direct".into()),
                 priority: index as u32,
                 must: false,
-                mark: 0,
+                mark: None,
             }
         })
         .collect();

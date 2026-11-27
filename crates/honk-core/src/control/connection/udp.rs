@@ -1,5 +1,7 @@
 use super::overall_dial_timeout;
 use super::routing::{RoutingDecision, build_connection_info, connection_chains};
+#[cfg(feature = "native-api")]
+use crate::control::udp_endpoint::EndpointObservation;
 use crate::control::udp_endpoint::{
     RawDnsRoute, UdpEndpoint, UdpInitLease, UdpTerminal, UdpTrafficEvidence,
 };
@@ -8,7 +10,7 @@ use crate::group::SelectionNetwork;
 
 use super::observation::ConnectionObservation;
 
-#[cfg(all(feature = "native-api", feature = "ebpf"))]
+#[cfg(all(feature = "native-api", feature = "legacy-tc"))]
 fn kernel_enforcement(
     observation: &ConnectionObservation,
     action: &'static str,
@@ -37,7 +39,11 @@ impl ControlPlaneHandle {
         &self,
         lease: UdpInitLease,
     ) -> anyhow::Result<()> {
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "native-api")]
+        let mut lease = lease;
+        #[cfg(feature = "native-api")]
+        let captured = lease.packet_observation.take();
+        #[cfg(feature = "legacy-tc")]
         let pending_cleanup = if lease.decision_token() == 0 {
             None
         } else {
@@ -50,17 +56,27 @@ impl ControlPlaneHandle {
                 crate::control::nfqueue::PendingUdpVerdicts::identity_for_lease(&lease),
             ))
         };
-        #[cfg(not(feature = "ebpf"))]
+        #[cfg(not(feature = "legacy-tc"))]
         if lease.decision_token() != 0 {
             anyhow::bail!("staged UDP lease requires the ebpf feature");
         }
-        #[cfg_attr(not(feature = "native-api"), allow(unused_mut))]
-        let mut observation = ConnectionObservation::begin(
-            self.native.as_deref(),
-            crate::observe::vocab::Network::Udp,
-            lease.client_addr(),
-            lease.original_dst(),
-        );
+        let begin = || {
+            ConnectionObservation::begin_in(
+                self.native.as_deref(),
+                crate::observe::vocab::Network::Udp,
+                lease.client_addr(),
+                lease.original_dst(),
+                #[cfg(feature = "native-api")]
+                lease
+                    .packet_source()
+                    .map(|source| source.memory_budget())
+                    .or(self.udp_pool.packet_memory_budget()),
+            )
+        };
+        #[cfg(feature = "native-api")]
+        let mut observation = captured.map_or_else(begin, Ok)?;
+        #[cfg(not(feature = "native-api"))]
+        let observation = begin()?;
         let native_terminal = lease.set_native_flow(observation.flow().cloned());
         let mut initializer = native_terminal
             .as_ref()
@@ -70,7 +86,7 @@ impl ControlPlaneHandle {
         let operation = async {
             tokio::select! {
                 _ = cancellation => {
-                    #[cfg(feature = "ebpf")]
+                    #[cfg(feature = "legacy-tc")]
                     if let Some((verdicts, identity)) = &pending_cleanup
                         && let Err(error) = verdicts.cancel(*identity).await
                     {
@@ -88,7 +104,7 @@ impl ControlPlaneHandle {
                     let Err(error) = result else {
                         return Ok(());
                     };
-                    #[cfg(feature = "ebpf")]
+                    #[cfg(feature = "legacy-tc")]
                     if let Some((verdicts, identity)) = &pending_cleanup
                         && let Err(cancel_error) = verdicts.cancel(*identity).await
                     {
@@ -127,15 +143,66 @@ impl ControlPlaneHandle {
         #[cfg(not(feature = "native-api"))]
         let mut observation = ConnectionObservation;
         let native_terminal = lease.native_terminal();
-        #[cfg(feature = "native-api")]
-        if let Some(capture) = lease.take_packet_route() {
-            observation.packet_route(capture);
-        }
+        observation.packet_route(lease.take_packet_route());
         let client_addr = lease.client_addr();
         let original_dst = lease.original_dst();
+        let packet_input = lease
+            .packet_source()
+            .and_then(|source| source.packet_input());
+        if let Some((process, mark)) = packet_input {
+            observation.packet_facts(
+                process,
+                lease
+                    .packet_dscp
+                    .ok_or_else(|| anyhow::anyhow!("packet UDP has no admitted DSCP"))?,
+                mark,
+            );
+        }
         let data = lease.first_payload();
         let raw_dns_route = lease.raw_dns_route();
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "native-api")]
+        let packet_route_budget = (observation.is_recording()
+            && !lease.owner().has_kernel_capture())
+        .then(|| {
+            lease
+                .packet_source()
+                .map(|source| source.owner().budget())
+                .or_else(|| self.udp_pool.packet_memory_budget().cloned())
+        })
+        .flatten();
+        let mut packet_routing = if lease.owner().has_kernel_capture() {
+            None
+        } else {
+            Some(match lease.packet_routing.take() {
+                Some(snapshot) => snapshot,
+                None => {
+                    self.prepare_packet_routing_snapshot(
+                        lease.scope(),
+                        client_addr,
+                        original_dst,
+                        "udp",
+                        lease
+                            .packet_dscp
+                            .ok_or_else(|| anyhow::anyhow!("packet UDP has no admitted DSCP"))?,
+                        lease.packet_source(),
+                        None,
+                        #[cfg(feature = "native-api")]
+                        (observation.is_recording(), packet_route_budget.as_ref()),
+                    )
+                    .await?
+                }
+            })
+        };
+        if let Some(snapshot) = &packet_routing {
+            anyhow::ensure!(
+                snapshot.source
+                    == lease
+                        .packet_source()
+                        .and_then(|source| source.optional_context()),
+                "packet UDP routing source changed"
+            );
+        }
+        #[cfg(feature = "legacy-tc")]
         let pending = if lease.decision_token() == 0 {
             None
         } else {
@@ -148,7 +215,7 @@ impl ControlPlaneHandle {
                 crate::control::nfqueue::PendingUdpVerdicts::identity_for_lease(&lease),
             ))
         };
-        #[cfg(not(feature = "ebpf"))]
+        #[cfg(not(feature = "legacy-tc"))]
         if lease.decision_token() != 0 {
             anyhow::bail!("staged UDP lease requires the ebpf feature");
         }
@@ -160,14 +227,26 @@ impl ControlPlaneHandle {
             lease.decision_token()
         );
 
-        let dial_mode = if raw_dns_route.is_some() {
+        if let Some(route) = &raw_dns_route {
             anyhow::ensure!(
                 original_dst.port() == 53 && lease.decision_token() == 0,
                 "raw DNS ownership requires an unstaged UDP/53 lease"
             );
+            anyhow::ensure!(
+                route.is_final() || packet_routing.is_some(),
+                "packet fallback identity requires captured routing"
+            );
+        }
+        let dial_mode = if raw_dns_route.as_ref().is_some_and(RawDnsRoute::is_final) {
             DialMode::Ip
         } else {
-            let config = self.config.read().await;
+            let current_config;
+            let config = if let Some(snapshot) = &packet_routing {
+                &snapshot.config
+            } else {
+                current_config = self.config.read().await;
+                &*current_config
+            };
             config
                 .global
                 .dial_mode
@@ -181,7 +260,7 @@ impl ControlPlaneHandle {
                 "Skipping honk-internal UDP {} -> {}",
                 client_addr, original_dst
             );
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             if let Some((verdicts, identity)) = &pending {
                 verdicts.cancel(*identity).await?;
             }
@@ -195,7 +274,7 @@ impl ControlPlaneHandle {
                 "Skipping broadcast/multicast UDP {} -> {}",
                 client_addr, original_dst
             );
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             if let Some((verdicts, identity)) = &pending {
                 verdicts.cancel(*identity).await?;
             }
@@ -205,36 +284,35 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
-        let (handoff, original_group) = if raw_dns_route.is_some() {
-            (None, None)
-        } else {
-            let tuples = build_tuples_key(
-                original_dst.ip(),
-                original_dst.port(),
-                client_addr.ip(),
-                client_addr.port(),
-                17, // UDP
-            );
-            self.lookup_udp_handoff(
-                &tuples,
-                lease.owner(),
-                #[cfg(feature = "native-api")]
-                observation,
-            )
-            .await?
-        };
-        #[cfg(feature = "native-api")]
-        let handoff = handoff.map(|mut handoff| {
-            if lease.decision_token() == 0 && lease.packet_trace_id() != Some(handoff.trace_id) {
-                // A queued socket datagram cannot identify a later token-zero tuple incarnation.
-                handoff.trace_id = 0;
-                handoff.capture = None;
-                handoff.capture_gap = Some("kernel_handoff_ambiguous");
-            }
-            handoff
-        });
-        observation.handoff(handoff.as_ref(), raw_dns_route.is_none());
+        let (mut handoff, original_group) =
+            if raw_dns_route.is_some() || !lease.owner().has_kernel_capture() {
+                (None, None)
+            } else {
+                let tuples = build_tuples_key(
+                    original_dst.ip(),
+                    original_dst.port(),
+                    client_addr.ip(),
+                    client_addr.port(),
+                    17, // UDP
+                );
+                self.lookup_udp_handoff(
+                    &tuples,
+                    lease.owner(),
+                    #[cfg(feature = "native-api")]
+                    observation,
+                    #[cfg(feature = "native-api")]
+                    lease.packet_trace_id(),
+                )
+                .await?
+            };
+        observation.handoff(
+            handoff.as_mut(),
+            raw_dns_route.is_none() && lease.owner().has_kernel_capture(),
+        );
         let skip_sniff = matches!(dial_mode, DialMode::Ip)
+            || packet_routing
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.final_before_sniff())
             || handoff.as_ref().is_some_and(|ho| {
                 ho.must != 0
                     || matches!(
@@ -250,8 +328,12 @@ impl ControlPlaneHandle {
             None
         } else {
             use crate::control::packet_sniffer::QuicSniffOutcome;
-            let sniffer_key =
-                crate::control::packet_sniffer::PacketSnifferKey::new(client_addr, original_dst);
+            let sniffer_key = crate::control::packet_sniffer::PacketSnifferKey::new(
+                lease.scope(),
+                client_addr,
+                original_dst,
+                lease.packet_lineage(),
+            );
             let mut outcome = self.sniffer_pool.feed_quic_initial(sniffer_key, &data);
             // A fragmented ClientHello: collect the rest of the Initial
             // flight before deciding which outbound owns the flow.
@@ -267,7 +349,7 @@ impl ControlPlaneHandle {
                     "QUIC ClientHello unresolved within budget; dropping for retransmit {} -> {}",
                     client_addr, original_dst
                 );
-                #[cfg(feature = "ebpf")]
+                #[cfg(feature = "legacy-tc")]
                 if let Some((verdicts, identity)) = &pending {
                     verdicts.cancel(*identity).await?;
                 }
@@ -291,13 +373,27 @@ impl ControlPlaneHandle {
             .map(|owner| owner.name());
         let group_owner =
             handoff_group.is_some() || matches!(&raw_dns_route, Some(RawDnsRoute::Group(_)));
-        let mut route = if let Some(raw_dns_route) = &raw_dns_route {
+        let mut route = if let Some(snapshot) = &mut packet_routing {
+            let mut input =
+                build_connection_info(quic_domain.clone(), original_dst, client_addr, "udp", None);
+            input.dscp = lease.packet_dscp;
+            self.route_packet_with_sniffed(
+                snapshot,
+                dial_mode,
+                &input,
+                domain_verified,
+                #[cfg(feature = "native-api")]
+                (observation.is_recording(), packet_route_budget.as_ref()),
+            )
+            .await?;
+            std::mem::take(&mut snapshot.decision)
+        } else if let Some(raw_dns_route) = &raw_dns_route {
             let (outbound, mark) = match raw_dns_route {
                 RawDnsRoute::Group(name) => (name.to_string(), None),
-                RawDnsRoute::Direct(mark) => (
-                    "direct".to_owned(),
-                    honk_outbound::proxy::DirectMark::new(*mark),
-                ),
+                RawDnsRoute::Direct(mark) => ("direct".to_owned(), (*mark != 0).then_some(*mark)),
+                RawDnsRoute::FallbackGroup(_) | RawDnsRoute::FallbackDirect(_) => {
+                    anyhow::bail!("packet fallback identity requires captured routing")
+                }
             };
             RoutingDecision {
                 outbound,
@@ -305,8 +401,7 @@ impl ControlPlaneHandle {
                 mark,
                 matched_rule: None,
                 reroute_by_sniffed_domain: false,
-                #[cfg(feature = "native-api")]
-                native_route: None,
+                native_route: Default::default(),
             }
         } else {
             let conn_info = build_connection_info(
@@ -328,7 +423,7 @@ impl ControlPlaneHandle {
             .await
         };
         observation.routed(&mut route);
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
         let matched_rule = route.matched_rule.take();
         let routed_constraint = if group_owner && !route.reroute_by_sniffed_domain {
@@ -336,9 +431,14 @@ impl ControlPlaneHandle {
         } else {
             OutboundConstraint::Any
         };
-        let mode_decision = self
-            .apply_mode_override(&mut route, routed_constraint)
-            .await;
+        let mode_decision = if let Some(snapshot) = &packet_routing {
+            let mode = snapshot.mode.clone();
+            route.apply_final_outbound(Some(mode.name.clone()));
+            mode
+        } else {
+            self.apply_mode_override(&mut route, routed_constraint)
+                .await
+        };
         let outbound_name = mode_decision.name;
         let mode_constraint = mode_decision.constraint;
         let target_domain = if matches!(
@@ -353,9 +453,13 @@ impl ControlPlaneHandle {
         observation.mode_applied(&outbound_name);
         observation.udp_dial_mode(dial_mode, quic_domain.as_deref(), domain_verification, None);
         let mark = route.mark;
+        anyhow::ensure!(
+            mark.is_none_or(|mark| !honk_ebpf_common::skb_mark_has_reserved_bits(mark)),
+            "direct rule mark uses a reserved datapath bit"
+        );
         self.stats
             .record_udp_route_latency(route_started_at.elapsed());
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some((verdicts, identity)) = &pending {
             match outbound_name.as_str() {
                 "direct" if !matches!(mode_constraint, OutboundConstraint::Group) => {
@@ -366,7 +470,8 @@ impl ControlPlaneHandle {
                         .activate_direct(
                             *identity,
                             lease,
-                            mark.map_or(0, honk_outbound::proxy::DirectMark::get),
+                            mark.and_then(honk_outbound::proxy::DirectMark::new)
+                                .map_or(0, honk_outbound::proxy::DirectMark::get),
                         )
                         .await
                         .inspect_err(|_| {
@@ -424,7 +529,7 @@ impl ControlPlaneHandle {
         } else {
             IpVersion::V4
         };
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         let staged_outbound;
         let (
             plan,
@@ -434,12 +539,32 @@ impl ControlPlaneHandle {
             runtime_generation,
             connect_timeout,
         ) = {
-            let config = self.config.read().await;
+            let current_config;
+            let config = if let Some(snapshot) = &packet_routing {
+                &snapshot.config
+            } else {
+                current_config = self.config.read().await;
+                &*current_config
+            };
+            #[cfg(feature = "native-api")]
+            let pinned_native = packet_routing.as_ref().map_or_else(
+                || {
+                    self.native.as_ref().map(|native| {
+                        (
+                            self.diagnostics.read().generation,
+                            native.catalog.snapshot(),
+                        )
+                    })
+                },
+                |snapshot| snapshot.native.clone(),
+            );
             #[cfg(feature = "native-api")]
             let mode_constraint = if let Some(expected) = &mode_decision.group_id {
-                if self.native.as_ref().is_some_and(|native| {
-                    native.catalog.snapshot().groups.get(&outbound_name) == Some(expected)
-                }) {
+                if pinned_native
+                    .as_ref()
+                    .and_then(|(_, catalog)| catalog.groups.get(&outbound_name))
+                    == Some(expected)
+                {
                     OutboundConstraint::Group
                 } else {
                     OutboundConstraint::Unavailable
@@ -449,33 +574,27 @@ impl ControlPlaneHandle {
             };
             #[cfg(feature = "native-api")]
             if observation.is_recording()
-                && let Some(native) = &self.native
+                && let Some((generation, catalog)) = &pinned_native
             {
-                observation.pin_selection(
-                    self.diagnostics.read().generation,
-                    &native.catalog.snapshot(),
-                    &config,
-                );
+                observation.pin_selection(*generation, catalog, config);
             }
-            let gm = {
-                let manager = self.group_manager.read();
-                if let Some(owner) = original_group {
-                    self.revalidate_udp_group(&manager, &owner)?;
-                }
-                if matches!(mode_constraint, OutboundConstraint::Group)
-                    && manager.group(&outbound_name).is_none()
-                {
-                    return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
-                }
-                Arc::clone(&manager)
+            let gm = match &packet_routing {
+                Some(snapshot) => Arc::clone(&snapshot.group_manager),
+                None => self.group_manager.read().clone(),
             };
-            #[cfg(feature = "ebpf")]
+            if let Some(owner) = &original_group {
+                self.revalidate_udp_group(&gm, owner)?;
+            }
+            if matches!(mode_constraint, OutboundConstraint::Group)
+                && gm.group(&outbound_name).is_none()
+            {
+                return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
+            }
+            #[cfg(feature = "legacy-tc")]
             {
                 staged_outbound = pending
                     .as_ref()
-                    .map(|_| {
-                        self.staged_udp_outbound(&config, &gm, &outbound_name, mode_constraint)
-                    })
+                    .map(|_| self.staged_udp_outbound(config, &gm, &outbound_name, mode_constraint))
                     .transpose()?;
             }
             let select = || {
@@ -492,7 +611,7 @@ impl ControlPlaneHandle {
                     }),
                 };
                 resolve_outbound_plan_for_target(
-                    &config,
+                    config,
                     &gm,
                     &outbound_name,
                     &context,
@@ -510,7 +629,7 @@ impl ControlPlaneHandle {
             let close_group_ids: std::collections::HashMap<String, String> =
                 if self.connection_tracker.is_enabled() {
                     #[cfg(feature = "native-api")]
-                    let catalog = self.native.as_ref().map(|native| native.catalog.snapshot());
+                    let catalog = pinned_native.as_ref().map(|(_, catalog)| catalog);
                     selection_chains
                         .iter()
                         .flatten()
@@ -539,7 +658,10 @@ impl ControlPlaneHandle {
                 close_group_ids,
                 kind,
                 gm,
-                self.runtime_registry.read().clone(),
+                packet_routing
+                    .as_ref()
+                    .map(|snapshot| Arc::clone(&snapshot.runtime))
+                    .unwrap_or_else(|| self.runtime_registry.read().clone()),
                 Duration::from_millis(config.global.connect_timeout_ms),
             )
         };
@@ -548,7 +670,7 @@ impl ControlPlaneHandle {
         lease.set_connection_guard(self.stats.track_outbound(outbound_tracker.clone()));
 
         if plan.targets.is_empty() {
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             if let Some((verdicts, identity)) = &pending {
                 verdicts.cancel(*identity).await?;
             }
@@ -563,15 +685,10 @@ impl ControlPlaneHandle {
             }
             return Ok(());
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let (Some((verdicts, identity)), Some(final_outbound)) = (&pending, staged_outbound) {
             verdicts
-                .activate_proxy(
-                    *identity,
-                    &lease,
-                    final_outbound,
-                    mark.map_or(0, honk_outbound::proxy::DirectMark::get),
-                )
+                .activate_proxy(*identity, &lease, final_outbound, mark.unwrap_or(0))
                 .await
                 .inspect_err(|_| {
                     #[cfg(feature = "native-api")]
@@ -594,8 +711,10 @@ impl ControlPlaneHandle {
         observation.udp_preparing();
         let Some((target, prepared)) = self
             .prepare_udp_candidates(
+                lease.scope(),
+                lease.packet_source().cloned(),
                 plan,
-                mark,
+                mark.and_then(honk_outbound::proxy::DirectMark::new),
                 client_addr,
                 original_dst,
                 target_domain.clone(),
@@ -690,6 +809,12 @@ impl ControlPlaneHandle {
             ));
         }
         let node = &target.node;
+        // A fresh shared source can publish during promotion, before the endpoint exists.
+        #[cfg(feature = "native-api")]
+        let endpoint_observation = EndpointObservation::reserve(
+            &self.udp_pool,
+            observation.flow().is_some() || native_terminal.is_some() || target_observer.is_some(),
+        )?;
         // Final promotion remains pre-publication and inside the unchanged
         // absolute preparation deadline.
         let source_pool = Arc::clone(&self.udp_pool);
@@ -773,7 +898,11 @@ impl ControlPlaneHandle {
         // after the winner is finalized and before the only first send. Any
         // failure is fail-closed; there is no listener-socket fallback.
         let reply_ready_started = std::time::Instant::now();
-        let reply_socket = match self.udp_pool.create_reply_socket(original_dst) {
+        let reply_socket = match self.udp_pool.create_reply_socket(
+            lease.scope(),
+            original_dst,
+            lease.packet_source(),
+        ) {
             Ok(socket) => Arc::new(socket),
             Err(error) => {
                 if let Some(terminal) = &native_terminal {
@@ -818,14 +947,21 @@ impl ControlPlaneHandle {
                 score_reporter,
             ),
         };
+        endpoint.bind_packet_source(lease.packet_source().cloned())?;
         endpoint.set_traffic_evidence(evidence.clone());
+        #[cfg(feature = "native-api")]
+        {
+            endpoint.native = endpoint_observation;
+        }
         endpoint.native.set_flow(
             observation.take_flow(),
             &self.udp_pool,
             native_terminal.clone(),
-        );
+        )?;
         #[cfg(feature = "native-api")]
-        endpoint.native.set_observer(target_observer);
+        endpoint
+            .native
+            .set_observer(target_observer, &self.udp_pool)?;
         let endpoint = Arc::new(endpoint);
 
         let queue_rx = match follower_rx {
@@ -839,6 +975,7 @@ impl ControlPlaneHandle {
             })?,
         };
         let mut driver = self.udp_pool.spawn_driver(
+            lease.scope(),
             client_addr,
             original_dst,
             lease.generation(),
@@ -892,6 +1029,7 @@ impl ControlPlaneHandle {
         let tracker_id = self
             .udp_pool
             .register_ready_tracker(
+                lease.scope(),
                 client_addr,
                 original_dst,
                 lease.decision_token(),
@@ -900,14 +1038,14 @@ impl ControlPlaneHandle {
                 &self.connection_tracker,
                 groups,
                 || {
-                    let id = uuid::Uuid::new_v4().to_string();
+                    let id = uuid::Uuid::new_v4();
                     let (rule, rule_payload) =
                         matched_rule.unwrap_or_else(|| ("Fallback".to_string(), String::new()));
                     let (upload, download) = endpoint.byte_counters();
                     crate::connection_tracker::ConnectionEntry {
                         id,
-                        source: client_addr.to_string(),
-                        destination: original_dst.to_string(),
+                        source: client_addr,
+                        destination: original_dst,
                         proxy: node.name.clone(),
                         #[cfg(feature = "native-api")]
                         routed_outbound: self
@@ -928,15 +1066,21 @@ impl ControlPlaneHandle {
                         download,
                         start_time: std::time::Instant::now(),
                         domain: quic_domain.clone(),
-                        network: "udp".to_string(),
-                        process: handoff.as_ref().and_then(|ho| ho.process_name()),
+                        network: "udp",
+                        process: match packet_input {
+                            Some((process, _)) => process.name(),
+                            None => handoff.as_ref().and_then(|ho| ho.process_name()),
+                        },
                         process_path: None,
                     }
                 },
             )
             .map_err(|()| anyhow::anyhow!("UDP endpoint retired before tracker publication"))?;
-        if let (Some(flow), Some(id)) = (endpoint.native.flow(), tracker_id.as_deref()) {
-            flow.attach_connection(id);
+        if let (Some(flow), Some(id)) = (endpoint.native.flow(), tracker_id) {
+            flow.attach_connection(
+                id.as_hyphenated()
+                    .encode_lower(&mut uuid::Uuid::encode_buffer()),
+            );
         }
         let first = lease.take_first().ok_or_else(|| {
             if let Some(terminal) = &native_terminal {
@@ -948,11 +1092,8 @@ impl ControlPlaneHandle {
         if let Some(conn_id) = tracker_id {
             self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
         }
-        if let Err(error) = driver.wait_first_ack().await {
-            // First-send failures are terminal for this endpoint; once the
-            // transport call starts, the packet is never replayed.
-            outbound_tracker.increment_errors();
-            return Err(error.into());
+        if !driver.confirm_first_send(&outbound_tracker).await? {
+            return Ok(());
         }
         debug!(
             network = "udp",

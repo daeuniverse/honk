@@ -3,7 +3,7 @@ use super::*;
 impl ControlPlane {
     pub fn new(
         config: Config,
-        ebpf: Box<dyn EbpfBackend>,
+        ebpf: Box<dyn crate::ebpf::PolicyBackend>,
         router: Router,
         proxy_registry: std::sync::Arc<ProxyRegistry>,
         dns_resolver: DnsResolver,
@@ -44,7 +44,7 @@ impl ControlPlane {
     /// The supplied DNS pool and forwarder must use the assembled configuration.
     pub fn new_with_upstream_pool(
         config: Config,
-        ebpf: Box<dyn EbpfBackend>,
+        ebpf: Box<dyn crate::ebpf::PolicyBackend>,
         router: Router,
         proxy_registry: std::sync::Arc<ProxyRegistry>,
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
@@ -65,7 +65,7 @@ impl ControlPlane {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_upstream_pool_and_budget(
         config: Config,
-        mut ebpf: Box<dyn EbpfBackend>,
+        mut ebpf: Box<dyn crate::ebpf::PolicyBackend>,
         router: Router,
         proxy_registry: std::sync::Arc<ProxyRegistry>,
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
@@ -85,7 +85,10 @@ impl ControlPlane {
             dns_socket_budget.limit() <= resource_budget.dns_sockets,
             "DNS socket admission exceeds its descriptor partition"
         );
-        honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
+        honk_outbound::util::init_dae_socket_mark(
+            config.global.effective_so_mark(),
+            config.required_socket_mark().is_some(),
+        )?;
         let (tx, rx) = mpsc::channel(256);
         let effective_log_file = crate::resolved_log_file_path(&config, None);
 
@@ -189,9 +192,15 @@ impl ControlPlane {
         let snapshot = initial_route_connectivity(&initial_routing_plan, &pinned_groups);
         publish_group_connectivity(ebpf.as_mut(), &snapshot)?;
         let initial_generation = ebpf.routing_policy_generation();
-        let ebpf_arc = Arc::new(RwLock::new(ebpf));
+        let (ebpf_arc, tc_kernel) = TcKernelController::share(ebpf);
         let router_arc = Arc::new(RwLock::new(router));
         let interrupt_groups = config.groups.clone();
+        #[cfg(target_os = "linux")]
+        let polling = config
+            .datapath
+            .as_ref()
+            .filter(|datapath| datapath.backend == honk_config::datapath::Backend::Xdp)
+            .map(|_| crate::xdp::polling::PollingPublication::new(&config));
         let config = Arc::new(config);
         let initial_routing_plan = routing_matcher::ActiveRoutingPlan::new(
             initial_routing_plan,
@@ -231,25 +240,26 @@ impl ControlPlane {
         // stays for node hostnames and startup. The same hook backs the
         // urltest (clash delay) measurements.
         {
-            let controller = dns_controller.clone();
-            let make_hook =
-                move |controller: std::sync::Arc<crate::control::dns_control::DnsController>| {
-                    let hook: crate::outbound::ResolveHook =
-                        Arc::new(move |host: String, port: u16| {
-                            let controller = controller.clone();
-                            Box::pin(async move {
-                                controller.resolve_domain(&host).await.map(|addresses| {
-                                    addresses
-                                        .into_iter()
-                                        .map(|ip| std::net::SocketAddr::new(ip, port))
-                                        .collect()
-                                })
+            let service = dns_controller.dns_service();
+            let make_hook = move |service: crate::dns::DnsService| {
+                let hook: crate::outbound::ResolveHook =
+                    Arc::new(move |host: String, port: u16| {
+                        let service = service.clone();
+                        Box::pin(async move {
+                            service.resolve_name(&host).await.map(|addresses| {
+                                addresses
+                                    .ipv4
+                                    .into_iter()
+                                    .chain(addresses.ipv6)
+                                    .map(|ip| std::net::SocketAddr::new(ip, port))
+                                    .collect()
                             })
-                        });
-                    hook
-                };
-            alive_set.set_resolver(make_hook(controller.clone()));
-            honk_outbound::urltest::set_urltest_resolver(make_hook(controller));
+                        })
+                    });
+                hook
+            };
+            alive_set.set_resolver(make_hook(service.clone()));
+            honk_outbound::urltest::set_urltest_resolver(make_hook(service));
         }
 
         let control_plane = Self {
@@ -265,6 +275,7 @@ impl ControlPlane {
             },
             startup_downgrades: StartupDowngrades::default(),
             ebpf: ebpf_arc,
+            tc_kernel,
             router: router_arc,
             proxy_registry,
             dns_resolver,
@@ -299,6 +310,10 @@ impl ControlPlane {
             outbound_id_map,
             resource_budget,
             dns_socket_budget,
+            #[cfg(target_os = "linux")]
+            process_polling: None,
+            #[cfg(target_os = "linux")]
+            polling,
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
                 resource_budget.active_tcp_flows,
             )),
@@ -317,7 +332,7 @@ impl ControlPlane {
             selector_bare_warm: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             mode_state: None,
             datapath_flags: None,
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             pending_udp_verdicts: None,
             datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(feature = "native-api")]
@@ -329,17 +344,21 @@ impl ControlPlane {
             native_owner: None,
             #[cfg(feature = "native-api")]
             subscriptions: None,
-            shutdown_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_requested: Arc::new(super::ShutdownIntent::default()),
             #[cfg(feature = "clash-api")]
             ui_download: Arc::new(tokio::sync::Mutex::new(None)),
             active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
+            #[cfg(target_os = "linux")]
+            core_forward_users: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(target_os = "linux")]
+            core_forward_mixed_users: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "reload-bench-counters")]
             reload_slow_path_entries: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             pre_dns_publication_hook: parking_lot::Mutex::new(None),
             #[cfg(all(test, feature = "clash-api"))]
             clash_publication_pause: parking_lot::Mutex::new(None),
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             iface_watcher: None,
         };
 
@@ -366,6 +385,84 @@ impl ControlPlane {
 
         Ok(control_plane)
     }
+
+    /// Attach the process-start polling resource before handing ingress to its owner.
+    #[cfg(target_os = "linux")]
+    pub fn with_process_polling(mut self, binding: PollBudgetBinding) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.process_polling.is_none(),
+            "process polling is already attached"
+        );
+        anyhow::ensure!(
+            self.command_rx.is_some(),
+            "process polling must attach before owner startup"
+        );
+        let polling = self
+            .polling
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("process polling requires an explicit XDP consumer"))?;
+        let policy = polling.snapshot().quota().map_err(anyhow::Error::msg)?;
+        if let Err(reason) = binding.prepare_policy(policy)
+            && reason == "process_budget_policy_mismatch"
+        {
+            anyhow::bail!(reason);
+        }
+        let error = binding.publish_policy(policy).err();
+        polling.attachment_error(error);
+        self.process_polling = Some(binding);
+        Ok(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn polling_runtime(
+        &self,
+    ) -> Option<(
+        Arc<crate::xdp::polling::PollingPublication>,
+        Option<ProcessPollBudget>,
+    )> {
+        self.polling.as_ref().map(|polling| {
+            (
+                Arc::clone(polling),
+                self.process_polling
+                    .as_ref()
+                    .map(PollBudgetBinding::participant_handle),
+            )
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::control) fn prepare_polling_config(
+        &self,
+        config: &Config,
+    ) -> Result<(), &'static str> {
+        if self.polling.is_none() {
+            return Ok(());
+        }
+        let policy = crate::xdp::polling::quota_policy(config)?;
+        if let Some(binding) = &self.process_polling
+            && let Err(reason) = binding.prepare_policy(policy)
+            && reason == "process_budget_policy_mismatch"
+        {
+            return Err(reason);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::control) fn publish_polling_config(&self, config: &Config) {
+        let Some(polling) = &self.polling else { return };
+        if !polling.differs(config) {
+            return;
+        }
+        let error = match crate::xdp::polling::quota_policy(config) {
+            Ok(policy) => self
+                .process_polling
+                .as_ref()
+                .and_then(|binding| binding.publish_policy(policy).err()),
+            Err(reason) => Some(reason),
+        };
+        polling.publish(config, error);
+    }
     pub(crate) fn set_log_file_override(
         &mut self,
         log_file_override: Option<PathBuf>,
@@ -382,12 +479,14 @@ impl ControlPlane {
     /// driver-ready work before `run()` has created listener tasks.
     pub(super) fn install_node_death_callback(&self) {
         let pool = self.connection_pool.clone();
-        let udp_pool = self.udp_pool.clone();
+        let udp_pool = Arc::downgrade(&self.udp_pool);
         let config_for_purge = self.config.clone();
         let runtime_registry = self.runtime_registry.clone();
         self.alive_set.set_death_callback(Some(Box::new(
             move |node_id: uuid::Uuid, _name: &str| {
-                udp_pool.remove_by_node(node_id);
+                if let Some(udp_pool) = udp_pool.upgrade() {
+                    udp_pool.remove_by_node(node_id);
+                }
                 let generation = runtime_registry.read().generation();
                 let node_addr = config_for_purge.try_read().ok().and_then(|c| {
                     c.nodes
@@ -430,11 +529,10 @@ impl ControlPlane {
             &config,
             &self.active_routing_plan.read().plan,
         );
-        if let Some(dictionary) = dictionary {
-            self.ebpf
-                .write()
-                .await
-                .bind_kernel_trace_dictionary(dictionary);
+        if let Some(dictionary) = dictionary
+            && let Ok(tc) = self.ebpf.write().await.tc_mut()
+        {
+            tc.bind_kernel_trace_dictionary(dictionary);
         }
         provider
             .current()

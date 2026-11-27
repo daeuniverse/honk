@@ -398,7 +398,7 @@ fn routing_plan(tag: u8) -> crate::control::routing_matcher::RoutingPushPlan {
         outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
         priority: 0,
         must: false,
-        mark: u32::from(tag),
+        mark: Some(u32::from(tag)),
     };
     let router = crate::routing::Router::new(&[rule], "direct").unwrap();
     crate::control::routing_matcher::RoutingPushPlan::compile(
@@ -447,7 +447,7 @@ fn routing_publish_is_atomic_and_root_is_last() {
 #[test]
 fn routing_generation_ceiling_rejects_before_staging() {
     let mut backend = MockEbpfBackend::new();
-    backend.next_generation = DNS_ROUTE_GENERATION_MAX - 1;
+    backend.policy.next_generation = DNS_ROUTE_GENERATION_MAX - 1;
     backend.publish_routing_plan(&routing_plan(1), &[]).unwrap();
     let accepted = backend.routing_snapshot();
     let writes = backend.routing_publication_order.clone();
@@ -630,6 +630,6 @@ fn test_cleanup_clears_all_maps() {
     assert!(backend.udp_conn_states.is_empty());
     assert!(backend.redirect_tracks.is_empty());
     assert!(backend.routing_handoffs.lock().is_empty());
-    assert!(backend.outbound_alive.is_empty());
+    assert!(backend.policy.outbound_alive.is_empty());
     assert!(backend.bpf_stats.is_empty());
 }

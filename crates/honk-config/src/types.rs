@@ -14,6 +14,7 @@ pub enum NodeProtocol {
     Tuic,
     Juicity,
     AnyTLS,
+    WireGuard,
     /// Built-in bypass outbound; reserved, not a configurable protocol.
     Direct,
     /// Built-in reject outbound; reserved, not a configurable protocol.
@@ -34,6 +35,7 @@ impl NodeProtocol {
             NodeProtocol::Tuic => "tuic",
             NodeProtocol::Juicity => "juicity",
             NodeProtocol::AnyTLS => "anytls",
+            NodeProtocol::WireGuard => "wireguard",
             NodeProtocol::Direct => "direct",
             NodeProtocol::Block => "block",
             NodeProtocol::Chain => "chain",
@@ -55,6 +57,7 @@ impl std::str::FromStr for NodeProtocol {
             "tuic" => Ok(NodeProtocol::Tuic),
             "juicity" => Ok(NodeProtocol::Juicity),
             "anytls" => Ok(NodeProtocol::AnyTLS),
+            "wireguard" | "wg" => Ok(NodeProtocol::WireGuard),
             "direct" => Ok(NodeProtocol::Direct),
             "block" => Ok(NodeProtocol::Block),
             "chain" => Ok(NodeProtocol::Chain),

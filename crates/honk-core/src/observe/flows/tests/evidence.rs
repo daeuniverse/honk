@@ -39,17 +39,17 @@ fn completeness_tracks_captured_frontier_and_sticky_loss_not_lifecycle_or_popula
 fn rejected_source_writes_never_authorize_causal_references() {
     let store = store();
     let flow = begin(&store, crate::observe::vocab::Network::Udp);
-    assert!(store.record_step(flow.id(), Some(1), dial_mode()));
-    assert!(!store.record_step("foreign-flow", Some(1), dial_mode()));
+    assert!(store.record_step(&flow.key, Some(1), dial_mode()));
+    assert!(!store.record_step(&Uuid::nil(), Some(1), dial_mode()));
     for _ in 0..MAX_STEPS {
         flow.step(None, dial_mode());
     }
-    assert!(!store.record_step(flow.id(), Some(1), dial_mode()));
+    assert!(!store.record_step(&flow.key, Some(1), dial_mode()));
     flow.finish(
         crate::observe::vocab::ConnectionState::Failed,
         "capture_lost",
     );
-    assert!(!store.record_step(flow.id(), Some(1), dial_mode()));
+    assert!(!store.record_step(&flow.key, Some(1), dial_mode()));
     let detail = store.get(flow.id()).unwrap();
     assert!(
         detail["trace"]["missing"]
@@ -87,7 +87,7 @@ fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
         name: String::new(),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
     let router = Router::from_config_with_geo_sources(
         &routing,
@@ -130,6 +130,7 @@ fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
             rule_id: Some(rules[0].rule_id.clone()),
             outbound: Some("direct".into()),
             must: Some(false),
+            mark_kind: Some(honk_ebpf_common::ROUTING_MARK_KEEP),
             mark: Some(0),
             input: Some(record::EvaluationInput::Traffic(record::RouteInput {
                 network: "tcp",
@@ -445,6 +446,7 @@ fn captured_url_rule_values_survive_summary_updates_and_new_router_generations()
             rule_id: Some(id.into()),
             outbound: Some("group/name@host".into()),
             must: None,
+            mark_kind: None,
             mark: None,
             input: Some(record::EvaluationInput::Traffic(record::RouteInput {
                 network: "tcp",

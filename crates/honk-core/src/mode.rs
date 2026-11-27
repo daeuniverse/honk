@@ -5,14 +5,15 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-type SharedEbpfBackend = Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::EbpfBackend>>>;
+type SharedPolicyBackend = Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>>;
 
 /// Shared outbound mode; native targets retain identity rather than display names.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModeState {
     /// Canonical clash mode: `"Rule"` | `"Global"` | `"Direct"`.
     pub mode: String,
     pub(crate) selection: Selection,
+    revision: u64,
     #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
     pub(crate) source: ModeSource,
 }
@@ -106,9 +107,14 @@ impl ModeState {
         Self {
             mode: Self::normalize(mode).unwrap_or_else(|| "Rule".to_string()),
             selection: Selection::Name(global_selection.into()),
+            revision: 0,
             #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
             source: ModeSource::Config,
         }
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 
     #[cfg(feature = "native-api")]
@@ -324,7 +330,7 @@ enum Persistence {
 }
 
 struct DatapathFlagsInner {
-    backend: SharedEbpfBackend,
+    backend: SharedPolicyBackend,
     mode_state: SharedModeState,
     cache_db: Option<Arc<crate::state::cache::CacheDb>>,
     state: DatapathFlagsState,
@@ -332,7 +338,7 @@ struct DatapathFlagsInner {
 
 impl DatapathFlagsHandle {
     pub fn new(
-        backend: SharedEbpfBackend,
+        backend: SharedPolicyBackend,
         mode_state: SharedModeState,
         cache_db: Option<Arc<crate::state::cache::CacheDb>>,
     ) -> Self {
@@ -443,6 +449,12 @@ impl DatapathFlagsHandle {
         let mut state = inner.state.clone();
         let mut mode = inner.mode_state.read().clone();
         let persistence = change(&mut state, &mut mode)?;
+        if mode != *inner.mode_state.read() {
+            mode.revision = mode
+                .revision
+                .checked_add(1)
+                .context("runtime mode revision exhausted")?;
+        }
         let flags = state.compose(&mode);
         let quiescence = {
             let mut backend = inner.backend.write().await;
@@ -450,9 +462,16 @@ impl DatapathFlagsHandle {
                 .set_datapath_flags(flags)
                 .with_context(|| format!("failed to publish datapath flags {flags:#010x}"))?;
             if quiesce {
-                backend
-                    .quiesce_udp_staging()
-                    .context("failed to quiesce staged UDP decisions")
+                match backend.quiesce_udp_staging_if_supported() {
+                    Ok(false) if state.nfqueue_enabled => Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "software policy has no TC capability",
+                    )
+                    .into()),
+                    result => result
+                        .map(|_| ())
+                        .context("failed to quiesce staged UDP decisions"),
+                }
             } else {
                 Ok(())
             }
@@ -511,6 +530,9 @@ impl DatapathFlagsHandle {
         }
         let backend = Arc::clone(&inner.backend);
         let mut backend = backend.write().await;
+        if !backend.supports_kernel_trace() {
+            return Ok(());
+        }
         // Demand may have changed while waiting for either publication lock.
         // The callback takes only a synchronous Settings snapshot, never a guard
         // across await; terminal disable cannot be undone by this publisher.
@@ -609,7 +631,7 @@ impl DatapathFlagsPublication<'_> {
     /// caller must commit degraded and keep admission closed, not report rejection.
     pub(crate) fn reset_for_activation(
         &mut self,
-        backend: &mut dyn crate::ebpf::EbpfBackend,
+        backend: &mut dyn crate::ebpf::PolicyBackend,
     ) -> anyhow::Result<()> {
         if !self.inner.mode_state.read().is_native() {
             return Ok(());
@@ -618,7 +640,14 @@ impl DatapathFlagsPublication<'_> {
             self.inner.state.initialized,
             "datapath flags are not initialized"
         );
-        let mode = ModeState::native();
+        let mut mode = ModeState::native();
+        mode.revision = self
+            .inner
+            .mode_state
+            .read()
+            .revision
+            .checked_add(1)
+            .context("runtime mode revision exhausted")?;
         backend
             .set_datapath_flags(self.inner.state.compose(&mode))
             .context("failed to reset runtime mode")?;
@@ -722,16 +751,99 @@ mod tests {
         DatapathFlagsHandle,
         SharedModeState,
         Arc<parking_lot::Mutex<Vec<u32>>>,
-        SharedEbpfBackend,
+        SharedPolicyBackend,
     );
 
     fn flags_fixture() -> FlagsFixture {
         let backend = crate::ebpf::mock::MockEbpfBackend::new();
         let writes = backend.datapath_flags_writes.clone();
-        let backend: SharedEbpfBackend = Arc::new(tokio::sync::RwLock::new(Box::new(backend)));
+        let backend: SharedPolicyBackend = Arc::new(tokio::sync::RwLock::new(Box::new(backend)));
         let state = Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "Proxy")));
         let handle = DatapathFlagsHandle::new(Arc::clone(&backend), Arc::clone(&state), None);
         (handle, state, writes, backend)
+    }
+
+    #[tokio::test]
+    async fn packet_mode_revision_fences_aba_and_ignores_flag_only_updates() {
+        let (handle, state, _, _) = flags_fixture();
+        handle.initialize(false, false).await.unwrap();
+        let admitted = state.read().revision();
+        handle.set_mode("Direct").await.unwrap();
+        let direct = state.read().revision();
+        assert!(direct > admitted);
+        handle.set_mode("Rule").await.unwrap();
+        assert!(
+            state.read().revision() > direct,
+            "Rule -> Direct -> Rule must not revive queued Core output"
+        );
+        let rule = state.read().revision();
+        handle.fence_nfqueue().await.unwrap();
+        handle.set_mode("Rule").await.unwrap();
+        assert_eq!(state.read().revision(), rule);
+        handle.set_global_selection("direct".into()).await.unwrap();
+        assert!(state.read().revision() > rule);
+    }
+
+    #[tokio::test]
+    async fn packet_policy_fences_without_kernel_staging_or_witnesses() {
+        let backend = crate::ebpf::userspace::UserspaceBackend::new(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(parking_lot::RwLock::new(
+                crate::ebpf::PnameSupport::Unavailable,
+            )),
+        );
+        let backend: SharedPolicyBackend = Arc::new(tokio::sync::RwLock::new(Box::new(backend)));
+        let state = Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "Proxy")));
+        let handle = DatapathFlagsHandle::new(backend, state, None);
+        handle.initialize(false, false).await.unwrap();
+        handle.fence_nfqueue().await.unwrap();
+        handle.set_mode("Direct").await.unwrap();
+        #[cfg(feature = "native-api")]
+        {
+            let samples = std::cell::Cell::new(0);
+            handle
+                .reconcile_kernel_trace(|| {
+                    samples.set(samples.get() + 1);
+                    true
+                })
+                .await
+                .unwrap();
+            assert_eq!(samples.get(), 1);
+        }
+        handle.disable().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tc_fence_propagates_quiescence_failure_with_nfqueue_disabled() {
+        let (handle, _, _, backend) = flags_fixture();
+        handle.initialize(false, false).await.unwrap();
+        backend.write().await.tc_mut().unwrap().arm_quiesce_fault();
+
+        let error = handle.fence_nfqueue().await.unwrap_err();
+        assert_eq!(error.root_cause().to_string(), "injected quiesce failure");
+        handle.fence_nfqueue().await.unwrap();
+    }
+
+    #[test]
+    fn tc_policy_rejects_packet_gateway_capabilities() {
+        use std::io::ErrorKind;
+
+        let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
+        let backend: &mut dyn crate::ebpf::PolicyBackend = &mut mock;
+        assert_eq!(
+            backend.mode_flags().unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            backend
+                .install_gateway(None)
+                .unwrap_err()
+                .downcast::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            ErrorKind::Unsupported
+        );
     }
 
     #[tokio::test]
@@ -776,7 +888,7 @@ mod tests {
                 ..ConnState::default()
             },
         );
-        let backend: SharedEbpfBackend = Arc::new(tokio::sync::RwLock::new(Box::new(mock)));
+        let backend: SharedPolicyBackend = Arc::new(tokio::sync::RwLock::new(Box::new(mock)));
         let state = Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "Proxy")));
         let handle = DatapathFlagsHandle::new(Arc::clone(&backend), state, None);
 
@@ -786,6 +898,8 @@ mod tests {
             backend
                 .read()
                 .await
+                .tc()
+                .unwrap()
                 .conn_state_lookup(&key)
                 .unwrap()
                 .is_none()

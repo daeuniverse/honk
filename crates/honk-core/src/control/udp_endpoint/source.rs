@@ -41,20 +41,30 @@ enum ReplyProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(in crate::control) struct SourceScope {
+    domain: ScopeId,
     runtime: usize,
     client: SocketAddr,
     path: SourcePath,
     reply: ReplyProjection,
+    packet_source: Option<SourceContext>,
 }
 
 impl SourceScope {
+    pub(super) fn owns_client(&self, domain: ScopeId, address: std::net::IpAddr) -> bool {
+        self.domain == domain && self.client.ip() == address
+    }
+
     pub(super) fn new(
+        domain: ScopeId,
         runtime: &Arc<NodeRuntime>,
         client: SocketAddr,
         path: SourcePath,
         reply_destination: Option<SocketAddr>,
+        packet_source: Option<SourceContext>,
     ) -> Self {
         Self {
+            domain,
+            packet_source,
             runtime: Arc::as_ptr(runtime) as usize,
             client: normalize_socket_addr(client),
             path,
@@ -118,6 +128,7 @@ pub(super) struct SourceOwner {
     id: u64,
     scope: SourceScope,
     transport: SourceTransport,
+    packet_source: Option<SourceWork>,
     _runtime: Arc<NodeRuntime>,
     state: Mutex<SourceState>,
     ready: AtomicBool,
@@ -135,16 +146,29 @@ pub(super) struct SourceOwner {
     node_id: uuid::Uuid,
     health_family: honk_outbound::alive::IpVersion,
     evidence: Option<Arc<UdpTrafficEvidence>>,
-    node_tracker: OutboundTracker,
+    node_tracker: Arc<OutboundTracker>,
     stats: Arc<StatsManager>,
     _source_permit: OwnedSemaphorePermit,
     #[cfg(test)]
     send_timeout_nanos: AtomicU64,
     #[cfg(test)]
     pub(super) foreign_reply_hook: Mutex<Option<Arc<ReplyAdmissionHook>>>,
+    _memory: Option<honk_netstack::MemoryReservation>,
 }
 
 impl SourceOwner {
+    #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
+    pub(super) fn delivering_foreign_reply(
+        &self,
+        scope: ScopeId,
+        client: SocketAddr,
+        destination: SocketAddr,
+    ) -> bool {
+        self.scope.domain == scope
+            && self.scope.client == normalize_socket_addr(client)
+            && self.state.lock().active_foreign_reply == Some(normalize_socket_addr(destination))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         id: u64,
@@ -155,15 +179,29 @@ impl SourceOwner {
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
         node_id: uuid::Uuid,
         health_family: honk_outbound::alive::IpVersion,
-        node_tracker: OutboundTracker,
+        node_tracker: Arc<OutboundTracker>,
         stats: Arc<StatsManager>,
         source_permit: OwnedSemaphorePermit,
+        packet_source: Option<SourceWork>,
         evidence: Option<Arc<UdpTrafficEvidence>>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+    ) -> Result<Arc<Self>, honk_outbound::proxy::PacketRejection> {
+        let memory = match &pool.memory_budget {
+            Some(budget) => Some(
+                budget
+                    .reserve(
+                        size_of::<Self>()
+                            + 2 * size_of::<usize>()
+                            + 2 * MAX_RETIRED_REPLY_PEERS * size_of::<SocketAddr>(),
+                    )
+                    .ok_or(honk_outbound::proxy::PacketRejection::Capacity)?,
+            ),
+            None => None,
+        };
+        Ok(Arc::new(Self {
             id,
             scope,
             transport,
+            packet_source: packet_source.map(SourceWork::into_shared_reply_source),
             _runtime: runtime,
             state: Mutex::new(SourceState {
                 retirement: None,
@@ -197,7 +235,8 @@ impl SourceOwner {
             send_timeout_nanos: AtomicU64::new(0),
             #[cfg(test)]
             foreign_reply_hook: Mutex::new(None),
-        })
+            _memory: memory,
+        }))
     }
 
     fn attach(self: &Arc<Self>) -> Option<SourceAttachment> {
@@ -297,6 +336,7 @@ impl SourceOwner {
         let changed = {
             let mut state = self.state.lock();
             if state.retirement.is_some()
+                || !packet_binding_active(self.packet_source.as_ref())
                 || !self.sent.load(Ordering::Acquire)
                 || self.has_reply.load(Ordering::Acquire)
             {
@@ -419,7 +459,9 @@ impl SourceOwner {
 
     fn idle_expired(&self) {
         if let Some(pool) = self.pool.upgrade() {
-            if !self.sent.load(Ordering::Acquire) {
+            if !packet_binding_active(self.packet_source.as_ref())
+                || !self.sent.load(Ordering::Acquire)
+            {
                 pool.retire_source_neutral(self, ScoreOutcome::Cancelled);
             } else if self.has_reply.load(Ordering::Acquire) {
                 pool.retire_replied_source(self);
@@ -465,7 +507,7 @@ pub(super) struct SourceEndpoint {
     target: SocketAddr,
     target_domain: Option<Box<str>>,
     reply_socket: Arc<ReplySocket>,
-    flow_tracker: OutboundTracker,
+    flow_tracker: Arc<OutboundTracker>,
     binding: Mutex<SourceEndpointBinding>,
 }
 
@@ -476,12 +518,16 @@ struct SourceEndpointBinding {
 }
 
 impl SourceEndpoint {
+    pub(super) fn packet_source(&self) -> Option<&SourceWork> {
+        self.owner.packet_source.as_ref()
+    }
+
     pub(super) fn new(
         attachment: SourceAttachment,
         target: SocketAddr,
         target_domain: Option<&str>,
         reply_socket: Arc<ReplySocket>,
-        flow_tracker: OutboundTracker,
+        flow_tracker: Arc<OutboundTracker>,
     ) -> Self {
         let view = attachment.owner.next_view.fetch_add(1, Ordering::Relaxed);
         Self {
@@ -500,7 +546,7 @@ impl SourceEndpoint {
         }
     }
 
-    #[cfg(all(test, feature = "native-api"))]
+    #[cfg(all(test, feature = "native-api", feature = "rprx"))]
     pub(super) fn owner_id(&self) -> u64 {
         self.owner.id
     }
@@ -522,6 +568,10 @@ impl SourceEndpoint {
     #[cfg(all(test, feature = "rprx"))]
     pub(super) fn mark_send_active_for_test(&self) {
         self.owner.state.lock().active_sender = self.view;
+    }
+
+    pub(super) fn scope(&self) -> ScopeId {
+        self.owner.scope.domain
     }
 
     pub(super) fn commit_binding(&self, endpoint_permit: OwnedSemaphorePermit) -> bool {
@@ -595,14 +645,14 @@ impl SourceEndpoint {
         let mut active = {
             let mut state = self.owner.state.lock();
             if self.retired.load(Ordering::Acquire) {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
+                return Err(retired_send(
+                    self.packet_source(),
                     "UDP flow retired before source send",
                 ));
             }
             if state.retirement.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
+                return Err(retired_send(
+                    self.packet_source(),
                     "UDP source retired before send",
                 ));
             }
@@ -735,13 +785,33 @@ impl Drop for SourceReplyLease {
     }
 }
 
-async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>) {
-    let _reply_lease = SourceReplyLease {
-        pool: Arc::clone(&pool),
-        owner: Arc::clone(&owner),
+#[cfg(feature = "rprx")]
+fn xudp_packet_source(source: Option<&SourceWork>) -> Option<[u8; 16]> {
+    let source = source?;
+    let (lineage, snapshot) = match source.optional_context() {
+        Some(context) => (context.lineage.get(), context.snapshot.get()),
+        // Host lineages are nonzero. A new binding must not reclaim the peer's old XUDP association.
+        None if source.owner().is_auxiliary() => (0, source.owner().binding()),
+        None => return None,
     };
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&lineage.to_be_bytes());
+    bytes[8..].copy_from_slice(&snapshot.to_be_bytes());
+    Some(bytes)
+}
+
+async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>) {
+    let lease = SourceReplyLease { pool, owner };
+    run_while_bound(
+        lease.owner.packet_source.as_ref(),
+        receive_source_replies(&lease.pool, &lease.owner),
+    )
+    .await;
+}
+
+async fn receive_source_replies(pool: &UdpEndpointPool, owner: &SourceOwner) {
     // Heap, not inline: an inline array adds 64 KiB to every source task.
-    let mut buf = vec![0u8; 65536];
+    let mut buf = vec![0u8; super::budget::RECEIVE_BYTES];
 
     loop {
         let retired = owner.retire_notify.notified();
@@ -783,7 +853,7 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
                         return;
                     }
                 };
-                match deliver_source_reply(&pool, &owner, peer, &buf[..len]).await {
+                match deliver_source_reply(pool, owner, peer, &buf[..len]).await {
                     SourceReplyDisposition::Delivered if owner.is_ready() => {
                         owner.report_available();
                         reply_idle_timeout
@@ -809,9 +879,19 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
 }
 
 impl UdpEndpointPool {
+    #[cfg(any(target_os = "linux", test))]
+    pub(super) fn retire_scope_sources(&self, domain: ScopeId) {
+        for entry in self.sources.iter() {
+            if entry.key().domain == domain {
+                entry.start_retiring(SourceRetirement::Neutral(ScoreOutcome::Cancelled));
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(in crate::control) async fn prepare_source(
         self: &Arc<Self>,
+        domain: ScopeId,
         registry: &ProxyRegistry,
         generation: Arc<OutboundRuntimeRegistry>,
         runtime: Arc<NodeRuntime>,
@@ -825,10 +905,31 @@ impl UdpEndpointPool {
         stats: Arc<StatsManager>,
         health_family: honk_outbound::alive::IpVersion,
         speculative: bool,
+        packet_source: Option<SourceWork>,
     ) -> anyhow::Result<SourcePreparation> {
-        let scope = SourceScope::new(&runtime, client, path, reply_destination);
+        if packet_source
+            .as_ref()
+            .is_some_and(|source| source.scope() != domain)
+        {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidInput, "UDP source scope mismatch").into(),
+            );
+        }
+        let scope = SourceScope::new(
+            domain,
+            &runtime,
+            client,
+            path,
+            reply_destination,
+            packet_source
+                .as_ref()
+                .and_then(SourceWork::optional_context),
+        );
         loop {
-            if generation.is_shutdown() || self.terminal.load(Ordering::Acquire) {
+            if generation.is_shutdown()
+                || self.terminal.load(Ordering::Acquire)
+                || !packet_binding_active(packet_source.as_ref())
+            {
                 return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
             }
             let changed = self.source_changed.notified();
@@ -837,6 +938,15 @@ impl UdpEndpointPool {
                 .get(&scope)
                 .map(|entry| Arc::clone(entry.value()))
             {
+                if owner.packet_source.as_ref().map(SourceWork::identity)
+                    != packet_source.as_ref().map(SourceWork::identity)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "shared UDP source execution owner mismatch",
+                    )
+                    .into());
+                }
                 if let Some(attachment) = owner.attach() {
                     return Ok(SourcePreparation::Reused(attachment));
                 }
@@ -853,8 +963,13 @@ impl UdpEndpointPool {
                     match path {
                         #[cfg(feature = "rprx")]
                         SourcePath::Vless(path) => {
-                            let global_id =
-                                runtime.vless_source_id(scope.client, path, reply_destination)?;
+                            let global_id = runtime.vless_source_id(
+                                domain.as_u64(),
+                                scope.client,
+                                path,
+                                reply_destination,
+                                xudp_packet_source(packet_source.as_ref()),
+                            )?;
                             VLessHandler::prepare_source_udp(
                                 Arc::clone(&runtime),
                                 target,
@@ -908,6 +1023,7 @@ impl UdpEndpointPool {
                 scope,
                 prepared,
                 source_permit,
+                packet_source,
                 runtime: Arc::clone(&runtime),
                 alive_set,
                 stats,
@@ -985,6 +1101,10 @@ impl UdpEndpointPool {
     }
 
     fn fail_source(&self, owner: &SourceOwner, outcome: ScoreOutcome, error: Option<&io::Error>) {
+        if !packet_binding_active(owner.packet_source.as_ref()) {
+            self.retire_interrupted_source(owner);
+            return;
+        }
         let outcome = if outcome == ScoreOutcome::NodeFailure {
             ScoreOutcome::shared_node_failure()
         } else {

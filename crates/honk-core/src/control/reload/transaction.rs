@@ -1,5 +1,47 @@
+use super::connectivity::installed_group_connectivity;
 use super::*;
 use crate::config_diagnostics::DiagnosticUpdate;
+use crate::dns::projection::{PreparedProjectionPublication, RoutingProjectionSnapshot};
+use crate::ebpf::PolicyBackend;
+#[cfg(target_os = "linux")]
+use crate::ebpf::userspace::GatewayReload;
+#[cfg(feature = "native-api")]
+use crate::mode::DatapathFlagsPublication;
+#[cfg(feature = "native-api")]
+use crate::observe::flows::kernel::KernelTraceDictionary;
+use honk_ebpf_common::DomainRouting;
+use std::{collections::BTreeMap, net::IpAddr};
+
+// After the first real flags write, cancellation must force the next reload through full
+// publication. Only that writer may restore flags and reopen the previous or committed generation.
+struct AuxiliaryReload<'a> {
+    admission: Option<(&'a ControlPlane, &'a DrainTracker)>,
+}
+
+impl AuxiliaryReload<'_> {
+    fn finish(mut self, outcome: ReloadOutcome) -> ReloadOutcome {
+        self.admission = None;
+        outcome
+    }
+}
+
+impl Drop for AuxiliaryReload<'_> {
+    fn drop(&mut self) {
+        if let Some((plane, request)) = self.admission {
+            // The publisher checks health and replaces its neutral TCX program under this
+            // same gate. If shutdown has already started, no future bind can acquire it.
+            #[cfg(target_os = "linux")]
+            let _start = plane.shutdown_requested.lock_capture_start().ok();
+            plane
+                .datapath_healthy
+                .store(false, std::sync::atomic::Ordering::Release);
+            #[cfg(target_os = "linux")]
+            plane.packet_routing_projection().close_gateway_dns();
+            plane.drain_tracker.start_rejecting();
+            request.start_rejecting();
+        }
+    }
+}
 
 #[cfg(test)]
 pub(in crate::control) struct PreDnsPublicationHookGuard<'a> {
@@ -228,8 +270,65 @@ impl ControlPlane {
             return Ok(ReloadOutcome::Rejected);
         }
         self.startup_downgrades.apply(&mut new_config);
+        #[cfg(target_os = "linux")]
+        if self
+            .core_forward_users
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+            && let Err(error) = super::super::core_forward::validate_config(&new_config)
+        {
+            warn!(%error, "reload rejected: active routed-only consumer");
+            return Ok(ReloadOutcome::Rejected);
+        }
         let current_router = self.router.read().await.clone();
         let current_config = self.config.read().await.clone();
+        #[cfg(target_os = "linux")]
+        let gateway_auxiliary = current_config.datapath.as_ref().is_some_and(|datapath| {
+            datapath
+                .interfaces
+                .iter()
+                .any(|interface| interface.role == honk_config::datapath::InterfaceRole::L3Lan)
+        });
+        #[cfg(all(not(target_os = "linux"), feature = "native-api"))]
+        let gateway_auxiliary = false;
+        #[cfg(target_os = "linux")]
+        let gateway_dns_enabled = gateway_auxiliary
+            || current_config
+                .datapath
+                .as_ref()
+                .is_some_and(|datapath| datapath.effective_dns_projection());
+        let same_datapath_setup = match (&current_config.datapath, &new_config.datapath) {
+            (None, None) => true,
+            (Some(current), Some(candidate)) => current.same_device_setup(candidate),
+            (None, Some(candidate)) | (Some(candidate), None) => {
+                candidate.backend == honk_config::datapath::Backend::Tc
+            }
+        };
+        if !same_datapath_setup {
+            warn!(
+                "reload rejected: datapath backend, Direct profile and device setup require restart"
+            );
+            return Ok(ReloadOutcome::Rejected);
+        }
+        #[cfg(target_os = "linux")]
+        if let Err(error) = crate::xdp::validate_config(&new_config) {
+            warn!(%error, "reload rejected: unsupported XDP policy facts or execution profile");
+            return Ok(ReloadOutcome::Rejected);
+        }
+        #[cfg(target_os = "linux")]
+        if let Err(error) = crate::tun::validate_config(&new_config) {
+            warn!(%error, "reload rejected: unsupported TUN policy facts or execution profile");
+            return Ok(ReloadOutcome::Rejected);
+        }
+        #[cfg(not(target_os = "linux"))]
+        if new_config
+            .datapath
+            .as_ref()
+            .is_some_and(|datapath| datapath.backend == honk_config::datapath::Backend::Tun)
+        {
+            warn!("reload rejected: TUN requires Linux");
+            return Ok(ReloadOutcome::Rejected);
+        }
         let admitted_udp_check_dns = self.alive_set.admitted_udp_check_dns();
         let admitted_udp_check_dns = admitted_udp_check_dns.as_deref();
         let udp_recovery_unchanged =
@@ -281,6 +380,11 @@ impl ControlPlane {
                 }
             }
         }
+        #[cfg(target_os = "linux")]
+        if let Err(reason) = self.prepare_polling_config(&new_config) {
+            warn!(reason, "reload rejected: process polling policy mismatch");
+            return Ok(ReloadOutcome::Rejected);
+        }
 
         let config_unchanged = effective_config_unchanged(current_config.as_ref(), &mut new_config);
         let group_slots_reusable = old_plan.matches_group_slots(&new_config.groups);
@@ -321,6 +425,7 @@ impl ControlPlane {
             && self.is_datapath_healthy()
         {
             let traffic_geo = current_router.geo_requirements();
+            let forwarding_geo = crate::routing::GeoRequirements::for_forwarding(&new_config);
             let dns_geo = current_dns_router.geo_requirements_snapshot();
             #[cfg(feature = "native-api")]
             let probed_geo_sources;
@@ -329,12 +434,15 @@ impl ControlPlane {
                 Some(sources) => sources,
                 None => {
                     probed_geo_sources =
-                        crate::routing::GeoSourceSet::probe_union(traffic_geo, dns_geo);
+                        crate::routing::GeoSourceSet::probe_union(&forwarding_geo, dns_geo);
                     &probed_geo_sources
                 }
             };
             #[cfg(not(feature = "native-api"))]
-            let geo_probe = crate::routing::GeoSourceSet::probe_union(traffic_geo, dns_geo);
+            let probed_geo_sources =
+                crate::routing::GeoSourceSet::probe_union(&forwarding_geo, dns_geo);
+            #[cfg(not(feature = "native-api"))]
+            let geo_probe = &probed_geo_sources;
             let traffic_geo_fingerprint = geo_probe.fingerprint_for(traffic_geo);
             let dns_geo_fingerprint = geo_probe.fingerprint_for(dns_geo);
             let hosts_fingerprint =
@@ -350,6 +458,7 @@ impl ControlPlane {
             if Arc::ptr_eq(&config, &current_config)
                 && current_router.geo_fingerprint() == traffic_geo_fingerprint
                 && current_dns_router.geo_fingerprint() == dns_geo_fingerprint
+                && current_router.firewall_matches(&new_config, geo_probe)
                 && current_dns_forwarder.policy_id().is_some_and(|policy| {
                     policy.matches_artifacts(&hosts_fingerprint, &dns_geo_fingerprint)
                 })
@@ -364,16 +473,44 @@ impl ControlPlane {
                 {
                     return Ok(ReloadOutcome::Rejected);
                 }
+                let generation = self.diagnostics.read().generation;
                 #[cfg(feature = "native-api")]
-                if replaces_sources && let Some(flags) = &self.datapath_flags {
-                    let mut mode = flags.publication().await;
+                let reset = self.datapath_flags.as_ref().filter(|_| replaces_sources);
+                #[cfg(feature = "native-api")]
+                let needs_datapath = reset.is_some() || gateway_auxiliary;
+                #[cfg(all(not(feature = "native-api"), target_os = "linux"))]
+                let needs_datapath = gateway_auxiliary;
+                #[cfg(any(feature = "native-api", target_os = "linux"))]
+                if needs_datapath {
+                    #[cfg(feature = "native-api")]
+                    let mut mode = match reset {
+                        Some(flags) => Some(flags.publication().await),
+                        None => None,
+                    };
                     let mut backend = self.ebpf.write().await;
-                    if let Err(error) = mode.reset_for_activation(backend.as_mut()) {
-                        warn!(%error, "reload rejected: runtime mode reset failed");
+                    let mut datapath = DatapathReloadTx {
+                        backend: backend.as_mut(),
+                    };
+                    let verified = datapath.verify_unchanged(
+                        #[cfg(target_os = "linux")]
+                        gateway_auxiliary.then(|| {
+                            (self.active_routing_plan.read().plan.fingerprint, generation)
+                        }),
+                        #[cfg(feature = "native-api")]
+                        mode.as_mut(),
+                    );
+                    if let Err(error) = verified {
+                        warn!(%error, "unchanged reload failed gateway verification or mode reset");
+                        #[cfg(target_os = "linux")]
+                        if gateway_auxiliary {
+                            datapath.degrade_gateway_dns();
+                            self.datapath_healthy
+                                .store(false, std::sync::atomic::Ordering::Release);
+                            self.stop_reload_rejection_if_healthy(drain);
+                        }
                         return Ok(ReloadOutcome::Rejected);
                     }
                 }
-                let generation = self.diagnostics.read().generation;
                 if !matches!(&diagnostic_update, DiagnosticUpdate::Preserve) {
                     self.diagnostics.write().buckets.apply(diagnostic_update);
                     #[cfg(feature = "native-api")]
@@ -397,6 +534,8 @@ impl ControlPlane {
                 {
                     owner.activate(&new_config);
                 }
+                #[cfg(target_os = "linux")]
+                self.publish_polling_config(&new_config);
                 let sources_replaced =
                     declaring_sources_replaced(current_config.as_ref(), &new_config);
                 if sources_replaced {
@@ -470,6 +609,7 @@ impl ControlPlane {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let traffic_geo = crate::routing::GeoRequirements::for_traffic(&new_config.routing.rules);
+        let forwarding_geo = crate::routing::GeoRequirements::for_forwarding(&new_config);
         let dns_geo = crate::dns::routing::DnsRouter::geo_requirements(&new_config.dns);
         #[cfg(feature = "native-api")]
         let loaded_geo_sources;
@@ -478,12 +618,12 @@ impl ControlPlane {
             Some(sources) => sources,
             None => {
                 loaded_geo_sources =
-                    crate::routing::GeoSourceSet::load(&traffic_geo.union(&dns_geo));
+                    crate::routing::GeoSourceSet::load(&forwarding_geo.union(&dns_geo));
                 &loaded_geo_sources
             }
         };
         #[cfg(not(feature = "native-api"))]
-        let geo_requirements = traffic_geo.union(&dns_geo);
+        let geo_requirements = forwarding_geo.union(&dns_geo);
         #[cfg(not(feature = "native-api"))]
         let geo_sources = &crate::routing::GeoSourceSet::load(&geo_requirements);
         let traffic_geo_fingerprint = geo_sources.fingerprint_for(&traffic_geo);
@@ -503,8 +643,8 @@ impl ControlPlane {
         // the DNS router rebuilds.
         let mut shared = crate::routing::SharedMatchers::default();
         shared.offer(current_router.ip_matchers());
-        let new_router = if reuse_routing_state {
-            current_router
+        let mut new_router = if reuse_routing_state {
+            current_router.clone()
         } else {
             match Router::from_config_sharing(&new_config.routing, geo_sources, &mut shared) {
                 Ok(router) => router,
@@ -515,6 +655,24 @@ impl ControlPlane {
                 }
             }
         };
+        if let Err(error) =
+            new_router.bind_firewall(&new_config, Some(&current_router), geo_sources, &mut shared)
+        {
+            warn!(%error, "Failed to prepare forwarding firewall policy");
+            self.stop_reload_rejection_if_healthy(drain);
+            return Ok(ReloadOutcome::Rejected);
+        }
+        #[cfg(target_os = "linux")]
+        if self
+            .core_forward_mixed_users
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+            && let Err(error) = super::super::core_forward::validate_mixed(&new_config, &new_router)
+        {
+            warn!(%error, "reload rejected: active mixed Core/Endpoint consumer");
+            self.stop_reload_rejection_if_healthy(drain);
+            return Ok(ReloadOutcome::Rejected);
+        }
         let pinned_router = Arc::new(new_router.clone());
         let new_has_direct_marks = new_router.has_direct_marks();
         let old_group_manager = self.group_manager.read().clone();
@@ -668,35 +826,63 @@ impl ControlPlane {
             .write()
             .await
             .mark_datapath_flags_write_origin(crate::ebpf::DatapathFlagsWriteOrigin::FenceNfqueue);
-        if let Err(error) = datapath_flags.fence_nfqueue().await {
+        let fenced = datapath_flags.fence_nfqueue().await;
+        let completion = AuxiliaryReload {
+            #[cfg(target_os = "linux")]
+            admission: gateway_auxiliary.then_some((self, drain)),
+            #[cfg(not(target_os = "linux"))]
+            admission: None,
+        };
+        if let Err(error) = fenced {
             error!(error = %format_args!("{error:#}"), "failed to fence NFQUEUE before reload");
             self.close_and_drain_pending_udp_admission().await;
             // Nothing was torn down yet: restore the old flags and keep
             // serving instead of rejecting new connections forever.
-            self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
-                .await;
-            return Ok(ReloadOutcome::Rejected);
+            self.restore_datapath_flags_after_rejected_reload(
+                &datapath_flags,
+                drain,
+                #[cfg(target_os = "linux")]
+                gateway_dns_enabled,
+                #[cfg(target_os = "linux")]
+                gateway_auxiliary,
+            )
+            .await;
+            return Ok(completion.finish(ReloadOutcome::Rejected));
         }
         drain.start_rejecting();
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some(pending) = self.pending_udp_verdicts.as_ref() {
             pending.cancel_all().await;
         }
         if !self.udp_pool.cancel_initializers_and_wait().await {
             warn!("UDP initializers did not drain before reload commit");
-            self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
-                .await;
-            return Ok(ReloadOutcome::Rejected);
+            self.restore_datapath_flags_after_rejected_reload(
+                &datapath_flags,
+                drain,
+                #[cfg(target_os = "linux")]
+                gateway_dns_enabled,
+                #[cfg(target_os = "linux")]
+                gateway_auxiliary,
+            )
+            .await;
+            return Ok(completion.finish(ReloadOutcome::Rejected));
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some(pending) = self.pending_udp_verdicts.as_ref() {
             pending.wait_empty().await;
         }
         if !self.udp_pool.wait_for_retirements().await {
             warn!("UDP endpoint retirements did not drain before reload commit");
-            self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
-                .await;
-            return Ok(ReloadOutcome::Rejected);
+            self.restore_datapath_flags_after_rejected_reload(
+                &datapath_flags,
+                drain,
+                #[cfg(target_os = "linux")]
+                gateway_dns_enabled,
+                #[cfg(target_os = "linux")]
+                gateway_auxiliary,
+            )
+            .await;
+            return Ok(completion.finish(ReloadOutcome::Rejected));
         }
         #[cfg(feature = "native-api")]
         let mut mode_reset_failed = false;
@@ -732,75 +918,42 @@ impl ControlPlane {
                     .group_slots
                     .len()
                     .max(new_config.groups.len());
-                // A manager-only rebind can change liveness without writing the slots.
-                // Restore the installed values on rejection, even when names match.
-                let old_connectivity = match super::connectivity::installed_group_connectivity(
-                    ebpf.as_ref(),
-                    transition_group_count,
-                ) {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        warn!(%error, "Failed to snapshot committed group connectivity");
-                        break 'publication Err(());
-                    }
+                let mut datapath = DatapathReloadTx {
+                    backend: ebpf.as_mut(),
                 };
-                let old_projection = projection_publication.project(&old_projection_snapshot);
-                let new_projection = projection_publication.project(&projection_snapshot);
-                // Recover a degraded runtime with a complete generation before reopening admission.
-                let routing_publication_needed = !self.is_datapath_healthy()
-                    || plan_guard.needs_udp_publication(&new_composition)
-                    || !old_plan.semantically_eq(&new_plan)
-                    || !old_projection
-                        .iter()
-                        .map(|(ip, bitmap)| (ip, &bitmap.bitmap))
-                        .eq(new_projection
-                            .iter()
-                            .map(|(ip, bitmap)| (ip, &bitmap.bitmap)));
-                drop(old_projection);
-                let provider = self.dns_controller.runtime_provider();
-
-                if let Err(error) = open_group_connectivity(ebpf.as_mut(), transition_group_count) {
-                    let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
-                    error!(%error, ?restore, "Failed to open group connectivity for reload transition");
-                    break 'publication Err(());
-                }
-                if routing_publication_needed {
-                    let mut new_domain_routes = new_projection
-                        .iter()
-                        .map(|(ip, bitmap)| (crate::ebpf::maps::ip_addr_to_lpm_key(*ip), *bitmap))
-                        .collect::<Vec<_>>();
-                    new_domain_routes
-                        .sort_unstable_by_key(|(key, _)| crate::ebpf::maps::lpm_key_bytes(key));
-                    if let Err(error) = ebpf.publish_routing_plan(&new_plan, &new_domain_routes) {
-                        match publish_group_connectivity(ebpf.as_mut(), &old_connectivity) {
-                            Ok(()) => error!(
-                                %error,
-                                "Compiled routing publication failed; active generation retained"
-                            ),
-                            Err(restore_error) => {
-                                error!(
-                                    %error,
-                                    %restore_error,
-                                    "Routing publication rejected but health restoration failed"
-                                );
-                                self.datapath_healthy
-                                    .store(false, std::sync::atomic::Ordering::Release);
-                                self.drain_tracker.start_rejecting();
-                                drain.start_rejecting();
-                            }
-                        }
+                let published_projection = match datapath.publish_routing(
+                    transition_group_count,
+                    &new_plan,
+                    &projection_publication,
+                    [&old_projection_snapshot, &projection_snapshot],
+                    || {
+                        !self.is_datapath_healthy()
+                            || plan_guard.needs_udp_publication(&new_composition)
+                            || !old_plan.semantically_eq(&new_plan)
+                    },
+                    #[cfg(target_os = "linux")]
+                    gateway_auxiliary,
+                ) {
+                    Ok(projection) => projection,
+                    Err(RoutingPublicationRejection::ConnectivityRestoreFailed) => {
+                        self.datapath_healthy
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        self.drain_tracker.start_rejecting();
+                        drain.start_rejecting();
                         break 'publication Err(());
                     }
-                }
+                    Err(RoutingPublicationRejection::Rejected) => break 'publication Err(()),
+                };
                 #[cfg(feature = "native-api")]
                 if let Some(mode) = &mut mode_publication
-                    && let Err(error) = mode.reset_for_activation(ebpf.as_mut())
+                    && let Err(error) = datapath.reset_mode(mode)
                 {
                     error!(%error, "configuration committed but runtime mode reset failed");
                     mode_reset_failed = true;
                 }
 
                 // Fence DNS admission for authority changes, not the preceding map staging.
+                let provider = self.dns_controller.runtime_provider();
                 let publication = provider.prepare_publication(new_runtime);
                 let old_registry =
                     std::mem::replace(&mut *runtime_guard, Arc::clone(&new_runtime_registry));
@@ -851,14 +1004,11 @@ impl ControlPlane {
                 new_group_manager.publish_score_membership();
                 new_group_manager
                     .publish_route_health_with_udp(new_config.global.udp_check_dns.as_deref());
-                let new_connectivity =
-                    group_connectivity_snapshot(&new_config, &new_group_manager, &self.alive_set);
-                if let Err(error) = publish_group_connectivity(ebpf.as_mut(), &new_connectivity) {
-                    warn!(
-                        %error,
-                        "Failed to publish exact group connectivity after reload; remaining slots stay fail-open"
-                    );
-                }
+                datapath.publish_final_connectivity(
+                    &new_config,
+                    &new_group_manager,
+                    &self.alive_set,
+                );
                 #[cfg(test)]
                 if let Some(hook) = {
                     let mut hook = self.pre_dns_publication_hook.lock();
@@ -868,8 +1018,14 @@ impl ControlPlane {
                 }
                 publication.commit();
                 *router_guard = new_router;
-                crate::ebpf::record_pname_routing(&router_guard, &**ebpf, &self.degradations);
+                crate::ebpf::record_pname_routing(
+                    &router_guard,
+                    datapath.backend,
+                    &self.degradations,
+                );
                 *config_guard = Arc::new(new_config);
+                #[cfg(target_os = "linux")]
+                self.publish_polling_config(&config_guard);
                 match &self.quic_score_target {
                     Some(target) => {
                         target.set_needed(crate::control::probers::needs_quic_probe(&config_guard))
@@ -913,20 +1069,19 @@ impl ControlPlane {
                 *group_guard = Arc::clone(&new_group_manager);
                 *outbound_guard = new_outbound_id_map;
                 plan_guard.publish(
-                    routing_publication_needed.then_some(&new_plan),
+                    published_projection.is_some().then_some(&new_plan),
                     &new_composition,
-                    ebpf.routing_policy_generation(),
+                    datapath.backend.routing_policy_generation(),
                     &config_guard,
                 );
-                #[cfg(feature = "native-api")]
-                if routing_publication_needed && let Some(dictionary) = prepared_dictionary {
-                    ebpf.bind_kernel_trace_dictionary(dictionary);
-                }
-                // The projection worker takes eBPF before its generation fence;
-                // publish under both locks so an old batch cannot enter this snapshot.
-                projection_publication.commit(
+                datapath.commit_projection(
+                    projection_publication,
                     projection_snapshot,
-                    routing_publication_needed.then_some(new_projection),
+                    published_projection,
+                    #[cfg(feature = "native-api")]
+                    prepared_dictionary,
+                    #[cfg(target_os = "linux")]
+                    gateway_dns_enabled,
                 );
                 Ok((old_registry, probe_wake))
             }
@@ -934,9 +1089,16 @@ impl ControlPlane {
         let (old_registry, probe_wake) = match old_registry_result {
             Ok(committed) => committed,
             Err(()) => {
-                self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
-                    .await;
-                return Ok(ReloadOutcome::Rejected);
+                self.restore_datapath_flags_after_rejected_reload(
+                    &datapath_flags,
+                    drain,
+                    #[cfg(target_os = "linux")]
+                    gateway_dns_enabled,
+                    #[cfg(target_os = "linux")]
+                    gateway_auxiliary,
+                )
+                .await;
+                return Ok(completion.finish(ReloadOutcome::Rejected));
             }
         };
         probe_wake.wake();
@@ -962,13 +1124,19 @@ impl ControlPlane {
             .await;
         #[cfg(feature = "native-api")]
         if mode_reset_failed {
-            self.datapath_healthy
-                .store(false, std::sync::atomic::Ordering::Release);
+            self.settle_committed_datapath(
+                CommittedDatapath::Degrade,
+                #[cfg(target_os = "linux")]
+                gateway_dns_enabled,
+                #[cfg(target_os = "linux")]
+                gateway_auxiliary,
+            )
+            .await;
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();
-            return Ok(ReloadOutcome::CommittedDegraded {
+            return Ok(completion.finish(ReloadOutcome::CommittedDegraded {
                 generation: generation.get(),
-            });
+            }));
         }
         self.open_pending_udp_admission();
         #[cfg(test)]
@@ -979,36 +1147,66 @@ impl ControlPlane {
         if let Err(error) = datapath_flags.reopen_nfqueue().await {
             error!(%error, "failed to reopen NFQUEUE after reload");
             self.close_and_drain_pending_udp_admission().await;
-            self.datapath_healthy
-                .store(false, std::sync::atomic::Ordering::Release);
+            self.settle_committed_datapath(
+                CommittedDatapath::Degrade,
+                #[cfg(target_os = "linux")]
+                gateway_dns_enabled,
+                #[cfg(target_os = "linux")]
+                gateway_auxiliary,
+            )
+            .await;
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();
-            return Ok(ReloadOutcome::CommittedDegraded {
+            return Ok(completion.finish(ReloadOutcome::CommittedDegraded {
                 generation: generation.get(),
-            });
+            }));
         }
         info!("Configuration applied — {} routes active", route_count);
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if !reuse_routing_state {
             self.warn_lan_self_protection().await;
         }
 
         // A completed slow path has republished everything a latch could
         // have torn; re-arm.
-        self.datapath_healthy
-            .store(true, std::sync::atomic::Ordering::Release);
+        let ready = self
+            .settle_committed_datapath(
+                CommittedDatapath::Activate {
+                    #[cfg(target_os = "linux")]
+                    generation: generation.get(),
+                    #[cfg(target_os = "linux")]
+                    fingerprint: new_plan.fingerprint,
+                },
+                #[cfg(target_os = "linux")]
+                gateway_dns_enabled,
+                #[cfg(target_os = "linux")]
+                gateway_auxiliary,
+            )
+            .await;
         self.stop_reload_rejection_if_healthy(drain);
-        Ok(ReloadOutcome::Committed {
-            generation: generation.get(),
-        })
+        let outcome = if ready {
+            ReloadOutcome::Committed {
+                generation: generation.get(),
+            }
+        } else {
+            self.close_and_drain_pending_udp_admission().await;
+            ReloadOutcome::CommittedDegraded {
+                generation: generation.get(),
+            }
+        };
+        Ok(completion.finish(outcome))
     }
 
     async fn restore_datapath_flags_after_rejected_reload(
         &self,
         datapath_flags: &crate::mode::DatapathFlagsHandle,
         drain: &DrainTracker,
+        #[cfg(target_os = "linux")] gateway_dns_enabled: bool,
+        #[cfg(target_os = "linux")] gateway_auxiliary: bool,
     ) {
         if !self.is_datapath_healthy() {
+            #[cfg(target_os = "linux")]
+            self.close_degraded_gateway_dns(gateway_dns_enabled).await;
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();
             return;
@@ -1021,6 +1219,8 @@ impl ControlPlane {
             .mark_datapath_flags_write_origin(crate::ebpf::DatapathFlagsWriteOrigin::ReopenNfqueue);
         if let Err(error) = datapath_flags.reopen_nfqueue().await {
             error!(%error, "failed to reopen NFQUEUE after rejected reload");
+            #[cfg(target_os = "linux")]
+            self.close_degraded_gateway_dns(gateway_dns_enabled).await;
             self.close_and_drain_pending_udp_admission().await;
             self.datapath_healthy
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -1028,25 +1228,83 @@ impl ControlPlane {
             self.drain_tracker.start_rejecting();
             return;
         }
+        #[cfg(target_os = "linux")]
+        if gateway_auxiliary {
+            let mut ebpf = self.ebpf.write().await;
+            let generation = self.diagnostics.read().generation;
+            let fingerprint = self.active_routing_plan.read().plan.fingerprint;
+            let mut datapath = DatapathReloadTx {
+                backend: ebpf.as_mut(),
+            };
+            if !datapath.restore_rejected_auxiliary(fingerprint, generation) {
+                self.datapath_healthy
+                    .store(false, std::sync::atomic::Ordering::Release);
+                drain.start_rejecting();
+                self.drain_tracker.start_rejecting();
+                drop(ebpf);
+                self.close_and_drain_pending_udp_admission().await;
+                return;
+            }
+        }
         drain.stop_rejecting();
     }
 
+    async fn settle_committed_datapath(
+        &self,
+        verdict: CommittedDatapath,
+        #[cfg(target_os = "linux")] gateway_dns_enabled: bool,
+        #[cfg(target_os = "linux")] gateway_auxiliary: bool,
+    ) -> bool {
+        #[cfg(target_os = "linux")]
+        let mut backend = if gateway_dns_enabled {
+            Some(self.ebpf.write().await)
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(backend) = backend.as_mut() {
+            let mut datapath = DatapathReloadTx {
+                backend: backend.as_mut(),
+            };
+            if !datapath.settle_committed_gateway(&verdict, gateway_auxiliary) {
+                self.datapath_healthy
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return false;
+            }
+        }
+        let ready = matches!(verdict, CommittedDatapath::Activate { .. });
+        self.datapath_healthy
+            .store(ready, std::sync::atomic::Ordering::Release);
+        ready
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn close_degraded_gateway_dns(&self, enabled: bool) {
+        if enabled {
+            let mut backend = self.ebpf.write().await;
+            DatapathReloadTx {
+                backend: backend.as_mut(),
+            }
+            .degrade_gateway_dns();
+        }
+    }
+
     fn open_pending_udp_admission(&self) {
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some(pending) = self.pending_udp_verdicts.as_ref() {
             pending.open_admission();
         }
     }
 
     async fn close_and_drain_pending_udp_admission(&self) {
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some(pending) = self.pending_udp_verdicts.as_ref() {
             pending.cancel_all().await;
         }
         if !self.udp_pool.cancel_initializers_and_wait().await {
             warn!("UDP initializers did not drain during admission teardown");
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let Some(pending) = self.pending_udp_verdicts.as_ref() {
             pending.wait_empty().await;
         }
@@ -1063,6 +1321,228 @@ impl ControlPlane {
         } else {
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();
+        }
+    }
+}
+
+enum RoutingPublicationRejection {
+    Rejected,
+    ConnectivityRestoreFailed,
+}
+
+enum CommittedDatapath {
+    Activate {
+        #[cfg(target_os = "linux")]
+        generation: u64,
+        #[cfg(target_os = "linux")]
+        fingerprint: [u8; 32],
+    },
+    Degrade,
+}
+
+/// The synchronous publication steps borrow the writer held by the caller.
+struct DatapathReloadTx<'a> {
+    backend: &'a mut dyn PolicyBackend,
+}
+
+impl DatapathReloadTx<'_> {
+    fn publish_routing(
+        &mut self,
+        group_count: usize,
+        plan: &routing_matcher::RoutingPushPlan,
+        projection: &PreparedProjectionPublication<'_>,
+        [old_snapshot, new_snapshot]: [&RoutingProjectionSnapshot; 2],
+        requires_new_routing: impl FnOnce() -> bool,
+        #[cfg(target_os = "linux")] gateway_auxiliary: bool,
+    ) -> Result<Option<BTreeMap<IpAddr, DomainRouting>>, RoutingPublicationRejection> {
+        // A manager-only rebind can change liveness without writing the slots.
+        // Restore the installed values on rejection, even when names match.
+        let old_connectivity = match installed_group_connectivity(self.backend, group_count) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(%error, "Failed to snapshot committed group connectivity");
+                return Err(RoutingPublicationRejection::Rejected);
+            }
+        };
+        let old_projection = projection.project(old_snapshot);
+        let new_projection = projection.project(new_snapshot);
+        let routing_publication_needed = requires_new_routing()
+            || !old_projection
+                .iter()
+                .map(|(ip, bitmap)| (ip, &bitmap.bitmap))
+                .eq(new_projection
+                    .iter()
+                    .map(|(ip, bitmap)| (ip, &bitmap.bitmap)));
+        drop(old_projection);
+
+        #[cfg(target_os = "linux")]
+        if gateway_auxiliary && let Some(gateway) = self.backend.gateway_reload() {
+            gateway.pause_gateway_auxiliary();
+        }
+        if let Err(error) = open_group_connectivity(self.backend, group_count) {
+            let restore = publish_group_connectivity(self.backend, &old_connectivity);
+            error!(%error, ?restore, "Failed to open group connectivity for reload transition");
+            return Err(if restore.is_ok() {
+                RoutingPublicationRejection::Rejected
+            } else {
+                RoutingPublicationRejection::ConnectivityRestoreFailed
+            });
+        }
+        if !routing_publication_needed {
+            return Ok(None);
+        }
+
+        let mut new_domain_routes = new_projection
+            .iter()
+            .map(|(ip, bitmap)| (crate::ebpf::maps::ip_addr_to_lpm_key(*ip), *bitmap))
+            .collect::<Vec<_>>();
+        new_domain_routes.sort_unstable_by_key(|(key, _)| crate::ebpf::maps::lpm_key_bytes(key));
+        if let Err(error) = self.backend.publish_routing_plan(plan, &new_domain_routes) {
+            return Err(
+                match publish_group_connectivity(self.backend, &old_connectivity) {
+                    Ok(()) => {
+                        error!(%error, "Compiled routing publication failed; active generation retained");
+                        RoutingPublicationRejection::Rejected
+                    }
+                    Err(restore_error) => {
+                        error!(%error, %restore_error, "Routing publication rejected but health restoration failed");
+                        RoutingPublicationRejection::ConnectivityRestoreFailed
+                    }
+                },
+            );
+        }
+        Ok(Some(new_projection))
+    }
+
+    fn publish_final_connectivity(
+        &mut self,
+        config: &Config,
+        manager: &GroupManager,
+        alive_set: &AliveDialerSet,
+    ) {
+        let connectivity = group_connectivity_snapshot(config, manager, alive_set);
+        if let Err(error) = publish_group_connectivity(self.backend, &connectivity) {
+            warn!(
+                %error,
+                "Failed to publish exact group connectivity after reload; remaining slots stay fail-open"
+            );
+        }
+    }
+
+    fn commit_projection(
+        &mut self,
+        projection: PreparedProjectionPublication<'_>,
+        snapshot: Arc<RoutingProjectionSnapshot>,
+        published: Option<BTreeMap<IpAddr, DomainRouting>>,
+        #[cfg(feature = "native-api")] dictionary: Option<KernelTraceDictionary>,
+        #[cfg(target_os = "linux")] gateway_dns_enabled: bool,
+    ) {
+        #[cfg(feature = "native-api")]
+        if published.is_some()
+            && let Some(dictionary) = dictionary
+        {
+            self.backend.bind_kernel_trace_dictionary(dictionary);
+        }
+        #[cfg(target_os = "linux")]
+        let generation = snapshot.generation();
+        // The worker takes eBPF before its generation fence. Commit the snapshot
+        // under both locks before staging DNS for the final flags verdict.
+        projection.commit(snapshot, published);
+        #[cfg(target_os = "linux")]
+        if gateway_dns_enabled && let Some(gateway) = self.backend.gateway_reload() {
+            gateway.stage_gateway_dns_reload(generation);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", feature = "native-api"))]
+    fn verify_unchanged(
+        &mut self,
+        #[cfg(target_os = "linux")] auxiliary: Option<([u8; 32], u64)>,
+        #[cfg(feature = "native-api")] mode: Option<&mut DatapathFlagsPublication<'_>>,
+    ) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some((fingerprint, generation)) = auxiliary {
+            self.require_gateway_auxiliary()?
+                .verify_gateway_auxiliary(fingerprint, generation)?;
+        }
+        #[cfg(feature = "native-api")]
+        if let Some(mode) = mode {
+            self.reset_mode(mode)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-api")]
+    fn reset_mode(&mut self, mode: &mut DatapathFlagsPublication<'_>) -> anyhow::Result<()> {
+        mode.reset_for_activation(self.backend)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn require_gateway_auxiliary(&mut self) -> anyhow::Result<&mut dyn GatewayReload> {
+        self.backend
+            .gateway_reload()
+            .ok_or_else(|| anyhow::anyhow!("policy backend is not the userspace backend"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_rejected_auxiliary(&mut self, fingerprint: [u8; 32], generation: u64) -> bool {
+        let restored = self.require_gateway_auxiliary().and_then(|gateway| {
+            gateway.restore_gateway_auxiliary()?;
+            gateway
+                .verify_gateway_auxiliary(fingerprint, generation)
+                .map_err(Into::into)
+        });
+        if let Err(error) = restored {
+            error!(%error, "rejected gateway reload could not restore prior authority");
+            self.degrade_gateway_dns();
+            return false;
+        }
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn settle_committed_gateway(
+        &mut self,
+        verdict: &CommittedDatapath,
+        gateway_auxiliary: bool,
+    ) -> bool {
+        let result = match self.backend.gateway_reload() {
+            Some(gateway) => match *verdict {
+                CommittedDatapath::Activate {
+                    generation,
+                    fingerprint,
+                } => gateway
+                    .finish_gateway_dns_reload(generation, fingerprint)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|published| {
+                        anyhow::ensure!(
+                            published || !gateway_auxiliary,
+                            "gateway final verdict has no matching staged generation"
+                        );
+                        Ok(())
+                    }),
+                CommittedDatapath::Degrade => {
+                    gateway.degrade_gateway_dns();
+                    Ok(())
+                }
+            },
+            None if gateway_auxiliary => Err(anyhow::anyhow!(
+                "policy backend is not the userspace backend"
+            )),
+            None => Ok(()),
+        };
+        if let Err(error) = result {
+            error!(%error, "committed gateway failed final verification");
+            self.degrade_gateway_dns();
+            return false;
+        }
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn degrade_gateway_dns(&mut self) {
+        if let Some(gateway) = self.backend.gateway_reload() {
+            gateway.degrade_gateway_dns();
         }
     }
 }

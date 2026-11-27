@@ -138,14 +138,14 @@ pub(super) async fn run_tcp_admission_scaler(
     }
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 pub(super) fn disable_nfqueue_for_startup(config: &mut Config, enabled: &mut bool) {
     config.global.nfqueue_enable = false;
     *enabled = false;
 }
 
 pub(super) struct OutboundHealthPublisher {
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     config: Arc<RwLock<Arc<Config>>>,
     routing_plan: routing_matcher::SharedRoutingPlan,
     group_manager: SharedGroupManager,
@@ -181,7 +181,7 @@ fn group_slot_flipped(
 
 impl OutboundHealthPublisher {
     pub(super) fn new(
-        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
         config: Arc<RwLock<Arc<Config>>>,
         routing_plan: routing_matcher::SharedRoutingPlan,
         group_manager: SharedGroupManager,
@@ -287,7 +287,7 @@ impl OutboundHealthPublisher {
 }
 
 impl ControlPlane {
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub(super) async fn degrade_nfqueue_startup(
         &mut self,
         enabled: &mut bool,
@@ -301,53 +301,6 @@ impl ControlPlane {
         self.startup_downgrades.record_nfqueue_unavailable();
         let mut config = self.config.write().await;
         disable_nfqueue_for_startup(Arc::make_mut(&mut config), enabled);
-    }
-
-    #[cfg(feature = "ebpf")]
-    pub(in crate::control) async fn warn_lan_self_protection(&self) {
-        if !daens_netns_exists() {
-            return;
-        }
-        // The caller holds reload_lock; never retain Config's guard while awaiting Router.
-        let config = self.config.read().await.clone();
-        let planned_config = Arc::clone(&config);
-        let interfaces = match tokio::task::spawn_blocking(move || {
-            crate::ebpf::interface::read_and_plan(
-                &planned_config.global.lan_interface,
-                &planned_config.global.wan_interface,
-            )
-            .map(|(_, plan)| plan.lan_roots)
-        })
-        .await
-        {
-            Ok(Ok(interfaces)) => interfaces,
-            result => {
-                debug!(
-                    ?result,
-                    "skip LAN self-protection warning: interface plan unavailable"
-                );
-                return;
-            }
-        };
-        if interfaces.is_empty() {
-            return;
-        }
-        let addresses = config.local_direct_cidrs();
-        let router = self.router.read().await;
-        let unconfirmed: Vec<_> = addresses
-            .into_iter()
-            .filter(|cidr| {
-                crate::routing::parse_ip_net_str(cidr)
-                    .is_some_and(|network| !router.confirms_lan_self_protection(network.addr()))
-            })
-            .collect();
-        if !unconfirmed.is_empty() {
-            warn!(
-                lan_interfaces = ?interfaces,
-                local_addresses = ?unconfirmed,
-                "LAN self-protection coverage could not be confirmed; review explicit direct(must) rules for management access, excluding port 53 if transparent DNS is intended; configured routing is unchanged"
-            );
-        }
     }
 
     pub(in crate::control) async fn dispatch_control_command(
@@ -518,7 +471,7 @@ impl ControlPlane {
                     }
                     None => true,
                 };
-                #[cfg(feature = "ebpf")]
+                #[cfg(feature = "legacy-tc")]
                 if applied {
                     self.warn_lan_self_protection().await;
                 }
@@ -559,9 +512,10 @@ impl ControlPlane {
             group_manager: self.group_manager.clone(),
             stats: self.stats.clone(),
             ebpf: self.ebpf.clone(),
+            tc_kernel: self.tc_kernel.clone(),
             active_routing_plan: self.active_routing_plan.clone(),
             udp_pool: self.udp_pool.clone(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             pending_udp_verdicts: self.pending_udp_verdicts.clone(),
             tcp_sniff_neg_cache: self.tcp_sniff_neg_cache.clone(),
             sniffer_pool: self.sniffer_pool.clone(),

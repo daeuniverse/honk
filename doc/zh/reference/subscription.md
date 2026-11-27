@@ -262,7 +262,7 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 
 完整配置或 provider 正文必须包含顶层 `proxies` 序列。缺少受支持的 `type`、服务器地址、有效非零端口或必需凭据的条目，honk 会跳过。端口可以是整数，也可以是数字字符串。JSON 用原生解码，支持显示名称里的 UTF-16 代理对转义。
 
-可接受的 `type` 有 `socks5`、`ss`/`shadowsocks`、`trojan`、`vmess`、`vless`、`hysteria2`/`hysteria`、`tuic`、`juicity` 和 `anytls`。无关的客户端元信息，honk 会忽略；不支持的线协议传输、代理插件，以及相互矛盾的安全设置，也不会被悄悄替换。
+接受的 `type` 值包括 `socks5`、`ss`/`shadowsocks`、`trojan`、`vmess`、`vless`、`hysteria2`/`hysteria`、`tuic`、`juicity`、`anytls` 与 `wireguard`。无关的客户端元信息会被忽略；不支持的线协议传输、代理插件和相互矛盾的安全设置不会被静默替换。
 
 #### 通用代理字段
 
@@ -285,6 +285,22 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 #### 协议专属选项
 
 支持的拼写别名会在派生节点身份前规范化。
+
+WireGuard 使用独立的单 peer adapter，接受仅含一个元素的 Mihomo `peers` 数组。父条目与 peer 声明在类型转换后必须相同；空/多 peer、无效 key/地址/MTU/reserved 及空 allowed-IP 列表仅拒绝该条目。`udp: false` 映射为 `network: tcp`。WARP `reserved` 接受三个整数字节或 base64，不会丢弃该值。有效的 AmneziaWG 参数、stream/TLS wrapper 和 `dialer-proxy` 链式代理会拒绝，不会替换成普通 WireGuard 或直连。
+
+| 含义 | Clash/Mihomo | sing-box 旧 outbound | sing-box endpoint |
+| --- | --- | --- | --- |
+| 本地私钥 | `private-key` | `private_key` | `private_key` |
+| Peer 端点 | 父条目或唯一 peer 的 `server`、`port` | 父条目或唯一 peer 的 `server`、`server_port` | 唯一 peer 的 `address`、`port` |
+| Peer 公钥 / PSK | 父条目或唯一 peer 的 `public-key`、`pre-shared-key` | `peer_public_key`、`pre_shared_key`，或唯一 peer 的 `public_key`、`pre_shared_key` | 唯一 peer 的 `public_key`、`pre_shared_key` |
+| 本地地址 | `ip`、`ipv6`，或 `local-address`/`local_address`/`address` 字符串/列表 | `local_address` 字符串/列表 | `address` 字符串/列表 |
+| MTU | `mtu` | `mtu` | `mtu` |
+| Keepalive 秒数 | 父条目或唯一 peer 的 `persistent-keepalive` | 父条目或唯一 peer 的 `persistent_keepalive_interval` | 唯一 peer 的 `persistent_keepalive_interval` |
+| WARP 客户端标识 | 父条目或唯一 peer 的 `reserved` | 父条目或唯一 peer 的 `reserved` | 唯一 peer 的 `reserved` |
+| Allowed IPs | 父条目或唯一 peer 的 `allowed-ips` | 父条目或唯一 peer 的 `allowed_ips` | 唯一 peer 的 `allowed_ips` |
+| UDP 权限 | `udp`，或与其一致的数据包 `network` | 数据包 `network` | 数据包 `network` |
+
+Key 解码、接口前缀移除、allowed-IP 规范化与 MTU 范围和 [WireGuard 分享链接及扁平节点](./nodes.md#wireguard) 共用实现。省略 allowed IPs 时使用两个全路由前缀；不会合成隧道地址。URI 列表调用同一个规范解析器。Surge 的 WireGuard section 引用不是 URI 分享链接，仍不受支持。
 
 | 协议 | 导入的选项 |
 | --- | --- |
@@ -402,6 +418,8 @@ TLS/SNI、REALITY、WebSocket/gRPC 升级 header、VLESS 数据包选项，以�
 | 节点级 uTLS 指纹提示 | 不覆盖 honk 的进程级 TLS 选择。 |
 
 不支持的链式代理、wire feature 或认证要求，honk 会报错，不会直接忽略。
+
+WireGuard 还可从旧 `type: wireguard` outbound 和新的 `endpoints` 数组导入。一个配置可以同时包含 `outbounds` 与 `endpoints`；两个列表中的有效条目都可在无效邻居存在时保留，诊断保留原 section 和从 1 开始的位置。Endpoint 必须恰好一个 peer。`system: true`、`system_interface: true`、非零 `listen_port`、peer 线协议扩展及 detour 链式代理不受支持；honk 隧道由用户态管理。Worker 数量提示不改变协议模型。
 
 在 sing-box 输入里，`network` 表示数据包网络 capability，不是流传输类型；流传输方式由 `transport.type` 选择。`h2` 这类不支持的名称，honk 会拒绝，不会把它当成裸 TCP。
 

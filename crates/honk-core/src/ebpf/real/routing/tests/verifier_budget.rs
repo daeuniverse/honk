@@ -9,7 +9,7 @@
 
 use super::{assert_route, decision, domain_entry, input, object, outbound_ids};
 use crate::control::routing_matcher::RoutingPushPlan;
-use crate::ebpf::EbpfBackend;
+use crate::ebpf::PolicyBackend;
 use crate::ebpf::real::RealEbpfBackend;
 use crate::routing::{Router, golden};
 use honk_config::types::DialMode;
@@ -64,7 +64,7 @@ fn facts_ahead_of_long_process_chains_stay_within_the_verifier_budget() {
     let mut torrent = golden::connection();
     torrent.process_name = Some("qbittorrent".into());
     let mut lan = golden::connection();
-    lan.mac = Some("02:00:00:00:00:06".into());
+    lan.mac = Some([2, 0, 0, 0, 0, 6]);
     let mut private = golden::connection();
     private.dst_ip = "192.168.7.7".parse().unwrap();
     let mut proxied = golden::connection();

@@ -2,7 +2,7 @@ use super::lifecycle::STAGE_TIMEOUT;
 use super::*;
 
 impl ControlPlane {
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     pub(super) async fn cleanup_nfqueue_startup_failure(
         &mut self,
         runtime: &mut Option<NfqueueRuntime>,
@@ -22,33 +22,31 @@ impl ControlPlane {
 
     /// Stop the retained DNS/persistence owners and clean up backend state.
     pub(super) async fn finalize_shutdown(&mut self) -> anyhow::Result<()> {
+        let userspace = self.finalize_userspace_shutdown().await;
+        info!("shutdown: cleaning up eBPF backend");
+        let backend = self.ebpf.write().await.cleanup().await;
+        userspace?;
+        backend?;
+        info!("Control plane stopped");
+        Ok(())
+    }
+
+    pub(in crate::control) async fn finalize_userspace_shutdown(&mut self) -> anyhow::Result<()> {
         let state_tick = self.state_tick.stop_and_join().await;
         info!("shutdown: stopping DNS controller");
         self.dns_controller.shutdown(STAGE_TIMEOUT).await;
         if let Some(mut audit) = self.dns_audit.take() {
             audit.shutdown().await;
         }
+        let dns = self.dns_controller.runtime_provider().finish_pause().await;
         let dns_cache = self.dns_controller.cache().await;
         let persistence = dns_cache.lock().await.persistence();
-        if let Some(persistence) = persistence {
-            // The worker is a std thread that cannot be aborted, but the
-            // Shutdown command is queued before the join starts, and the
-            // spawn_blocking join keeps owning the thread handle even if
-            // this future is dropped on timeout — no detached writer.
-            match tokio::time::timeout(STAGE_TIMEOUT, persistence.shutdown()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => warn!(%error, "DNS persistence shutdown failed"),
-                Err(_) => warn!(
-                    "DNS persistence shutdown exceeded {:?}; continuing",
-                    STAGE_TIMEOUT
-                ),
-            }
-        }
-        info!("shutdown: cleaning up eBPF backend");
-        let backend = self.ebpf.write().await.cleanup().await;
+        let persistence = match persistence {
+            Some(persistence) => persistence.shutdown().await.map_err(anyhow::Error::from),
+            None => Ok(()),
+        };
         state_tick?;
-        backend?;
-        info!("Control plane stopped");
-        Ok(())
+        dns?;
+        persistence
     }
 }

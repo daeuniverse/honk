@@ -9,18 +9,18 @@ use crate::stats::StatsManager;
 use honk_config::Config;
 use honk_config::node::{Group, GroupPolicy, Node, OutboundConfig};
 use honk_config::types::NodeProtocol;
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 use honk_ebpf_common::DAE_BYPASS_MARK;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
-pub(super) mod netns;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
+pub(crate) mod netns;
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 pub(super) mod shared_udp;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "legacy-tc", target_os = "linux"))]
 pub(super) mod wire;
 
 pub(in crate::control) struct TestRetirement {
@@ -33,7 +33,7 @@ impl TestRetirement {
         let (fatal_tx, fatal) = tokio::sync::mpsc::unbounded_channel();
         let task = crate::control::spawn_retirement_worker(
             Arc::clone(&handle.udp_pool),
-            Arc::clone(&handle.ebpf),
+            handle.tc_kernel.clone().unwrap(),
             Arc::clone(&handle.connection_tracker),
             fatal_tx,
             Arc::clone(&handle.tcp_flow_pins),
@@ -79,7 +79,7 @@ pub(in crate::control) type CapturedTcpTarget =
 
 #[derive(Debug, Clone)]
 pub(in crate::control) enum UdpTestMode {
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     TcpConnect,
     DialError,
     SendError,
@@ -122,7 +122,7 @@ pub(in crate::control) enum UdpTestMode {
         hold_reply: bool,
     },
     DnsResponseCaptureTarget(Arc<parking_lot::Mutex<Option<SocketAddr>>>),
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     KernelSocket(Arc<UdpSocket>),
     TcpHold {
         entered: Arc<tokio::sync::Notify>,
@@ -179,7 +179,7 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
                 sends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             UdpTestMode::KernelSocket(socket) => {
                 socket.send_to(_data, self.relay).await?;
                 Ok(())
@@ -207,7 +207,7 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         if let UdpTestMode::KernelSocket(socket) = &self.mode {
             let (size, _) = socket.recv_from(buf).await?;
             return Ok((size, self.relay));
@@ -245,20 +245,42 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
 pub(in crate::control) struct UdpTestReplySocketFactory;
 
 impl crate::control::udp_endpoint::UdpReplySocketFactory for UdpTestReplySocketFactory {
-    fn create(&self, _original_dst: SocketAddr) -> std::io::Result<UdpSocket> {
+    fn create(
+        &self,
+        scope: honk_datapath::ScopeId,
+        _original_dst: SocketAddr,
+        _packet_source: Option<&crate::control::netstack::SourceWork>,
+    ) -> std::io::Result<crate::control::udp_endpoint::ReplySocketFd> {
+        if scope != honk_datapath::ScopeId::HOST {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "unreserved test scope",
+            ));
+        }
         let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
         socket.set_nonblocking(true)?;
-        UdpSocket::from_std(socket)
+        UdpSocket::from_std(socket).map(crate::control::udp_endpoint::ReplySocketFd::Kernel)
     }
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 #[derive(Debug)]
 pub(super) struct KernelUdpReplySocketFactory;
 
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 impl crate::control::udp_endpoint::UdpReplySocketFactory for KernelUdpReplySocketFactory {
-    fn create(&self, original_dst: SocketAddr) -> std::io::Result<UdpSocket> {
+    fn create(
+        &self,
+        scope: honk_datapath::ScopeId,
+        original_dst: SocketAddr,
+        _packet_source: Option<&crate::control::netstack::SourceWork>,
+    ) -> std::io::Result<crate::control::udp_endpoint::ReplySocketFd> {
+        if scope != honk_datapath::ScopeId::HOST {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "kernel replies require HOST scope",
+            ));
+        }
         let domain = if original_dst.is_ipv4() {
             socket2::Domain::IPV4
         } else {
@@ -274,7 +296,7 @@ impl crate::control::udp_endpoint::UdpReplySocketFactory for KernelUdpReplySocke
         }
         socket.set_mark(DAE_BYPASS_MARK)?;
         socket.bind(&original_dst.into())?;
-        UdpSocket::from_std(socket.into())
+        UdpSocket::from_std(socket.into()).map(crate::control::udp_endpoint::ReplySocketFd::Kernel)
     }
 }
 
@@ -282,7 +304,18 @@ impl crate::control::udp_endpoint::UdpReplySocketFactory for KernelUdpReplySocke
 pub(super) struct FailingUdpTestReplySocketFactory;
 
 impl crate::control::udp_endpoint::UdpReplySocketFactory for FailingUdpTestReplySocketFactory {
-    fn create(&self, _original_dst: SocketAddr) -> std::io::Result<UdpSocket> {
+    fn create(
+        &self,
+        scope: honk_datapath::ScopeId,
+        _original_dst: SocketAddr,
+        _packet_source: Option<&crate::control::netstack::SourceWork>,
+    ) -> std::io::Result<crate::control::udp_endpoint::ReplySocketFd> {
+        if scope != honk_datapath::ScopeId::HOST {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "unreserved test scope",
+            ));
+        }
         Err(std::io::Error::other("scripted anyfrom setup failure"))
     }
 }
@@ -302,7 +335,7 @@ impl honk_outbound::proxy::TcpOutbound for UdpTestHandler {
         _connect_timeout: Duration,
     ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
         let stream = match &self.mode {
-            #[cfg(feature = "ebpf")]
+            #[cfg(feature = "legacy-tc")]
             UdpTestMode::TcpConnect => TcpStream::connect(target).await?,
             UdpTestMode::TcpHold { entered, release } => {
                 let stream = honk_outbound::util::connect_marked(
@@ -597,10 +630,14 @@ pub(super) async fn serve_test_udp_to(
     let slow_permit = Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()
         .expect("test slow permit");
-    let reservation =
-        handle
-            .udp_pool
-            .reserve_or_enqueue(client, dst, payload, slow_permit, &handle.stats);
+    let reservation = handle.udp_pool.reserve_or_enqueue(
+        honk_datapath::ScopeId::HOST,
+        client,
+        dst,
+        payload,
+        slow_permit,
+        &handle.stats,
+    );
     match reservation {
         crate::control::udp_endpoint::EndpointReservation::Initializing(lease) => {
             handle.serve_udp_connection(lease).await
@@ -647,7 +684,7 @@ pub(in crate::control) fn canonical_socks5(
     node
 }
 
-pub(in crate::control) fn control_plane(config: Config) -> ControlPlane {
+pub(crate) fn control_plane(config: Config) -> ControlPlane {
     ControlPlane::new(
         config,
         Box::new(MockEbpfBackend::new()),
@@ -657,6 +694,10 @@ pub(in crate::control) fn control_plane(config: Config) -> ControlPlane {
         test_dns_forwarder(),
     )
     .expect("test control plane")
+}
+
+pub(crate) fn tcp_slots(plane: &ControlPlane) -> Arc<tokio::sync::Semaphore> {
+    Arc::clone(&plane.concurrency_limit)
 }
 
 pub(in crate::control) fn test_dns_forwarder() -> Arc<dns::forwarder::DnsForwarder> {
@@ -701,7 +742,7 @@ pub(in crate::control) fn changed_routing_config() -> Config {
             outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         });
     config
 }
@@ -732,7 +773,7 @@ pub(in crate::control) fn score_reload_config(revision: u64) -> Config {
             outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         });
     config.nodes = nodes.to_vec();
     config.groups = vec![Group {

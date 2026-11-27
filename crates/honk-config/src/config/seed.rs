@@ -2,9 +2,14 @@ use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use super::Config;
+use crate::datapath::{
+    DatapathConfig, DatapathInput, REMOVED_HOST_XSK_MODE_CODE, REMOVED_HOST_XSK_MODE_MESSAGE,
+    removed_host_xsk_mode_setting,
+};
 use crate::diagnostic::{
     DetailedDiagnostic, DiagnosticSources, SettingPath, SourceRef, report_detailed_diagnostics,
 };
+use crate::error::{DetailedConfigError, ErrorCategory};
 use crate::node::{Node, RawNodeSeed};
 
 pub(crate) const CONFIG_FIELDS: &[&str] = &[
@@ -16,6 +21,7 @@ pub(crate) const CONFIG_FIELDS: &[&str] = &[
     "subscriptions",
     "experimental",
     "assets",
+    "datapath",
 ];
 
 /// Public data-only adapter. Its serde errors are always redacted.
@@ -41,6 +47,7 @@ enum Field {
     Subscriptions,
     Experimental,
     Assets,
+    Datapath,
     #[serde(other)]
     Ignore,
 }
@@ -49,12 +56,23 @@ impl<'de> DeserializeSeed<'de> for ConfigSeed<'_> {
     type Value = Config;
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Config, D::Error> {
-        RawConfigSeed {
+        let start = self.diagnostics.len();
+        let result = RawConfigSeed {
             diagnostics: self.diagnostics,
             source: self.source,
         }
-        .deserialize(deserializer)
-        .map_err(|_| D::Error::custom("invalid configuration fields"))
+        .deserialize(deserializer);
+        result.map_err(|_| {
+            let reason = if self.diagnostics[start..]
+                .iter()
+                .any(|diagnostic| diagnostic.code == REMOVED_HOST_XSK_MODE_CODE)
+            {
+                REMOVED_HOST_XSK_MODE_MESSAGE
+            } else {
+                "invalid configuration fields"
+            };
+            D::Error::custom(reason)
+        })
     }
 }
 
@@ -66,14 +84,36 @@ impl<'de> DeserializeSeed<'de> for RawConfigSeed<'_> {
     }
 }
 
+impl RawConfigSeed<'_> {
+    fn datapath<E: serde::de::Error>(
+        &mut self,
+        input: Option<DatapathInput>,
+    ) -> Result<Option<DatapathConfig>, E> {
+        input
+            .map(|input| {
+                input.into_config(|| {
+                    let error = DetailedConfigError::new(
+                        ErrorCategory::Parse,
+                        REMOVED_HOST_XSK_MODE_CODE,
+                        self.source.clone(),
+                        removed_host_xsk_mode_setting(),
+                        REMOVED_HOST_XSK_MODE_MESSAGE,
+                    );
+                    self.diagnostics.push(*error.diagnostic);
+                })
+            })
+            .transpose()
+    }
+}
+
 impl<'de> Visitor<'de> for RawConfigSeed<'_> {
     type Value = Config;
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("a configuration")
     }
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Config, A::Error> {
+    fn visit_map<A: MapAccess<'de>>(mut self, mut map: A) -> Result<Config, A::Error> {
         let mut config = Config::default();
-        let mut seen = 0u8;
+        let mut seen = 0u16;
         while let Some(field) = map.next_key::<Field>()? {
             if matches!(field, Field::Ignore) {
                 map.next_value::<serde::de::IgnoredAny>()?;
@@ -123,12 +163,13 @@ impl<'de> Visitor<'de> for RawConfigSeed<'_> {
                     }
                 }
                 Field::Assets => config.assets = map.next_value()?,
+                Field::Datapath => config.datapath = self.datapath(map.next_value()?)?,
                 Field::Ignore => unreachable!(),
             }
         }
         Ok(config)
     }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Config, A::Error> {
+    fn visit_seq<A: SeqAccess<'de>>(mut self, mut seq: A) -> Result<Config, A::Error> {
         // Derived Config serde also accepts sequences in declaration order.
         let global = seq.next_element()?.unwrap_or_default();
         let dns = seq.next_element()?.unwrap_or_default();
@@ -144,6 +185,7 @@ impl<'de> Visitor<'de> for RawConfigSeed<'_> {
         let input: ExperimentalInput = seq.next_element()?.unwrap_or_default();
         let experimental = input.into_config(self.diagnostics, &self.source);
         let assets = seq.next_element()?.unwrap_or_default();
+        let datapath = self.datapath(seq.next_element()?.unwrap_or_default())?;
         if experimental.legacy_udp_nfqueue.is_some() {
             self.diagnostics
                 .push(crate::diagnostic::legacy_nfqueue_warning(
@@ -172,6 +214,7 @@ impl<'de> Visitor<'de> for RawConfigSeed<'_> {
             subscriptions,
             experimental,
             assets,
+            datapath,
         })
     }
 }

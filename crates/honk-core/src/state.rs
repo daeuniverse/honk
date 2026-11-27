@@ -506,7 +506,7 @@ pub(crate) fn open_read_only(data_dir: &Path) -> Result<(File, Connection), Stat
     Ok((directory, connection))
 }
 
-fn state_directory(
+pub(crate) fn state_directory(
     data_dir: &Path,
     create: bool,
     check: fn(&File, Target) -> Result<(), StateError>,
@@ -729,7 +729,7 @@ pub(crate) fn pragma(connection: &Connection, name: &str) -> Result<i64, StateEr
 }
 
 /// A directory or regular file owned by the euid with no group or other bits.
-fn private(file: &File, target: Target) -> Result<(), StateError> {
+pub(crate) fn private(file: &File, target: Target) -> Result<(), StateError> {
     match check_private(file, target)? {
         Some((rule, _)) => Err(Refusal::new(target, rule).into()),
         None => Ok(()),

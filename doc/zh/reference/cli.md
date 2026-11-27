@@ -23,6 +23,7 @@ honk-core [OPTIONS] [COMMAND]
 | `--mock-ebpf` | 省略，关 | 用 `MockEbpfBackend`，不加载内核 eBPF。见 [`--mock-ebpf`](#--mock-ebpf)。 |
 | `--store file\|db` | 省略，`file` | 从 `<data-dir>/state/honk.db` 里的修订版本加载配置。见 [`--store`](#--store)。 |
 | `--data-dir PATH` | 省略，`/var/lib/honk` | 数据目录，状态数据库在它下面的 `state/honk.db`。见 [`--data-dir`](#--data-dir)。 |
+| `--busy-poll-calibration-experiment` | 关 | 仅供 XDP 实验：允许身份完整匹配的 `status: candidate` 轮询记录，仍运行与合格 adaptive 相同的有限 runtime/账本；不绕过身份、驻留、配额或显式 Event。记录绑定预先写好的实验登记，而不是未来成功结果。产品启动不应带此参数，reload 不能改变它。 |
 
 两个二进制都提供 `-h`/`--help` 和 `-v`/`--version`。
 
@@ -292,6 +293,8 @@ UDP NFQUEUE 没有环境变量开关，由 `global.nfqueue_enable` 控制，默�
 ### eBPF 目标文件
 
 启用 `ebpf` feature 时，`build.rs` 通过 `include_bytes!` 内嵌目标文件。`--bpf-object` 在运行时替换这些字节。
+
+`packet-ebpf` 构建支持 XDP/TUN，须显式配置 XDP 或 TUN 并设 `global.nfqueue_enable: false`。此构建拒绝 `--bpf-object`（`-b`）。`legacy-tc` 和兼容入口 `ebpf` 均包含三个对象。
 
 honk 在 probe/loading 之前就拒绝对象声明的 `ByName` pinning：要用未 pin 的 map 重新构建，把 pin 路径交给 core 管理。没启用 `ebpf` 的构建用 mock 后端。
 

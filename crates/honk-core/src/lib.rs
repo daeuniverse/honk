@@ -20,6 +20,9 @@ pub mod config_diagnostics;
 pub(crate) mod configuration;
 pub mod connection_tracker;
 pub mod control;
+#[cfg(any(feature = "legacy-tc", test))]
+mod dae0_addresses;
+#[cfg(feature = "legacy-tc")]
 pub mod daens;
 pub(crate) mod degradations;
 pub mod dns;
@@ -30,7 +33,7 @@ mod marked_http;
 pub mod mode;
 #[cfg(feature = "native-api")]
 pub mod native_api;
-#[cfg(feature = "ebpf")]
+#[cfg(target_os = "linux")]
 pub(crate) mod netlink;
 #[cfg_attr(not(feature = "native-api"), path = "observe/inert.rs")]
 pub(crate) mod observe;
@@ -42,9 +45,16 @@ pub mod state;
 pub mod stats;
 pub mod subscription;
 mod sysctl;
+#[cfg(target_os = "linux")]
+pub(crate) mod tun;
+#[cfg(target_os = "linux")]
+pub(crate) mod xdp;
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
+    pub(crate) mod netns;
+
     pub(crate) mod routed_udp;
 
     pub(crate) fn run_exact_in_child(env: &str, name: &str) -> bool {
@@ -221,7 +231,7 @@ fn total_memory_bytes() -> Option<u64> {
 }
 
 /// Detect the interface used by the IPv4 default route.
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 ///
 /// Parses `/proc/net/route` and returns the interface with destination
 /// `00000000` and mask `00000000` and the lowest metric.
@@ -232,7 +242,7 @@ fn detect_default_interface() -> Option<String> {
 /// Default eBPF object file embedded into the binary.
 /// Built-in eBPF object embedded at compile time by build.rs.
 /// `--bpf-object` CLI flag overrides this at runtime.
-#[cfg(feature = "ebpf")]
+#[cfg(feature = "legacy-tc")]
 const DEFAULT_BPF_OBJECT: &[u8] = include_bytes!(env!("HONK_EBPF_OBJECT"));
 
 #[derive(clap::Subcommand, Debug)]
@@ -332,6 +342,10 @@ pub struct Cli {
     #[arg(long)]
     pub mock_ebpf: bool,
 
+    /// Permit fully bound candidate polling parameters for a preregistered lab experiment
+    #[arg(long)]
+    pub busy_poll_calibration_experiment: bool,
+
     /// Where the administered configuration lives: the `-c` file tree, or the
     /// revisions in `<data-dir>/state/honk.db`
     #[arg(long, value_enum, default_value = "file")]
@@ -349,6 +363,7 @@ pub enum ConfigStore {
 }
 
 pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
+    cli.validate_object_option()?;
     use std::time::Duration;
 
     let cmd = cli.command.as_ref().expect("subcommand required");
@@ -433,7 +448,10 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
         ClashCommand::Delay { node, url } => {
             let config = read_config()?;
             config.validate()?;
-            honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
+            honk_outbound::util::init_dae_socket_mark(
+                config.global.effective_so_mark(),
+                config.required_socket_mark().is_some(),
+            )?;
             honk_outbound::bootstrap::set_global(
                 honk_outbound::bootstrap::BootstrapResolver::parse(
                     &config.global.bootstrap_resolver,
@@ -630,11 +648,11 @@ fn prepare_nfqueue_startup(config: &mut Config, mock_mode: bool) -> bool {
     let reason = if mock_mode {
         Some("the mock eBPF backend was selected".to_string())
     } else {
-        #[cfg(not(feature = "ebpf"))]
+        #[cfg(not(feature = "legacy-tc"))]
         {
             Some("honk-core was built without the ebpf feature".to_string())
         }
-        #[cfg(feature = "ebpf")]
+        #[cfg(feature = "legacy-tc")]
         {
             honk_nfqueue::preflight()
                 .err()
@@ -732,6 +750,58 @@ fn load_operator_config(
     admit_operator_config(config, source, diagnostics)
 }
 
+const PACKET_ONLY: bool = cfg!(all(feature = "packet-ebpf", not(feature = "legacy-tc")));
+const TC_BUILD_ERROR: &str = "TC backend is unavailable in this packet-only build; select xdp or tun, or rebuild with --features ebpf";
+const XDP_NFQUEUE_ERROR: &str =
+    "XDP requires global.nfqueue_enable: false; NFQUEUE is not an XDP fallback";
+const TUN_NFQUEUE_ERROR: &str = "TUN requires global.nfqueue_enable: false";
+
+fn validate_packet_build(
+    config: &Config,
+    source: &honk_config::diagnostic::SourceRef,
+) -> Result<(), DetailedConfigError> {
+    use honk_config::datapath::Backend;
+    if !PACKET_ONLY {
+        return Ok(());
+    }
+    let backend = config
+        .datapath
+        .as_ref()
+        .map_or(Backend::Tc, |dp| dp.backend);
+    let (setting, message) = match backend {
+        Backend::Tc => (
+            SettingPath::new("datapath").field("backend"),
+            TC_BUILD_ERROR,
+        ),
+        Backend::Xdp | Backend::Tun if config.global.nfqueue_enable => (
+            SettingPath::new("global").field("nfqueue_enable"),
+            if backend == Backend::Xdp {
+                XDP_NFQUEUE_ERROR
+            } else {
+                TUN_NFQUEUE_ERROR
+            },
+        ),
+        _ => return Ok(()),
+    };
+    Err(DetailedConfigError::new(
+        ErrorCategory::Validation,
+        "invalid-datapath-config",
+        source.clone(),
+        setting,
+        message,
+    ))
+}
+
+impl Cli {
+    fn validate_object_option(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !PACKET_ONLY || self.bpf_object.is_none(),
+            "--bpf-object requires legacy-tc support"
+        );
+        Ok(())
+    }
+}
+
 fn admit_operator_config(
     config: Config,
     source: honk_config::diagnostic::SourceRef,
@@ -739,6 +809,7 @@ fn admit_operator_config(
 ) -> Result<Config, DetailedConfigError> {
     config.append_diagnostics(source.clone(), diagnostics);
     let result = config.validate_detailed().and_then(|()| {
+        validate_packet_build(&config, &source)?;
         subscription::validate_subscription_ids(&config.subscriptions).map_err(|_| {
             DetailedConfigError::new(
                 ErrorCategory::Validation,
@@ -836,7 +907,39 @@ async fn abort_startup(
     error
 }
 
+fn validate_runtime_backend(config: &Config, cli: &Cli) -> anyhow::Result<()> {
+    use honk_config::datapath::Backend;
+    let backend = config
+        .datapath
+        .as_ref()
+        .map_or(Backend::Tc, |dp| dp.backend);
+    match backend {
+        Backend::Tc => {}
+        Backend::Xdp => {
+            anyhow::ensure!(!cli.mock_ebpf, "XDP cannot be selected with --mock-ebpf");
+            #[cfg(not(target_os = "linux"))]
+            anyhow::bail!("XDP requires Linux");
+            #[cfg(target_os = "linux")]
+            xdp::validate_config(config)?;
+        }
+        Backend::Tun => {
+            #[cfg(not(target_os = "linux"))]
+            anyhow::bail!("TUN requires Linux");
+            #[cfg(target_os = "linux")]
+            {
+                tun::validate_runtime(config, cli.mock_ebpf)?;
+            }
+        }
+    }
+    anyhow::ensure!(
+        !cli.busy_poll_calibration_experiment || backend == Backend::Xdp,
+        "--busy-poll-calibration-experiment requires the explicit XDP backend"
+    );
+    Ok(())
+}
+
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    cli.validate_object_option()?;
     #[cfg(feature = "native-api")]
     let started_at = std::time::SystemTime::now();
     #[cfg(feature = "native-api")]
@@ -852,9 +955,22 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         cli.store == ConfigStore::File,
         "--store db needs the native-api feature"
     );
-    let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
+    let mock_mode = cli.mock_ebpf || cfg!(not(feature = "legacy-tc"));
     // Everything else in `run` drops before it.
-    let _instance_lock = instance_lock(mock_mode)?;
+    let mut _instance_lock = if PACKET_ONLY {
+        None
+    } else {
+        instance_lock(mock_mode)?
+    };
+    let mut claim_packet = |config: &Config| -> anyhow::Result<()> {
+        if PACKET_ONLY {
+            validate_runtime_backend(config, &cli)?;
+            if _instance_lock.is_none() {
+                _instance_lock = instance_lock(false)?;
+            }
+        }
+        Ok(())
+    };
     #[cfg(feature = "native-api")]
     let mut database = None;
     let startup = (|| -> anyhow::Result<_> {
@@ -864,8 +980,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             // is fine once the db holds a revision.
             let entry =
                 std::fs::canonicalize(&cli.config).or_else(|_| std::path::absolute(&cli.config))?;
-            let startup =
-                native_api::store::DatabaseStartup::open(&entry, &cli.data_dir, &mut diagnostics)?;
+            let startup = native_api::store::DatabaseStartup::open_with_admission(
+                &entry,
+                &cli.data_dir,
+                &mut diagnostics,
+                &mut claim_packet,
+            )?;
             native_sources = Some(startup.sources.clone());
             let config = startup.config.clone();
             database = Some(startup);
@@ -888,6 +1008,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         );
         #[cfg(not(feature = "dns-syslog"))]
         audit::validate_config(&config.global)?;
+        claim_packet(&config)?;
         let requested_data_dir = PathBuf::from(&config.global.data_dir);
         let (runtime_data_dir, data_dir_creation_error) =
             prepare_runtime_data_dir(&requested_data_dir)?;
@@ -972,6 +1093,24 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             return Err(error);
         }
     };
+    use honk_config::datapath::Backend;
+    let backend = config
+        .datapath
+        .as_ref()
+        .map_or(Backend::Tc, |datapath| datapath.backend);
+    let xdp_mode = backend == Backend::Xdp;
+    let packet_mode = matches!(backend, Backend::Xdp | Backend::Tun);
+    if !PACKET_ONLY {
+        validate_runtime_backend(&config, &cli)?;
+    }
+    let tc_mode = backend == Backend::Tc && !mock_mode;
+    let _packet_instance_lock = if !PACKET_ONLY && packet_mode && mock_mode {
+        instance_lock(false)?
+    } else {
+        None
+    };
+    let packet_admission = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pname_support = Arc::new(parking_lot::RwLock::new(ebpf::PnameSupport::Unavailable));
 
     // Console, optional file, and Clash API output use independent layers.
     // With no `/logs` subscription, the API layer contributes no callsite interest.
@@ -1059,6 +1198,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         ),
     }
     let dns_socket_budget = dns::transport::DnsSocketBudget::new(resource_budget.dns_sockets);
+    #[cfg(target_os = "linux")]
+    let process_polling = if xdp_mode {
+        Some(control::ProcessPollBudget::initialize_process(
+            cli.busy_poll_calibration_experiment,
+        )?)
+    } else {
+        None
+    };
     let tcp_flow_max = resource_budget.active_tcp_flows.saturating_mul(2);
     if tcp_flow_max < 256 {
         warn!(
@@ -1069,7 +1216,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         );
     }
 
-    honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
+    honk_outbound::util::init_dae_socket_mark(
+        config.global.effective_so_mark(),
+        config.required_socket_mark().is_some(),
+    )?;
+    honk_outbound::proxy::wireguard::init_memory_share(resource_budget.wireguard_memory)?;
 
     // Install the bootstrap resolver for proxy-server hostname lookups so
     // node dials never depend on the (potentially self-intercepted) regular
@@ -1129,11 +1280,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // The old instance owns queue 320 until this lock is released. Check
     // NFQUEUE only after the handoff so a transient busy result cannot turn
     // a healthy restart into a permanently degraded process.
-    let nfqueue_unavailable = prepare_nfqueue_startup(&mut config, mock_mode);
+    let nfqueue_unavailable =
+        backend == Backend::Tc && prepare_nfqueue_startup(&mut config, mock_mode);
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     let _dae0_guard;
-    if !mock_mode {
+    if tc_mode {
         // QUIC socket headroom: the default 208 KiB rmem/wmem caps a
         // ~1ms-RTT QUIC path at ~2 Gbps (setsockopt is clamped to 2×max).
         // Raise the ceiling so the 8 MiB SO_RCVBUF/SO_SNDBUF requests in
@@ -1149,67 +1301,87 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     let mut interface_handoff = None;
-    let ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
-        #[cfg(feature = "ebpf")]
-        {
-            _dae0_guard = None;
+    let ebpf_backend: Box<dyn crate::ebpf::PolicyBackend> = match backend {
+        Backend::Xdp | Backend::Tun => {
+            #[cfg(feature = "legacy-tc")]
+            {
+                _dae0_guard = None;
+            }
+            Box::new(ebpf::userspace::UserspaceBackend::new(
+                Arc::clone(&packet_admission),
+                Arc::clone(&pname_support),
+            ))
         }
-        info!("Using mock eBPF backend");
-        Box::new(ebpf::mock::MockEbpfBackend::new())
-    } else {
-        #[cfg(feature = "ebpf")]
-        {
-            // PARAM.dae0_ifindex must describe the pair before eBPF load.
-            let (guard, dae0_setup) = daens::create_dae0_link()?;
-            info!(
-                "dae0 link created before eBPF load (ifindex={})",
-                dae0_setup.ifindex()
-            );
-            _dae0_guard = Some(guard);
-            let bpf_object_bytes = match &cli.bpf_object {
-                Some(path) => {
-                    info!("Loading real eBPF backend from {}", path.display());
-                    std::fs::read(path).map_err(|e| {
-                        anyhow::anyhow!("failed to read eBPF object file {}: {}", path.display(), e)
-                    })?
-                }
-                None => {
-                    info!("Loading real eBPF backend from built-in object");
-                    DEFAULT_BPF_OBJECT.to_vec()
-                }
-            };
-            let (backend, handoff) = ebpf::real::start_interfaces(
-                &bpf_object_bytes,
-                &cli.bpf_pin_root,
-                config.global.tproxy_port,
-                &dae0_setup,
-                &config.global.lan_interface,
-                &config.global.wan_interface,
-                &degradations,
-                ebpf::interface::read_topology,
-            )
-            .await?;
-            interface_handoff = Some(handoff);
-
-            Box::new(backend)
-        }
-        #[cfg(not(feature = "ebpf"))]
-        {
-            info!("eBPF feature not compiled in, using mock backend");
+        #[cfg(any(feature = "legacy-tc", not(feature = "packet-ebpf")))]
+        Backend::Tc if cli.mock_ebpf => {
+            #[cfg(feature = "legacy-tc")]
+            {
+                _dae0_guard = None;
+            }
+            info!("Using mock eBPF backend");
             Box::new(ebpf::mock::MockEbpfBackend::new())
         }
+        Backend::Tc => {
+            #[cfg(feature = "legacy-tc")]
+            {
+                // PARAM.dae0_ifindex must describe the pair before eBPF load.
+                let (guard, dae0_setup) = daens::create_dae0_link()?;
+                info!(
+                    "dae0 link created before eBPF load (ifindex={})",
+                    dae0_setup.ifindex()
+                );
+                _dae0_guard = Some(guard);
+                let bpf_object_bytes = match &cli.bpf_object {
+                    Some(path) => {
+                        info!("Loading real eBPF backend from {}", path.display());
+                        std::fs::read(path).map_err(|e| {
+                            anyhow::anyhow!(
+                                "failed to read eBPF object file {}: {}",
+                                path.display(),
+                                e
+                            )
+                        })?
+                    }
+                    None => {
+                        info!("Loading real eBPF backend from built-in object");
+                        DEFAULT_BPF_OBJECT.to_vec()
+                    }
+                };
+                let (backend, handoff) = ebpf::real::start_interfaces(
+                    &bpf_object_bytes,
+                    &cli.bpf_pin_root,
+                    config.global.tproxy_port,
+                    &dae0_setup,
+                    &config.global.lan_interface,
+                    &config.global.wan_interface,
+                    &degradations,
+                    ebpf::interface::read_topology,
+                )
+                .await?;
+                interface_handoff = Some(handoff);
+
+                Box::new(backend)
+            }
+            #[cfg(all(feature = "packet-ebpf", not(feature = "legacy-tc")))]
+            anyhow::bail!(TC_BUILD_ERROR);
+            #[cfg(not(feature = "packet-ebpf"))]
+            {
+                info!("eBPF feature not compiled in, using mock backend");
+                Box::new(ebpf::mock::MockEbpfBackend::new())
+            }
+        }
     };
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     let mut ebpf_backend = ebpf_backend;
 
-    if !mock_mode {
-        #[cfg(feature = "ebpf")]
+    if tc_mode {
+        #[cfg(feature = "legacy-tc")]
         {
             // Attach dae0_ingress on dae0 (host namespace) first, while
             // dae0peer is still in the host namespace as well.
-            ebpf_backend.attach_dae0_programs()?;
+            ebpf_backend.tc_mut()?.attach_dae0_programs()?;
             info!("dae0 programs attached");
 
             // Move dae0peer into daens and install the daens policy routing.
@@ -1230,17 +1402,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             // the backend).  It overrides socket selection for proxy-bound
             // packets arriving on dae0peer and delivers them to the TPROXY
             // listener while keeping the original destination intact.
-            ebpf_backend.attach_sk_lookup()?;
+            ebpf_backend.tc_mut()?.attach_sk_lookup()?;
             info!("tproxy_sk_lookup attached in daens");
 
             // Attach the dae0peer TC ingress program (scoped switch inside
             // the backend).  It uses bpf_sk_assign() to hand proxy-bound
             // packets to the transparent listener socket while preserving
             // the original destination.
-            ebpf_backend.attach_dae0peer_ingress()?;
+            ebpf_backend.tc_mut()?.attach_dae0peer_ingress()?;
             info!("dae0peer_ingress attached in daens");
         }
-    } else {
+    } else if backend == Backend::Tc {
         info!("Skipping real interface binding (mock mode)");
     }
 
@@ -1251,12 +1423,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Accepted connections are handled on host-netns worker threads, and
     // replies to the client egress dae0peer and take the host dae0_ingress
     // rewrite path. Direct traffic bypasses userspace.
-    if !mock_mode {
+    if tc_mode {
         info!(
             "Using eBPF TC redirect datapath (tproxy_mark=0x{:x})",
             config.global.tproxy_mark
         );
-    } else {
+    } else if backend == Backend::Tc {
         info!("Skipping eBPF datapath setup (mock mode)");
     }
 
@@ -1266,13 +1438,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .effective_client_subnet()
         .map_err(anyhow::Error::new)?;
 
-    let traffic_geo = routing::GeoRequirements::for_traffic(&config.routing.rules);
+    let traffic_geo = routing::GeoRequirements::for_forwarding(&config);
     let dns_geo = dns::routing::DnsRouter::geo_requirements(&config.dns);
     let geo_sources = routing::GeoSourceSet::load(&traffic_geo.union(&dns_geo));
     let mut shared = routing::SharedMatchers::default();
-    let router = routing::Router::from_config_sharing(&config.routing, &geo_sources, &mut shared)?;
+    let mut router =
+        routing::Router::from_config_sharing(&config.routing, &geo_sources, &mut shared)?;
+    router.bind_firewall(&config, None, &geo_sources, &mut shared)?;
     info!("Router ready with {} compiled routes", router.route_count());
-    ebpf::record_pname_routing(&router, ebpf_backend.as_ref(), &degradations);
+    if backend == Backend::Tc {
+        ebpf::record_pname_routing(&router, ebpf_backend.as_ref(), &degradations);
+    }
 
     let proxy_registry = std::sync::Arc::new(proxy::ProxyRegistry::default_resolver()?);
     info!(
@@ -1355,6 +1531,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         resource_budget,
         Arc::clone(&degradations),
     )?;
+    #[cfg(target_os = "linux")]
+    if let Some(publisher) = process_polling {
+        control_plane =
+            control_plane.with_process_polling(control::PollBudgetBinding::Publisher(publisher))?;
+    }
     honk_outbound::bootstrap::set_node_host_resolver(Some(dns::node_host::resolver(
         &control_plane.dns_service(),
     )));
@@ -1373,10 +1554,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .install_startup_diagnostics(startup_diagnostics)
         .await;
     control_plane.set_log_file_override(cli.log_file.clone(), log_file_path);
-    #[cfg(feature = "ebpf")]
+    #[cfg(feature = "legacy-tc")]
     control_plane.set_iface_watcher(interface_handoff.map(|handoff| {
         ebpf::real::IfaceWatcher::spawn(
-            control_plane.ebpf_handle(),
+            control_plane.policy_backend_handle(),
             control_plane.config_handle(),
             control_plane.command_sender(),
             Arc::clone(&degradations),
@@ -1536,7 +1717,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    info!("Starting control plane listeners and accept loop");
+    info!(
+        backend = match backend {
+            Backend::Tc => "tc",
+            Backend::Xdp => "xdp",
+            Backend::Tun => "tun",
+        },
+        "Starting selected datapath owner"
+    );
 
     let cmd_tx = control_plane.command_sender();
 
@@ -1662,7 +1850,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 info!("Received SIGTERM, shutting down...");
             }
         }
-        shutdown_intent.store(true, std::sync::atomic::Ordering::Release);
+        shutdown_intent.request();
         let _ = cmd_tx.send(control::ControlCommand::Shutdown).await;
     });
 
@@ -1674,9 +1862,40 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     } else {
         info!("honk-core is running.");
     }
-    let control_result = control_plane.run().await;
+    let (control_plane, control_result) = match backend {
+        #[cfg(all(feature = "packet-ebpf", not(feature = "legacy-tc")))]
+        Backend::Tc => anyhow::bail!(TC_BUILD_ERROR),
+        #[cfg(any(feature = "legacy-tc", not(feature = "packet-ebpf")))]
+        Backend::Tc => {
+            let result = control_plane.run().await;
+            (Some(control_plane), result)
+        }
+        Backend::Xdp => {
+            #[cfg(target_os = "linux")]
+            {
+                xdp::run(control_plane, packet_admission, pname_support).await
+            }
+            #[cfg(not(target_os = "linux"))]
+            unreachable!("XDP admission requires Linux")
+        }
+        Backend::Tun => {
+            #[cfg(target_os = "linux")]
+            {
+                tun::run(
+                    control_plane,
+                    &cli.bpf_pin_root,
+                    packet_admission,
+                    pname_support,
+                )
+                .await
+            }
+            #[cfg(not(target_os = "linux"))]
+            unreachable!("TUN admission requires Linux")
+        }
+    };
     #[cfg(feature = "native-api")]
-    native_api::NativeRuntime::shutdown(native, &control_plane, control_result.is_err()).await;
+    native_api::NativeRuntime::shutdown(native, control_plane.as_ref(), control_result.is_err())
+        .await;
 
     // Signal systemd that we're stopping (Type=notify)
     #[cfg(target_os = "linux")]
@@ -1687,6 +1906,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let _ = sig_handle.await;
     let _ = sighup_handle.await;
     let subscription_result = subscription_supervisor.shutdown().await;
+    drop(control_plane);
     info!("honk-core stopped");
 
     control_result?;
@@ -1867,7 +2087,7 @@ mod startup_lifecycle_tests {
         assert!(!config.global.nfqueue_enable);
     }
 
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(feature = "legacy-tc"))]
     #[test]
     fn nfqueue_requested_without_ebpf_falls_back_to_disabled() {
         let mut config = honk_config::Config::default();
@@ -2035,6 +2255,40 @@ mod startup_lifecycle_tests {
             "{error}"
         );
         assert!(error.contains("within 0s"), "{error}");
+    }
+
+    #[cfg(all(feature = "packet-ebpf", not(feature = "legacy-tc")))]
+    #[tokio::test]
+    async fn packet_only_rejection_precedes_lock_and_directory_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry = temp.path().join("config.dae");
+        let data = temp.path().join("uncreated");
+        let lock = temp.path().join("instance.lock");
+        std::fs::write(
+            &entry,
+            format!("global {{ data_dir: '{}' }}\n", data.display()),
+        )
+        .unwrap();
+        super::TEST_INSTANCE_LOCK.with(|slot| slot.replace(Some(lock.clone())));
+        for extra in [
+            vec![],
+            vec!["--mock-ebpf"],
+            vec!["--bpf-object", "/missing-object"],
+        ] {
+            let mut args = vec!["honk-core", "--config", entry.to_str().unwrap()];
+            args.extend(&extra);
+            let error = super::run(Cli::try_parse_from(args).unwrap())
+                .await
+                .unwrap_err();
+            let expected = if extra.first() == Some(&"--bpf-object") {
+                "--bpf-object requires legacy-tc support"
+            } else {
+                super::TC_BUILD_ERROR
+            };
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert!(!data.exists() && !lock.exists());
+        }
+        super::TEST_INSTANCE_LOCK.with(|slot| slot.replace(None));
     }
 
     #[test]

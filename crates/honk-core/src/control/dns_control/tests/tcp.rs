@@ -75,7 +75,11 @@ async fn native_log_keeps_admission_refusal_and_forward_failure() {
     let source = server.peer_addr().unwrap();
     let task = tokio::spawn(async move {
         controller
-            .serve_bound_tcp_dns(&mut server, source)
+            .serve_bound_tcp_dns(
+                &mut server,
+                source,
+                crate::dns::projection::QueryScope::HOST,
+            )
             .await
             .unwrap();
     });
@@ -310,7 +314,7 @@ async fn tcp_connection_handles_multiple_frames() {
                 "127.0.0.1:53".parse().expect("original destination"),
             )
             .await?;
-        Ok::<_, anyhow::Error>((handled, server.nodelay()?))
+        Ok::<_, anyhow::Error>(handled)
     });
 
     let first = query_with_txid("example.com", 0x1111);
@@ -322,7 +326,7 @@ async fn tcp_connection_handles_multiple_frames() {
     assert_eq!(&read_tcp_response(&mut client).await[0..2], &second[0..2]);
 
     drop(client);
-    assert_eq!(task.await.expect("task").expect("handler"), (true, true));
+    assert!(task.await.expect("task").expect("handler"));
 }
 
 #[tokio::test]
@@ -334,6 +338,7 @@ async fn bound_tcp_connection_uses_shared_persistent_frame_loop() {
             .serve_bound_tcp_dns(
                 &mut server,
                 "127.0.0.1:10007".parse().expect("client address"),
+                crate::dns::projection::QueryScope::HOST,
             )
             .await
     });
@@ -357,6 +362,7 @@ async fn bound_tcp_connection_closes_after_idle_timeout() {
             .serve_bound_tcp_dns(
                 &mut server,
                 "127.0.0.1:10008".parse().expect("client address"),
+                crate::dns::projection::QueryScope::HOST,
             )
             .await
     });
@@ -403,7 +409,11 @@ async fn dns_flow_tracks_each_persistent_frame_and_actual_delivery() {
     let source = server.peer_addr().unwrap();
     let task = tokio::spawn(async move {
         observer
-            .scope(controller.serve_bound_tcp_dns(&mut server, source))
+            .scope(controller.serve_bound_tcp_dns(
+                &mut server,
+                source,
+                crate::dns::projection::QueryScope::HOST,
+            ))
             .await
     });
     for txid in [1, 2] {
@@ -447,7 +457,11 @@ async fn dns_flow_does_not_promote_answer_to_failed_client_delivery() {
         let observed = socket2::SockRef::from(&server).try_clone().unwrap();
         let task = tokio::spawn(async move {
             observer
-                .scope(controller.serve_bound_tcp_dns(&mut server, source))
+                .scope(controller.serve_bound_tcp_dns(
+                    &mut server,
+                    source,
+                    crate::dns::projection::QueryScope::HOST,
+                ))
                 .await
         });
         write_tcp_query(&mut client, &query_with_txid("first.example", 1)).await;

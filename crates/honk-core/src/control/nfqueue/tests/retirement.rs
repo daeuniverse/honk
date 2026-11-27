@@ -14,7 +14,8 @@ async fn cancel_token_mismatch_drops_local_guards_and_marks_cell_dead() {
             },
         )
         .unwrap();
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(backend)));
     let endpoints = Arc::new(UdpEndpointPool::new());
     let stats = Arc::new(StatsManager::new());
     let (pending, _fatal) = PendingUdpVerdicts::new(backend, endpoints, stats);
@@ -50,6 +51,8 @@ async fn cancel_drops_original_and_removes_exact_pending_state() {
             .backend
             .read()
             .await
+            .tc()
+            .unwrap()
             .conn_state_lookup(&fixture.identity.tuples())
             .unwrap()
             .is_none()
@@ -78,7 +81,8 @@ async fn staged_admission_keeps_captured_incarnation_through_cancel() {
             ..Default::default()
         },
     );
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(mock)));
     let endpoints = Arc::new(UdpEndpointPool::new());
     let (pending, mut fatal) = PendingUdpVerdicts::new(
         Arc::clone(&backend),
@@ -111,7 +115,9 @@ async fn staged_admission_keeps_captured_incarnation_through_cancel() {
     assert_eq!(lease.owner().incarnation(), Some(61));
     assert_eq!(identity.owner.incarnation(), Some(61));
     {
-        let mut backend = backend.write().await;
+        let mut backend = tokio::sync::RwLockWriteGuard::map(backend.write().await, |backend| {
+            backend.tc_mut().unwrap()
+        });
         let mut state = backend.conn_state_lookup(&key.tuples()).unwrap().unwrap();
         state.incarnation = 62;
         backend.udp_conn_state_store(&key.tuples(), &state).unwrap();
@@ -125,6 +131,8 @@ async fn staged_admission_keeps_captured_incarnation_through_cancel() {
         backend
             .read()
             .await
+            .tc()
+            .unwrap()
             .conn_state_lookup(&key.tuples())
             .unwrap()
             .unwrap()

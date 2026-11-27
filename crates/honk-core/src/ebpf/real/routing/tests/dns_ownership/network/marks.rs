@@ -906,7 +906,7 @@ fn compiled_direct_mark_index_matches_canonical_table_and_absent_actions() {
         routing.rules = rules.into();
         routing.default_must = true;
         // Bit 0 must not seed the generated program's destination-fact READY bit.
-        routing.default_mark = 0x181;
+        routing.default_mark = Some(0x181);
         let router = Router::from_config(&routing).unwrap();
         let plan = RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::Ip).unwrap();
         let mut backend =

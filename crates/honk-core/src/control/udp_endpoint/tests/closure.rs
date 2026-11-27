@@ -13,9 +13,9 @@ pub(in crate::control::udp_endpoint) fn tracked_entry(
     dst: SocketAddr,
 ) -> ConnectionEntry {
     ConnectionEntry {
-        id: id.to_owned(),
-        source: client.to_string(),
-        destination: dst.to_string(),
+        id: id.parse().unwrap(),
+        source: client,
+        destination: dst,
         proxy: "direct".into(),
         #[cfg(feature = "native-api")]
         routed_outbound: None,
@@ -28,7 +28,7 @@ pub(in crate::control::udp_endpoint) fn tracked_entry(
         download: Arc::new(AtomicU64::new(0)),
         start_time: Instant::now(),
         domain: None,
-        network: "udp".into(),
+        network: "udp",
         process: None,
         process_path: None,
     }
@@ -44,14 +44,14 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
             let stats = Arc::new(StatsManager::new());
             let tracker = Arc::new(ConnectionTracker::new());
             tracker.enable();
-            let backend: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+            let backend: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
                 Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
             let (fatal, mut failures) = mpsc::unbounded_channel();
             let pins = Arc::new(crate::control::connection::handoff::TcpFlowPins::default());
             let port = Arc::new(RetirementPort::default());
             let worker = spawn_retirement_worker(
                 Arc::clone(&pool),
-                Arc::clone(&backend),
+                crate::control::TcKernelController::for_test(Arc::clone(&backend)),
                 Arc::clone(&tracker),
                 fatal,
                 Arc::clone(&pins),
@@ -72,6 +72,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
             endpoint.record_pending_reply_peer(destination);
             let weak = Arc::downgrade(&endpoint);
             let mut lease = match pool.reserve_owned_or_enqueue(
+                honk_datapath::ScopeId::HOST,
                 source,
                 destination,
                 Bytes::from_static(b"live"),
@@ -94,6 +95,8 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
             backend
                 .write()
                 .await
+                .tc_mut()
+                .unwrap()
                 .udp_conn_state_store(
                     &key,
                     &ConnState {
@@ -105,6 +108,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                 .unwrap();
             let queue = lease.take_queue_receiver().unwrap();
             let mut driver = pool.spawn_driver(
+                honk_datapath::ScopeId::HOST,
                 source,
                 destination,
                 generation,
@@ -120,6 +124,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
             assert!(lease.commit_ready(Arc::clone(&endpoint)));
             let id = pool
                 .register_ready_tracker(
+                    honk_datapath::ScopeId::HOST,
                     source,
                     destination,
                     101,
@@ -127,7 +132,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                     &endpoint,
                     &tracker,
                     vec!["captured-parent".into()],
-                    || tracked_entry("owned-udp", source, destination),
+                    || tracked_entry("00000000-0000-0000-0000-00000000000a", source, destination),
                 )
                 .unwrap()
                 .unwrap();
@@ -142,7 +147,9 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                 .snapshot_group("captured-parent", Some("udp"))
                 .pop()
                 .unwrap();
-            let mut locked = backend.write().await;
+            let mut locked = tokio::sync::RwLockWriteGuard::map(backend.write().await, |backend| {
+                backend.tc_mut().unwrap()
+            });
             if mismatch {
                 locked
                     .redirect_track_store(
@@ -155,10 +162,11 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                     .unwrap();
             }
             if already_retiring {
-                pool.remove(source, destination);
+                pool.remove(honk_datapath::ScopeId::HOST, source, destination);
             }
             let pending = tracker.start_close(selected);
-            let mut duplicate = Box::pin(tracker.close_id(&id));
+            let wire_id = id.to_string();
+            let mut duplicate = Box::pin(tracker.close_id(&wire_id));
             assert!(futures::poll!(&mut duplicate).is_pending());
             let mut bulk = Box::pin(tracker.close_matching(Some("udp"), None, 1000));
             assert!(futures::poll!(&mut bulk).is_pending());
@@ -177,11 +185,19 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                 assert_eq!(pending.await, CloseOutcome::Failed);
                 assert_eq!(duplicate.await, CloseOutcome::Failed);
                 assert!(bulk.await.unwrap().failed);
-                assert_eq!(tracker.close_id(&id).await, CloseOutcome::Failed);
+                assert_eq!(
+                    tracker.close_id(&id.to_string()).await,
+                    CloseOutcome::Failed
+                );
                 assert!(failures.recv().await.is_some());
                 assert!(matches!(
                     pool.endpoints
-                        .get(&EndpointKey::new(source, destination))
+                        .get(&EndpointKey::new(
+                            honk_datapath::ScopeId::HOST,
+                            source,
+                            destination,
+                            None,
+                        ))
                         .unwrap()
                         .value(),
                     EndpointEntry::Retiring { .. }
@@ -190,6 +206,8 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                     backend
                         .read()
                         .await
+                        .tc()
+                        .unwrap()
                         .conn_state_lookup(&key)
                         .unwrap()
                         .unwrap()
@@ -205,11 +223,14 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                     backend
                         .read()
                         .await
+                        .tc()
+                        .unwrap()
                         .conn_state_lookup(&key)
                         .unwrap()
                         .is_none()
                 );
                 let replacement = match pool.reserve_owned_or_enqueue(
+                    honk_datapath::ScopeId::HOST,
                     source,
                     destination,
                     Bytes::from_static(b"new"),
@@ -221,7 +242,14 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                     EndpointReservation::Initializing(lease) => lease,
                     _ => panic!("acknowledged retirement permits tuple reuse"),
                 };
-                assert!(!pool.close_exact(source, destination, 101, generation));
+                assert!(!pool.close_exact(
+                    honk_datapath::ScopeId::HOST,
+                    source,
+                    destination,
+                    101,
+                    generation,
+                    None,
+                ));
                 assert!(replacement.still_initializing());
                 drop(replacement);
                 assert!(pool.shutdown().await.joined);
@@ -249,11 +277,13 @@ async fn udp_close_without_exact_pool_owner_completes_all_claims() {
             let source = "127.0.0.1:10001".parse().unwrap();
             let destination = "127.0.0.1:10002".parse().unwrap();
             tracker.register_owned(
-                tracked_entry("missing-owner", source, destination),
+                tracked_entry("00000000-0000-0000-0000-00000000000c", source, destination),
                 ConnectionOwner {
                     signal: Arc::clone(&signal),
                     action: CloseAction::Udp {
                         pool: weak_pool,
+                        scope: ScopeId::HOST,
+                        packet_lineage: None,
                         client: source,
                         destination,
                         token: 101,
@@ -276,7 +306,9 @@ async fn udp_close_without_exact_pool_owner_completes_all_claims() {
             );
             assert_eq!(first.wait().await, CloseOutcome::Failed);
             assert_eq!(
-                tracker.close_id("missing-owner").await,
+                tracker
+                    .close_id("00000000-0000-0000-0000-00000000000c")
+                    .await,
                 CloseOutcome::Failed
             );
             assert!(
@@ -288,12 +320,14 @@ async fn udp_close_without_exact_pool_owner_completes_all_claims() {
             );
             signal.finish(true);
             assert_eq!(
-                tracker.close_id("missing-owner").await,
+                tracker
+                    .close_id("00000000-0000-0000-0000-00000000000c")
+                    .await,
                 CloseOutcome::Failed
             );
             let replacement = CloseSignal::new();
             tracker.register_owned(
-                tracked_entry("missing-owner", source, destination),
+                tracked_entry("00000000-0000-0000-0000-00000000000c", source, destination),
                 ConnectionOwner {
                     signal: Arc::clone(&replacement),
                     action: CloseAction::Tcp,
@@ -303,10 +337,24 @@ async fn udp_close_without_exact_pool_owner_completes_all_claims() {
             assert_eq!(tracker.close_selected(stale).await, CloseOutcome::Gone);
             let mut cancelled = Box::pin(replacement.cancelled());
             assert!(futures::poll!(&mut cancelled).is_pending());
-            tracker.remove("missing-owner");
-            assert_eq!(tracker.close_id("missing-owner").await, CloseOutcome::Gone);
-            tracker.register(tracked_entry("unowned", source, destination));
-            assert_eq!(tracker.close_id("unowned").await, CloseOutcome::NotClosable);
+            tracker.remove(&uuid::uuid!("00000000-0000-0000-0000-00000000000c"));
+            assert_eq!(
+                tracker
+                    .close_id("00000000-0000-0000-0000-00000000000c")
+                    .await,
+                CloseOutcome::Gone
+            );
+            tracker.register(tracked_entry(
+                "00000000-0000-0000-0000-00000000000b",
+                source,
+                destination,
+            ));
+            assert_eq!(
+                tracker
+                    .close_id("00000000-0000-0000-0000-00000000000b")
+                    .await,
+                CloseOutcome::NotClosable
+            );
             drop(retained_pool);
         }
     })
@@ -335,6 +383,7 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
             uuid::Uuid::new_v4(),
         ));
         let mut lease = match pool.reserve_owned_or_enqueue(
+            honk_datapath::ScopeId::HOST,
             source,
             destination,
             Bytes::from_static(b"live"),
@@ -349,6 +398,7 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
         let generation = lease.generation();
         assert!(lease.commit_ready(Arc::clone(&endpoint)));
         pool.register_ready_tracker(
+            honk_datapath::ScopeId::HOST,
             source,
             destination,
             101,
@@ -356,7 +406,7 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
             &endpoint,
             &tracker,
             Vec::new(),
-            || tracked_entry("acknowledged", source, destination),
+            || tracked_entry("00000000-0000-0000-0000-00000000000d", source, destination),
         )
         .unwrap();
         let selected = tracker
@@ -407,9 +457,23 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
             )
             .unwrap();
         assert_eq!(outcomes[0], crate::ebpf::RetireOutcome::ConnRetired);
-        tracker.remove("acknowledged");
-        assert!(pool.complete_removal(source, destination, removal.owner, generation));
-        assert!(!pool.close_exact(source, destination, 101, generation));
+        tracker.remove(&uuid::uuid!("00000000-0000-0000-0000-00000000000d"));
+        assert!(pool.complete_removal(
+            removal.scope,
+            source,
+            destination,
+            removal.owner,
+            generation,
+            removal.packet_lineage,
+        ));
+        assert!(!pool.close_exact(
+            honk_datapath::ScopeId::HOST,
+            source,
+            destination,
+            101,
+            generation,
+            None,
+        ));
         assert_eq!(pending.wait().await, CloseOutcome::Closed);
         signal.finish(false);
         assert_eq!(
@@ -418,7 +482,12 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
                 .await,
             CloseOutcome::Closed
         );
-        assert_eq!(tracker.close_id("acknowledged").await, CloseOutcome::Gone);
+        assert_eq!(
+            tracker
+                .close_id("00000000-0000-0000-0000-00000000000d")
+                .await,
+            CloseOutcome::Gone
+        );
     })
     .await
     .unwrap();
@@ -460,20 +529,21 @@ async fn token_zero_endpoint_retirement_cannot_select_recreated_kernel_flow() {
             },
         )
         .unwrap();
-        let backend: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+        let backend: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
             Arc::new(tokio::sync::RwLock::new(Box::new(mock)));
         let pins = Arc::new(crate::control::connection::handoff::TcpFlowPins::default());
         let (fatal, mut failures) = mpsc::unbounded_channel();
         let port = Arc::new(RetirementPort::default());
         let worker = spawn_retirement_worker(
             Arc::clone(&pool),
-            Arc::clone(&backend),
+            crate::control::TcKernelController::for_test(Arc::clone(&backend)),
             tracker,
             fatal,
             Arc::clone(&pins),
             Arc::clone(&port),
         );
         let lease = match pool.reserve_or_enqueue_at(
+            honk_datapath::ScopeId::HOST,
             source,
             destination,
             b"old",
@@ -490,6 +560,8 @@ async fn token_zero_endpoint_retirement_cannot_select_recreated_kernel_flow() {
         backend
             .write()
             .await
+            .tc_mut()
+            .unwrap()
             .udp_conn_state_store(
                 &key,
                 &ConnState {
@@ -505,6 +577,8 @@ async fn token_zero_endpoint_retirement_cannot_select_recreated_kernel_flow() {
             backend
                 .read()
                 .await
+                .tc()
+                .unwrap()
                 .conn_state_lookup(&key)
                 .unwrap()
                 .unwrap()

@@ -240,7 +240,7 @@ async fn check_routed_tcp_health() {
     listeners.publish(&mut real).unwrap();
     let programs = real.programs.clone().unwrap();
     let (plane, stop_updates) = ControlPlane::tc_health_fixture(config, real).unwrap();
-    let backend = plane.ebpf_handle();
+    let backend = plane.policy_backend_handle();
     backend.write().await.set_datapath_ready(true).unwrap();
     let src = "192.0.2.84".parse().unwrap();
     let dst = "198.51.100.84".parse().unwrap();
@@ -257,6 +257,8 @@ async fn check_routed_tcp_health() {
         backend
             .read()
             .await
+            .tc()
+            .unwrap()
             .routing_handoff_lookup(&tuple(src, dst, src_port, dst_port, IPPROTO_TCP))
             .unwrap()
     };
@@ -560,7 +562,7 @@ async fn check_routed_udp_health() {
     listeners.publish(&mut real).unwrap();
     let programs = real.programs.clone().unwrap();
     let (plane, stop_updates) = ControlPlane::tc_health_fixture(config, real).unwrap();
-    let backend = plane.ebpf_handle();
+    let backend = plane.policy_backend_handle();
     let slot = async |id, domain: ProbeDomain, family: IpVersion| {
         backend
             .read()

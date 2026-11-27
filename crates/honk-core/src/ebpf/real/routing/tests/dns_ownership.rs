@@ -1,7 +1,7 @@
 use super::{object, outbound_ids, rule};
 use crate::control::routing_matcher::RoutingPushPlan;
-use crate::ebpf::EbpfBackend;
 use crate::ebpf::real::RealEbpfBackend;
+use crate::ebpf::{EbpfBackend, PolicyBackend};
 use crate::routing::Router;
 use aya::Pod;
 use aya::maps::{Array, HashMap};

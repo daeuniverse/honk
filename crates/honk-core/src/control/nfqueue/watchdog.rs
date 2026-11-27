@@ -4,9 +4,12 @@ impl PendingUdpVerdicts {
     /// `None` means the pending owner is settled; `Some` is the backend's refusal.
     pub(super) fn retire_pending(
         &self,
-        backend: &mut dyn EbpfBackend,
+        backend: &mut dyn crate::ebpf::PolicyBackend,
         request: CleanupRequest,
     ) -> Result<Option<UdpDecisionCommitResult>, PendingUdpDecisionError> {
+        let backend = backend
+            .tc_mut()
+            .map_err(|error| self.fatal_error("retire pending flow", format!("{error:#}")))?;
         let (key, token, incarnation) = match request {
             CleanupRequest::Flow(identity) => (
                 identity.tuples(),
@@ -123,8 +126,10 @@ impl PendingUdpVerdicts {
         &'a self,
         cell: &Arc<FlowCell>,
         identity: PendingUdpIdentity,
-    ) -> Result<tokio::sync::RwLockWriteGuard<'a, Box<dyn EbpfBackend>>, PendingUdpDecisionError>
-    {
+    ) -> Result<
+        tokio::sync::RwLockWriteGuard<'a, Box<dyn crate::ebpf::PolicyBackend>>,
+        PendingUdpDecisionError,
+    > {
         let deadline = {
             let state = cell.state.lock();
             let CellState::Pending {
@@ -151,8 +156,10 @@ impl PendingUdpVerdicts {
     pub(super) async fn backend_before_deadline<'a>(
         &'a self,
         cell: &Arc<FlowCell>,
-    ) -> Result<tokio::sync::RwLockWriteGuard<'a, Box<dyn EbpfBackend>>, PendingUdpDecisionError>
-    {
+    ) -> Result<
+        tokio::sync::RwLockWriteGuard<'a, Box<dyn crate::ebpf::PolicyBackend>>,
+        PendingUdpDecisionError,
+    > {
         let deadline = {
             let state = cell.state.lock();
             let CellState::Pending { started_at, .. } = &*state else {
@@ -193,6 +200,7 @@ impl PendingUdpVerdicts {
         cell.changed.notify_waiters();
         self.drop_many(verdicts, DropOutcome::Cancel);
         self.endpoints.retire_staged_identity(
+            identity.scope,
             identity.client(),
             identity.destination(),
             identity.owner.token,
@@ -228,7 +236,7 @@ impl PendingUdpVerdicts {
         owner: crate::ebpf::UdpFlowOwner,
         flow_slot: OwnedSemaphorePermit,
     ) {
-        let identity = PendingUdpIdentity::new(key, owner, 0);
+        let identity = PendingUdpIdentity::new(honk_datapath::ScopeId::HOST, key, owner, 0);
         vacant.insert(Arc::new(FlowCell::terminal(
             identity,
             CellState::Dead {

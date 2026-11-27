@@ -434,7 +434,8 @@ impl ScoreReporter {
         self.first_response_at(Instant::now());
     }
 
-    pub(super) fn first_response_at(&self, now: Instant) {
+    /// Record the response at the time the I/O owner observed it.
+    pub fn first_response_at(&self, now: Instant) {
         let mut progress = self.shared.progress.lock();
         if progress.finished || progress.first_response {
             return;
@@ -491,7 +492,8 @@ impl ScoreReporter {
         self.transfer_at(0, bytes, Instant::now());
     }
 
-    pub(super) fn transfer_at(&self, tx: u64, rx: u64, now: Instant) {
+    /// Publish confirmed transfer bytes at their observed I/O time.
+    pub fn transfer_at(&self, tx: u64, rx: u64, now: Instant) {
         self.transfer_with_send_start_at(tx, rx, None, Some(now));
     }
 

@@ -255,7 +255,7 @@ Blank lines, comments, and Shadowrocket `REMARKS=` / `STATUS=` metadata lines ar
 
 A full profile or provider payload must contain a top-level `proxies` sequence. Entries without a supported `type`, server address, valid nonzero port, or required credentials are skipped. Ports may be integers or numeric strings. JSON is decoded natively, including UTF-16 surrogate-pair escapes in display names.
 
-Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vless`, `hysteria2`/`hysteria`, `tuic`, `juicity`, and `anytls`. Unrelated client metadata is ignored. Unsupported wire transports, proxy plugins, and contradictory security settings are not silently reinterpreted.
+Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vless`, `hysteria2`/`hysteria`, `tuic`, `juicity`, `anytls`, and `wireguard`. Unrelated client metadata is ignored; unsupported wire transports, proxy plugins, and contradictory security settings are not silently reinterpreted.
 
 #### Common proxy fields
 
@@ -278,6 +278,22 @@ Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vle
 #### Protocol-specific options
 
 Supported spelling aliases normalize before node identity is derived.
+
+WireGuard uses a dedicated single-peer adapter, including a one-element Mihomo `peers` array. Parent and peer claims must agree after typed conversion; zero/multiple peers, malformed keys/addresses/MTU/reserved bytes and empty allowed-IP lists reject only that entry. `udp: false` maps to `network: tcp`. WARP `reserved` accepts three integer bytes or base64, without dropping the value. Active AmneziaWG options, stream/TLS wrappers and `dialer-proxy` chaining reject instead of producing a plain/direct substitute.
+
+| Meaning | Clash/Mihomo | sing-box legacy outbound | sing-box endpoint |
+| --- | --- | --- | --- |
+| Our private key | `private-key` | `private_key` | `private_key` |
+| Peer endpoint | `server`, `port` on parent or sole peer | `server`, `server_port` on parent or sole peer | sole peer `address`, `port` |
+| Peer public key / PSK | `public-key`, `pre-shared-key` on parent or sole peer | `peer_public_key`, `pre_shared_key`, or sole peer `public_key`, `pre_shared_key` | sole peer `public_key`, `pre_shared_key` |
+| Local addresses | `ip`, `ipv6`, or `local-address`/`local_address`/`address` string/list | `local_address` string/list | `address` string/list |
+| MTU | `mtu` | `mtu` | `mtu` |
+| Keepalive seconds | `persistent-keepalive` on parent or sole peer | `persistent_keepalive_interval` on parent or sole peer | sole peer `persistent_keepalive_interval` |
+| WARP client identifier | `reserved` on parent or sole peer | `reserved` on parent or sole peer | sole peer `reserved` |
+| Allowed IPs | `allowed-ips` on parent or sole peer | `allowed_ips` on parent or sole peer | sole peer `allowed_ips` |
+| UDP permission | `udp`, or agreeing packet `network` | packet `network` | packet `network` |
+
+Key decoding, interface-prefix stripping, allowed-IP canonicalization and MTU bounds are shared with [WireGuard share links and flat nodes](./nodes.md#wireguard). Missing allowed IPs default to both full routes; no tunnel address is synthesized. URI lists delegate to the same canonical parser. Surge-style WireGuard section references are not URI links and remain unsupported.
 
 | Protocol | Imported options |
 | --- | --- |
@@ -395,6 +411,8 @@ sing-box TLS is off when `tls` or `tls.enabled` is absent, so Trojan, Hysteria2,
 | Per-node uTLS fingerprint hint | Does not override honk's process-wide TLS selection. |
 
 Unsupported chaining, wire features, and authentication requirements are not silently discarded.
+
+WireGuard additionally imports the legacy `type: wireguard` outbound and the newer `endpoints` array. A profile can contain both `outbounds` and `endpoints`; valid entries in both survive invalid neighbors, with diagnostics retaining their original section and one-based position. Endpoints must describe exactly one peer. `system: true`, `system_interface: true`, nonzero `listen_port`, peer wire extensions and detour chaining are unsupported; honk's tunnel is userspace-owned. Worker-count hints do not change the protocol model.
 
 In sing-box input, `network` is packet capability, not a stream type. `transport.type` selects the stream. Unsupported stream names such as `h2` reject the entry rather than becoming raw TCP.
 

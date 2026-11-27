@@ -6,7 +6,7 @@ backend lock; commit installs the current routing extension before bindability.
 Attempt every independent variant after individual load or extension errors. Keep
 original relocation map FDs alive through every verifier job, including after logger
 or event-consumer cancellation; consumers use duplicate handles. Routing publication
-uses committed target metadata, and receive-trace preparation cannot wait for the
+requires a committed target and validates every field of the 128-byte RoutingInput, and receive-trace preparation cannot wait for the
 program-loader mutex while holding backend ownership.
 
 Read with: `AGENTS.md` (Technology stack, Current validation guidance); `datapath.md` for the ABI and runtime invariants; `configuration.md` for NFQUEUE activation; `test-locations.md` for where the real-kernel tests live; the VM procedure is `.github/workflows/ci.yml` and skill `honk-real-ebpf-tests`.
@@ -14,13 +14,16 @@ Read with: `AGENTS.md` (Technology stack, Current validation guidance); `datapat
 The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
 - `default = ["clash-api", "jemalloc", "rprx"]`
-- `ebpf` — aya real backend + `honk-nfqueue`, requires Linux kernel 6.12+; otherwise `MockEbpfBackend`. NFQUEUE activation follows `configuration.md`.
+- `ebpf` selects `legacy-tc`, which includes `packet-ebpf`, the real Aya TC backend and `honk-nfqueue` (Linux 6.12+). `packet-ebpf` alone includes Host and TUN objects and rejects TC configurations. A build without either capability keeps the default mock. Physical XDP and TUN use the shared userspace policy backend. Explicit XDP Host and TUN `host_facts: true` require the feature and real source admission; TUN false remains independently buildable. TUN requires `/dev/net/tun`, device/route and SO_MARK privileges, rejects mock and requires NFQUEUE off. Its Direct path creates new outbound sockets without original-operation, pre-NAT or TTL equivalence. NFQUEUE activation follows `configuration.md`.
+- XDP Host is an explicitly configured FD-owned TCX egress with a private nonpersistent TUN per binding. Check the actual cgroup attachments, socket-storage BTF and kernel consumption, positive tracked zone-zero replies and precise fd/flow/return ownership. Current, worker and children time namespaces need a matching zero MONOTONIC offset. It does not require BPF LSM, private XSKs or external program pins. All kernel attachments and saturation, late-packet, coexistence and crash fixtures belong in disposable guests, never on the maintainer's host.
+- XDP Host's admission does not establish TUN S-b capability. TUN `host_facts: true` needs its own actual socket-source/read admission and lifecycle evidence.
 - `clash-api` — Clash-compatible REST/WS API (pulls in optional axum/tower-http).
 - `native-api` — independent, opt-in native HTTP observations/control with a default-off listener; build with `--features native-api` (or `native-ui`); the full and `-native-api` release artifacts include it. It can run with mock or real eBPF and without Clash; real-kernel CI enables it for lifecycle regression coverage.
 - `jemalloc` — shipped binary allocates through jemalloc (see Technology stack in `AGENTS.md`); build with `--no-default-features --features "clash-api,ebpf,rprx,native-ui"` for the release capabilities with stock malloc. `native-ui` embeds both pinned doona editions and requires the absolute standard directory `HONK_DOONA_DIR` plus its `-lite` sibling (`export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`); use `native-api` instead only when embedded hosting (`ui: embedded` or `ui: embedded-lite`, the lighter doona lite preview edition; both need `native-ui`) is not needed.
 - `rprx` — forwards to `honk-outbound/rprx`: registers VLESS (VLESS Encryption and xtls-rprx-vision) and VMess handlers; without it VLESS/VMess nodes parse fine but fail at dial with "No handler for protocol".
 
 Score is always compiled, without a Cargo feature; omitted policy selects Selector.
+
 
 Preserve [TCX finality](../../doc/en/design/datapath.md#interface-hook-sets): unguarded, mark-preserving passes continue with NEXT; mark writers and existing ownership guards terminate with PASS, never PIPE as continuation.
 
@@ -72,7 +75,12 @@ The VM gate includes compiled routing (its exact-name-guarded `dns_ownership::tc
 TCP accepted-FD child-proof and tuple-reuse ownership, UDP fullcone source ownership, real VLAN/macsec frame cases,
 bond binding, native lifecycle, UDP receive tracing (including per-family attachment failure), route-only watcher,
 lazy interface binding and SO_MARK socket checks. Exact nonempty
-selections in the guest gate must remain intact.
+selections in the guest gate must remain intact. The XDP daemon smoke must verify FD link detachment and kernel forwarding after exit/SIGKILL, plus Nth-queue startup unwind; physical guard/pin readback is no longer its contract. Preserve the separate Host binding/cleanup lane. Gateway CT kfunc lookups are zone 0 only; test nft/legacy startup admission and nft runtime changes in the private VM namespace.
+The `l3-lan` selection in the XDP daemon smoke needs guest `wireguard-tools` and kernel WireGuard in addition to TCX and TUN. It exercises an actual auxiliary LAN beside physical queues; a userspace WireGuard peer or a socketpair alone does not prove auxiliary TCX capture or return-path ownership.
+
+TUN S-a real-FD validation belongs to `.github/ci/tun-daemon-smoke.sh`, restricted to the same disposable floor/recent guest and its private namespaces with a matching daemon. The fixture owns operator forwarding/firewall/main-route prerequisites; the daemon must own TUN/address/table/five-rule/receipt setup. The complete gate must retain TC/XDP selections and exercise all twelve A Host/Transit × IPv4/IPv6 × TCP/connected/unconnected UDP rows, actual proxy and Endpoint Direct exchanges, FD/read-write/mark/DNS/reload/failure/representation subrows and confirmed stop versus crash guards. Socketpair/unit tests are not TUN evidence; record missing rows as NOT_RUN, never HostFacts/Native or E6.4 acceptance. This location/required matrix is not a claim that the gate has run.
+
+Wave 3C Stage 1 uses unprivileged config, realm, queue lifecycle and fault-injection tests. Stage 2 uses the disposable Linux 6.12.0 and 7.2.5 guests to validate actual `IFF_MULTI_QUEUE` attachment, traffic, shutdown and 1/2/4/8-queue scaling. Record each stage separately. HostFacts uses a separate single-reader lane. Auxiliary TCX TUN admission rejects multiqueue.
 
 Use skill `honk-real-ebpf-tests` for the prerequisite sequence from CI: an
 x86_64 Ubuntu 24.04 host, repository-pinned Rust toolchains, build/VM packages,
@@ -89,7 +97,7 @@ suites run only in the guest, under the fixture guard and markers that skill
 
 Keep every object map unpinned, including allocator maps; core owns explicit pin paths (see [object admission](../../doc/en/design/control-plane.md#startup-and-shutdown)).
 
-`build.rs` always emits `HONK_VERSION` from the GitHub release tag, local `git describe`, or Cargo package version without Git metadata. `honk_core::VERSION` supplies both CLIs and Clash `/version`; runtime needs no Git. With `ebpf`, locate `crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o` and **verify `.BTF`**. Missing, BTF-less or stale objects trigger a rebuild with the channel read from `crates/honk-ebpf/rust-toolchain.toml`, stripping child `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`: environment flags override `crates/honk-ebpf/.cargo/config.toml`'s `--btf` and silently omit BTF. The child also strips inherited `CARGO_PROFILE_*` overrides so host profiling cannot replace the standalone kernel crate's release policy. The object records its compiler channel in a `.toolchain` sidecar; source or pin changes invalidate it, and a sidecar older than core's `build.rs` triggers a rebuild after embedding-policy changes. Copy to `OUT_DIR/honk-ebpf.o`, set `HONK_EBPF_OBJECT`; `lib.rs` embeds with `include_bytes!`. Runtime override: `--bpf-object`; manually built or supplied objects remain the caller's responsibility.
+`build.rs` always emits `HONK_VERSION` from the GitHub release tag, local `git describe`, or Cargo package version without Git metadata. `honk_core::VERSION` supplies both CLIs and Clash `/version`; runtime needs no Git. `ci/ebpf-objects.sh` prepares the selected artifacts under `crates/honk-ebpf/target/bpfel-unknown-none/release/prebuilt`. Each receipt binds name, compiler channel, source inputs and ELF bytes. A local stale bundle rebuilds using the pinned nightly. `HONK_EBPF_PREBUILT_DIR` selects a verified read-only bundle and rejects stale or missing objects. The producing job strips Host debug information before publication.
 
 ```bash
 # Requires Linux kernel 6.12+, clang/llvm/libbpf headers, nightly + bpf-linker.

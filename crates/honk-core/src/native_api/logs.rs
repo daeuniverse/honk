@@ -131,7 +131,7 @@ impl LogStore {
         self.recording.load(Ordering::Acquire)
             && !self.stopped.load(Ordering::Acquire)
             && metadata.is_event()
-            && metadata.target() != crate::logging::QUIET_TARGET
+            && !crate::logging::is_quiet_target(metadata.target())
             && severity(metadata.level()) <= self.level.load(Ordering::Acquire)
     }
 

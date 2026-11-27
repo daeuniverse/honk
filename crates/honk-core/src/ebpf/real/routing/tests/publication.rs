@@ -1,8 +1,8 @@
 use super::super::{attach_extension, bpf_syscall, create_maps, load_extension};
 use super::{assert_route, input, object, outbound_ids, rule};
 use crate::control::routing_matcher::RoutingPushPlan;
-use crate::ebpf::EbpfBackend;
 use crate::ebpf::real::RealEbpfBackend;
+use crate::ebpf::{EbpfBackend, PolicyBackend};
 use crate::routing::{Router, golden};
 use aya_obj::generated::{bpf_attr, bpf_cmd};
 use honk_config::types::DialMode;
@@ -110,7 +110,7 @@ fn publication_failure_recovery_and_frozen_root() {
             outbound: honk_config::routing::RoutingOutbound::Simple("proxy".into()),
             priority: 0,
             must: false,
-            mark: 0x600 + index,
+            mark: Some(0x600 + index),
         })
         .collect::<Vec<_>>();
     let initial_router = Router::new(&initial_rules, "direct").unwrap();
@@ -120,7 +120,7 @@ fn publication_failure_recovery_and_frozen_root() {
     let mut active_hit_connection = golden::connection();
     active_hit_connection.dst_ip = "192.0.2.255".parse().unwrap();
     active_hit_connection.src_ip = "198.51.100.255".parse().unwrap();
-    active_hit_connection.mac = Some("02:00:00:00:00:ff".into());
+    active_hit_connection.mac = Some([0x2, 0x0, 0x0, 0x0, 0x0, 0xff]);
     let active_hit = input(&active_hit_connection);
     let mut active_miss_connection = active_hit_connection.clone();
     active_miss_connection.src_ip = "203.0.113.1".parse().unwrap();
@@ -162,10 +162,38 @@ fn publication_failure_recovery_and_frozen_root() {
         outbound: honk_config::routing::RoutingOutbound::Simple("block".into()),
         priority: 0,
         must: false,
-        mark: 0x700,
+        mark: Some(0x700),
     };
     let recovery_router = Router::new(std::slice::from_ref(&recovery_rule), "direct").unwrap();
     let recovery = RoutingPushPlan::compile(&recovery_router, &ids, DialMode::Ip).unwrap();
+    let descriptor = published_descriptor(&backend);
+    let link_fds = |backend: &RealEbpfBackend| {
+        backend
+            .routing_generation
+            .as_ref()
+            .unwrap()
+            .links
+            .iter()
+            .map(AsRawFd::as_raw_fd)
+            .collect::<Vec<_>>()
+    };
+    let active_links = link_fds(&backend);
+    assert!(!active_links.is_empty());
+    let bindings = std::mem::take(&mut backend.bindings);
+    let test_targets = backend.routing_test_targets.take();
+    let error = backend.publish_routing_plan(&recovery, &[]).unwrap_err();
+    assert!(error.to_string().contains("no routing target"));
+    assert_eq!(published_descriptor(&backend), descriptor);
+    assert_eq!(backend.active_routing_slot().unwrap(), old_slot);
+    assert_eq!(link_fds(&backend), active_links);
+    backend.bindings = bindings;
+    backend.routing_test_targets = test_targets;
+    assert_route(
+        &mut backend,
+        "empty target set preserves active route",
+        &active_hit,
+        active_hit_decision,
+    );
     let mut map_fill_candidate = recovery.clone();
     map_fill_candidate
         .facts
@@ -242,7 +270,7 @@ fn publication_failure_recovery_and_frozen_root() {
     let mut root_candidate_rule = recovery_rule;
     root_candidate_rule.name = "root-failure".into();
     root_candidate_rule.outbound = honk_config::routing::RoutingOutbound::Simple("proxy".into());
-    root_candidate_rule.mark = 0x701;
+    root_candidate_rule.mark = Some(0x701);
     let root_candidate_router =
         Router::new(std::slice::from_ref(&root_candidate_rule), "direct").unwrap();
     let root_candidate =

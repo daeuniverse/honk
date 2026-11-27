@@ -958,7 +958,7 @@ async fn a_route_relay_replenishes_no_pool() -> anyhow::Result<()> {
             let generation_id = generation.generation();
             let key = ConnectionPool::ready_key(generation_id, leaf.id, destination, None);
             // Both paths can fund the same target-bound refill as soon as the relay ends.
-            assert!(!pool.note_target(generation_id, &key));
+            assert!(!pool.note_target(&key));
 
             let mut client = TcpStream::connect(destination).await?;
             let (socket, src) = ingress.accept().await?;

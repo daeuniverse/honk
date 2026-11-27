@@ -16,7 +16,6 @@ use honk_ebpf_common::{RedirectEntry, RedirectTuple};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use tokio::net::UdpSocket;
 
 const CASE: &str = "control::tests::udp_fullcone::netns_udp_full_cone_source_contract";
@@ -199,6 +198,8 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                     for destination in [a, b] {
                         ebpf.read()
                             .await
+                            .tc()
+                            .unwrap()
                             .redirect_track_lookup(&redirect_key(client_addr, destination))?
                             .context("contacted target must have exact redirect framing")?;
                     }
@@ -222,15 +223,27 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                             receive(&client, c, b"uncontacted-C-to-client").await?;
                         }
                         ensure!(
-                            ebpf.read().await.redirect_track_lookup(&c_key)?.is_none(),
+                            ebpf.read()
+                                .await
+                                .tc()?
+                                .redirect_track_lookup(&c_key)?
+                                .is_none(),
                             "C unexpectedly acquired exact redirect framing"
                         );
                         ensure!(
-                            ebpf.read().await.conn_state_lookup(&forward)?.is_none(),
+                            ebpf.read()
+                                .await
+                                .tc()?
+                                .conn_state_lookup(&forward)?
+                                .is_none(),
                             "foreign reply learned client-to-C UDP state"
                         );
                         ensure!(
-                            ebpf.read().await.conn_state_lookup(&reverse)?.is_none(),
+                            ebpf.read()
+                                .await
+                                .tc()?
+                                .conn_state_lookup(&reverse)?
+                                .is_none(),
                             "foreign reply learned C-to-client UDP state"
                         );
                     }
@@ -263,12 +276,16 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                                 tuples_key(destination, client_addr, 17),
                             ] {
                                 ensure!(
-                                    ebpf.read().await.conn_state_lookup(&tuple)?.is_none(),
+                                    ebpf.read().await.tc()?.conn_state_lookup(&tuple)?.is_none(),
                                     "stateless source53 traffic created ordinary conn-state"
                                 );
                             }
-                            ensure!(udp_pool.get(client_addr, destination).is_some());
-                            udp_pool.remove(client_addr, destination);
+                            ensure!(
+                                udp_pool
+                                    .get(honk_datapath::ScopeId::HOST, client_addr, destination)
+                                    .is_some()
+                            );
+                            udp_pool.remove(honk_datapath::ScopeId::HOST, client_addr, destination);
                         }
                         tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
                             while !udp_pool.is_empty() {
@@ -287,7 +304,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                                 tuples_key(destination, client_addr, 17),
                             ] {
                                 ensure!(
-                                    ebpf.read().await.conn_state_lookup(&tuple)?.is_none(),
+                                    ebpf.read().await.tc()?.conn_state_lookup(&tuple)?.is_none(),
                                     "stateless retirement acquired ordinary conn-state"
                                 );
                             }
@@ -300,7 +317,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                     Ok::<_, anyhow::Error>(())
                 }
                 .await;
-                shutdown.store(true, Ordering::Release);
+                shutdown.request();
                 let command = if task.is_finished() {
                     Ok(())
                 } else {

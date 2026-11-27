@@ -24,17 +24,22 @@ const TEST_PACKET_SIZE: usize = 256;
 const CHILD: &str = "HONK_QUIC_SOURCE_METRICS_CHILD";
 
 #[derive(Debug)]
-pub(super) struct BoundReplies(pub(super) HashMap<SocketAddr, std::net::UdpSocket>);
+pub(super) struct BoundReplies(pub(super) HashMap<(ScopeId, SocketAddr), std::net::UdpSocket>);
 
 impl UdpReplySocketFactory for BoundReplies {
-    fn create(&self, source: SocketAddr) -> io::Result<UdpSocket> {
+    fn create(
+        &self,
+        scope: ScopeId,
+        source: SocketAddr,
+        _packet_source: Option<&SourceWork>,
+    ) -> io::Result<ReplySocketFd> {
         let socket = self
             .0
-            .get(&source)
+            .get(&(scope, source))
             .ok_or_else(|| io::Error::other("unreserved reply source"))?
             .try_clone()?;
         socket.set_nonblocking(true)?;
-        UdpSocket::from_std(socket)
+        UdpSocket::from_std(socket).map(ReplySocketFd::Kernel)
     }
 }
 
@@ -54,14 +59,23 @@ struct Fixture {
 
 impl Fixture {
     async fn new(mode: QuicUdpMode, ipv6: bool) -> Self {
+        Self::with_scopes(mode, ipv6, &[ScopeId::HOST]).await
+    }
+
+    async fn with_scopes(mode: QuicUdpMode, ipv6: bool, scopes: &[ScopeId]) -> Self {
         let bind: SocketAddr = if ipv6 { "[::1]:0" } else { "127.0.0.1:0" }
             .parse()
             .unwrap();
         let peer = QuicUdpPeer::start(mode, bind).await.unwrap();
-        Self::with_peer(mode, bind, peer).await
+        Self::with_peer(mode, bind, peer, scopes).await
     }
 
-    async fn with_peer(mode: QuicUdpMode, bind: SocketAddr, peer: QuicUdpPeer) -> Self {
+    async fn with_peer(
+        mode: QuicUdpMode,
+        bind: SocketAddr,
+        peer: QuicUdpPeer,
+        scopes: &[ScopeId],
+    ) -> Self {
         let ipv6 = bind.is_ipv6();
         let generation =
             Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&peer.node)).unwrap());
@@ -71,7 +85,12 @@ impl Fixture {
         for _ in 0..TEST_TARGETS {
             let socket = std::net::UdpSocket::bind(bind).unwrap();
             socket.set_nonblocking(true).unwrap();
-            bound.insert(socket.local_addr().unwrap(), socket.try_clone().unwrap());
+            for &scope in scopes {
+                bound.insert(
+                    (scope, socket.local_addr().unwrap()),
+                    socket.try_clone().unwrap(),
+                );
+            }
             targets.push(UdpSocket::from_std(socket).unwrap());
         }
         let score = GroupManager::new(
@@ -114,6 +133,7 @@ impl Fixture {
 
     async fn prepare(
         &self,
+        scope: ScopeId,
         client: SocketAddr,
         target: SocketAddr,
         rewrite: Option<SocketAddr>,
@@ -121,6 +141,7 @@ impl Fixture {
     ) -> SourcePreparation {
         self.pool
             .prepare_source(
+                scope,
                 &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&self.generation),
                 Arc::clone(&self.runtime),
@@ -134,16 +155,23 @@ impl Fixture {
                 Arc::clone(&self.stats),
                 self.family,
                 speculative,
+                None,
             )
             .await
             .unwrap()
     }
 
-    fn reserve(&self, client: SocketAddr, target: SocketAddr, payload: &[u8]) -> UdpInitLease {
+    fn reserve(
+        &self,
+        scope: ScopeId,
+        client: SocketAddr,
+        target: SocketAddr,
+        payload: &[u8],
+    ) -> UdpInitLease {
         let slow = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let EndpointReservation::Initializing(lease) =
             self.pool
-                .reserve_or_enqueue(client, target, payload, slow, &self.stats)
+                .reserve_or_enqueue(scope, client, target, payload, slow, &self.stats)
         else {
             panic!("expected vacant endpoint");
         };
@@ -175,11 +203,16 @@ impl Fixture {
             .unwrap()
             .start();
         reporter.setup_succeeded();
+        let reply = Arc::new(
+            self.pool
+                .create_reply_socket(lease.scope(), original, None)
+                .unwrap(),
+        );
         let endpoint = UdpEndpoint::new_source_scored(
             attachment,
             target,
             None,
-            Arc::new(self.pool.create_reply_socket(original).unwrap()),
+            reply,
             self.stats
                 .outbound_tracker(&self.peer.node.name, crate::stats::OutboundKind::Node),
             self.peer.node.id,
@@ -191,10 +224,15 @@ impl Fixture {
         #[cfg(feature = "native-api")]
         endpoint
             .native
-            .set_observer(honk_outbound::runtime::flow_observation::current());
+            .set_observer(
+                honk_outbound::runtime::flow_observation::current(),
+                &self.pool,
+            )
+            .unwrap();
         let endpoint = Arc::new(endpoint);
         let queue = lease.take_queue_receiver().unwrap();
         let mut driver = self.pool.spawn_driver(
+            lease.scope(),
             client,
             original,
             lease.generation(),
@@ -215,9 +253,15 @@ impl Fixture {
 
     async fn flow(&self, index: usize, payload: &[u8]) -> Arc<UdpEndpoint> {
         let target = self.target(index);
-        let lease = self.reserve(self.client(), target, payload);
+        let lease = self.reserve(honk_datapath::ScopeId::HOST, self.client(), target, payload);
         let attachment = self
-            .prepare(self.client(), target, None, false)
+            .prepare(
+                honk_datapath::ScopeId::HOST,
+                self.client(),
+                target,
+                None,
+                false,
+            )
             .await
             .commit(&self.pool)
             .await
@@ -277,7 +321,13 @@ async fn quic_source_send_outcomes_preserve_siblings() {
         let packet = f.packet().await;
         let target = f.target(1);
         let attachment = f
-            .prepare(f.client(), target, None, false)
+            .prepare(
+                honk_datapath::ScopeId::HOST,
+                f.client(),
+                target,
+                None,
+                false,
+            )
             .await
             .commit(&f.pool)
             .await
@@ -286,7 +336,12 @@ async fn quic_source_send_outcomes_preserve_siblings() {
         owner.set_send_timeout_for_test(SHORT_WAIT);
         let timeouts = honk_outbound::quic::quic_stats_snapshot().send_timeouts;
         let gate = owner.hold_send_gate_for_test().await;
-        let lease = f.reserve(f.client(), target, b"must-not-send");
+        let lease = f.reserve(
+            honk_datapath::ScopeId::HOST,
+            f.client(),
+            target,
+            b"must-not-send",
+        );
         let (queued, mut driver) = f
             .install(lease, attachment, f.client(), target, target)
             .await;
@@ -311,8 +366,13 @@ async fn quic_source_send_outcomes_preserve_siblings() {
             timeouts
         );
         assert!(matches!(
-            f.pool
-                .fast_path_enqueue(f.client(), f.target(0), b"after-timeout", &f.stats),
+            f.pool.fast_path_enqueue(
+                honk_datapath::ScopeId::HOST,
+                f.client(),
+                f.target(0),
+                b"after-timeout",
+                &f.stats
+            ),
             Some(EndpointReservation::Enqueued)
         ));
         let next = f.packet().await;
@@ -331,13 +391,24 @@ async fn quic_source_send_outcomes_preserve_siblings() {
         );
         let cancelled_target = f.target(3);
         let attachment = f
-            .prepare(f.client(), cancelled_target, None, false)
+            .prepare(
+                honk_datapath::ScopeId::HOST,
+                f.client(),
+                cancelled_target,
+                None,
+                false,
+            )
             .await
             .commit(&f.pool)
             .await
             .unwrap();
         let gate = owner.hold_send_gate_for_test().await;
-        let lease = f.reserve(f.client(), cancelled_target, b"cancelled-in-queue");
+        let lease = f.reserve(
+            honk_datapath::ScopeId::HOST,
+            f.client(),
+            cancelled_target,
+            b"cancelled-in-queue",
+        );
         let (cancelled, mut driver) = f
             .install(
                 lease,
@@ -347,7 +418,8 @@ async fn quic_source_send_outcomes_preserve_siblings() {
                 cancelled_target,
             )
             .await;
-        f.pool.remove(f.client(), cancelled_target);
+        f.pool
+            .remove(honk_datapath::ScopeId::HOST, f.client(), cancelled_target);
         drop(gate);
         assert_eq!(
             driver.wait_first_ack().await.unwrap_err().kind(),
@@ -388,8 +460,13 @@ async fn tuic_source_accepts_first_and_later_empty_payloads() {
         f.targets[0].send_to(b"", first.mapping).await.unwrap();
         assert_eq!(received(&f.client).await, (Vec::new(), f.target(0)));
         assert!(matches!(
-            f.pool
-                .fast_path_enqueue(f.client(), f.target(0), b"", &f.stats),
+            f.pool.fast_path_enqueue(
+                honk_datapath::ScopeId::HOST,
+                f.client(),
+                f.target(0),
+                b"",
+                &f.stats
+            ),
             Some(EndpointReservation::Enqueued)
         ));
         let second = f.packet().await;
@@ -418,14 +495,20 @@ async fn quic_source_stream_io_timeout_and_retirement_settle_once() {
         let peer = QuicUdpPeer::start_with_stream_hold(mode, bind, Some(Arc::clone(&hold)))
             .await
             .unwrap();
-        let mut f = Fixture::with_peer(mode, bind, peer).await;
+        let mut f = Fixture::with_peer(mode, bind, peer, &[ScopeId::HOST]).await;
         hold.release.notify_one();
         let sibling = f.flow(0, b"sibling").await;
         hold.entered.notified().await;
         let first = f.packet().await;
         let target = f.target(1);
         let attachment = f
-            .prepare(f.client(), target, None, false)
+            .prepare(
+                honk_datapath::ScopeId::HOST,
+                f.client(),
+                target,
+                None,
+                false,
+            )
             .await
             .commit(&f.pool)
             .await
@@ -433,7 +516,12 @@ async fn quic_source_stream_io_timeout_and_retirement_settle_once() {
         let owner = attachment.owner();
         owner.set_send_timeout_for_test(SHORT_WAIT);
         let before = honk_outbound::quic::quic_stats_snapshot().send_timeouts;
-        let lease = f.reserve(f.client(), target, &[0x5a; TEST_PACKET_SIZE]);
+        let lease = f.reserve(
+            honk_datapath::ScopeId::HOST,
+            f.client(),
+            target,
+            &[0x5a; TEST_PACKET_SIZE],
+        );
         let (endpoint, mut driver) = f
             .install(lease, attachment, f.client(), target, target)
             .await;
@@ -443,7 +531,8 @@ async fn quic_source_stream_io_timeout_and_retirement_settle_once() {
         // The peer has read the command, while its 64-byte QUIC stream window
         // prevents the complete UDP frame from being accepted by write_all.
         if retire {
-            f.pool.remove(f.client(), target);
+            f.pool
+                .remove(honk_datapath::ScopeId::HOST, f.client(), target);
             hold.release.notify_one();
             assert_eq!(
                 driver.wait_first_ack().await.unwrap_err().kind(),
@@ -526,7 +615,8 @@ async fn native_quic_source_records_current_view_and_reused_peer() {
         });
         let mut pending = Vec::new();
         for (index, flow) in flows.iter().enumerate().take(2) {
-            let operation = std::pin::pin!(f.prepare(f.client(), f.target(index), None, false));
+            let operation =
+                std::pin::pin!(f.prepare(ScopeId::HOST, f.client(), f.target(index), None, false));
             let observer = flow.observer(5, None, "dial_target").unwrap();
             pending.push(observer.scope(operation).await);
         }
@@ -537,9 +627,23 @@ async fn native_quic_source_records_current_view_and_reused_peer() {
             let observer = flow.observer(7, Some(attempt), "dial_target").unwrap();
             let prepared = match pending.next() {
                 Some(prepared) => prepared,
-                None => f.prepare(f.client(), target, None, false).await,
+                None => {
+                    f.prepare(
+                        honk_datapath::ScopeId::HOST,
+                        f.client(),
+                        target,
+                        None,
+                        false,
+                    )
+                    .await
+                }
             };
-            let lease = f.reserve(f.client(), target, b"observed");
+            let lease = f.reserve(
+                honk_datapath::ScopeId::HOST,
+                f.client(),
+                target,
+                b"observed",
+            );
             let mut driver = {
                 let operation = std::pin::pin!(async {
                     let attachment = prepared.commit(&f.pool).await.unwrap();
@@ -587,3 +691,4 @@ async fn native_quic_source_records_current_view_and_reused_peer() {
 }
 
 mod association;
+mod scopes;

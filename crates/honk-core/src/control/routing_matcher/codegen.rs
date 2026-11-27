@@ -11,12 +11,17 @@ use aya_obj::generated::{
     BPF_JGT, BPF_JMP, BPF_JNE, BPF_JSET, BPF_K, BPF_LD, BPF_LDX, BPF_MEM, BPF_MOV, BPF_OR, BPF_ST,
     BPF_STX, BPF_W, BPF_X, bpf_insn,
 };
+use honk_config::types::DialMode;
+use honk_ebpf_common::xdp_gateway::{
+    GATEWAY_DNS_BITMAP_OFFSET, GATEWAY_DNS_READY, GATEWAY_ROUTE_NEED_DNS,
+};
 use honk_ebpf_common::{
     KernelRouteOutput, ROUTE_FACT_PRESENT_SHIFT, ROUTE_TRACE_COMPLETE, ROUTE_TRACE_ENABLED,
     ROUTE_TRACE_MATCHED, ROUTE_TRACE_NOT_MATCHED, ROUTE_TRACE_OVERFLOW, ROUTE_TRACE_VALUES,
     ROUTE_TRACE_VERSION, ROUTE_TRACE_WORDS, ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN,
     ROUTING_FEATURE_DOMAIN_REROUTE, ROUTING_FEATURE_PROCESS, ROUTING_INPUT_ALLOW_DIRECT_FINALITY,
-    ROUTING_INPUT_MAC_PRESENT, ROUTING_PROCESS_MAX_LEN, RoutingDecision, RoutingInput,
+    ROUTING_INPUT_MAC_PRESENT, ROUTING_MARK_KEEP, ROUTING_MARK_SET, ROUTING_PROCESS_MAX_LEN,
+    RoutingDecision, RoutingInput,
 };
 
 const R0: u8 = 0;
@@ -56,11 +61,16 @@ const MUST: i16 = std::mem::offset_of!(RoutingDecision, must) as i16;
 const DOMAIN_FINAL: i16 = std::mem::offset_of!(RoutingDecision, domain_final) as i16;
 const RULE_ID: i16 = std::mem::offset_of!(RoutingDecision, rule_id) as i16;
 const TRACE_FLAGS: i16 = std::mem::offset_of!(KernelRouteOutput, flags) as i16;
+const MARK_KIND: i16 = std::mem::offset_of!(KernelRouteOutput, mark_kind) as i16;
 const TRACE_FACT_STATE: i16 = std::mem::offset_of!(KernelRouteOutput, fact_state) as i16;
 const TRACE_INPUT: i16 = std::mem::offset_of!(KernelRouteOutput, input) as i16;
 const TRACE_DOMAIN: i16 = std::mem::offset_of!(KernelRouteOutput, domain_bitmap) as i16;
 const TRACE_OUTCOMES: i16 = std::mem::offset_of!(KernelRouteOutput, outcomes) as i16;
 const DIRECT_MARK_INDEX: i16 = std::mem::offset_of!(RoutingDecision, direct_mark_index) as i16;
+const HOST_SCRATCH_END: i16 = TRACE_INPUT - STACK_DOMAIN_KEY;
+const _: () = assert!(HOST_SCRATCH_END as usize <= std::mem::size_of::<KernelRouteOutput>());
+const _: () =
+    assert!(GATEWAY_DNS_BITMAP_OFFSET == (HOST_SCRATCH_END + FactKind::Domain.area()) as usize);
 
 /// One lookup category. Each owns a 32-byte stack area holding its
 /// `DomainRouting` bitmap once resolved: domain at [-32, -1], destination at
@@ -74,7 +84,7 @@ enum FactKind {
 }
 
 impl FactKind {
-    fn area(self) -> i16 {
+    const fn area(self) -> i16 {
         -(self as i16 + 1) * FACT_BYTES
     }
 }
@@ -103,6 +113,17 @@ pub struct RoutingBytecode {
     pub trace_layout: Option<KernelTraceLayout>,
 }
 
+/// Gateway function body: R1 is `RoutingInput` and R2 is caller-guarded scratch.
+/// With DNS shadow, R3 is zero on the first pass and `GATEWAY_DNS_READY` with a bitmap.
+/// Return 1 for proven direct, 0 for Endpoint, `GATEWAY_ROUTE_NEED_DNS` for the
+/// first reachable domain predicate without a bitmap, or a negative input error.
+#[derive(Debug, Clone)]
+pub struct GatewayBytecode {
+    pub insns: Vec<bpf_insn>,
+    pub source_lines: Vec<RoutingSourceLine>,
+    pub fingerprint: [u8; 32],
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Label(usize);
 
@@ -112,6 +133,7 @@ struct Assembler {
     labels: Vec<Option<usize>>,
     fixups: Vec<(usize, Label)>,
     trace_layout: Option<KernelTraceLayout>,
+    host_scratch: bool,
 }
 
 impl Assembler {
@@ -122,6 +144,7 @@ impl Assembler {
             labels: Vec::new(),
             fixups: Vec::new(),
             trace_layout: None,
+            host_scratch: false,
         }
     }
 
@@ -148,6 +171,26 @@ impl Assembler {
             self.insns.len() < BPF_INSTRUCTION_CAPACITY,
             "routing program exceeds BPF instruction capacity"
         );
+        let (dst, src) = if self.host_scratch {
+            if dst == R10 {
+                ensure!(
+                    matches!(code & 7, BPF_ST | BPF_STX),
+                    "unexpected Host frame-pointer destination"
+                );
+            }
+            if src == R10 {
+                ensure!(
+                    code & 7 == BPF_LDX || code == (BPF_ALU64 | BPF_MOV | BPF_X),
+                    "unexpected Host frame-pointer source"
+                );
+            }
+            (
+                if dst == R10 { R9 } else { dst },
+                if src == R10 { R9 } else { src },
+            )
+        } else {
+            (dst, src)
+        };
         let insn = bpf_insn {
             code: code as u8,
             _bitfield_1: bpf_insn::new_bitfield_1(dst, src),
@@ -178,12 +221,12 @@ impl Assembler {
                 .get(label.0)
                 .and_then(|target| *target)
                 .with_context(|| format!("unresolved jump label ordinal {}", label.0))?;
-            let delta = target as isize - index as isize - 1;
-            ensure!(
-                i16::try_from(delta).is_ok(),
-                "routing jump out of range: {index} -> {target}"
-            );
-            self.insns[index].off = delta as i16;
+            let delta = i64::try_from(target)?
+                .checked_sub(i64::try_from(index)?)
+                .and_then(|delta| delta.checked_sub(1))
+                .context("routing jump offset overflow")?;
+            self.insns[index].off = i16::try_from(delta)
+                .with_context(|| format!("routing jump out of range: {index} -> {target}"))?;
         }
         Ok(RoutingBytecode {
             insns: self.insns,
@@ -250,8 +293,9 @@ impl Assembler {
 /// (Destination/Source/MAC). Kept in R8, which callee-saves across the
 /// lookup helper; it says this call already resolved the category, not
 /// that the emitter merely emitted a lookup somewhere.
+/// Gateway DNS shadow reserves bit 3 for its caller-provided domain bitmap.
 ///
-/// The verifier must not see its initial value as a constant. Initialized
+/// Outside gateway DNS shadow, the verifier must not see an initial constant:
 /// with `mov 0` it is one precise value per resolution history, states
 /// with different values cannot subsume each other, and every later
 /// process-name chain is walked once per value: the #280 policy cost
@@ -271,20 +315,136 @@ pub fn emit_routing_program(
     plan: &RoutingPushPlan,
     fds: RoutingMapFds,
 ) -> anyhow::Result<RoutingBytecode> {
-    validate_plan(plan)?;
+    emit_routing_program_inner(plan, fds, false, false, false, true)
+}
+
+/// Host callers reserve the output's unused trace payload as scratch under their busy guard.
+/// This shares canonical routing while leaving no additional BPF stack frame or trace output.
+pub fn emit_host_routing_program(
+    plan: &RoutingPushPlan,
+    fds: RoutingMapFds,
+) -> anyhow::Result<RoutingBytecode> {
+    emit_routing_program_inner(plan, fds, true, false, false, true)
+}
+
+/// Emit gateway classification using canonical predicates and map-backed scratch.
+/// The caller supplies a complete TCP SYN/UDP input and owns the scratch busy guard.
+/// Host supplies a normalized pname and length. LAN and auxiliary inputs always
+/// have Missing process identity. The caller captures Rule-mode direct authority
+/// in the input's ALLOW_DIRECT_FINALITY bit.
+pub fn emit_gateway_routing_program(
+    plan: &RoutingPushPlan,
+    fds: RoutingMapFds,
+    dns_shadow: bool,
+    allow_process: bool,
+) -> std::io::Result<GatewayBytecode> {
+    let bytecode = emit_routing_program_inner(
+        plan,
+        fds,
+        true,
+        true,
+        dns_shadow && plan.has_domain_rules,
+        allow_process,
+    )
+    .map_err(std::io::Error::other)?;
+    Ok(GatewayBytecode {
+        insns: bytecode.insns,
+        source_lines: bytecode.lines,
+        fingerprint: plan.fingerprint,
+    })
+}
+
+fn emit_gateway_terminal(
+    asm: &mut Assembler,
+    action: KernelAction,
+    dial_mode: DialMode,
+    dns_shadow: bool,
+) -> anyhow::Result<()> {
+    let direct = action.outbound == honk_ebpf_common::OutboundIndex::Direct as u8
+        && !action.mark.is_some_and(|mark| mark != 0);
+    if !direct {
+        asm.mov_imm(R0, 0)?;
+        return asm.exit();
+    }
+    let denied = asm.label();
+    let check_port = !action.must || dns_shadow;
+    let allowed = asm.label();
+    if action.must && dns_shadow {
+        let dns = asm.label();
+        asm.jump(BPF_JSET, READY, GATEWAY_DNS_READY, dns)?;
+        asm.ja(allowed)?;
+        asm.bind(dns);
+    }
+    if !action.must {
+        asm.ldx_w(R0, R6, INPUT_FLAGS)?;
+        asm.and_imm(R0, ROUTING_INPUT_ALLOW_DIRECT_FINALITY as i32)?;
+        asm.jump(BPF_JEQ, R0, 0, denied)?;
+        let skip_domain_final = (dns_shadow && dial_mode == DialMode::Ip).then(|| asm.label());
+        if dns_shadow {
+            asm.jump(
+                BPF_JSET,
+                READY,
+                GATEWAY_DNS_READY,
+                skip_domain_final.unwrap_or(denied),
+            )?;
+        }
+        asm.ldx_w(R0, R7, DOMAIN_FINAL)?;
+        asm.jump(BPF_JEQ, R0, 0, denied)?;
+        if let Some(skip) = skip_domain_final {
+            asm.bind(skip);
+        }
+    }
+    if check_port {
+        asm.ldx_w(R0, R6, INPUT_DST_PORT)?;
+        asm.jump(BPF_JEQ, R0, 53, denied)?;
+    }
+    asm.bind(allowed);
+    asm.mov_imm(R0, 1)?;
+    asm.exit()?;
+    if check_port {
+        asm.bind(denied);
+        asm.mov_imm(R0, 0)?;
+        asm.exit()?;
+    }
+    Ok(())
+}
+
+fn validate_map_fds(fds: &RoutingMapFds, domain: bool) -> anyhow::Result<()> {
     for (name, fd) in [
         ("destination_v4", fds.destination_v4),
         ("destination_v6", fds.destination_v6),
         ("source_v4", fds.source_v4),
         ("source_v6", fds.source_v6),
         ("mac", fds.mac),
-        ("domain", fds.domain),
     ] {
         ensure!(fd >= 0, "invalid {name} routing map fd {fd}");
     }
+    ensure!(
+        !domain || fds.domain >= 0,
+        "invalid domain routing map fd {}",
+        fds.domain
+    );
+    Ok(())
+}
+
+fn emit_routing_program_inner(
+    plan: &RoutingPushPlan,
+    fds: RoutingMapFds,
+    host_scratch: bool,
+    gateway: bool,
+    dns_shadow: bool,
+    allow_process: bool,
+) -> anyhow::Result<RoutingBytecode> {
+    validate_plan(plan)?;
+    validate_map_fds(&fds, !gateway)?;
 
     let mut asm = Assembler::new();
-    asm.trace_layout = plan.trace_layout();
+    asm.host_scratch = host_scratch;
+    asm.trace_layout = if host_scratch {
+        None
+    } else {
+        plan.trace_layout()
+    };
     asm.source(0, "routing function prologue");
     for register in [R1, R2] {
         let nonnull = asm.label();
@@ -295,9 +455,14 @@ pub fn emit_routing_program(
     }
     asm.mov_reg(R6, R1)?;
     asm.mov_reg(R7, R2)?;
+    if asm.host_scratch {
+        asm.mov_reg(R9, R2)?;
+        asm.add_imm(R9, i32::from(HOST_SCRATCH_END))?;
+    }
     asm.st_imm(R7, DIRECT_MARK_INDEX, u32::MAX as i32)?;
     asm.st_imm(R7, OUTBOUND, plan.fallback.outbound as i32)?;
     asm.st_imm(R7, MARK, 0)?;
+    asm.st_imm(R7, MARK_KIND, ROUTING_MARK_KEEP as i32)?;
     asm.st_imm(R7, MUST, 0)?;
     asm.st_imm(
         R7,
@@ -305,7 +470,12 @@ pub fn emit_routing_program(
         (!plan.has_domain_rules || plan.features & ROUTING_FEATURE_DOMAIN_REROUTE == 0) as i32,
     )?;
     asm.st_imm(R7, RULE_ID, u32::MAX as i32)?;
-    asm.ldx_w(READY, R7, MARK)?;
+    if dns_shadow {
+        // The trusted call sites pass constants so the verifier can prune the DNS branches.
+        asm.mov_reg(READY, R3)?;
+    } else {
+        asm.ldx_w(READY, R7, MARK)?;
+    }
     for kind in [FactKind::Destination, FactKind::Source, FactKind::Mac] {
         for word in 0..FACT_BYTES / 8 {
             asm.ldx_w(R1, R7, MARK)?;
@@ -314,7 +484,7 @@ pub fn emit_routing_program(
     }
     emit_trace_init(&mut asm)?;
 
-    if plan.has_domain_rules {
+    if plan.has_domain_rules && !gateway {
         emit_fact_lookup(&mut asm, FactKind::Domain, &fds)?;
     }
 
@@ -331,10 +501,56 @@ pub fn emit_routing_program(
         asm.source(rule.id + 1, rule.source.as_str());
         let fail = asm.label();
         let mut conditional = false;
-        for (rank, (_, condition)) in rule.runtime_conditions().enumerate() {
+        let mut missing_process = false;
+        let mut domain_barrier = false;
+        let conditions = rule.runtime_conditions();
+        let gateway_domain = gateway
+            && conditions
+                .clone()
+                .any(|(_, condition)| matches!(condition.predicate, KernelPredicate::Domain(_)));
+        domain_prefix |= gateway_domain;
+        // An unavailable domain need not defer a rule the Host process has already excluded.
+        let process_first =
+            gateway_domain && allow_process && plan.features & ROUTING_FEATURE_PROCESS != 0;
+        let early = |(_, condition): &(usize, &KernelCondition)| {
+            condition.predicate.is_port()
+                || matches!(condition.predicate, KernelPredicate::ProcessName(_))
+        };
+        let conditions = process_first
+            .then(|| conditions.clone().filter(early))
+            .into_iter()
+            .flatten()
+            .chain(conditions.filter(|condition| !process_first || !early(condition)));
+        for (rank, (_, condition)) in conditions.enumerate() {
             domain_prefix |= matches!(condition.predicate, KernelPredicate::Domain(_));
+            if gateway {
+                match condition.predicate {
+                    KernelPredicate::Domain(_) => {
+                        if dns_shadow {
+                            let ready = asm.label();
+                            asm.jump(BPF_JSET, READY, GATEWAY_DNS_READY, ready)?;
+                            asm.mov_imm(R0, GATEWAY_ROUTE_NEED_DNS)?;
+                            asm.exit()?;
+                            asm.bind(ready);
+                        } else {
+                            domain_barrier = true;
+                            break;
+                        }
+                    }
+                    KernelPredicate::ProcessName(_) if !allow_process => {
+                        if !condition.not {
+                            asm.ja(fail)?;
+                            conditional = true;
+                            missing_process = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             let pass = asm.label();
-            if plan.trace_enabled {
+            if asm.trace_layout.is_some() {
                 let missed = asm.label();
                 emit_condition(&mut asm, condition, pass, missed, &fds)?;
                 asm.bind(missed);
@@ -347,16 +563,26 @@ pub fn emit_routing_program(
             asm.bind(pass);
             emit_trace_outcome(&mut asm, rule_slot + 1 + rank, ROUTE_TRACE_MATCHED)?;
         }
-        emit_trace_outcome(&mut asm, rule_slot, ROUTE_TRACE_MATCHED)?;
-        emit_action(
-            &mut asm,
-            rule.action,
-            Some(rule.id),
-            domain_reroute && !domain_prefix,
-        )?;
-        emit_trace_or(&mut asm, TRACE_FLAGS, ROUTE_TRACE_COMPLETE)?;
-        asm.mov_imm(R0, 0)?;
-        asm.exit()?;
+        if domain_barrier {
+            // Current domain facts cannot prove that a future sniffed domain will miss.
+            asm.mov_imm(R0, 0)?;
+            asm.exit()?;
+        } else if !missing_process {
+            emit_trace_outcome(&mut asm, rule_slot, ROUTE_TRACE_MATCHED)?;
+            emit_action(
+                &mut asm,
+                rule.action,
+                Some(rule.id),
+                domain_reroute && !domain_prefix,
+            )?;
+            emit_trace_or(&mut asm, TRACE_FLAGS, ROUTE_TRACE_COMPLETE)?;
+            if gateway {
+                emit_gateway_terminal(&mut asm, rule.action, plan.dial_mode, dns_shadow)?;
+            } else {
+                asm.mov_imm(R0, 0)?;
+                asm.exit()?;
+            }
+        }
         if !conditional {
             return asm.finish();
         }
@@ -364,7 +590,7 @@ pub fn emit_routing_program(
         emit_trace_outcome(&mut asm, rule_slot, ROUTE_TRACE_NOT_MATCHED)?;
     }
 
-    // The prologue's zero MARK seeds READY, so fallback options are stored only here.
+    // Keep the prologue's zero MARK available to seed lazy fact areas.
     asm.source(0, "fallback");
     emit_trace_outcome(&mut asm, trace_slot, ROUTE_TRACE_MATCHED)?;
     emit_action(
@@ -374,8 +600,12 @@ pub fn emit_routing_program(
         domain_reroute && !domain_prefix,
     )?;
     emit_trace_or(&mut asm, TRACE_FLAGS, ROUTE_TRACE_COMPLETE)?;
-    asm.mov_imm(R0, 0)?;
-    asm.exit()?;
+    if gateway {
+        emit_gateway_terminal(&mut asm, plan.fallback, plan.dial_mode, dns_shadow)?;
+    } else {
+        asm.mov_imm(R0, 0)?;
+        asm.exit()?;
+    }
     asm.finish()
 }
 
@@ -399,9 +629,16 @@ fn emit_action(
     if rule_id.is_some() {
         asm.st_imm(R7, OUTBOUND, action.outbound as i32)?;
     }
-    if rule_id.is_some() || action.mark != 0 {
-        asm.st_imm(R7, MARK, action.mark as i32)?;
-    }
+    asm.st_imm(R7, MARK, action.mark.unwrap_or(0) as i32)?;
+    asm.st_imm(
+        R7,
+        MARK_KIND,
+        if action.mark.is_some() {
+            ROUTING_MARK_SET
+        } else {
+            ROUTING_MARK_KEEP
+        } as i32,
+    )?;
     if rule_id.is_some() || action.must {
         asm.st_imm(R7, MUST, action.must as i32)?;
     }
@@ -695,6 +932,10 @@ fn emit_port_ranges(
 ) -> anyhow::Result<()> {
     asm.ldx_w(R0, R6, offset)?;
     for range in ranges {
+        if range.start == range.end {
+            asm.jump(BPF_JEQ, R0, range.start as i32, on_true)?;
+            continue;
+        }
         let next = asm.label();
         let inside = asm.label();
         asm.jump(BPF_JGE, R0, range.start as i32, inside)?;
