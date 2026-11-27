@@ -26,6 +26,17 @@ fn new_reactor(max_slots: usize, budget: &Arc<MemoryBudget>) -> DirectReactor {
     DirectReactor::new(max_slots, |bytes| budget.reserve(bytes)).unwrap()
 }
 
+fn attach_flow(
+    reactor: &mut DirectReactor,
+    id: FlowId,
+    attach: DirectAttach,
+    now: Instant,
+) -> DirectHandle {
+    reactor
+        .attach(id, attach, now)
+        .unwrap_or_else(|_| panic!("Direct fixture attachment refused"))
+}
+
 fn attach(budget: &Arc<MemoryBudget>) -> (DirectAttach, DirectObserver, TcpStream, RelayProgress) {
     attach_with_live_observation(budget, true)
 }
@@ -103,42 +114,98 @@ fn owned_kernel_ready(reactor: &DirectReactor) -> bool {
     )
 }
 
-#[tokio::test]
-async fn stale_epoll_event_and_abort_do_not_schedule_a_reused_slot() {
-    let mut stack = client();
+#[test]
+fn stale_epoll_ready_and_abort_do_not_schedule_a_reused_slot() {
+    let (mut client, old_client, mut stack, old, mut now) = connected();
     let budget = MemoryBudget::new(1 << 20);
     let mut reactor = new_reactor(1, &budget);
-    let (a, mut first, mut peer, _) = attach(&budget);
-    let old = connect(&mut stack);
-    let now = Instant::now();
-    assert!(reactor.attach(old, a, now).is_ok());
-    let token = u64::from(reactor.slots[0].generation) << 32;
-    reactor.abort(old);
+    let (attachment, mut first, mut peer, _) = attach(&budget);
+    let stale = attach_flow(&mut reactor, old, attachment, now);
+    let token = reactor
+        .epoll
+        .token(reactor.slots[stale.index].watch_generation, stale.index);
+    reactor.abort(stale);
+    assert_eq!(reactor.live_index(stale), None);
     assert_eq!(reactor.epoll_waiters, 0);
     assert!(!owned_kernel_ready(&reactor));
     assert!(matches!(
-        poll_fn(|cx| first.poll_update(cx)).await.1,
+        expect_update(&mut first).1,
         Some(DirectOutcome::Cancelled)
     ));
     assert_eq!(peer.read(&mut [0]).unwrap(), 0);
-    let (a, mut successor, _peer, _) = attach(&budget);
-    let new = connect(&mut stack);
-    assert!(reactor.attach(new, a, now).is_ok());
-    assert!(poll_fn(|cx| successor.poll_update(cx)).await.0.attached);
+
+    client.tcp_abort(old_client);
+    now += Duration::from_millis(10);
+    transfer(&mut client, &mut stack, now);
+    stack.tcp_close(old);
+    assert!(!stack.tcp_retained(old));
+    let new_client = client
+        .tcp_connect(now, "198.51.100.2:443".parse().unwrap())
+        .unwrap();
+    now += Duration::from_millis(10);
+    transfer(&mut client, &mut stack, now);
+    let new = stack.poll_accept().unwrap().id;
+    assert_eq!(new.index(), old.index());
+    assert_ne!(new, old);
+    stack.tcp_accept(new, AcceptOpts::default()).unwrap();
+    transfer(&mut stack, &mut client, now);
+    transfer(&mut client, &mut stack, now);
+    assert_eq!(stack.tcp_state(new), Some(TcpState::Established));
+
+    let (attachment, mut successor, mut peer, _) = attach(&budget);
+    let current = attach_flow(&mut reactor, new, attachment, now);
+    assert_eq!(current.index, stale.index);
+    assert!(expect_update(&mut successor).0.attached);
     reactor.service(&mut stack, now).unwrap();
     assert!(reactor.ready.is_empty());
+    assert_eq!(reactor.live_index(stale), None);
+    assert_eq!(reactor.live_index(current), Some(current.index));
+    assert!(reactor.watched_pump(token).is_none());
     reactor.socket_ready(token, libc::EPOLLIN as u32);
-    reactor.abort(old);
+    reactor.mark_ready(stale);
+    reactor.abort(stale);
     assert!(reactor.ready.is_empty());
     assert_eq!(reactor.epoll_waiters, 1);
-    assert!(reactor.by_flow.contains_key(&new));
+    assert_eq!(reactor.live_index(current), Some(current.index));
+
+    assert_eq!(client.tcp_write(new_client, b"new"), Ok(3));
+    now += Duration::from_millis(10);
+    deliver_client_turn(&mut client, &mut stack, &mut reactor, (new, current), now);
+    let mut received = [0; 3];
+    peer.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"new");
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(first.poll_update(&mut cx).is_pending());
     reactor.close();
     assert_eq!(reactor.epoll_waiters, 0);
     assert!(!reactor.has_pending_work());
     assert!(matches!(
-        poll_fn(|cx| successor.poll_update(cx)).await.1,
+        expect_update(&mut successor).1,
         Some(DirectOutcome::Cancelled)
     ));
+}
+
+#[test]
+fn exhausted_software_generation_retires_the_slot() {
+    let mut stack = client();
+    let budget = MemoryBudget::new(1 << 20);
+    let mut reactor = new_reactor(2, &budget);
+    let now = Instant::now();
+    reactor.slots[0].generation = u64::MAX - 1;
+    let (attachment, _, _, _) = attach(&budget);
+    let last = attach_flow(&mut reactor, connect(&mut stack), attachment, now);
+    assert_eq!(last.index, 0);
+    assert_eq!(last.generation, u64::MAX);
+    assert_eq!(reactor.live_index(last), Some(0));
+    reactor.abort(last);
+    assert_eq!(reactor.live_index(last), None);
+    assert_eq!(reactor.free, [1]);
+
+    let (attachment, _, _, _) = attach(&budget);
+    let next = attach_flow(&mut reactor, connect(&mut stack), attachment, now);
+    assert_eq!(next.index, 1);
+    assert_eq!(next.generation, 1);
+    assert_eq!(reactor.live_index(next), Some(1));
 }
 
 #[test]
@@ -149,11 +216,11 @@ fn close_discards_ready_entries_and_cancels_the_remaining_pump() {
     let now = Instant::now();
     let old = connect(&mut stack);
     let (first, _, _first_peer, _) = attach(&budget);
-    assert!(reactor.attach(old, first, now).is_ok());
+    let handle = attach_flow(&mut reactor, old, first, now);
 
     let (second, mut observer, mut peer, _) = attach(&budget);
     assert!(reactor.attach(connect(&mut stack), second, now).is_ok());
-    reactor.abort(old);
+    reactor.abort(handle);
     assert!(expect_update(&mut observer).0.attached);
     assert!(reactor.has_pending_work());
     reactor.close();
@@ -199,11 +266,12 @@ fn deliver_client(
     client: &mut Stack,
     server: &mut Stack,
     reactor: &mut DirectReactor,
+    binding: (FlowId, DirectHandle),
     now: &mut Instant,
 ) {
     for _ in 0..8 {
         *now += Duration::from_millis(10);
-        deliver_client_turn(client, server, reactor, *now);
+        deliver_client_turn(client, server, reactor, binding, *now);
     }
 }
 
@@ -211,14 +279,25 @@ fn deliver_client_turn(
     client: &mut Stack,
     server: &mut Stack,
     reactor: &mut DirectReactor,
+    binding: (FlowId, DirectHandle),
     now: Instant,
 ) {
     transfer(client, server, now);
-    while let Some((id, _)) = server.poll_event() {
-        reactor.mark_ready(id);
-    }
+    mark_stack_events(server, reactor, binding);
     reactor.service(server, now).unwrap();
     transfer(server, client, now);
+}
+
+fn mark_stack_events(
+    server: &mut Stack,
+    reactor: &mut DirectReactor,
+    (flow, handle): (FlowId, DirectHandle),
+) {
+    while let Some((id, _)) = server.poll_event() {
+        if id == flow {
+            reactor.mark_ready(handle);
+        }
+    }
 }
 
 #[tokio::test]
@@ -227,11 +306,17 @@ async fn half_closed_client_receives_every_byte_across_partial_ring_credits() {
     let budget = MemoryBudget::new(1 << 20);
     let mut reactor = new_reactor(1, &budget);
     let (a, mut observer, mut peer, counters) = attach(&budget);
-    assert!(reactor.attach(id, a, now).is_ok());
+    let handle = attach_flow(&mut reactor, id, a, now);
     let request = b"complete request before FIN";
     assert_eq!(client.tcp_write(client_id, request).unwrap(), request.len());
     client.tcp_shutdown(client_id).unwrap();
-    deliver_client(&mut client, &mut server, &mut reactor, &mut now);
+    deliver_client(
+        &mut client,
+        &mut server,
+        &mut reactor,
+        (id, handle),
+        &mut now,
+    );
     let mut received = Vec::new();
     peer.read_to_end(&mut received).unwrap();
     assert_eq!(received, request);
@@ -277,9 +362,7 @@ async fn half_closed_client_receives_every_byte_across_partial_ring_credits() {
             }
         }
         transfer(&mut client, &mut server, now);
-        while let Some((ready, _)) = server.poll_event() {
-            reactor.mark_ready(ready);
-        }
+        mark_stack_events(&mut server, &mut reactor, (id, handle));
         reactor.poll_ready(&mut cx).unwrap();
         reactor.service(&mut server, now).unwrap();
         if eof {
@@ -306,7 +389,7 @@ async fn upstream_fin_allows_client_to_finish_its_request() {
     let mut reactor = new_reactor(1, &budget);
     let (a, mut observer, mut peer, _) = attach(&budget);
     peer.shutdown(Shutdown::Write).unwrap();
-    assert!(reactor.attach(id, a, now).is_ok());
+    let handle = attach_flow(&mut reactor, id, a, now);
     tokio::time::timeout(
         Duration::from_secs(2),
         poll_fn(|cx| {
@@ -327,7 +410,13 @@ async fn upstream_fin_allows_client_to_finish_its_request() {
     let request = b"late request";
     assert_eq!(client.tcp_write(client_id, request).unwrap(), request.len());
     client.tcp_shutdown(client_id).unwrap();
-    deliver_client(&mut client, &mut server, &mut reactor, &mut now);
+    deliver_client(
+        &mut client,
+        &mut server,
+        &mut reactor,
+        (id, handle),
+        &mut now,
+    );
     let mut bytes = Vec::new();
     peer.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, request);
@@ -375,10 +464,16 @@ async fn reset_retains_original_error_and_socket_side() {
         let budget = MemoryBudget::new(1 << 20);
         let mut reactor = new_reactor(1, &budget);
         let (a, mut observer, peer, _) = attach(&budget);
-        assert!(reactor.attach(id, a, now).is_ok());
+        let handle = attach_flow(&mut reactor, id, a, now);
         if client_reset {
             client.tcp_abort(client_id);
-            deliver_client(&mut client, &mut server, &mut reactor, &mut now);
+            deliver_client(
+                &mut client,
+                &mut server,
+                &mut reactor,
+                (id, handle),
+                &mut now,
+            );
         } else {
             socket2::SockRef::from(&peer)
                 .set_linger(Some(Duration::ZERO))
@@ -430,7 +525,7 @@ fn quiet_flow_reports_accepted_bytes_and_an_idle_half_close_expires() {
         let (attach, mut observer, mut peer, counters) =
             attach_with_live_observation(&budget, observe_live);
         let started = stack_now.max(Instant::now());
-        assert!(reactor.attach(id, attach, started).is_ok());
+        let handle = attach_flow(&mut reactor, id, attach, started);
         let (accepted, outcome) = expect_update(&mut observer);
         assert!(accepted.attached && outcome.is_none());
         assert_eq!(accepted.upload, 0);
@@ -438,7 +533,13 @@ fn quiet_flow_reports_accepted_bytes_and_an_idle_half_close_expires() {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let first_at = started + Duration::from_millis(10);
         assert_eq!(client.tcp_write(client_id, b"a"), Ok(1));
-        deliver_client_turn(&mut client, &mut server, &mut reactor, first_at);
+        deliver_client_turn(
+            &mut client,
+            &mut server,
+            &mut reactor,
+            (id, handle),
+            first_at,
+        );
         assert_eq!(counters.upload.load(Ordering::Relaxed), 1);
         if observe_live {
             let (first, outcome) = expect_update(&mut observer);
@@ -452,7 +553,13 @@ fn quiet_flow_reports_accepted_bytes_and_an_idle_half_close_expires() {
 
         let second_at = first_at + Duration::from_millis(10);
         assert_eq!(client.tcp_write(client_id, b"b"), Ok(1));
-        deliver_client_turn(&mut client, &mut server, &mut reactor, second_at);
+        deliver_client_turn(
+            &mut client,
+            &mut server,
+            &mut reactor,
+            (id, handle),
+            second_at,
+        );
         let outbound = &counters.outbound.as_ref().unwrap().tx_bytes;
         assert_eq!(counters.upload.load(Ordering::Relaxed), 2);
         assert_eq!(outbound.load(Ordering::Relaxed), 2);
@@ -478,15 +585,14 @@ fn quiet_flow_reports_accepted_bytes_and_an_idle_half_close_expires() {
         assert_eq!(client.tcp_write(client_id, b"c"), Ok(1));
         client.tcp_shutdown(client_id).unwrap();
         let earliest_drain = fin_at.max(Instant::now()) + DRAIN_DEADLINE;
-        deliver_client_turn(&mut client, &mut server, &mut reactor, fin_at);
+        deliver_client_turn(&mut client, &mut server, &mut reactor, (id, handle), fin_at);
         let latest_drain = fin_at.max(Instant::now()) + DRAIN_DEADLINE;
         let mut request = Vec::new();
         peer.read_to_end(&mut request).unwrap();
         assert_eq!(request, b"abc");
         assert!(observer.poll_update(&mut cx).is_pending());
 
-        let index = reactor.by_flow[&id];
-        let drain_at = reactor.slots[index].timers[DRAIN].deadline.unwrap();
+        let drain_at = reactor.slots[handle.index].timers[DRAIN].deadline.unwrap();
         assert!((earliest_drain..=latest_drain).contains(&drain_at));
         reactor.service(&mut server, drain_at).unwrap();
         let (snapshot, outcome) = expect_update(&mut observer);
@@ -516,7 +622,7 @@ fn drain_arm_and_renewal_allow_full_idle_time_after_an_old_turn() {
     let old_turn = Instant::now() - Duration::from_secs(1);
     peer.shutdown(Shutdown::Write).unwrap();
     wait_for_fd(attach.socket.as_raw_fd(), libc::POLLRDHUP);
-    assert!(reactor.attach(id, attach, old_turn).is_ok());
+    let handle = attach_flow(&mut reactor, id, attach, old_turn);
     assert!(expect_update(&mut observer).0.attached);
 
     let before_fin = Instant::now();
@@ -531,7 +637,7 @@ fn drain_arm_and_renewal_allow_full_idle_time_after_an_old_turn() {
     assert_eq!(client.tcp_write(client_id, b"survivor"), Ok(8));
     stack_now += Duration::from_millis(10);
     transfer(&mut client, &mut server, stack_now);
-    reactor.mark_ready(id);
+    reactor.mark_ready(handle);
 
     let before_upload = Instant::now();
     reactor.service(&mut server, old_turn).unwrap();
@@ -558,9 +664,15 @@ async fn upstream_reset_while_client_fin_and_stack_credit_held() {
         let budget = MemoryBudget::new(1 << 20);
         let mut reactor = new_reactor(1, &budget);
         let (attach, mut observer, mut peer, counters) = attach(&budget);
-        assert!(reactor.attach(id, attach, now).is_ok());
+        let handle = attach_flow(&mut reactor, id, attach, now);
         client.tcp_shutdown(client_id).unwrap();
-        deliver_client(&mut client, &mut server, &mut reactor, &mut now);
+        deliver_client(
+            &mut client,
+            &mut server,
+            &mut reactor,
+            (id, handle),
+            &mut now,
+        );
         assert_eq!(peer.read(&mut [0]).unwrap(), 0);
 
         // The first chunk fits the Stack. Leave the extra byte buffered in the socket.
@@ -584,7 +696,7 @@ async fn upstream_reset_while_client_fin_and_stack_credit_held() {
             server.tcp_reserve_tx(id, 1, |_| panic!("Stack must be full")),
             Err(StreamError::WouldBlock)
         ));
-        let index = reactor.by_flow[&id];
+        let index = handle.index;
         let pump = reactor.slots[index].pump.as_ref().unwrap();
         let mut tail = [0];
         assert_eq!(pump.socket.peek(&mut tail).unwrap(), 1);
@@ -608,12 +720,18 @@ async fn upstream_reset_while_client_fin_and_stack_credit_held() {
         assert!(!reactor.service(&mut server, now).unwrap());
         wait_for_fd(reactor.epoll.as_raw_fd(), libc::POLLIN);
         assert!(
-            reactor.by_flow.contains_key(&id),
+            reactor.live_index(handle).is_some(),
             "credit pressure must preserve the buffered byte"
         );
         if release_credit {
             // A real client ACK restores credit. readv must deliver the tail before the reset.
-            deliver_client(&mut client, &mut server, &mut reactor, &mut now);
+            deliver_client(
+                &mut client,
+                &mut server,
+                &mut reactor,
+                (id, handle),
+                &mut now,
+            );
         } else {
             // Expire the drain deadline while withholding every client ACK.
             now = reactor.slots[index].timers[DRAIN].deadline.unwrap();
@@ -637,7 +755,7 @@ async fn upstream_reset_while_client_fin_and_stack_credit_held() {
         assert_eq!(snapshot.download, expected);
         assert_eq!(counters.download.load(Ordering::Relaxed), expected);
         assert_eq!(snapshot.upload, 0);
-        assert!(!reactor.by_flow.contains_key(&id));
+        assert_eq!(reactor.live_index(handle), None);
         assert!(
             observer
                 .poll_update(&mut Context::from_waker(futures::task::noop_waker_ref()))

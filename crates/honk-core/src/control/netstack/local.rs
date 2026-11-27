@@ -1,14 +1,14 @@
 //! Device-owned protocol state. The shared endpoint carries commands and original output receipts.
+use super::remote::RemoteChunkPool;
 use super::*;
 use crate::connection_tracker::CloseSignal;
 use crate::sniffing::{MAX_CLIENT_HELLO_SIZE, SNIFF_TIMEOUT, SniffResult};
 use crate::xdp::worker::{
     PeerHold,
-    direct::{DirectAttach, DirectReactor},
+    direct::{DirectAttach, DirectHandle, DirectReactor},
 };
 use futures::task::AtomicWaker;
 use honk_netstack::{StreamError, TcpState};
-use remote::RemoteChunkPool;
 use std::collections::{BTreeMap, HashMap, HashSet, LinkedList, VecDeque};
 use std::sync::{
     Weak,
@@ -29,7 +29,7 @@ const TERMINAL: u8 = 2;
 const RETIRED: u8 = 4;
 const CANCELLED: u8 = 8;
 const FAILED: u8 = 16;
-const FLOW_SIGNAL_BYTES: usize = size_of::<FlowSignal>() + size_of::<Binding>() + 384;
+const FLOW_SIGNAL_BYTES: usize = size_of::<FlowSignal>() + 384;
 
 struct Reply {
     source: SocketAddr,
@@ -193,7 +193,69 @@ impl LocalShared {
     }
 }
 
-pub(super) type SlotIndex = FlowIdMap<usize>;
+pub(super) struct SlotIndex {
+    active: Box<[Option<(FlowId, usize)>]>,
+    retiring_aliases: FlowIdMap<usize>,
+    len: usize,
+    limit: usize,
+}
+
+impl SlotIndex {
+    fn new(max_slots: usize, frames: usize) -> Self {
+        let limit = max_slots + frames;
+        Self {
+            active: vec![None; max_slots].into_boxed_slice(),
+            retiring_aliases: FlowIdMap::with_capacity_and_hasher(limit, Default::default()),
+            len: 0,
+            limit,
+        }
+    }
+
+    fn active(&self, id: &FlowId) -> Option<&usize> {
+        let (current, index) = self.active.get(id.index())?.as_ref()?;
+        (current == id).then_some(index)
+    }
+
+    pub(super) fn get(&self, id: &FlowId) -> Option<&usize> {
+        self.active(id).or_else(|| self.retiring_aliases.get(id))
+    }
+
+    pub(super) fn insert(&mut self, id: FlowId, index: usize) {
+        assert!(self.len < self.limit, "funded flow metadata full");
+        if let Some((old, old_index)) = self.active[id.index()].replace((id, index)) {
+            // A reused protocol slot can still owe a queued control or an exported frame.
+            assert_ne!(old, id);
+            assert!(self.retiring_aliases.insert(old, old_index).is_none());
+        }
+        self.len += 1;
+    }
+
+    fn move_to_alias(&mut self, id: FlowId) {
+        if let Some(index) = self.active(&id).copied() {
+            self.active[id.index()] = None;
+            assert!(self.retiring_aliases.insert(id, index).is_none());
+        }
+    }
+
+    fn remove(&mut self, id: &FlowId) {
+        if self.active(id).is_some() {
+            self.active[id.index()] = None;
+        } else {
+            assert!(self.retiring_aliases.remove(id).is_some());
+        }
+        self.len -= 1;
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+enum FlowWork {
+    App,
+    Protocol(Ready),
+    Deadline,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum LocalTurn {
@@ -206,7 +268,7 @@ pub(crate) struct LocalOwner {
     pub(super) inner: Inner,
     pub(super) turn: LocalTurn,
     direct: DirectReactor,
-    flows: FlowIdMap<Binding>,
+    bindings: Box<[Option<Binding>]>,
     tuples: HashMap<(SocketAddr, SocketAddr), FlowId>,
     retiring: Vec<FlowId>,
     writer_retry: Option<Instant>,
@@ -219,7 +281,7 @@ pub(crate) struct LocalOwner {
 struct Binding {
     handle: LocalFlow,
     remote: Option<remote::RemoteOwner>,
-    direct: bool,
+    direct: Option<DirectHandle>,
     closing: bool,
     deadline: Option<Instant>,
     sniff: Option<oneshot::Sender<io::Result<SniffResult>>>,
@@ -547,9 +609,9 @@ impl PacketDriver {
             parked.rights = Rights::Abandoned;
         }
         shared.pool.close();
-        owner.direct.close();
+        owner.close_direct();
         shared.shutdown(true);
-        for binding in owner.flows.values_mut() {
+        for binding in owner.bindings.iter_mut().flatten() {
             let state = &binding.handle.0;
             let on_failure = {
                 let mut pending = state.callback.lock();
@@ -599,8 +661,9 @@ impl PacketDriver {
             owner
                 .tuples
                 .get(&(client, destination))
-                .and_then(|id| owner.flows.get(id))
-                .is_some_and(|binding| binding.direct)
+                .and_then(|id| owner.active_slot(*id))
+                .and_then(|index| owner.bindings[index].as_ref())
+                .is_some_and(|binding| binding.direct.is_some())
         })
     }
     pub(crate) fn make_local(&mut self, total_pools: usize) -> io::Result<()> {
@@ -638,6 +701,7 @@ impl PacketDriver {
         let budget = &shared.budget;
         let pool = RemoteChunkPool::new(budget, total_pools)?;
         let slots = guard.slots.len();
+        let max_slots = guard.half_open.len();
         let frames = guard.frames.len();
         let peers = guard.peers.len();
         let ancillary = guard
@@ -655,7 +719,7 @@ impl PacketDriver {
             })
             .ok_or_else(capacity)?;
         let memory = pool.reserve(bytes).ok_or_else(capacity)?;
-        let direct = DirectReactor::new(guard.half_open.len(), |bytes| pool.reserve(bytes))?;
+        let direct = DirectReactor::new(max_slots, |bytes| pool.reserve(bytes))?;
         // The parked scope still owns plain SourceWork counters and its original join right.
         // A closed ledger refuses all shared output grants while the physical device owns its pool.
         let ledger_config = FrameConfig {
@@ -748,10 +812,7 @@ impl PacketDriver {
         };
         let mut inner = std::mem::replace(&mut *guard, parked);
         std::mem::swap(&mut inner.source_work, &mut guard.source_work);
-        inner.local_slots = Some(FlowIdMap::with_capacity_and_hasher(
-            slots,
-            Default::default(),
-        ));
+        inner.local_slots = Some(SlotIndex::new(max_slots, frames));
         inner.local_pending = Vec::with_capacity(inner.half_open.len());
         inner.local_peers = Some(LocalPeers::new(
             peers,
@@ -763,7 +824,7 @@ impl PacketDriver {
             inner,
             turn: LocalTurn::Idle,
             direct,
-            flows: FlowIdMap::with_capacity_and_hasher(slots, Default::default()),
+            bindings: (0..slots).map(|_| None).collect(),
             tuples: HashMap::with_capacity(slots),
             retiring: Vec::with_capacity(slots),
             writer_retry: None,
@@ -828,6 +889,7 @@ impl PacketDriver {
         let source = packet_source(packet);
         let shared = self.scope.0.local.get().expect("physical owner");
         let _source_update = shared.source_update(source);
+        let budget = &self.scope.0.budget;
         let floor = owner
             .inner
             .stack
@@ -848,13 +910,7 @@ impl PacketDriver {
                     && source
                         .tcp_flags
                         .is_some_and(|flags| flags & (SYN | ACK | RST | FIN) == SYN)
-                    && self
-                        .scope
-                        .0
-                        .budget
-                        .limit()
-                        .saturating_sub(self.scope.0.budget.used())
-                        < floor
+                    && budget.limit().saturating_sub(budget.used()) < floor
                 {
                     shared.drain_pool();
                 }
@@ -905,7 +961,8 @@ impl PacketDriver {
             callback: Mutex::new(None),
             _memory: memory,
         }));
-        let slot = inner.slot(syn.id).expect("admitted original SYN");
+        let index = inner.slot_index(syn.id).expect("admitted original SYN");
+        let slot = inner.slots[index].as_mut().expect("funded local flow");
         slot.accepted = true;
         let routing = slot.routing.take();
         let process = slot.process.take();
@@ -916,17 +973,15 @@ impl PacketDriver {
         let mut flow = FlowIo::new_local(self.scope.clone(), syn, handle.clone(), process);
         flow.set_routing(routing);
         owner.tuples.insert((syn.client, syn.original_dst), syn.id);
-        owner.flows.insert(
-            syn.id,
-            Binding {
-                handle,
-                remote: None,
-                direct: false,
-                closing: false,
-                deadline: None,
-                sniff: None,
-            },
-        );
+        let previous = owner.bindings[index].replace(Binding {
+            handle,
+            remote: None,
+            direct: None,
+            closing: false,
+            deadline: None,
+            sniff: None,
+        });
+        assert!(previous.is_none(), "physical binding slot already occupied");
         Ok(Some((syn, flow)))
     }
     pub(crate) fn begin_local_turn(&mut self, cx: &Context<'_>, now: Instant) {
@@ -942,7 +997,7 @@ impl PacketDriver {
     #[cfg(all(test, feature = "native-api"))]
     pub(crate) fn has_submitted_direct(&self) -> bool {
         self.local.as_ref().is_some_and(|owner| {
-            owner.flows.values().any(|binding| {
+            owner.bindings.iter().flatten().any(|binding| {
                 matches!(
                     binding.handle.0.request.lock().as_ref(),
                     Some(Request::Direct(_, None))
@@ -952,7 +1007,7 @@ impl PacketDriver {
     }
     #[cfg(all(test, feature = "native-api"))]
     pub(crate) fn close_local_direct(&mut self) {
-        self.local.as_mut().expect("local driver").direct.close();
+        self.local.as_mut().expect("local driver").close_direct();
     }
     pub(crate) fn bind_worker_epoll(
         &mut self,
@@ -1007,7 +1062,11 @@ impl PacketDriver {
                 now,
                 &mut turn,
             ) {
-                let binding = owner.flows.get_mut(&id).expect("attached Direct flow");
+                let index = owner.active_slot(id).expect("attached Direct flow");
+                let binding = owner.bindings[index]
+                    .as_mut()
+                    .expect("attached Direct binding");
+                assert!(binding.direct.take().is_some());
                 binding.closing = true;
                 binding.handle.0.flags.fetch_or(CLOSE, Ordering::Release);
                 let slot = owner.inner.slot(id).expect("attached Direct slot");
@@ -1317,9 +1376,9 @@ impl LocalOwner {
     }
     fn abort(&mut self, shared: &LocalShared) {
         shared.pool.close();
-        self.direct.close();
+        self.close_direct();
         self.inner.abort();
-        for binding in self.flows.values_mut() {
+        for binding in self.bindings.iter_mut().flatten() {
             binding
                 .handle
                 .0
@@ -1331,6 +1390,16 @@ impl LocalOwner {
             }
             binding.handle.0.wake_by_ref();
         }
+    }
+    fn close_direct(&mut self) {
+        for binding in self.bindings.iter_mut().flatten() {
+            binding.direct = None;
+        }
+        self.direct.close();
+    }
+
+    fn active_slot(&self, id: FlowId) -> Option<usize> {
+        self.inner.local_slots.as_ref()?.active(&id).copied()
     }
     fn dispatch(&mut self, scope: &PacketScope, now: Instant) -> bool {
         let shared = scope.0.local.get().expect("local owner");
@@ -1345,10 +1414,7 @@ impl LocalOwner {
                 shared.has_ready.store(!queue.is_empty(), Ordering::Release);
                 drop(queue);
                 for &id in &batch[..1 + rest] {
-                    if let Some(flow) = self.flows.get(&id) {
-                        flow.handle.0.queued.swap(false, Ordering::AcqRel);
-                    }
-                    self.service_flow(scope, id, Ready::default(), now, false);
+                    self.service_flow(scope, id, FlowWork::App, now);
                 }
             }
         }
@@ -1366,8 +1432,7 @@ impl LocalOwner {
             let Some((id, ready)) = self.inner.stack.as_mut().and_then(Stack::poll_event) else {
                 break;
             };
-            self.direct.mark_ready(id);
-            self.service_flow(scope, id, ready, now, false);
+            self.service_flow(scope, id, FlowWork::Protocol(ready), now);
             more |= n == BATCH;
         }
         for n in 1..=BATCH {
@@ -1377,28 +1442,34 @@ impl LocalOwner {
             if due > now {
                 break;
             }
-            self.service_flow(scope, id, Ready::default(), now, true);
+            self.service_flow(scope, id, FlowWork::Deadline, now);
             more |= n == BATCH;
         }
         self.reap(scope);
         // Servicing a request can re-enqueue it after the batch was detached.
         more || shared.has_ready.load(Ordering::Acquire)
     }
-    fn service_flow(
-        &mut self,
-        scope: &PacketScope,
-        id: FlowId,
-        ready: Ready,
-        now: Instant,
-        timed: bool,
-    ) {
-        // Steady Direct readiness goes straight to the reactor; no binding mutex or metadata round trip.
-        let Some(binding) = self.flows.get_mut(&id) else {
+    fn service_flow(&mut self, scope: &PacketScope, id: FlowId, work: FlowWork, now: Instant) {
+        let Some(index) = self.active_slot(id) else {
             return;
         };
-        if !ready.is_empty() && binding.direct {
+        let Some(binding) = self.bindings[index].as_mut() else {
             return;
-        }
+        };
+        let (ready, timed) = match work {
+            FlowWork::App => {
+                binding.handle.0.queued.swap(false, Ordering::AcqRel);
+                (Ready::default(), false)
+            }
+            FlowWork::Protocol(ready) => {
+                if let Some(direct) = binding.direct {
+                    self.direct.mark_ready(direct);
+                    return;
+                }
+                (ready, false)
+            }
+            FlowWork::Deadline => (Ready::default(), true),
+        };
         let handle = binding.handle.clone();
         let flags = handle
             .0
@@ -1414,7 +1485,9 @@ impl LocalOwner {
         }
         if flags & ABORT != 0 {
             handle.0.status.fetch_or(CANCELLED, Ordering::Release);
-            self.direct.abort(id);
+            if let Some(direct) = binding.direct.take() {
+                self.direct.abort(direct);
+            }
             if let Some(s) = &mut self.inner.stack {
                 s.tcp_abort(id);
             }
@@ -1432,7 +1505,7 @@ impl LocalOwner {
             && handle.can_bind()
             && !terminal
             && !binding.closing
-            && let Some(slot) = self.inner.slot(id)
+            && let Some(slot) = self.inner.slots[index].as_mut()
         {
             slot.rx_admitted = true;
         }
@@ -1450,7 +1523,7 @@ impl LocalOwner {
                 && !binding.closing
                 && !self.inner.closing
                 && (!terminal || readable)
-                && !binding.direct
+                && binding.direct.is_none()
                 && binding.remote.is_none()
                 && binding.sniff.is_none();
             match request {
@@ -1465,13 +1538,14 @@ impl LocalOwner {
                         }
                     } else {
                         match self.direct.attach(id, attach, now) {
-                            Ok(()) => {
-                                binding.direct = true;
-                                if let Some(slot) = self.inner.slot(id) {
+                            Ok(direct) => {
+                                binding.direct = Some(direct);
+                                if let Some(slot) = self.inner.slots[index].as_mut() {
                                     slot.rx_admitted = true;
                                 }
                                 if done.is_some_and(|done| done.send(Ok(())).is_err()) {
-                                    self.direct.abort(id);
+                                    binding.direct = None;
+                                    self.direct.abort(direct);
                                     handle.abort();
                                 }
                             }
@@ -1577,8 +1651,13 @@ impl LocalOwner {
                 }
             }
         }
-        if binding.closing && can_close && self.inner.slot(id).is_some_and(|slot| slot.app_open) {
-            self.direct.abort(id);
+        let slot = self.inner.slots[index]
+            .as_mut()
+            .expect("closing exact flow");
+        if binding.closing && can_close && slot.app_open {
+            if let Some(direct) = binding.direct.take() {
+                self.direct.abort(direct);
+            }
             if let Some(stack) = &mut self.inner.stack {
                 if binding
                     .remote
@@ -1589,7 +1668,7 @@ impl LocalOwner {
                 }
                 stack.tcp_close(id);
             }
-            self.inner.slot(id).expect("closing exact flow").app_open = false;
+            slot.app_open = false;
             self.retiring.push(id);
             self.inner.reap_pending = true;
             binding.remote = None;
@@ -1641,21 +1720,26 @@ impl LocalOwner {
 
     fn reap_retiring(&mut self, scope: &PacketScope, i: usize) -> bool {
         let id = self.retiring[i];
-        let index = self.inner.local_slots.as_ref().expect("physical aliases")[&id];
+        let slots = self.inner.local_slots.as_mut().expect("physical aliases");
+        let index = slots.get(&id).copied().expect("original retiring index");
         let slot = self.inner.slots[index]
             .as_ref()
             .expect("original retiring flow");
-        if slot.outputs != 0
-            || self
-                .inner
-                .stack
-                .as_ref()
-                .is_some_and(|s| s.tcp_retained(id))
+        debug_assert!(!slot.app_open);
+        if self
+            .inner
+            .stack
+            .as_ref()
+            .is_some_and(|s| s.tcp_retained(id))
         {
             return false;
         }
+        if slot.outputs != 0 {
+            slots.move_to_alias(id);
+            return false;
+        }
         self.retiring.swap_remove(i);
-        self.inner.local_slots.as_mut().unwrap().remove(&id);
+        slots.remove(&id);
         let slot = self.inner.slots[index].take().expect("original retirement");
         if self.tuples.get(&(slot.client, slot.destination)) == Some(&id) {
             self.tuples.remove(&(slot.client, slot.destination));
@@ -1664,7 +1748,7 @@ impl LocalOwner {
         if let Some(resources) = &self.inner.resources {
             resources.retire_tcp(self.inner.worker, id, slot.client, slot.destination);
         }
-        if let Some(mut binding) = self.flows.remove(&id) {
+        if let Some(mut binding) = self.bindings[index].take() {
             let shared = scope.0.local.get().expect("local owner");
             binding.schedule(&mut self.deadlines, None);
             let flow = binding.handle;
@@ -1934,8 +2018,14 @@ impl PacketDriver {
         let Some(&id) = owner.tuples.get(&tuple) else {
             return Ok(None);
         };
-        let index = state.local_slots.as_ref().expect("local aliases")[&id];
-        let slot = state.slots[index]
+        let Some(index) = state
+            .local_slots
+            .as_ref()
+            .and_then(|slots| slots.active(&id))
+        else {
+            return Ok(None);
+        };
+        let slot = state.slots[*index]
             .as_ref()
             .expect("original local TCP slot");
         if !slot.rx_admitted || !slot.app_open {
@@ -1973,8 +2063,8 @@ impl PacketDriver {
 }
 
 pub(super) struct LocalWindowGrowth {
-    slots: FlowIdMap<usize>,
-    flows: FlowIdMap<Binding>,
+    slots: SlotIndex,
+    bindings: Box<[Option<Binding>]>,
     tuples: HashMap<(SocketAddr, SocketAddr), FlowId>,
     retiring: Vec<FlowId>,
     ready: VecDeque<FlowId>,
@@ -1993,7 +2083,11 @@ impl LocalOwner {
         peers: usize,
     ) -> Option<LocalWindowGrowth> {
         if scope.0.local.get()?.window_growth.get().is_some()
-            || !self.flows.is_empty()
+            || self
+                .inner
+                .local_slots
+                .as_ref()
+                .is_some_and(|index| !index.is_empty())
             || !self.inner.stack.as_ref()?.is_quiescent()
         {
             return None;
@@ -2010,8 +2104,8 @@ impl LocalOwner {
         let growth = local.reserve(new.checked_sub(old)?)?;
         let overlap = local.reserve(old)?;
         Some(LocalWindowGrowth {
-            slots: FlowIdMap::with_capacity_and_hasher(slots, Default::default()),
-            flows: FlowIdMap::with_capacity_and_hasher(slots, Default::default()),
+            slots: SlotIndex::new(self.inner.half_open.len(), frames),
+            bindings: (0..slots).map(|_| None).collect(),
             tuples: HashMap::with_capacity(slots),
             retiring: Vec::with_capacity(slots),
             ready: VecDeque::with_capacity(slots),
@@ -2027,7 +2121,7 @@ impl LocalWindowGrowth {
     pub(super) fn install(mut self, owner: &mut LocalOwner, scope: &PacketScope) {
         let shared = scope.0.local.get().expect("local owner startup");
         owner.inner.local_slots = Some(self.slots);
-        owner.flows = self.flows;
+        owner.bindings = self.bindings;
         owner.tuples = self.tuples;
         owner.retiring = self.retiring;
         owner.inner.local_peers = Some(self.peers);
@@ -2053,12 +2147,12 @@ impl LocalWindowGrowth {
 // Hashbrown reserves control bytes, a load-factor margin and power-of-two buckets. Four
 // buckets per requested item also cover the allocation header and the old/new map peaks.
 fn window_bytes(slots: usize, frames: usize, peers: usize, ancillary: usize) -> Option<usize> {
-    let maps = 4
-        * (size_of::<(FlowId, Binding)>()
-            + size_of::<(FlowId, usize)>()
-            + size_of::<((SocketAddr, SocketAddr), FlowId)>()
-            + 3);
-    let per_slot = maps + 3 * size_of::<FlowId>();
+    let maps =
+        4 * (size_of::<(FlowId, usize)>() + size_of::<((SocketAddr, SocketAddr), FlowId)>() + 2);
+    let per_slot = maps
+        + size_of::<Option<Binding>>()
+        + size_of::<Option<(FlowId, usize)>>()
+        + 3 * size_of::<FlowId>();
     slots
         .checked_mul(per_slot + 4 * (size_of::<(IpAddr, usize)>() + 1))?
         .checked_add(
@@ -2479,8 +2573,12 @@ mod tests {
             driver.service(&mut cx, now);
             let committed = accepted.snapshot().0;
             assert!(committed > 0);
+            let local = driver.local.as_ref().unwrap();
+            let index = local.active_slot(id).unwrap();
             assert!(
-                driver.local.as_ref().unwrap().flows[&id]
+                local.bindings[index]
+                    .as_ref()
+                    .unwrap()
                     .remote
                     .as_ref()
                     .unwrap()
@@ -2902,7 +3000,7 @@ impl Inner {
         flow.is_some_and(|id| {
             self.local_slots
                 .as_ref()
-                .is_some_and(|slots| slots.contains_key(&id))
+                .is_some_and(|slots| slots.get(&id).is_some())
         })
     }
     pub(super) fn pin_local_output(&mut self, address: IpAddr) {
@@ -2996,6 +3094,7 @@ mod source_work_tests {
     mod bulk_retirement;
     mod pressure;
     mod ready_dispatch;
+    mod retirement_aliases;
 
     fn input(
         client: SocketAddr,
@@ -3411,7 +3510,7 @@ mod source_work_tests {
                 drop(request);
             });
             gate.wait();
-            owner_state.service_flow(&scope, id, Ready::default(), now, false);
+            owner_state.service_flow(&scope, id, FlowWork::App, now);
         });
 
         // A request serviced at the last dispatch slot is followed by this pump turn,

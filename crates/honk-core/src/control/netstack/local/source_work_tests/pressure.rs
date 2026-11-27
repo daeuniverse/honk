@@ -33,12 +33,10 @@ async fn local_tcp_admission_reclaims_idle_chunks_once() {
         let idle = budget.used();
         // The first chunk uses the small-flow size. Only the six full bulk chunks cache.
         let seed = vec![7; 6 * remote::BULK_CHUNK + (4 << 10)];
-        let remote = driver
-            .local
+        let local = driver.local.as_mut().unwrap();
+        let index = local.active_slot(id).unwrap();
+        let remote = local.bindings[index]
             .as_mut()
-            .unwrap()
-            .flows
-            .get_mut(&id)
             .unwrap()
             .remote
             .as_mut()

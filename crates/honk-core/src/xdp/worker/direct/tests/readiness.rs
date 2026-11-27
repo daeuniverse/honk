@@ -38,18 +38,18 @@ fn drive_until_write_wait(
     reactor: &mut DirectReactor,
     client: &mut Stack,
     server: &mut Stack,
-    id: FlowId,
+    handle: DirectHandle,
     now: &mut Instant,
     mut on_finish: impl FnMut(&mut Stack, FlowId),
 ) {
     for _ in 0..BATCH {
         *now += Duration::from_millis(10);
         transfer(client, server, *now);
-        reactor.mark_ready(id);
+        reactor.mark_ready(handle);
         reactor
             .service_with_finish(server, *now, &mut on_finish)
             .unwrap();
-        if reactor.slots[0]
+        if reactor.slots[handle.index]
             .pump
             .as_ref()
             .is_none_or(Pump::wants_write_epoll)
@@ -75,7 +75,7 @@ fn queued_input_reaches_client_on_first_waiter_with_a_pre_origin_turn() {
         peer.write_all(b"r").unwrap();
         wait_for_fd(attach.socket.as_raw_fd(), libc::POLLIN);
 
-        assert!(reactor.attach(id, attach, turn).is_ok());
+        let handle = attach_flow(&mut reactor, id, attach, turn);
         let (accepted, outcome) = expect_update(&mut observer);
         assert!(accepted.attached && outcome.is_none());
         assert_eq!(accepted.download, 0);
@@ -107,7 +107,7 @@ fn queued_input_reaches_client_on_first_waiter_with_a_pre_origin_turn() {
             assert!(observer.poll_update(&mut cx).is_pending());
         }
         assert!(reactor.deadline().is_none());
-        reactor.abort(id);
+        reactor.abort(handle);
         let (snapshot, outcome) = expect_update(&mut observer);
         check_times(snapshot);
         assert!(matches!(outcome, Some(DirectOutcome::Cancelled)));
@@ -122,14 +122,14 @@ async fn hold_download_credit(
     attach: DirectAttach,
     peer: &mut TcpStream,
     now: Instant,
-) -> RawFd {
+) -> (RawFd, DirectHandle) {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(!reactor.poll_ready(&mut cx).unwrap());
     let socket = attach.socket.as_raw_fd();
     assert_eq!(stack.tcp_write(id, &FULL_CREDIT), Ok(FULL_CREDIT.len()));
     peer.write_all(b"r").unwrap();
     wait_for_fd(socket, libc::POLLIN);
-    assert!(reactor.attach(id, attach, now).is_ok());
+    let handle = attach_flow(reactor, id, attach, now);
     {
         // Drive the fixture with a real outer edge before testing the forced drain.
         let _ready = tokio::time::timeout(
@@ -144,7 +144,7 @@ async fn hold_download_credit(
     reactor.service(stack, now).unwrap();
     assert_eq!(reactor.epoll_waiters, 0);
     assert!(!reactor.has_pending_work());
-    socket
+    (socket, handle)
 }
 
 #[tokio::test]
@@ -153,7 +153,8 @@ async fn queued_output_resumes_an_upload_without_an_outer_poll() {
     let budget = MemoryBudget::new(1 << 20);
     let mut reactor = new_reactor(1, &budget);
     let (attach, _, mut peer, counters) = constrained_socket(&budget);
-    let socket = hold_download_credit(&mut reactor, &mut server, id, attach, &mut peer, now).await;
+    let (socket, handle) =
+        hold_download_credit(&mut reactor, &mut server, id, attach, &mut peer, now).await;
     peer.write_all(b"s").unwrap();
     wait_for_fd(reactor.epoll.as_raw_fd(), libc::POLLIN);
 
@@ -164,7 +165,7 @@ async fn queued_output_resumes_an_upload_without_an_outer_poll() {
     for _ in 0..BATCH {
         now += Duration::from_millis(10);
         transfer(&mut client, &mut server, now);
-        reactor.mark_ready(id);
+        reactor.mark_ready(handle);
         reactor.service(&mut server, now).unwrap();
         if reactor.epoll_waiters != 0 {
             break;
@@ -200,7 +201,8 @@ async fn queued_error_after_forwarded_fin_reaches_terminal_observer() {
     let budget = MemoryBudget::new(1 << 20);
     let mut reactor = new_reactor(1, &budget);
     let (attach, mut observer, mut peer, _) = attach(&budget);
-    let socket = hold_download_credit(&mut reactor, &mut server, id, attach, &mut peer, now).await;
+    let (socket, handle) =
+        hold_download_credit(&mut reactor, &mut server, id, attach, &mut peer, now).await;
 
     peer.shutdown(Shutdown::Write).unwrap();
     wait_for_fd(socket, libc::POLLRDHUP);
@@ -218,7 +220,7 @@ async fn queued_error_after_forwarded_fin_reaches_terminal_observer() {
         Ok(FULL_CREDIT.len())
     );
     assert_eq!(received, FULL_CREDIT);
-    reactor.mark_ready(id);
+    reactor.mark_ready(handle);
     reactor.service(&mut server, now).unwrap();
 
     now += Duration::from_millis(10);
@@ -297,7 +299,7 @@ fn shared_dispatch_preserves_other_sources_and_rejects_stale_tokens() {
 
     let (old, _, mut old_peer, _) = attach_with_live_observation(&budget, false);
     old_peer.write_all(b"x").unwrap();
-    assert!(left.attach(left_id, old, now).is_ok());
+    let old_handle = attach_flow(&mut left, left_id, old, now);
     let old_token = left_tag | (1 << 32);
     let old_events = wait_for_direct_event(
         &worker,
@@ -305,7 +307,7 @@ fn shared_dispatch_preserves_other_sources_and_rejects_stale_tokens() {
         libc::EPOLLIN as u32,
         "old Direct socket did not report its read edge",
     );
-    left.abort(left_id);
+    left.abort(old_handle);
 
     let (attach, _, mut left_peer, left_counts) = attach_with_live_observation(&budget, false);
     let left_socket = attach.socket.as_raw_fd();
@@ -334,6 +336,8 @@ fn shared_dispatch_preserves_other_sources_and_rejects_stale_tokens() {
     assert!(!left.poll_ready(&mut cx).unwrap());
     assert!(!left.service(&mut left_stack, now).unwrap());
     assert!(right.service(&mut right_stack, now).unwrap());
+    assert!(left.watched_pump(old_token).is_none());
+    assert!(right.watched_pump(old_token).is_none());
     left.socket_ready(old_token, old_events);
     right.socket_ready(old_token, old_events);
     assert!(!left.has_pending_work());
@@ -405,24 +409,29 @@ fn shared_watch_generation_wraps_after_proven_removal() {
     reactor
         .bind_worker_epoll(Arc::clone(&worker.fd), 0)
         .unwrap();
-    reactor.slots[0].generation = POISONED_GENERATION - 2;
+    reactor.slots[0].watch_generation = POISONED_WATCH_GENERATION - 2;
 
     let (attach, _, mut peer, _) = attach_with_live_observation(&budget, false);
     peer.write_all(b"x").unwrap();
-    assert!(reactor.attach(id, attach, now).is_ok());
-    let old_token = TOKEN_DIRECT_BIT | (u64::from(POISONED_GENERATION - 1) << 32);
+    let old_handle = attach_flow(&mut reactor, id, attach, now);
+    let old_token = TOKEN_DIRECT_BIT | (u64::from(POISONED_WATCH_GENERATION - 1) << 32);
     let old_events = wait_for_direct_event(
         &worker,
         old_token,
         libc::EPOLLIN as u32,
         "last valid Direct generation was not registered",
     );
-    reactor.abort(id);
+    reactor.abort(old_handle);
 
     let (attach, _, mut peer, _) = attach_with_live_observation(&budget, false);
     let mut duplicate = attach.socket.try_clone().unwrap();
-    assert!(reactor.attach(id, attach, now).is_ok());
+    let new_handle = attach_flow(&mut reactor, id, attach, now);
+    assert_eq!(new_handle.index, old_handle.index);
+    assert_eq!(new_handle.generation, old_handle.generation + 1);
+    assert_eq!(reactor.live_index(old_handle), None);
+    assert_eq!(reactor.live_index(new_handle), Some(new_handle.index));
     reactor.service(&mut stack, now).unwrap();
+    assert!(reactor.watched_pump(old_token).is_none());
     reactor.socket_ready(old_token, old_events);
     assert!(!reactor.has_pending_work());
 
@@ -457,7 +466,7 @@ fn shared_unblocked_upload_leaves_epollout_unarmed() {
     let (attach, _, mut peer, _) = attach_with_live_observation(&budget, false);
     let socket = attach.socket.as_raw_fd();
     wait_for_fd(socket, libc::POLLOUT);
-    assert!(reactor.attach(id, attach, now).is_ok());
+    let handle = attach_flow(&mut reactor, id, attach, now);
     let mut events = [libc::epoll_event { events: 0, u64: 0 }];
     assert_eq!(worker.poll_nonblocking(&mut events).unwrap(), 0);
 
@@ -466,6 +475,7 @@ fn shared_unblocked_upload_leaves_epollout_unarmed() {
         &mut client,
         &mut server,
         &mut reactor,
+        (id, handle),
         now + Duration::from_millis(10),
     );
     let mut received = [0; 7];
@@ -486,14 +496,14 @@ fn shared_second_mod_preserves_epollout_and_resumes_upload() {
         .unwrap();
     let (attach, mut observer, mut peer, counters) = constrained_socket(&budget);
     let socket = attach.socket.as_raw_fd();
-    assert!(reactor.attach(id, attach, now).is_ok());
+    let handle = attach_flow(&mut reactor, id, attach, now);
     let request: Vec<u8> = (0..(64 << 10)).map(|i| (i % 251) as u8).collect();
     assert_eq!(client.tcp_write(client_id, &request), Ok(request.len()));
     drive_until_write_wait(
         &mut reactor,
         &mut client,
         &mut server,
-        id,
+        handle,
         &mut now,
         |_, _| {
             panic!("Direct upload ended before the peer opened its window");
@@ -541,13 +551,19 @@ fn shared_second_mod_preserves_epollout_and_resumes_upload() {
         now += Duration::from_millis(10);
         transfer(&mut server, &mut client, now);
         transfer(&mut client, &mut server, now);
-        reactor.mark_ready(id);
+        reactor.mark_ready(handle);
     }
     assert_eq!(received_len, request.len());
     assert_eq!(received, request);
 
     client.tcp_shutdown(client_id).unwrap();
-    deliver_client(&mut client, &mut server, &mut reactor, &mut now);
+    deliver_client(
+        &mut client,
+        &mut server,
+        &mut reactor,
+        (id, handle),
+        &mut now,
+    );
     assert_eq!(peer.read(&mut [0]).unwrap(), 0);
     peer.shutdown(Shutdown::Write).unwrap();
     let ready = wait_for_direct_event(
@@ -574,7 +590,7 @@ fn shared_mod_failure_finishes_and_releases_the_absent_watch() {
         .bind_worker_epoll(Arc::clone(&worker.fd), 0)
         .unwrap();
     let (attach, mut observer, _peer, _) = constrained_socket(&budget);
-    assert!(reactor.attach(id, attach, now).is_ok());
+    let handle = attach_flow(&mut reactor, id, attach, now);
     let socket = &reactor.slots[0].pump.as_ref().unwrap().socket;
     reactor
         .epoll
@@ -595,7 +611,7 @@ fn shared_mod_failure_finishes_and_releases_the_absent_watch() {
         &mut reactor,
         &mut client,
         &mut server,
-        id,
+        handle,
         &mut now,
         |stack, id| {
             assert!(closed.replace(id).is_none());
@@ -644,7 +660,7 @@ fn finish_callback_precedes_observer_wake_on_success_error_and_drain() {
             .bind_worker_epoll(Arc::clone(&worker.fd), 0)
             .unwrap();
         let (attach, mut observer, peer, _) = attach_with_live_observation(&budget, false);
-        assert!(reactor.attach(id, attach, now).is_ok());
+        let handle = attach_flow(&mut reactor, id, attach, now);
         assert!(expect_update(&mut observer).0.attached);
         let signal = Arc::new(TerminalWake::default());
         let waker = Waker::from(Arc::clone(&signal));
@@ -658,7 +674,7 @@ fn finish_callback_precedes_observer_wake_on_success_error_and_drain() {
         }
         now += Duration::from_millis(10);
         transfer(&mut client, &mut server, now);
-        reactor.mark_ready(id);
+        reactor.mark_ready(handle);
         if peer_fin {
             peer.shutdown(Shutdown::Write).unwrap();
             let token = TOKEN_DIRECT_BIT | (1 << 32);
@@ -675,13 +691,14 @@ fn finish_callback_precedes_observer_wake_on_success_error_and_drain() {
                 .unwrap();
             now = reactor.deadline().expect("Direct half-close deadline");
         }
-        reactor
-            .service_with_finish(&mut server, now, |stack, flow| {
-                assert_eq!(flow, id);
-                stack.tcp_close(flow);
-                assert!(!signal.closed.swap(true, Ordering::AcqRel));
-            })
-            .unwrap();
+        let mut turn = reactor.begin_service().unwrap();
+        let (flow, publish) = reactor.next_finished(&mut server, now, &mut turn).unwrap();
+        assert_eq!(flow, id);
+        assert_eq!(reactor.live_index(handle), None);
+        assert!(!signal.woken.load(Ordering::Acquire));
+        server.tcp_close(flow);
+        assert!(!signal.closed.swap(true, Ordering::AcqRel));
+        publish();
 
         assert!(signal.woken.load(Ordering::Acquire));
         let (_, outcome) = expect_update(&mut observer);

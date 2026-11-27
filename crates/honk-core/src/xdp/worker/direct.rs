@@ -6,11 +6,10 @@ pub(crate) use observation::{DirectAttach, DirectObserver, DirectOutcome, Direct
 use pump::Pump;
 
 use super::epoll::{BudgetedEpollFd, TOKEN_DIRECT_BIT, WATCH_BYTES};
-use crate::control::netstack::FlowIdMap;
 use crate::relay::{RelayStats, splice::DRAIN_DEADLINE};
 use honk_netstack::{FlowId, MemoryReservation, Stack};
 use nix::errno::Errno;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io;
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -22,14 +21,22 @@ use tokio::io::unix::AsyncFd;
 
 const BATCH: usize = 64;
 const READ_INTEREST: u32 = (libc::EPOLLIN | libc::EPOLLRDHUP) as u32;
-const POISONED_GENERATION: u32 = 0x00ff_ffff;
+const POISONED_WATCH_GENERATION: u32 = 0x00ff_ffff;
 const DRAIN: usize = 0;
 const REPORT: usize = 1;
 const REPORT_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Identifies one socket within its original Direct reactor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DirectHandle {
+    index: usize,
+    generation: u64,
+}
+
 #[derive(Default)]
 struct Slot {
-    generation: u32,
+    generation: u64,
+    watch_generation: u32,
     pump: Option<Pump>,
     // A ready entry can be reused by the next occupant of this slot.
     queued: bool,
@@ -73,7 +80,7 @@ impl Slot {
             events: READ_INTEREST
                 | libc::EPOLLET as u32
                 | if out_armed { libc::EPOLLOUT as u32 } else { 0 },
-            u64: epoll.token(self.generation, index),
+            u64: epoll.token(self.watch_generation, index),
         };
         epoll.control(libc::EPOLL_CTL_MOD, &pump.socket, Some(&mut event))?;
         self.epoll_et = true;
@@ -146,7 +153,6 @@ pub(crate) struct DirectReactor {
     epoll_waiters: usize,
     slots: Vec<Slot>,
     free: Vec<usize>,
-    by_flow: FlowIdMap<usize>,
     ready: VecDeque<usize>,
     first: [Option<usize>; 2],
     last: [Option<usize>; 2],
@@ -160,11 +166,8 @@ impl DirectReactor {
         max_slots: usize,
         mut reserve: impl FnMut(usize) -> Option<MemoryReservation>,
     ) -> io::Result<Self> {
-        // Each socket reserves one watch plus fd table space.
-        // Two map entries per slot leave room to rehash tombstones in place at maximum
-        // occupancy. Load factor and power-of-two rounding take fewer than five buckets per slot.
-        let per =
-            size_of::<Slot>() + 2 * size_of::<usize>() + 5 * (size_of::<(FlowId, usize)>() + 1);
+        // Both the free list and ready queue hold at most one index per slot.
+        let per = size_of::<Slot>() + 2 * size_of::<usize>();
         let bytes = max_slots
             .checked_mul(per)
             .and_then(|bytes| bytes.checked_add(size_of::<Self>()));
@@ -195,7 +198,6 @@ impl DirectReactor {
             epoll_waiters: 0,
             slots: (0..max_slots).map(|_| Slot::default()).collect(),
             free: (0..max_slots).rev().collect(),
-            by_flow: HashMap::with_capacity_and_hasher(2 * max_slots, Default::default()),
             ready: VecDeque::with_capacity(max_slots),
             first: [None; 2],
             last: [None; 2],
@@ -236,28 +238,33 @@ impl DirectReactor {
         self.epoll_waiters
     }
 
+    /// The owner admits only one binding for each original flow.
     pub(crate) fn attach(
         &mut self,
         id: FlowId,
         attach: DirectAttach,
         now: Instant,
-    ) -> Result<(), DirectAttach> {
-        if self.closed || self.by_flow.contains_key(&id) {
+    ) -> Result<DirectHandle, DirectAttach> {
+        if self.closed {
             return Err(attach);
         }
         let Some(&index) = self.free.last() else {
             return Err(attach);
         };
         let slot = &mut self.slots[index];
+        let Some(generation) = slot.generation.checked_add(1) else {
+            return Err(attach);
+        };
         // DEL clears pending events, and each batch is dispatched before a slot is reused.
-        let generation = if slot.generation == POISONED_GENERATION - 1 {
+        // The software handle may outlive those batches and uses a separate generation.
+        let watch_generation = if slot.watch_generation == POISONED_WATCH_GENERATION - 1 {
             1
         } else {
-            slot.generation + 1
+            slot.watch_generation + 1
         };
         let mut event = libc::epoll_event {
             events: READ_INTEREST,
-            u64: self.epoll.token(generation, index),
+            u64: self.epoll.token(watch_generation, index),
         };
         if let Err(error) =
             self.epoll
@@ -268,12 +275,12 @@ impl DirectReactor {
         }
         self.free.pop();
         slot.generation = generation;
+        slot.watch_generation = watch_generation;
         slot.epoll_et = false;
         slot.pump = Some(Pump::new(id, attach, now));
-        self.by_flow.insert(id, index);
         self.sync_epoll_waiter(index);
         self.enqueue(index);
-        Ok(())
+        Ok(DirectHandle { index, generation })
     }
 
     fn sync_epoll_waiter(&mut self, index: usize) {
@@ -307,18 +314,28 @@ impl DirectReactor {
         }
     }
 
-    pub(crate) fn mark_ready(&mut self, id: FlowId) {
-        if let Some(&index) = self.by_flow.get(&id) {
+    fn live_index(&self, handle: DirectHandle) -> Option<usize> {
+        let slot = self.slots.get(handle.index)?;
+        (slot.generation == handle.generation && slot.pump.is_some()).then_some(handle.index)
+    }
+
+    pub(crate) fn mark_ready(&mut self, handle: DirectHandle) {
+        if let Some(index) = self.live_index(handle) {
             self.enqueue(index);
         }
     }
 
-    pub(crate) fn socket_ready(&mut self, token: u64, events: u32) {
+    fn watched_pump(&mut self, token: u64) -> Option<(usize, &mut Pump)> {
         let index = token as u32 as usize;
-        if let Some(slot) = self.slots.get_mut(index)
-            && token == self.epoll.token(slot.generation, index)
-            && let Some(pump) = &mut slot.pump
-        {
+        let slot = self.slots.get_mut(index)?;
+        if token != self.epoll.token(slot.watch_generation, index) {
+            return None;
+        }
+        Some((index, slot.pump.as_mut()?))
+    }
+
+    pub(crate) fn socket_ready(&mut self, token: u64, events: u32) {
+        if let Some((index, pump)) = self.watched_pump(token) {
             pump.socket_ready(events);
             self.sync_epoll_waiter(index);
             self.enqueue(index);
@@ -456,12 +473,11 @@ impl DirectReactor {
         self.remove_deadline(index, REPORT);
         let slot = &mut self.slots[index];
         let pump = slot.pump.take().expect("active Direct socket");
-        self.by_flow.remove(&pump.id);
         // Explicitly deregister even if another subsystem kept a duplicate of the open file.
         if let Err(error) = self.epoll.control(libc::EPOLL_CTL_DEL, &pump.socket, None)
             && error.raw_os_error() != Some(libc::ENOENT)
         {
-            slot.generation = POISONED_GENERATION;
+            slot.watch_generation = POISONED_WATCH_GENERATION;
             if let ReactorEpoll::Shared { epoll, .. } = &self.epoll
                 && let Some(credit) = self.watch_credit.take()
             {
@@ -471,7 +487,7 @@ impl DirectReactor {
         }
         drop(pump.socket);
         slot.epoll_out_armed = false;
-        if slot.generation != POISONED_GENERATION {
+        if slot.generation != u64::MAX && slot.watch_generation != POISONED_WATCH_GENERATION {
             self.free.push(index);
         }
         self.sync_epoll_waiter(index);
@@ -487,8 +503,8 @@ impl DirectReactor {
         (id, move || progress.finish(DirectOutcome::Finished(result)))
     }
 
-    pub(crate) fn abort(&mut self, id: FlowId) {
-        if let Some(&index) = self.by_flow.get(&id) {
+    pub(crate) fn abort(&mut self, handle: DirectHandle) {
+        if let Some(index) = self.live_index(handle) {
             self.detach(index).1.finish(DirectOutcome::Cancelled);
         }
     }
@@ -633,7 +649,7 @@ impl DirectReactor {
 
 impl Drop for DirectReactor {
     fn drop(&mut self) {
-        if matches!(self.epoll, ReactorEpoll::Shared { .. }) && !self.by_flow.is_empty() {
+        if matches!(self.epoll, ReactorEpoll::Shared { .. }) && !self.closed {
             self.close_pumps(false);
         }
     }
