@@ -991,6 +991,13 @@ impl Inner {
         destination: SocketAddr,
         lineage: Option<NonZeroU64>,
     ) -> bool {
+        if let Some(retained) = self
+            .resources
+            .as_ref()
+            .and_then(|r| r.retains_tcp_on(self.worker, source, destination))
+        {
+            return lineage.is_none() && retained;
+        }
         self.stack
             .as_ref()
             .is_some_and(|stack| stack.retains_tcp_with_lineage(source, destination, lineage))

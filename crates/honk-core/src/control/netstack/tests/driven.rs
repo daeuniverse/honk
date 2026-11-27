@@ -801,17 +801,11 @@ async fn driven_shared_refund_resumes_a_sleeping_writer_without_ingress() {
 fn direct_reservation_refusals_preserve_unsent_bytes_and_other_class_progress() {
     let now = Instant::now();
     let (scope, owner, budget) = runtime(now);
+    let (backing, storage_bytes, fixed_bytes) = initial_frame_storage(&scope, limits());
     let client = "10.0.0.2:40000".parse().unwrap();
     let (mut io, server_seq) = handshake(&scope, now, client, 100);
     let mut driver = owner.hand_off();
-    let backing: Vec<_> = scope
-        .0
-        .inner
-        .lock()
-        .frames
-        .iter()
-        .map(|frame| frame.as_ref().unwrap().as_ptr() as usize)
-        .collect();
+    let idle_budget = budget.used();
     let mut packet = [0xa5; 1280];
     let before = scope.stats().unwrap().tx_packets;
     for class in [TxClass::Control, TxClass::Bulk] {
@@ -828,11 +822,13 @@ fn direct_reservation_refusals_preserve_unsent_bytes_and_other_class_progress() 
             assert_eq!(inner.queued, 0);
         }
     }
+    assert_eq!(budget.used(), idle_budget);
     let first = b"first-unsent";
     assert!(matches!(
         std::pin::Pin::new(&mut io).poll_write(&mut context(), first),
         Poll::Ready(Ok(n)) if n == first.len()
     ));
+    let before_refusals = budget.used();
     let error = driver
         .materialize_into(now, TxClass::Bulk, &mut packet[..1279])
         .err()
@@ -855,6 +851,7 @@ fn direct_reservation_refusals_preserve_unsent_bytes_and_other_class_progress() 
     ));
     assert_eq!(scope.stats().unwrap().tx_packets, before);
     assert_eq!(packet, [0xa5; 1280]);
+    assert_eq!(budget.used(), before_refusals);
     let stranger = "10.0.0.3:40001".parse().unwrap();
     scope.receive(&segment(stranger, 1, 700, tcp::ACK, &[]), now);
     driver.begin_turn(now);
@@ -874,6 +871,7 @@ fn direct_reservation_refusals_preserve_unsent_bytes_and_other_class_progress() 
         std::pin::Pin::new(&mut io).poll_write(&mut context(), next),
         Poll::Ready(Ok(n)) if n == next.len()
     ));
+    let held_budget = budget.used();
     let before = scope.stats().unwrap().tx_packets;
     assert!(matches!(
         driver
@@ -883,19 +881,15 @@ fn direct_reservation_refusals_preserve_unsent_bytes_and_other_class_progress() 
     ));
     assert_eq!(scope.stats().unwrap().tx_packets, before);
     assert_eq!(packet, original);
+    assert_eq!(budget.used(), held_budget);
     {
         let inner = scope.0.inner.lock();
+        assert_eq!(inner._storage.bytes(), storage_bytes);
+        assert_eq!(frame_backing(&inner), backing);
         assert_plain_frame_charge(&inner, &budget, 2 * 1280);
-        assert_eq!(
-            inner
-                .frames
-                .iter()
-                .map(|frame| frame.as_ref().unwrap().as_ptr() as usize)
-                .collect::<Vec<_>>(),
-            backing
-        );
     }
     drop(held);
+    assert_eq!(budget.used(), held_budget);
     let sent = materialized(&mut driver, now, TxClass::Bulk, &mut packet);
     let (header, payload) = decode_packet(&packet[..sent.len()]);
     assert_eq!(header.seq, server_seq.wrapping_add(first.len() as u32));
@@ -908,6 +902,7 @@ fn direct_reservation_refusals_preserve_unsent_bytes_and_other_class_progress() 
     ));
     scope.0.inner.lock().ledger.close();
     let before = scope.stats().unwrap().tx_packets;
+    let closed_budget = budget.used();
     let original = packet;
     assert!(
         driver
@@ -915,6 +910,7 @@ fn direct_reservation_refusals_preserve_unsent_bytes_and_other_class_progress() 
             .is_err()
     );
     assert_eq!(scope.stats().unwrap().tx_packets, before);
+    assert_eq!(budget.used(), closed_budget);
     assert_eq!(packet, original);
     let tx = scope
         .0
@@ -936,6 +932,9 @@ fn direct_reservation_refusals_preserve_unsent_bytes_and_other_class_progress() 
     ));
     driver.finish_turn(&mut context(), now);
     assert!(scope.0.inner.lock().finished);
+    assert_eq!(budget.used(), fixed_bytes);
+    drop((driver, owner, scope));
+    assert_eq!(budget.used(), 0);
 }
 
 #[tokio::test]
@@ -1066,6 +1065,7 @@ async fn direct_udp_observes_atomic_cpu_fragment_prefix_for_both_families() {
 fn direct_scope_unwind_cancels_only_unpublished_credit_without_relocking() {
     let now = Instant::now();
     let (scope, owner, budget) = runtime(now);
+    let (backing, storage_bytes, fixed_bytes) = initial_frame_storage(&scope, limits());
     let (mut io, _) = handshake(&scope, now, "10.0.0.2:40000".parse().unwrap(), 100);
     let retired = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&retired);
@@ -1084,6 +1084,7 @@ fn direct_scope_unwind_cancels_only_unpublished_credit_without_relocking() {
     ));
     let mut driver = owner.hand_off();
     let before = scope.stats().unwrap().tx_packets;
+    let before_unpublished = budget.used();
     let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut inner = scope.0.inner.lock();
         let lease = inner.ledger.reserve_tx(TxClass::Bulk).unwrap();
@@ -1095,6 +1096,7 @@ fn direct_scope_unwind_cancels_only_unpublished_credit_without_relocking() {
     }));
     assert!(unwind.is_err());
     assert_eq!(scope.stats().unwrap().tx_packets, before);
+    assert_eq!(budget.used(), before_unpublished);
     let mut packet = [0; 1280];
     let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         driver.begin_turn(now);
@@ -1114,6 +1116,9 @@ fn direct_scope_unwind_cancels_only_unpublished_credit_without_relocking() {
         let mut inner = scope.0.inner.lock();
         assert!(inner.frames.iter().all(Option::is_some));
         assert_plain_frame_charge(&inner, &budget, 2 * 1280);
+        assert_eq!(frame_backing(&inner), backing);
+        assert_eq!(inner._storage.bytes(), storage_bytes);
+        assert_eq!(budget.used(), fixed_bytes);
         assert_eq!(inner.ledger.outstanding_tx().count(), 0);
         assert!(inner.output_peers.iter().all(Option::is_none));
         assert!(inner.slots.iter().all(Option::is_none));
@@ -1125,6 +1130,9 @@ fn direct_scope_unwind_cancels_only_unpublished_credit_without_relocking() {
     driver.finish_turn(&mut context(), now);
     assert!(scope.0.inner.lock().finished);
     assert!(scope.0.inner.lock().rights == Rights::Returned);
+    assert_eq!(budget.used(), fixed_bytes);
+    drop((driver, owner, scope));
+    assert_eq!(budget.used(), 0);
 }
 
 #[test]

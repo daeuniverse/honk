@@ -54,7 +54,7 @@ async fn physical_tcp_batch_checks_each_ack_and_flushes_before_reset() {
     let (realm, owners) = capture_realm(1280, 1, 16, 1, 1, &budget).unwrap();
     let scope = realm.owner(0).unwrap();
     let now = Instant::now();
-    let peers = PeerAuthority::new(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+    let peers = PeerAuthority::new(Arc::new(true.into()));
     let (path, flow, reply) = physical_synack(&realm, &peers, now);
     let client = flow.peer_addr();
     let server = decode(&reply).0.seq.wrapping_add(1);
@@ -221,7 +221,7 @@ async fn physical_tcp_batch_preserves_exported_output() {
         let scope = realm.owner(0).unwrap();
         assert_eq!(scope.0.workers, workers);
         let now = Instant::now();
-        let peers = PeerAuthority::new(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let peers = PeerAuthority::new(Arc::new(true.into()));
         let (path, mut flow, synack) = physical_synack(&realm, &peers, now);
         let original = synack.packet().to_vec();
         let server = decode(&synack).0.seq.wrapping_add(1);
@@ -321,7 +321,7 @@ async fn physical_tcp_batch_retries_moved_peer_with_pending_output_once() {
         let budget = MemoryBudget::new(CAPTURE_MEMORY);
         let (realm, owners) = capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
         let scope = realm.owner(0).unwrap();
-        let peers = PeerAuthority::new(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let peers = PeerAuthority::new(Arc::new(true.into()));
         let now = Instant::now();
         let (path, mut flow, synack) = physical_synack(&realm, &peers, now);
         let server = decode(&synack).0.seq.wrapping_add(1);
@@ -348,7 +348,7 @@ async fn physical_tcp_batch_retries_moved_peer_with_pending_output_once() {
             peers.saturate_revision_for_test();
         }
         let before = scope.stats().unwrap();
-        let foreign_peers = PeerAuthority::new(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let foreign_peers = PeerAuthority::new(Arc::new(true.into()));
         let mut batch = None;
         let warm = RealmRxBatch::receive_sharded(
             &mut batch,
@@ -629,22 +629,72 @@ async fn simultaneous_syn_dispatch_holds_one_owner_until_the_last_handoff_return
     assert_eq!(realm.dispatch_owner(other, view).unwrap().0.worker(), other);
 
     let destination = "203.0.113.9:443".parse().unwrap();
-    let capacity = crate::xdp::worker::CELLS + 2;
+    let mut corrupt = packet.clone();
+    let offset = wire::parse_ip(&packet).unwrap().payload.start;
+    corrupt[offset + 16] ^= 1;
+    let (owner, claim) = realm
+        .dispatch_owner(first, wire::PacketView::from_slice(&corrupt))
+        .unwrap();
+    assert_eq!(
+        owner.receive(&corrupt, Instant::now()),
+        Rx::Dropped(DropReason::Checksum)
+    );
+    assert_eq!(realm.tcp_directory_owner(client, destination, true), None);
+    drop(claim);
+    assert_eq!(realm.dispatch_owner(other, view).unwrap().0.worker(), other);
+
     let mut held = Vec::new();
-    for port in 1..=capacity {
-        let source = SocketAddr::new(client.ip(), port as u16);
-        held.push(
-            realm
-                .tcp_dispatch(1, source, destination)
-                .unwrap()
-                .1
-                .unwrap(),
-        );
+    for port in 1..client.port() {
+        let source = SocketAddr::new(client.ip(), port);
+        match realm.tcp_dispatch(1, source, destination, true) {
+            Ok((1, Some(claim))) => held.push(claim),
+            Err(error) if error.kind() == io::ErrorKind::OutOfMemory => break,
+            _ => panic!("first SYN must reserve its receiving worker"),
+        }
     }
-    assert!(realm.tcp_dispatch(0, client, destination).is_err());
+    assert!(held.len() >= 1024);
+    assert_eq!(realm.ownership_dir_full(), 1);
+    assert!(realm.dispatch_owner(0, view).is_err());
+    let (unknown, claim) = realm.tcp_dispatch(0, client, destination, false).unwrap();
+    assert_eq!(unknown, 0);
+    assert!(claim.is_none());
+    assert_eq!(realm.ownership_dir_full(), 2);
     let retained = SocketAddr::new(client.ip(), 1);
-    assert_eq!(realm.tcp_dispatch(0, retained, destination).unwrap().0, 1);
+    let mapped = SocketAddr::new("::ffff:192.0.2.10".parse().unwrap(), 1);
+    assert_eq!(
+        realm.tcp_dispatch(0, mapped, destination, false).unwrap().0,
+        1
+    );
+    assert_eq!(
+        realm
+            .tcp_dispatch(0, retained, destination, true)
+            .unwrap()
+            .0,
+        1
+    );
+    assert_eq!(realm.tcp_directory_owner(mapped, destination, true), None);
+    assert!(!realm.tcp_directory_retains_source(mapped.ip()));
+    let resources = realm.owners()[1].0.inner.lock().resources.clone().unwrap();
+    assert!(!resources.retains_tcp_source_on(1, mapped.ip()));
+    // A saturated directory still honors a matching reservation. A foreign worker
+    // cannot publish a second FlowId even if it is fed the raw packet directly.
+    let now = Instant::now();
+    let reserved_syn = segment(retained, 50, 0, tcp::SYN, &[]);
+    assert_eq!(
+        realm.owners()[0].receive(&reserved_syn, now),
+        Rx::Dropped(DropReason::HalfOpen)
+    );
+    assert_eq!(realm.owners()[1].receive(&reserved_syn, now), Rx::Consumed);
     drop(held);
+    let (_, reserved_flow) = realm.owners()[1].poll_accept().unwrap();
+    assert_eq!(reserved_flow.peer_addr(), retained);
+    assert_eq!(
+        realm.tcp_directory_owner(mapped, destination, true),
+        Some(1)
+    );
+    assert!(resources.retains_tcp_source_on(1, mapped.ip()));
+    assert!(!resources.retains_tcp_source_on(0, mapped.ip()));
+    drop(reserved_flow);
 
     let scope = &realm.owners()[first];
     let now = Instant::now();
@@ -692,11 +742,67 @@ async fn migrated_fin_and_syn_keep_the_compact_time_wait_and_exported_ack_owner(
     scope.drive(now);
     let final_ack = output(scope);
     assert_eq!(decode(&final_ack).0.flags, tcp::ACK);
+    let dst: SocketAddr = "203.0.113.9:443".parse().unwrap();
+    let mut ptb = [0; 128];
+    let size =
+        wire::icmp::emit_packet_too_big(&mut ptb, client.ip(), dst.ip(), 1280, final_ack.packet())
+            .unwrap();
+    let quote = wire::PacketView::from_slice(&ptb[..size]);
+    assert_eq!(realm.dispatch_owner(0, quote).unwrap().0.worker(), 1);
+    assert!(realm.tcp_directory_retains_source(client.ip()));
     scope.shutdown(true);
     let view = wire::PacketView::from_slice(&late_fin);
     assert_eq!(realm.dispatch_owner(0, view).unwrap().0.worker(), 1);
     final_ack.release();
     assert_eq!(realm.dispatch_owner(0, view).unwrap().0.worker(), 0);
+    assert_eq!(realm.dispatch_owner(0, quote).unwrap().0.worker(), 0);
+    assert!(!realm.tcp_directory_retains_source(client.ip()));
+    for owner in owners {
+        owner.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn releasing_old_time_wait_output_after_reopen_keeps_the_live_generation() {
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, owners) = capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
+    let client = client_for(&realm, 0);
+    let destination = "203.0.113.9:443".parse().unwrap();
+    let scope = realm.owner(1).unwrap();
+    let now = Instant::now();
+    let (flow, server) = handshake(scope, now, client, 100);
+    let original = flow.flow_id();
+    drop(flow);
+    scope.drive(now);
+    output(scope).release();
+    let server = server.wrapping_add(1);
+    scope.receive(&segment(client, 101, server, tcp::ACK, &[]), now);
+    scope.receive(&segment(client, 101, server, tcp::FIN | tcp::ACK, &[]), now);
+    scope.drive(now);
+    let old_output = output(scope);
+    assert_eq!(old_output.flow_id(), Some(original));
+    assert_eq!(scope.stats().unwrap().timewait_entries, 1);
+    let syn = segment(client, 100_000, 0, tcp::SYN, &[]);
+    let (owner, claim) = realm
+        .dispatch_owner(0, wire::PacketView::from_slice(&syn))
+        .unwrap();
+    assert_eq!(owner.worker(), 1);
+    assert_eq!(owner.receive(&syn, now), Rx::Consumed);
+    drop(claim);
+    let (_, replacement) = owner.poll_accept().unwrap();
+    assert_ne!(replacement.flow_id(), original);
+    old_output.release();
+    assert_eq!(
+        realm.tcp_directory_owner(client, destination, true),
+        Some(1)
+    );
+    scope.shutdown(true);
+    assert_eq!(
+        realm.tcp_directory_owner(client, destination, true),
+        Some(1)
+    );
+    drop(replacement);
+    assert_eq!(realm.tcp_directory_owner(client, destination, true), None);
     for owner in owners {
         owner.shutdown().await;
     }
@@ -840,6 +946,113 @@ async fn sharded_output_window_funds_both_owners_and_refunds_the_overlap() {
     assert_eq!(budget.used(), pressure.bytes());
     drop(pressure);
     assert_eq!(budget.used(), 0);
+}
+
+#[tokio::test]
+async fn local_window_pair_preserves_parked_source_work_and_funds_both_drivers() {
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, owners) = capture_realm(1500, 1, 256, 2, 1, &budget).unwrap();
+    realm
+        .install_admission_fence(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .unwrap();
+    let Ok([first_owner, second_owner]) = <[PacketOwner; 2]>::try_from(owners) else {
+        panic!("two original queue owners");
+    };
+    let mut first = first_owner.hand_off();
+    let mut second = second_owner.hand_off();
+    first.make_local(2).unwrap();
+    second.make_local(2).unwrap();
+    let layout = |driver: &PacketDriver| {
+        let inner = &driver.local.as_ref().unwrap().inner;
+        let available = inner.ledger.drain_state();
+        (
+            available.control_free,
+            available.bulk_free,
+            inner.frames[0].as_ref().unwrap().as_ptr(),
+        )
+    };
+    let narrow = [layout(&first), layout(&second)];
+    let held = second
+        .scope
+        .local_source_work("192.0.2.1".parse().unwrap())
+        .unwrap();
+    assert!(!PacketDriver::widen_local_pair(
+        &mut first,
+        &mut second,
+        256
+    ));
+    drop(held);
+    let pressure = budget.reserve(budget.limit() - budget.used()).unwrap();
+    assert!(!PacketDriver::widen_local_pair(
+        &mut first,
+        &mut second,
+        256
+    ));
+    assert_eq!([layout(&first), layout(&second)], narrow);
+    drop(pressure);
+    assert!(PacketDriver::widen_local_pair(&mut first, &mut second, 256));
+    for (driver, (control, bulk, frame)) in [&mut first, &mut second].into_iter().zip(narrow) {
+        assert_eq!(layout(driver), (control * 2, bulk * 2, frame));
+        let aliases = driver.local.as_ref().unwrap().inner.slots.len();
+        let sources: Vec<_> = (0..aliases)
+            .map(|n| {
+                let address = std::net::Ipv4Addr::from(0xc0000200u32 + n as u32);
+                driver.scope.local_source_work(address.into()).unwrap()
+            })
+            .collect();
+        assert!(
+            driver
+                .scope
+                .local_source_work("198.51.100.1".parse().unwrap())
+                .is_err()
+        );
+        drop(sources);
+        driver.scope.shutdown(true);
+        driver.service(&mut context(), Instant::now());
+    }
+    assert!(first_owner.reclaim().await && second_owner.reclaim().await);
+    drop((first, second));
+    first_owner.run().await;
+    second_owner.run().await;
+    drop(realm);
+    assert_eq!(budget.used(), 0);
+}
+
+#[tokio::test]
+async fn shared_physical_realms_keep_their_original_dispatch_without_a_local_directory() {
+    for (workers, members) in [(1, 1), (2, 1), (2, 2)] {
+        let budget = MemoryBudget::new(CAPTURE_MEMORY);
+        let (realm, owners) =
+            capture_realm_for_workers(1280, 64, 16, workers, members, false, &budget).unwrap();
+        assert!(!realm.tracks_tcp());
+        assert_eq!(realm.queue_affine(), workers == 2 && members == 1);
+        let client = client_for(&realm, 0);
+        let destination = "203.0.113.9:443".parse().unwrap();
+        let syn = segment(client, 100, 0, tcp::SYN, &[]);
+        let later = segment(client, 101, 1, tcp::ACK, &[]);
+        let (scope, claim) = realm
+            .dispatch_owner(workers - 1, wire::PacketView::from_slice(&syn))
+            .unwrap();
+        let worker = usize::from(realm.queue_affine());
+        assert_eq!(scope.worker(), worker);
+        assert_eq!(scope.receive(&syn, Instant::now()), Rx::Consumed);
+        drop(claim);
+        let (_, flow) = scope.poll_accept().unwrap();
+        assert_eq!(
+            realm
+                .dispatch_owner(0, wire::PacketView::from_slice(&later))
+                .unwrap()
+                .0
+                .worker(),
+            worker
+        );
+        assert!(scope.retains_tcp(client, destination));
+        assert_eq!(realm.ownership_dir_full(), 0);
+        drop(flow);
+        for owner in owners {
+            owner.shutdown().await;
+        }
+    }
 }
 
 #[tokio::test]

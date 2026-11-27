@@ -196,7 +196,7 @@ impl PacketDriver {
     }
 
     /// Terminal protocol return can precede the final application completion or waiter drop.
-    pub(crate) async fn wait_auxiliary_work(&self) -> io::Result<()> {
+    pub(crate) async fn wait_auxiliary_work(&mut self) -> io::Result<()> {
         let shared = &self.scope.0;
         let aux = shared
             .auxiliary

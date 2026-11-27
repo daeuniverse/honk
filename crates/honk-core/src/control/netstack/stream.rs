@@ -9,12 +9,18 @@ use honk_netstack::{FlowId, MemoryReservation, StreamError, SynInfo};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{PacketScope, RetirementCallback, WaitFor, Waiter, capacity, closed, register};
+#[cfg(target_os = "linux")]
+use super::{RemoteProgress, local::LocalFlow, remote::RemoteEndpoint};
 
 /// Application ownership of an original, Stack-local TCP incarnation.
 #[derive(Debug)]
 pub struct FlowIo {
     scope: PacketScope,
     binding: u64,
+    #[cfg(target_os = "linux")]
+    physical: Option<LocalFlow>,
+    #[cfg(target_os = "linux")]
+    remote: Option<RemoteEndpoint>,
     id: FlowId,
     local: SocketAddr,
     peer: SocketAddr,
@@ -35,6 +41,10 @@ impl FlowIo {
         Self {
             binding: scope.binding(),
             scope,
+            #[cfg(target_os = "linux")]
+            physical: None,
+            #[cfg(target_os = "linux")]
+            remote: None,
             id: syn.id,
             local: syn.original_dst,
             peer: syn.client,
@@ -57,6 +67,53 @@ impl FlowIo {
         self
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn new_local(
+        scope: PacketScope,
+        syn: SynInfo,
+        local: LocalFlow,
+        process: Option<super::ProcessMeta>,
+    ) -> Self {
+        let mut io = Self::new(scope, syn, process);
+        io.physical = Some(local);
+        io
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::control) fn local(&self) -> Option<&LocalFlow> {
+        self.physical.as_ref()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::control) async fn attach_remote(&mut self) -> io::Result<()> {
+        self.attach_remote_with(None).await
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::control) async fn attach_remote_with(
+        &mut self,
+        counters: Option<super::RemoteCounters>,
+    ) -> io::Result<()> {
+        if !self.open || self.remote.is_some() {
+            return Err(super::invalid(
+                "remote attachment requires an open unbound stream",
+            ));
+        }
+        self.remote = Some(
+            self.physical
+                .as_ref()
+                .ok_or_else(closed)?
+                .attach_remote(counters)
+                .await?,
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::control) fn remote_progress(&self) -> Option<RemoteProgress> {
+        self.remote.as_ref().map(RemoteEndpoint::progress)
+    }
+
     pub fn scope(&self) -> ScopeId {
         self.scope.scope()
     }
@@ -76,6 +133,9 @@ impl FlowIo {
     pub(in crate::control) fn direct_relay_runtime(&self) -> Option<&super::DirectRelayOwner> {
         #[cfg(target_os = "linux")]
         {
+            if self.physical.is_some() {
+                return None;
+            }
             self.scope.0.direct_relay_runtime.get()
         }
         #[cfg(not(target_os = "linux"))]
@@ -94,6 +154,11 @@ impl FlowIo {
 
     /// Mark only a successfully selected non-Block outbound stream, never pending routing.
     pub(in crate::control) fn mark_rx_admitted(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(local) = &self.physical {
+            local.mark_rx_admitted();
+            return;
+        }
         self.scope.0.with(|inner| {
             if inner.closing || inner.finished || self.binding != self.scope.binding() {
                 return;
@@ -133,7 +198,7 @@ impl FlowIo {
     }
 
     pub(in crate::control) fn try_reserve_memory(&self, bytes: usize) -> Option<MemoryReservation> {
-        self.scope.0.budget.reserve(bytes)
+        self.scope.reserve_memory(bytes)
     }
 
     /// The guard aborts on cancellation; exact completion is still owned by the runtime.
@@ -141,6 +206,8 @@ impl FlowIo {
         FlowRetirement {
             scope: self.scope.clone(),
             binding: self.binding,
+            #[cfg(target_os = "linux")]
+            physical: self.physical.clone(),
             id: self.id,
             completed: false,
         }
@@ -158,15 +225,22 @@ impl FlowIo {
         &mut self,
         callback: F,
     ) -> io::Result<()> {
-        self.set_retirement_callback_with_credit(None, callback)
+        self.set_retirement_callback_with_credit(None, None, callback)
     }
 
     pub(in crate::control) fn set_retirement_callback_with_credit<F: FnOnce() + Send + 'static>(
         &mut self,
         credit: Option<MemoryReservation>,
+        on_failure: Option<std::sync::Arc<crate::connection_tracker::CloseSignal>>,
         callback: F,
     ) -> io::Result<()> {
-        set_callback(&self.scope, self.id, self.binding, credit, callback)
+        let callback = funded_callback(&self.scope, credit, callback)?;
+        #[cfg(target_os = "linux")]
+        if let Some(local) = &self.physical {
+            return local.set_retirement_callback(callback, on_failure);
+        }
+        debug_assert!(on_failure.is_none());
+        set_callback(&self.scope, self.id, self.binding, callback)
     }
 
     fn close(&mut self) {
@@ -174,6 +248,12 @@ impl FlowIo {
             return;
         }
         self.open = false;
+        #[cfg(target_os = "linux")]
+        if let Some(local) = &self.physical {
+            local.close();
+            drop(self.remote.take());
+            return;
+        }
         let registrations = self.scope.0.with(|inner| {
             let index = inner.slot_index(self.id)?;
             let slot = inner.slots[index].as_mut().unwrap();
@@ -189,6 +269,12 @@ impl FlowIo {
     }
 
     pub fn abort(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(local) = &self.physical {
+            local.abort();
+            self.close();
+            return;
+        }
         self.scope.0.with(|inner| {
             if self.binding == self.scope.binding()
                 && let Some(stack) = &mut inner.stack
@@ -203,6 +289,12 @@ impl FlowIo {
     /// Cancellation leaves a runtime-owned callback/alias, not a detached cleanup task.
     pub async fn retire(&mut self) -> io::Result<()> {
         self.close();
+        #[cfg(target_os = "linux")]
+        if let Some(local) = &self.physical {
+            local.wait().await?;
+            self.abort_on_drop = false;
+            return Ok(());
+        }
         wait(&self.scope, self.id, self.binding).await?;
         self.abort_on_drop = false;
         Ok(())
@@ -212,6 +304,12 @@ impl FlowIo {
 impl Drop for FlowIo {
     fn drop(&mut self) {
         if self.abort_on_drop {
+            #[cfg(target_os = "linux")]
+            if let Some(local) = &self.physical {
+                local.abort();
+                self.close();
+                return;
+            }
             abort_retirement(&self.scope, self.id, self.binding);
         }
         self.close();
@@ -223,20 +321,38 @@ impl Drop for FlowIo {
 pub struct FlowRetirement {
     scope: PacketScope,
     binding: u64,
+    #[cfg(target_os = "linux")]
+    physical: Option<LocalFlow>,
     id: FlowId,
     completed: bool,
 }
 
 impl FlowRetirement {
     pub fn abort(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(local) = &self.physical {
+            local.abort();
+            return;
+        }
         abort_retirement(&self.scope, self.id, self.binding);
     }
 
     pub fn on_retired<F: FnOnce() + Send + 'static>(&self, callback: F) -> io::Result<()> {
-        set_callback(&self.scope, self.id, self.binding, None, callback)
+        let callback = funded_callback(&self.scope, None, callback)?;
+        #[cfg(target_os = "linux")]
+        if let Some(local) = &self.physical {
+            return local.set_retirement_callback(callback, None);
+        }
+        set_callback(&self.scope, self.id, self.binding, callback)
     }
 
     pub async fn wait(&mut self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(local) = &self.physical {
+            local.wait().await?;
+            self.completed = true;
+            return Ok(());
+        }
         wait(&self.scope, self.id, self.binding).await?;
         self.completed = true;
         Ok(())
@@ -265,28 +381,31 @@ fn abort_retirement(scope: &PacketScope, id: FlowId, binding: u64) {
     scope.0.finish_with_wakers(inner, wakers);
 }
 
-fn set_callback<F: FnOnce() + Send + 'static>(
+fn funded_callback<F: FnOnce() + Send + 'static>(
     scope: &PacketScope,
-    id: FlowId,
-    binding: u64,
     credit: Option<MemoryReservation>,
     callback: F,
-) -> io::Result<()> {
+) -> io::Result<RetirementCallback> {
     let memory = match credit {
         Some(credit) => {
             assert_eq!(credit.bytes(), size_of::<F>());
             credit
         }
-        None => scope
-            .0
-            .budget
-            .reserve(size_of::<F>())
-            .ok_or_else(capacity)?,
+        None => scope.reserve_memory(size_of::<F>()).ok_or_else(capacity)?,
     };
-    let mut callback = Some(RetirementCallback {
+    Ok(RetirementCallback {
         callback: Box::new(callback),
         _memory: memory,
-    });
+    })
+}
+
+fn set_callback(
+    scope: &PacketScope,
+    id: FlowId,
+    binding: u64,
+    callback: RetirementCallback,
+) -> io::Result<()> {
+    let mut callback = Some(callback);
     scope.0.with(|inner| {
         if scope.binding() >> 1 != binding >> 1 {
             return Err(closed());
@@ -317,7 +436,7 @@ async fn wait(scope: &PacketScope, id: FlowId, binding: u64) -> io::Result<()> {
     .await
 }
 
-fn stream_error(error: StreamError) -> io::Error {
+pub(crate) fn stream_error(error: StreamError) -> io::Error {
     let kind = match error {
         StreamError::WouldBlock => io::ErrorKind::WouldBlock,
         StreamError::Closed => io::ErrorKind::BrokenPipe,
@@ -337,6 +456,13 @@ impl AsyncRead for FlowIo {
     ) -> Poll<io::Result<()>> {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
+        }
+        #[cfg(target_os = "linux")]
+        if self.physical.is_some() {
+            return match &mut self.get_mut().remote {
+                Some(remote) => Pin::new(remote).poll_read(cx, buf),
+                None => Poll::Ready(Err(stream_error(StreamError::Stale))),
+            };
         }
         self.scope.0.with(|inner| {
             if self.binding != self.scope.binding() {
@@ -368,6 +494,16 @@ impl AsyncWrite for FlowIo {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
+        #[cfg(target_os = "linux")]
+        if self.physical.is_some() {
+            if !self.open {
+                return Poll::Ready(Err(closed()));
+            }
+            return match &mut self.get_mut().remote {
+                Some(remote) => Pin::new(remote).poll_write(cx, data),
+                None => Poll::Ready(Err(stream_error(StreamError::Stale))),
+            };
+        }
         self.scope.0.with(|inner| {
             if self.binding != self.scope.binding() {
                 return Poll::Ready(Err(closed()));
@@ -387,7 +523,19 @@ impl AsyncWrite for FlowIo {
     }
 
     /// Accepted bytes belong to the stack's retransmission queue until acknowledged.
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        #[cfg(target_os = "linux")]
+        if self.physical.is_some() {
+            if !self.open {
+                return Poll::Ready(Err(closed()));
+            }
+            return match &mut self.get_mut().remote {
+                Some(remote) => Pin::new(remote).poll_flush(cx),
+                None => Poll::Ready(Err(stream_error(StreamError::Stale))),
+            };
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = cx;
         if self.open && self.scope.0.inner.lock().stack.is_some() {
             Poll::Ready(Ok(()))
         } else {
@@ -396,6 +544,16 @@ impl AsyncWrite for FlowIo {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        #[cfg(target_os = "linux")]
+        if self.physical.is_some() {
+            if !self.open {
+                return Poll::Ready(Err(closed()));
+            }
+            return match &mut self.get_mut().remote {
+                Some(remote) => Pin::new(remote).poll_shutdown(cx),
+                None => Poll::Ready(Err(stream_error(StreamError::Stale))),
+            };
+        }
         self.scope.0.with(|inner| {
             if self.binding != self.scope.binding() {
                 return Poll::Ready(Err(closed()));
@@ -435,8 +593,7 @@ fn direct_relay_runtime_belongs_to_the_original_flow_scope() {
     {
         let _entered = coordinator.enter();
         driver
-            .sole_owner()
-            .unwrap()
+            .owner_scope()
             .publish_direct_relay_runtime(tokio::runtime::Handle::current(), fence.clone())
             .unwrap();
     }

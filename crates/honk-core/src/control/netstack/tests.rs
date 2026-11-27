@@ -58,6 +58,38 @@ fn assert_plain_frame_charge(inner: &Inner, budget: &MemoryBudget, expected_payl
     assert!(budget.used() >= inner._storage.bytes());
 }
 
+fn frame_backing(inner: &Inner) -> Vec<(usize, usize)> {
+    inner
+        .frames
+        .iter()
+        .map(|frame| {
+            let bytes = frame.as_ref().expect("original CPU frame backing");
+            (bytes.as_ptr() as usize, bytes.len())
+        })
+        .collect()
+}
+
+fn initial_frame_storage(
+    scope: &PacketScope,
+    limits: RuntimeLimits,
+) -> (Vec<(usize, usize)>, usize, usize) {
+    let frame_size = usize::from(config().mtu);
+    let layout = ScopeFrameLayout::new(limits, frame_size, 0, 1, false).unwrap();
+    let inner = scope.0.inner.lock();
+    let backing = frame_backing(&inner);
+    assert_eq!(backing.len(), limits.control_frames + limits.bulk_frames);
+    assert!(backing.iter().all(|&(_, len)| len == frame_size));
+    let payload_bytes = backing.iter().map(|&(_, len)| len).sum::<usize>();
+    let storage_bytes = payload_bytes + layout.metadata_bytes;
+    assert_eq!(inner._storage.bytes(), storage_bytes);
+    let fixed_bytes = storage_bytes + inner.ledger.charged_bytes() + scope.0._metadata.bytes();
+    assert_eq!(
+        scope.0.budget.used(),
+        fixed_bytes + inner.stack.as_ref().unwrap().overhead_reserved()
+    );
+    (backing, storage_bytes, fixed_bytes)
+}
+
 fn context() -> Context<'static> {
     Context::from_waker(Waker::noop())
 }
@@ -189,7 +221,8 @@ fn host_process_is_bound_only_to_the_new_flow_id() {
     let receive = |client, result: Option<io::Result<ProcessMeta>>| {
         let syn = segment(client, 100, 0, tcp::SYN, &[]);
         scope.0.with(|inner| {
-            let (rx, report) = inner.receive_checked(&syn, RxMeta::VERIFY, now, now, |_| true);
+            let (rx, report) =
+                inner.receive_checked(&syn, RxMeta::VERIFY, now, now, None, |_| true);
             inner
                 .bind_host_process(rx, report, |_, source| {
                     assert_eq!(source.src, client);
@@ -339,36 +372,28 @@ fn mixed_direct_cpu_batch_retains_original_flows_through_reuse_and_close() {
     let mut outputs = Vec::new();
     for _ in 0..2 {
         let budget = MemoryBudget::new(32 << 20);
-        let (scope, owner) = PacketScope::new(
-            config(),
-            Arc::clone(&budget),
-            RuntimeLimits {
-                control_frames: 2,
-                bulk_frames: 2,
-                ..limits()
-            },
-            now,
-        )
-        .unwrap();
+        let frame_limits = RuntimeLimits {
+            control_frames: 2,
+            bulk_frames: 2,
+            ..limits()
+        };
+        let (scope, owner) =
+            PacketScope::new(config(), Arc::clone(&budget), frame_limits, now).unwrap();
+        let frame_storage = initial_frame_storage(&scope, frame_limits);
         let (mut io, server_seq) = handshake(&scope, now, client, 100);
         let old = io.flow_id();
         let retired = Arc::new(AtomicUsize::new(0));
         let callback_scope = scope.clone();
         let observed = Arc::clone(&retired);
-        io.set_retirement_callback(move || {
+        let callback = move || {
             assert!(callback_scope.0.inner.try_lock().is_some());
             let _ = callback_scope.stats();
             observed.fetch_add(1, Ordering::SeqCst);
-        })
-        .unwrap();
-        let backing: Vec<_> = scope
-            .0
-            .inner
-            .lock()
-            .frames
-            .iter()
-            .map(|frame| frame.as_ref().unwrap().as_ptr() as usize)
-            .collect();
+        };
+        let callback_bytes = std::mem::size_of_val(&callback);
+        let before_install = budget.used();
+        io.set_retirement_callback(callback).unwrap();
+        assert_eq!(budget.used(), before_install + callback_bytes);
         assert!(matches!(
             std::pin::Pin::new(&mut io).poll_write(&mut context(), b"cpu-old"),
             Poll::Ready(Ok(7))
@@ -422,9 +447,19 @@ fn mixed_direct_cpu_batch_retains_original_flows_through_reuse_and_close() {
         assert_eq!(new_synack.flow_id(), Some(new_io.flow_id()));
         let frames = [packet, control_packet, new_packet];
         scope.shutdown(false);
+        let after_retirement = budget.used() - callback_bytes;
         outputs.extend([cpu, direct, reset]);
         runtimes.push((
-            scope, owner, driver, new_io, new_synack, retired, old, backing, budget, frames,
+            scope,
+            owner,
+            driver,
+            new_io,
+            new_synack,
+            retired,
+            old,
+            frame_storage,
+            (budget, after_retirement),
+            frames,
         ));
     }
     assert_eq!(runtimes[0].6, runtimes[1].6, "FlowIds are Stack-local");
@@ -438,10 +473,21 @@ fn mixed_direct_cpu_batch_retains_original_flows_through_reuse_and_close() {
     assert!(batch.iter().all(Option::is_none));
     assert!(outputs.iter().all(|output| output.queued.is_none()));
     drop(outputs);
-    for (scope, _owner, mut driver, new_io, new_synack, retired, old, backing, budget, _frames) in
-        runtimes
+    for (
+        scope,
+        owner,
+        mut driver,
+        new_io,
+        new_synack,
+        retired,
+        old,
+        (backing, storage_bytes, fixed_bytes),
+        (budget, after_retirement),
+        _frames,
+    ) in runtimes
     {
         assert_eq!(retired.load(Ordering::SeqCst), 1);
+        assert_eq!(budget.used(), after_retirement);
         {
             let inner = scope.0.inner.lock();
             assert!(!inner.slots.iter().flatten().any(|slot| slot.id == old));
@@ -457,15 +503,12 @@ fn mixed_direct_cpu_batch_retains_original_flows_through_reuse_and_close() {
             );
             assert_eq!(inner.ledger.outstanding_tx().count(), 1);
             assert_eq!(inner.output_peers.iter().flatten().count(), 1);
-            let restored: Vec<_> = inner
-                .frames
-                .iter()
-                .map(|frame| frame.as_ref().unwrap().as_ptr() as usize)
-                .collect();
-            assert_eq!(restored, backing);
+            assert_eq!(frame_backing(&inner), backing);
+            assert_eq!(inner._storage.bytes(), storage_bytes);
             assert_plain_frame_charge(&inner, &budget, 4 * 1280);
         }
         scope.shutdown(true);
+        assert_eq!(budget.used(), fixed_bytes);
         drop(new_io);
         driver.finish_turn(&mut context(), now);
         assert!(!scope.0.inner.lock().finished);
@@ -474,6 +517,9 @@ fn mixed_direct_cpu_batch_retains_original_flows_through_reuse_and_close() {
         assert!(scope.0.inner.lock().finished);
         assert!(scope.0.inner.lock().rights == Rights::Returned);
         assert_eq!(retired.load(Ordering::SeqCst), 1);
+        assert_eq!(budget.used(), fixed_bytes);
+        drop((driver, owner, scope));
+        assert_eq!(budget.used(), 0);
     }
 }
 

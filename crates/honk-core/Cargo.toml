@@ -115,6 +115,7 @@ flate2 = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+crossbeam-utils = "0.8.23"
 honk-xsk.workspace = true
 libsystemd.workspace = true
 

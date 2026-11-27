@@ -1763,6 +1763,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
+ "crossbeam-utils",
  "dashmap",
  "flate2",
  "futures",

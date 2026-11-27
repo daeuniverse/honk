@@ -170,10 +170,10 @@ impl PacketRealm {
         let (worker, claim) = match ip.proto {
             wire::PROTO_UDP => (self.worker_for_udp(ip.src), None),
             wire::PROTO_TCP => {
-                let mut ports = [0; 4];
+                let mut ports = [0; 14];
                 if ip.payload.len() < ports.len()
                     || view
-                        .copy_to(ip.payload.start..ip.payload.start + 4, &mut ports)
+                        .copy_to(ip.payload.start..ip.payload.start + ports.len(), &mut ports)
                         .is_none()
                 {
                     return Ok((&self.owners()[0], None));
@@ -182,6 +182,8 @@ impl PacketRealm {
                     local,
                     SocketAddr::new(ip.src, u16::from_be_bytes([ports[0], ports[1]])),
                     SocketAddr::new(ip.dst, u16::from_be_bytes([ports[2], ports[3]])),
+                    ports[13] & (wire::tcp::SYN | wire::tcp::ACK | wire::tcp::RST | wire::tcp::FIN)
+                        == wire::tcp::SYN,
                 )?
             }
             wire::PROTO_ICMP | wire::PROTO_ICMPV6 => (self.quoted_worker(view, &ip), None),

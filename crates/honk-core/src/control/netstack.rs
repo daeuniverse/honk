@@ -7,8 +7,12 @@
 //! is a CPU-packet capability; both CPU and direct output retain their original scope credit
 //! until actual I/O completion or explicit local disposal, never a fabricated NIC CQ.
 
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::fmt;
 use std::future::poll_fn;
+#[cfg(target_os = "linux")]
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -32,16 +36,24 @@ use tokio::sync::Notify;
 
 #[cfg(target_os = "linux")]
 mod fragment_peer;
+#[cfg(target_os = "linux")]
+pub(crate) mod local;
 mod realm;
 mod realm_receive;
+#[cfg(target_os = "linux")]
+pub(in crate::control) mod remote;
 #[cfg(target_os = "linux")]
 pub(in crate::control) use fragment_peer::{FragmentPeer, fragment_offset_zero};
 #[cfg(target_os = "linux")]
 pub(crate) use realm::capture_realm;
+#[cfg(target_os = "linux")]
+pub(crate) use realm::capture_realm_for_workers;
 use realm::{HalfOpenHold, RealmResources};
 pub(crate) use realm::{PacketRealm, PacketRealmPlan, TcpClaim};
 #[cfg(target_os = "linux")]
 pub(crate) use realm_receive::RealmRxBatch;
+#[cfg(target_os = "linux")]
+pub(in crate::control) use remote::{RemoteCounters, RemoteProgress};
 
 mod auxiliary;
 #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
@@ -57,6 +69,8 @@ pub(in crate::control) use source::SourceWork;
 use source::Sources;
 
 mod stream;
+#[cfg(target_os = "linux")]
+pub(crate) use stream::stream_error;
 pub use stream::{FlowIo, FlowRetirement};
 
 #[cfg(test)]
@@ -108,6 +122,7 @@ pub(crate) fn capture_scope_with_output(
         caps,
         budget,
         0,
+        false,
     )?;
     Ok((
         scopes.pop().expect("singleton realm scope"),
@@ -233,6 +248,8 @@ struct Shared {
     budget: Arc<MemoryBudget>,
     auxiliary: Option<Arc<Auxiliary>>,
     inner: Mutex<Inner>,
+    #[cfg(target_os = "linux")]
+    local: OnceLock<Box<local::LocalShared>>,
     owner_wake: Notify,
     #[cfg(target_os = "linux")]
     direct_relay_runtime: OnceLock<DirectRelayOwner>,
@@ -245,6 +262,32 @@ struct Shared {
     >,
     // Includes the Arc allocation, shared state and the frame-independent arrays.
     _metadata: MemoryReservation,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) type FlowIdMap<V> = HashMap<FlowId, V, BuildHasherDefault<FlowIdHasher>>;
+
+// Stack-issued FlowIds hash their slot index and generation as two u32s.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+pub(crate) struct FlowIdHasher(u64);
+
+#[cfg(target_os = "linux")]
+impl Hasher for FlowIdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 << 8) | u64::from(byte);
+        }
+    }
+
+    fn write_u32(&mut self, word: u32) {
+        self.0 = (self.0 << 32) | u64::from(word);
+    }
+
+    fn finish(&self) -> u64 {
+        let mixed = self.0.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        mixed ^ (mixed >> 32)
+    }
 }
 
 struct FlowSlot {
@@ -291,6 +334,11 @@ enum Rights {
 }
 
 struct Inner {
+    #[cfg(target_os = "linux")]
+    local_slots: Option<local::SlotIndex>,
+    #[cfg(target_os = "linux")]
+    local_pending: Vec<FlowId>,
+    worker: usize,
     rights: Rights,
     stack: Option<Stack>,
     ledger: FrameLedger<Option<FlowId>>,
@@ -314,6 +362,8 @@ struct Inner {
     capture_admission: Option<Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(target_os = "linux")]
     peers: Box<[Option<crate::xdp::worker::PeerHold>]>,
+    #[cfg(target_os = "linux")]
+    local_peers: Option<local::LocalPeers>,
     // All slots at or beyond this bound are vacant; holes inside it retain their indices.
     #[cfg(target_os = "linux")]
     peer_end: usize,
@@ -598,6 +648,11 @@ impl PacketScope {
             budget,
             auxiliary,
             inner: Mutex::new(Inner {
+                #[cfg(target_os = "linux")]
+                local_slots: None,
+                #[cfg(target_os = "linux")]
+                local_pending: Vec::new(),
+                worker,
                 rights: Rights::Task,
                 stack: Some(stack),
                 ledger,
@@ -621,6 +676,8 @@ impl PacketScope {
                     .collect(),
                 #[cfg(target_os = "linux")]
                 peers: frames.peers,
+                #[cfg(target_os = "linux")]
+                local_peers: None,
                 #[cfg(target_os = "linux")]
                 peer_end: 0,
                 #[cfg(target_os = "linux")]
@@ -648,6 +705,8 @@ impl PacketScope {
                 _storage: storage,
             }),
             owner_wake: Notify::new(),
+            #[cfg(target_os = "linux")]
+            local: OnceLock::new(),
             #[cfg(target_os = "linux")]
             direct_relay_runtime: OnceLock::new(),
             #[cfg(all(test, feature = "native-api"))]
@@ -681,6 +740,11 @@ impl PacketScope {
         self.0.with(|inner| {
             if inner.closing || !allowed() {
                 return Err(closed());
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(local) = self.0.local.get() {
+                local.accepting(true);
+                return Ok(());
             }
             if self.auxiliary_active() {
                 inner.stack.as_mut().ok_or_else(closed)?.set_accepting(true);
@@ -773,6 +837,14 @@ impl PacketScope {
         )
     }
 
+    fn reserve_memory(&self, bytes: usize) -> Option<MemoryReservation> {
+        #[cfg(target_os = "linux")]
+        if let Some(shared) = self.0.local.get() {
+            return shared.reserve(bytes);
+        }
+        self.0.budget.reserve(bytes)
+    }
+
     /// Borrowed `Rx` ranges index `packet`: consume/copy them before recycling input storage.
     /// Closing admission does not stop delivery to existing TCP/TIME_WAIT incarnations.
     pub fn receive(&self, packet: &[u8], now: Instant) -> Rx {
@@ -791,7 +863,7 @@ impl PacketScope {
             }
             if inner.resources.is_some() {
                 return inner
-                    .receive_checked(packet, RxMeta::VERIFY, now, now, |_| true)
+                    .receive_checked(packet, RxMeta::VERIFY, now, now, None, |_| true)
                     .0;
             }
             match &mut inner.stack {
@@ -835,8 +907,9 @@ impl PacketScope {
                     on_source(source, pending)
                 });
             }
-            let (rx, report) =
-                inner.receive_checked(packet, meta, now, now, |source| on_source(source, pending));
+            let (rx, report) = inner.receive_checked(packet, meta, now, now, None, |source| {
+                on_source(source, pending)
+            });
             (rx, inner.receive_result(report))
         })
     }
@@ -846,6 +919,20 @@ impl PacketScope {
     }
 
     pub(crate) fn retains_source(&self, address: IpAddr) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(local) = self.0.local.get()
+            && local.retains_source(address)
+        {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        if self.is_local() {
+            let inner = self.0.inner.lock();
+            return inner.source_work.retains_address(address)
+                || inner.resources.as_ref().is_some_and(|resources| {
+                    resources.retains_tcp_source_on(self.worker(), address)
+                });
+        }
         let inner = self.0.inner.lock();
         inner
             .stack
@@ -895,11 +982,14 @@ impl PacketScope {
                 return (Rx::Dropped(DropReason::NotForUs), Default::default());
             }
             let pending = check_output && inner.pending_source_output(packet);
-            let (rx, report) =
-                inner.receive_checked(packet, RxMeta::VERIFY, now, service_at, |source| {
-                    on_source(source, pending)
-                });
-            inner.register_tcp_new(&report, admission, None);
+            let (rx, report) = inner.receive_checked(
+                packet,
+                RxMeta::VERIFY,
+                now,
+                service_at,
+                Some(admission),
+                |source| on_source(source, pending),
+            );
             if inner.resources.is_some() {
                 inner.advance(service_at);
             }
@@ -916,7 +1006,7 @@ impl PacketScope {
         now: Instant,
         on_source: impl FnMut(honk_netstack::ValidatedSource) -> bool,
     ) -> (Rx, super::packet_endpoint::PacketReceive) {
-        let (rx, report) = inner.receive_checked(packet, meta, now, now, on_source);
+        let (rx, report) = inner.receive_checked(packet, meta, now, now, None, on_source);
         inner.bind_host_process(rx, report, |inner, source| {
             inner
                 .host_process
@@ -1014,6 +1104,10 @@ impl PacketScope {
 
     pub fn close_admission(&self) {
         self.0.with(|inner| {
+            #[cfg(target_os = "linux")]
+            if let Some(local) = self.0.local.get() {
+                local.accepting(false);
+            }
             if let Some(stack) = &mut inner.stack {
                 stack.set_accepting(false);
             }
@@ -1024,6 +1118,15 @@ impl PacketScope {
     /// disposes queued CPU packets/protocol state, but cannot reclaim exported output leases.
     pub fn shutdown(&self, abort: bool) {
         let mut inner = self.0.inner.lock();
+        #[cfg(target_os = "linux")]
+        if let Some(local) = self.0.local.get()
+            && inner.rights == Rights::Driven
+        {
+            inner.closing = true;
+            drop(inner);
+            local.shutdown(abort);
+            return;
+        }
         let wake_credit = !inner.closing && inner.credit_waiters != 0;
         inner.closing = true;
         if let Some(aux) = &self.0.auxiliary {
@@ -1104,6 +1207,10 @@ impl PacketScope {
         class: Option<TxClass>,
         outputs: &mut [Option<OutputLease>],
     ) -> Poll<Option<usize>> {
+        #[cfg(target_os = "linux")]
+        if self.is_local() {
+            return Poll::Ready(None);
+        }
         self.0.with(|inner| inner.export(self, cx, class, outputs))
     }
 
@@ -1113,12 +1220,20 @@ impl PacketScope {
 
     /// No live TCP/TIME_WAIT/control protocol state and no flow slot; exported leases may remain.
     pub fn is_protocol_quiescent(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(local) = self.0.local.get() {
+            return local.quiescent();
+        }
         let inner = self.0.inner.lock();
         inner.stack.as_ref().is_none_or(Stack::is_quiescent)
             && inner.slots.iter().all(Option::is_none)
     }
 
     pub fn stats(&self) -> Option<StackStats> {
+        #[cfg(target_os = "linux")]
+        if let Some(local) = self.0.local.get() {
+            return local.stats();
+        }
         self.0.inner.lock().stack.as_ref().map(Stack::stats)
     }
 }
@@ -1280,6 +1395,9 @@ impl Shared {
                 .expect("retirement callback owns exact slot");
             assert_eq!(slot.id, id);
             inner.tx_waiters -= usize::from(slot.tx.is_some());
+            if let Some(resources) = &inner.resources {
+                resources.retire_tcp(self.worker, id, slot.client, slot.destination);
+            }
             inner.closed_apps -= 1;
             let device = inner.device_wake();
             Self::wake_terminal_waiters(&mut inner, WaitFor::Retirement(id), &mut wakes);
@@ -1292,6 +1410,10 @@ impl Shared {
     /// Applies `Inner::device_wake` after unlocking. Notify carries a permit even if the
     /// owner has not started awaiting yet.
     fn wake_owner(&self, device: Option<Option<Waker>>) {
+        #[cfg(target_os = "linux")]
+        if let Some(local) = self.local.get() {
+            local.wake_device();
+        }
         match device {
             Some(Some(waker)) => waker.wake(),
             // The driver is scheduled, entering its first service, or recording a turn rescan.
@@ -1302,6 +1424,49 @@ impl Shared {
 }
 
 impl Inner {
+    fn send_reserved_udp(
+        &mut self,
+        lease: FrameLease,
+        source: SocketAddr,
+        client: SocketAddr,
+        payload: &[u8],
+        context: Option<SourceContext>,
+    ) -> io::Result<usize> {
+        let index = self.index(lease);
+        let stack = self.stack.as_mut().expect("open scope stack");
+        let out = self.frames[index].as_mut().expect("reserved frame storage");
+        let result = if let Some(context) = context {
+            stack.udp_send_from_with_context(source, client, payload, context, out)
+        } else {
+            stack
+                .udp_send_from(source, client, payload, out)
+                .map(|len| Transmit {
+                    len,
+                    gso: None,
+                    csum: honk_netstack::TxCsum::Full,
+                    flow: None,
+                    source: None,
+                })
+        };
+        match result {
+            Ok(tx) => {
+                self.publish(lease, tx, TxClass::Bulk, None);
+                Ok(payload.len())
+            }
+            Err(error) => {
+                self.ledger
+                    .cancel_tx(lease)
+                    .expect("failed datagram consumed no output");
+                let kind = if error == UdpError::Busy {
+                    io::ErrorKind::OutOfMemory
+                } else {
+                    io::ErrorKind::InvalidInput
+                };
+                Err(io::Error::new(kind, error))
+            }
+        }
+    }
+
     fn receive_result(
         &self,
         report: honk_netstack::ReceiveReport,
@@ -1310,6 +1475,13 @@ impl Inner {
 
         let owner = match report.outcome {
             TcpAccepted(id) | TcpNew(id) if !self.closing && !self.finished => {
+                #[cfg(target_os = "linux")]
+                if let Some(indexes) = &self.local_slots {
+                    return Self::receive_from_slot(
+                        report,
+                        indexes.get(&id).and_then(|&i| self.slots[i].as_ref()),
+                    );
+                }
                 self.slots.iter().flatten().find(|slot| slot.id == id)
             }
             _ => None,
@@ -1369,6 +1541,12 @@ impl Inner {
                 .expect("queued frame owns storage");
             self.exported_cpu[usize::from(queued.class == TxClass::Bulk)] += 1;
             *output = Some(OutputLease(OutputOwner {
+                #[cfg(target_os = "linux")]
+                local_peer: scope
+                    .0
+                    .local
+                    .get()
+                    .and_then(|_| self.output_peer_holds.get_mut(index)?.take()),
                 scope: scope.clone(),
                 queued: Some(queued),
                 bytes: Some(bytes),
@@ -1403,6 +1581,10 @@ impl Inner {
 
     // ponytail: bounded linear owner lookup; use a fixed index if measured flow counts need it.
     fn slot_index(&self, id: FlowId) -> Option<usize> {
+        #[cfg(target_os = "linux")]
+        if let Some(indexes) = &self.local_slots {
+            return indexes.get(&id).copied();
+        }
         self.slots
             .iter()
             .position(|slot| slot.as_ref().is_some_and(|slot| slot.id == id))
@@ -1478,7 +1660,7 @@ impl Inner {
         lease: FrameLease,
         tx: Transmit,
         class: TxClass,
-    ) -> io::Result<Queued> {
+    ) -> io::Result<(Queued, bool)> {
         if let Some(context) = tx.source {
             assert!(
                 self.source_work.facts(context).is_some(),
@@ -1491,12 +1673,11 @@ impl Inner {
         if let Some(context) = tx.source {
             self.source_work.retain_output(context);
         }
-        if let Some(id) = tx.flow
-            && let Some(slot) = self.slot(id)
-        {
+        let flow_bound = tx.flow.and_then(|id| self.slot(id)).is_some_and(|slot| {
             slot.outputs += 1;
-        }
-        Ok(Queued { lease, tx, class })
+            true
+        });
+        Ok((Queued { lease, tx, class }, flow_bound))
     }
 
     fn install(
@@ -1507,11 +1688,21 @@ impl Inner {
         class: TxClass,
         destination: IpAddr,
         fragment: Option<honk_netstack::FragmentInfo>,
-    ) -> io::Result<Queued> {
+    ) -> io::Result<(Queued, bool)> {
         #[cfg(not(target_os = "linux"))]
         let _ = fragment;
-        let queued = self.submit_output(lease, tx, class)?;
+        let (queued, flow_bound) = self.submit_output(lease, tx, class)?;
         self.output_peers[index] = Some(destination);
+        #[cfg(target_os = "linux")]
+        if !flow_bound {
+            self.pin_local_output(destination);
+        }
+        #[cfg(target_os = "linux")]
+        let held = if fragment.is_none() && index < self.output_peer_holds.len() {
+            self.peer_hold_at(destination).cloned()
+        } else {
+            None
+        };
         #[cfg(target_os = "linux")]
         if let Some(output) = self.output_peer_holds.get_mut(index) {
             *output = match fragment {
@@ -1524,15 +1715,10 @@ impl Inner {
                     })
                     .and_then(|peer| peer.peer.clone()),
                 Some(_) => None,
-                None => self
-                    .peers
-                    .iter()
-                    .flatten()
-                    .find(|peer| peer.address() == destination)
-                    .cloned(),
+                None => held,
             };
         }
-        Ok(queued)
+        Ok((queued, flow_bound))
     }
 
     fn publish(
@@ -1557,15 +1743,36 @@ impl Inner {
             let bytes = &self.frames[index].as_ref().expect("reserved Host output")[..tx.len];
             binding.outputs[index] = host::HostOutput::from_packet(bytes, fragment);
         }
-        let queued = self
+        let (queued, _flow_bound) = self
             .install(lease, index, tx, class, destination, fragment)
             .expect("reserved complete output frame");
         self.push(queued);
+        #[cfg(target_os = "linux")]
+        if !_flow_bound {
+            self.refresh_local_pending();
+        }
+    }
+
+    fn note_empty_output_class(&mut self, class: TxClass) {
+        #[cfg(target_os = "linux")]
+        self.refresh_local_pending();
+        // The CPU prefix and this protocol class were both checked by the same owner.
+        // Only advance() can service a newly pending close.
+        if self.pending_closes == 0
+            && !self.closing
+            && let Some(rescan) = &mut self.turn_needs_scan
+        {
+            rescan[usize::from(class == TxClass::Bulk)] = false;
+        }
     }
 
     fn release(&mut self, queued: Queued) {
         let index = self.index(queued.lease);
-        self.output_peers[index] = None;
+        let destination = self.output_peers[index].take();
+        #[cfg(target_os = "linux")]
+        self.unpin_local_output(queued.tx.flow, destination);
+        #[cfg(not(target_os = "linux"))]
+        let _ = destination;
         #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
         if let Some(binding) = &mut self.host_process {
             binding.outputs[index] = None;
@@ -1638,6 +1845,8 @@ impl Inner {
             self.ledger
                 .cancel_tx(lease)
                 .expect("unused output reservation");
+            #[cfg(target_os = "linux")]
+            self.refresh_local_pending();
             false
         }
     }
@@ -1808,6 +2017,11 @@ impl PacketOwner {
     /// keeps the joined finish obligation: park it in `reclaim`, then run it.
     pub(in crate::control) fn hand_off(&self) -> PacketDriver {
         let mut inner = self.scope.0.inner.lock();
+        #[cfg(target_os = "linux")]
+        assert!(
+            self.scope.0.local.get().is_none(),
+            "a physical driving right is single-use"
+        );
         assert!(
             inner.rights == Rights::Task,
             "one driving right per original owner"
@@ -1815,6 +2029,8 @@ impl PacketOwner {
         inner.rights = Rights::Driven;
         drop(inner);
         PacketDriver {
+            #[cfg(target_os = "linux")]
+            local: None,
             scope: self.scope.clone(),
             fallback: None,
             deadline: None,
@@ -1831,9 +2047,18 @@ impl PacketOwner {
             notified.as_mut().enable();
             {
                 let mut inner = self.scope.0.inner.lock();
+                #[cfg(target_os = "linux")]
+                if let Some(local) = self.scope.0.local.get() {
+                    MutexGuard::unlocked(&mut inner, || local.deliver_callbacks());
+                }
                 if inner.rights != Rights::Driven {
                     let returned = inner.rights == Rights::Returned && inner.finished;
                     inner.rights = Rights::Task;
+                    drop(inner);
+                    #[cfg(target_os = "linux")]
+                    if let Some(local) = self.scope.0.local.get() {
+                        local.deliver_callbacks();
+                    }
                     return returned;
                 }
             }
@@ -1842,6 +2067,11 @@ impl PacketOwner {
     }
 
     pub async fn run(self) {
+        #[cfg(target_os = "linux")]
+        if let Some(local) = self.scope.0.local.get() {
+            local.finish_abandoned(&self.scope).await;
+            return;
+        }
         loop {
             let notified = self.scope.0.owner_wake.notified();
             tokio::pin!(notified);
@@ -1906,6 +2136,10 @@ pub(crate) enum TunOutput {
     Packet(usize),
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing the original frame owner would allocate for every generated packet"
+)]
 pub(crate) enum MaterializedOutput {
     Idle,
     Closed,
@@ -1926,13 +2160,50 @@ pub(crate) struct DirectOutput {
 /// The exclusive driving right handed to one device owner. Not Clone; only `hand_off` makes
 /// one. Keep it in the outer device owner, never inside a scope callback or lock holder.
 pub(crate) struct PacketDriver {
+    #[cfg(target_os = "linux")]
+    local: Option<Box<local::LocalOwner>>,
     scope: PacketScope,
     // Kept until serviced so frequent unrelated device polls cannot postpone it.
     fallback: Option<Instant>,
     deadline: Option<Instant>,
 }
 
+enum DrivingInner<'a> {
+    Shared(MutexGuard<'a, Inner>),
+    #[cfg(target_os = "linux")]
+    Local(&'a mut Inner),
+}
+
+impl std::ops::Deref for DrivingInner<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        match self {
+            Self::Shared(inner) => inner,
+            #[cfg(target_os = "linux")]
+            Self::Local(inner) => inner,
+        }
+    }
+}
+
+impl std::ops::DerefMut for DrivingInner<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        match self {
+            Self::Shared(inner) => inner,
+            #[cfg(target_os = "linux")]
+            Self::Local(inner) => inner,
+        }
+    }
+}
+
 impl PacketDriver {
+    fn driving_inner(&mut self) -> DrivingInner<'_> {
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = &mut self.local {
+            return DrivingInner::Local(&mut owner.inner);
+        }
+        DrivingInner::Shared(self.scope.0.inner.lock())
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn sole_owner(&self) -> Option<&PacketScope> {
         (self.scope.0.workers == 1).then_some(&self.scope)
@@ -1959,20 +2230,33 @@ impl PacketDriver {
 
     /// Complete CPU service for startup-only driving and realms using the CPU/SG path.
     pub(crate) fn service(&mut self, cx: &mut Context<'_>, now: Instant) -> bool {
-        let more = self.begin(now, |inner| inner.fill(now));
+        let more = self.begin(now, Some(cx), |inner| inner.fill(now));
         self.finish_turn(cx, now);
         more
     }
 
     /// Advance timers and pending closes before a bounded direct-output turn.
     pub(crate) fn begin_turn(&mut self, now: Instant) {
-        self.begin(now, |inner| {
+        self.begin(now, None, |inner| {
             inner.turn_needs_scan.get_or_insert([false; 2]);
             false
         });
     }
 
-    fn begin(&mut self, now: Instant, output: impl FnOnce(&mut Inner) -> bool) -> bool {
+    fn begin(
+        &mut self,
+        now: Instant,
+        _cx: Option<&Context<'_>>,
+        output: impl FnOnce(&mut Inner) -> bool,
+    ) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = &mut self.local {
+            owner.start_turn(&self.scope, now, _cx);
+            if self.scope.local_failed() {
+                return false;
+            }
+            return output(&mut owner.inner);
+        }
         let mut inner = self.scope.0.inner.lock();
         if inner.rights != Rights::Driven {
             self.deadline = None;
@@ -1991,6 +2275,11 @@ impl PacketDriver {
 
     /// Rearm after the last emission or disposal, preserving any unserviced mutation.
     pub(crate) fn finish_turn(&mut self, cx: &mut Context<'_>, now: Instant) {
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = &mut self.local {
+            self.deadline = owner.finish_turn(&self.scope, cx, now);
+            return;
+        }
         let shared = &self.scope.0;
         let wakes = {
             let mut inner = shared.inner.lock();
@@ -2045,6 +2334,12 @@ impl PacketDriver {
     /// A failed synchronous device round can enter asynchronous teardown before service resumes.
     #[cfg(target_os = "linux")]
     pub(crate) fn interrupt_turn(&mut self, cx: &Context<'_>) {
+        if let Some(owner) = &mut self.local {
+            owner.turn = local::LocalTurn::Idle;
+            owner.inner.turn_needs_scan = None;
+            cx.waker().wake_by_ref();
+            return;
+        }
         let mut inner = self.scope.0.inner.lock();
         if inner.turn_needs_scan.take().is_some() {
             register(&mut inner.output_waker, cx.waker());
@@ -2057,7 +2352,7 @@ impl PacketDriver {
     /// Discard only locally queued packets. Exported owners still need their actual CQ.
     #[cfg(target_os = "linux")]
     pub(crate) fn service_closing(&mut self, cx: &mut Context<'_>, now: Instant) -> bool {
-        let more = self.begin(now, |inner| {
+        let more = self.begin(now, Some(cx), |inner| {
             for _ in 0..BATCH {
                 let Some(queued) = inner.pop(None) else { break };
                 inner.release(queued);
@@ -2075,7 +2370,11 @@ impl PacketDriver {
         class: TxClass,
         l3: &mut [u8],
     ) -> io::Result<MaterializedOutput> {
-        let mut inner = self.scope.0.inner.lock();
+        #[cfg(target_os = "linux")]
+        if self.scope.local_failed() {
+            return Ok(MaterializedOutput::Closed);
+        }
+        let mut inner = self.driving_inner();
         if inner.rights != Rights::Driven
             || inner.aborted
             || inner.finished
@@ -2126,14 +2425,7 @@ impl PacketDriver {
         );
         state.drain_half_open();
         let Some((tx, fragment)) = tx? else {
-            // The CPU prefix and this protocol class were both checked under this lock.
-            // Only advance() can service a newly pending close.
-            if reservation.inner.pending_closes == 0
-                && !reservation.inner.closing
-                && let Some(rescan) = &mut reservation.inner.turn_needs_scan
-            {
-                rescan[usize::from(class == TxClass::Bulk)] = false;
-            }
+            state.note_empty_output_class(class);
             return Ok(MaterializedOutput::Idle);
         };
         if tx.len == 0 || tx.len > frame_size {
@@ -2143,9 +2435,10 @@ impl PacketDriver {
             .map_err(io::Error::other)?
             .1;
         let index = reservation.inner.index(lease);
-        let queued = reservation
-            .inner
-            .install(lease, index, tx, class, destination, fragment)?;
+        let (queued, _flow_bound) =
+            reservation
+                .inner
+                .install(lease, index, tx, class, destination, fragment)?;
         #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
         if tx.flow.is_none()
             && let Some(binding) = &mut reservation.inner.host_process
@@ -2154,6 +2447,10 @@ impl PacketDriver {
         }
         reservation.lease = None;
         #[cfg(target_os = "linux")]
+        if !_flow_bound {
+            reservation.inner.refresh_local_pending();
+        }
+        #[cfg(target_os = "linux")]
         let path = reservation
             .inner
             .output_peer_holds
@@ -2161,10 +2458,22 @@ impl PacketDriver {
             .and_then(Option::as_ref)
             .filter(|hold| hold.learned())
             .map(|hold| hold.original_path());
+        #[cfg(target_os = "linux")]
+        let local_peer = if reservation.inner.local_slots.is_some() {
+            reservation
+                .inner
+                .output_peer_holds
+                .get_mut(index)
+                .and_then(Option::take)
+        } else {
+            None
+        };
         drop(reservation);
         drop(inner);
         Ok(MaterializedOutput::Packet(DirectOutput {
             owner: OutputOwner {
+                #[cfg(target_os = "linux")]
+                local_peer,
                 scope: self.scope.clone(),
                 queued: Some(queued),
                 bytes: None,
@@ -2248,7 +2557,7 @@ impl PacketDriver {
             IovTransmit::Packet(tx) => {
                 // The protocol owner stayed live under this lock through the write. Record
                 // its exact identity and return the credit before any stream/source reap.
-                let queued = state
+                let (queued, _) = state
                     .submit_output(lease, tx, class)
                     .expect("complete reserved TUN output");
                 reservation.lease = None;
@@ -2270,6 +2579,13 @@ impl PacketDriver {
         class: TxClass,
         outputs: &mut [Option<OutputLease>],
     ) -> Poll<Option<usize>> {
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = &mut self.local {
+            if self.scope.local_failed() {
+                return Poll::Ready(None);
+            }
+            return owner.inner.export(&self.scope, cx, Some(class), outputs);
+        }
         let mut inner = self.scope.0.inner.lock();
         if inner.rights != Rights::Driven {
             return Poll::Ready(None);
@@ -2281,6 +2597,11 @@ impl PacketDriver {
 impl Drop for PacketDriver {
     /// Only a right change; the parked original owner performs any cleanup.
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = self.local.take() {
+            owner.return_right(&self.scope);
+            return;
+        }
         let stale = {
             let mut inner = self.scope.0.inner.lock();
             if inner.rights != Rights::Driven {
@@ -2300,6 +2621,8 @@ impl Drop for PacketDriver {
 pub struct OutputLease(OutputOwner);
 
 pub(crate) struct OutputOwner {
+    #[cfg(target_os = "linux")]
+    local_peer: Option<crate::xdp::worker::PeerHold>,
     scope: PacketScope,
     queued: Option<Queued>,
     bytes: Option<Box<[u8]>>,
@@ -2358,6 +2681,9 @@ impl OutputOwner {
     #[cfg(target_os = "linux")]
     pub(crate) fn peer_hold(&self) -> Option<crate::xdp::worker::PeerHold> {
         let queued = self.queued?;
+        if self.scope.0.local.get().is_some() {
+            return self.local_peer.clone();
+        }
         let inner = self.scope.0.inner.lock();
         inner
             .output_peer_holds
@@ -2398,6 +2724,14 @@ impl OutputOwner {
 
     pub(crate) fn release_batch(outputs: &mut [Option<&mut OutputOwner>]) {
         assert!(outputs.len() <= BATCH);
+        #[cfg(target_os = "linux")]
+        for entry in &mut *outputs {
+            if let Some(owner) = entry
+                && owner.return_local()
+            {
+                entry.take();
+            }
+        }
         // ponytail: at most 64x64 scope comparisons; index only if measured batches need it.
         while let Some(shared) = outputs
             .iter()
@@ -2439,6 +2773,10 @@ impl fmt::Debug for OutputLease {
 
 impl Drop for OutputOwner {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if self.return_local() {
+            return;
+        }
         if let Some(queued) = self.queued.take() {
             let bytes = self.bytes.take();
             self.scope.0.with(|inner| {
@@ -2488,6 +2826,10 @@ impl DatagramSender {
         let scope = self.realm.as_ref().map_or(&self.scope, |realm| {
             &realm.owners()[realm.worker_for_udp(client.ip())]
         });
+        #[cfg(target_os = "linux")]
+        if let Some(local) = scope.0.local.get() {
+            return local.send_udp(self, payload, client).await;
+        }
         let mut waiter = Waiter::new(scope);
         poll_fn(|cx| {
             scope.0.with(|inner| {
@@ -2518,46 +2860,13 @@ impl DatagramSender {
                     }
                     Err(error) => return Poll::Ready(Err(io::Error::other(error))),
                 };
-                let index = inner.index(lease);
-                let stack = inner.stack.as_mut().expect("open scope stack");
-                let out = inner.frames[index]
-                    .as_mut()
-                    .expect("reserved frame storage");
-                let result = if let Some(context) = self
-                    .packet_source
-                    .as_ref()
-                    .and_then(SourceWork::optional_context)
-                {
-                    stack.udp_send_from_with_context(self.source, client, payload, context, out)
-                } else {
-                    stack
-                        .udp_send_from(self.source, client, payload, out)
-                        .map(|len| Transmit {
-                            len,
-                            gso: None,
-                            csum: honk_netstack::TxCsum::Full,
-                            flow: None,
-                            source: None,
-                        })
-                };
-                match result {
-                    Ok(tx) => {
-                        inner.publish(lease, tx, TxClass::Bulk, None);
-                        Poll::Ready(Ok(payload.len()))
-                    }
-                    Err(error) => {
-                        inner
-                            .ledger
-                            .cancel_tx(lease)
-                            .expect("failed datagram consumed no output");
-                        let kind = if error == UdpError::Busy {
-                            io::ErrorKind::OutOfMemory
-                        } else {
-                            io::ErrorKind::InvalidInput
-                        };
-                        Poll::Ready(Err(io::Error::new(kind, error)))
-                    }
-                }
+                Poll::Ready(inner.send_reserved_udp(
+                    lease,
+                    self.source,
+                    client,
+                    payload,
+                    self.source_context(),
+                ))
             })
         })
         .await

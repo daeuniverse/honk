@@ -2,6 +2,10 @@ use super::*;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 
+mod ownership;
+use ownership::OwnershipDir;
+pub(crate) use ownership::TcpClaim;
+
 #[derive(Clone)]
 pub(crate) struct PacketRealm(Arc<RealmOwners>);
 
@@ -75,8 +79,14 @@ impl PacketRealm {
             + owners.len() * size_of::<PacketScope>();
         let memory = owners[0].0.budget.reserve(bytes).ok_or_else(capacity)?;
         Ok(Self(Arc::new(RealmOwners {
-            affinity: if queue_affine {
-                owners[0].0.inner.lock().resources.clone()
+            affinity: if queue_affine || owners.len() == 1 {
+                owners[0]
+                    .0
+                    .inner
+                    .lock()
+                    .resources
+                    .clone()
+                    .filter(|r| queue_affine || r.tracks_tcp())
             } else {
                 None
             },
@@ -104,10 +114,7 @@ impl PacketRealm {
     }
 
     pub(crate) fn worker_for_tcp(&self, client: SocketAddr, destination: SocketAddr) -> usize {
-        self.worker((
-            SocketAddr::new(client.ip().to_canonical(), client.port()),
-            SocketAddr::new(destination.ip().to_canonical(), destination.port()),
-        ))
+        self.worker(ownership::canonical(client, destination))
     }
 
     pub(crate) fn worker_for_udp(&self, client: IpAddr) -> usize {
@@ -115,55 +122,7 @@ impl PacketRealm {
     }
 
     pub(crate) fn queue_affine(&self) -> bool {
-        self.0.affinity.is_some()
-    }
-
-    pub(crate) fn tcp_dispatch(
-        &self,
-        local: usize,
-        source: SocketAddr,
-        destination: SocketAddr,
-    ) -> io::Result<(usize, Option<TcpClaim>)> {
-        let Some(resources) = &self.0.affinity else {
-            return Ok((self.worker_for_tcp(source, destination), None));
-        };
-        let tuple = (source, destination);
-        let mut state = resources.half_open.lock();
-        let index = state
-            .claims
-            .iter()
-            .position(|cell| cell.as_ref().is_some_and(|entry| entry.tuple == tuple))
-            .or_else(|| state.claims.iter().position(Option::is_none))
-            .ok_or_else(capacity)?;
-        let entry = state.claims[index].get_or_insert(ClaimEntry {
-            tuple,
-            preferred: local,
-            owner: None,
-            users: 0,
-        });
-        entry.users += 1;
-        let claim = TcpClaim {
-            resources: Arc::clone(resources),
-            index,
-        };
-        if let Some(owner) = entry.owner {
-            return Ok((owner, Some(claim)));
-        }
-        let preferred = entry.preferred;
-        drop(state);
-
-        // No shard lock may nest under half_open: receive takes them in the other order.
-        // Until publication, contenders may scan independently but cannot enter a Stack.
-        let owner = if self.owners()[preferred].retains_tcp(source, destination)
-            || !self.owners()[1 - preferred].retains_tcp(source, destination)
-        {
-            preferred
-        } else {
-            1 - preferred
-        };
-        let mut state = resources.half_open.lock();
-        let entry = state.claims[index].as_mut().expect("live dispatch claim");
-        Ok((*entry.owner.get_or_insert(owner), Some(claim)))
+        self.0.owners.len() == 2 && self.0.affinity.is_some()
     }
 
     pub(crate) fn datagram_sender(&self, source: SocketAddr) -> DatagramSender {
@@ -179,6 +138,7 @@ impl PacketRealm {
 
 pub(super) struct RealmResources {
     half_open: Mutex<HalfOpen>,
+    directory: Option<OwnershipDir>,
     pub(super) icmp: Mutex<(honk_netstack::IcmpState, Instant)>,
     pub(super) udp_pending: Arc<MemoryBudget>,
     _memory: MemoryReservation,
@@ -187,31 +147,14 @@ pub(super) struct RealmResources {
 struct HalfOpen {
     total: usize,
     sources: Box<[Option<(IpAddr, usize)>]>,
-    claims: Box<[Option<ClaimEntry>]>,
+    claims: Box<[Option<SharedClaim>]>,
 }
 
-struct ClaimEntry {
+struct SharedClaim {
     tuple: (SocketAddr, SocketAddr),
     preferred: usize,
-    owner: Option<usize>,
+    worker: Option<usize>,
     users: usize,
-}
-
-pub(crate) struct TcpClaim {
-    resources: Arc<RealmResources>,
-    index: usize,
-}
-
-impl Drop for TcpClaim {
-    fn drop(&mut self) {
-        let mut state = self.resources.half_open.lock();
-        let cell = &mut state.claims[self.index];
-        let entry = cell.as_mut().expect("live dispatch claim");
-        entry.users -= 1;
-        if entry.users == 0 {
-            *cell = None;
-        }
-    }
 }
 
 pub(super) struct HalfOpenHold {
@@ -220,7 +163,13 @@ pub(super) struct HalfOpenHold {
 }
 
 impl RealmResources {
-    fn new(budget: &Arc<MemoryBudget>, now: Instant, claims: usize) -> io::Result<Arc<Self>> {
+    fn new(
+        budget: &Arc<MemoryBudget>,
+        now: Instant,
+        directory_slots: usize,
+        workers: usize,
+        shared_claims: usize,
+    ) -> io::Result<Arc<Self>> {
         let limits = honk_netstack::IcmpLimits::default();
         let bytes = honk_netstack::IcmpState::overhead_bound(limits)
             .and_then(|n| {
@@ -229,15 +178,19 @@ impl RealmResources {
                 )
             })
             .and_then(|n| n.checked_add(1024 * size_of::<Option<(IpAddr, usize)>>()))
-            .and_then(|n| n.checked_add(claims * size_of::<Option<ClaimEntry>>()))
+            .and_then(|n| n.checked_add(OwnershipDir::bytes(directory_slots)?))
+            .and_then(|n| {
+                n.checked_add(shared_claims.checked_mul(size_of::<Option<SharedClaim>>())?)
+            })
             .ok_or_else(capacity)?;
         let memory = budget.reserve(bytes).ok_or_else(capacity)?;
         Ok(Arc::new(Self {
             half_open: Mutex::new(HalfOpen {
                 total: 0,
                 sources: (0..1024).map(|_| None).collect(),
-                claims: (0..claims).map(|_| None).collect(),
+                claims: (0..shared_claims).map(|_| None).collect(),
             }),
+            directory: (directory_slots != 0).then(|| OwnershipDir::new(directory_slots, workers)),
             icmp: Mutex::new((honk_netstack::IcmpState::new(limits), now)),
             udp_pending: MemoryBudget::new(512 * 1024),
             _memory: memory,
@@ -294,28 +247,25 @@ pub(crate) fn capture_realm(
     members: usize,
     budget: &Arc<MemoryBudget>,
 ) -> anyhow::Result<(PacketRealm, Vec<PacketOwner>)> {
-    capture_realm_with_output(
+    capture_realm_for_workers(
         mtu,
         realms,
         bulk_frames,
         workers,
-        usize::try_from(mtu.max(1280))?,
-        TxCaps::NONE,
         members,
+        members == 1,
         budget,
     )
 }
 
 #[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn capture_realm_with_output(
+pub(crate) fn capture_realm_for_workers(
     mtu: u32,
     realms: usize,
     bulk_frames: usize,
     workers: usize,
-    output_capacity: usize,
-    caps: TxCaps,
     members: usize,
+    local: bool,
     budget: &Arc<MemoryBudget>,
 ) -> anyhow::Result<(PacketRealm, Vec<PacketOwner>)> {
     let (scopes, owners) = capture_partition(
@@ -323,10 +273,11 @@ pub(crate) fn capture_realm_with_output(
         realms,
         bulk_frames,
         workers,
-        output_capacity,
-        caps,
+        usize::try_from(mtu.max(1280))?,
+        TxCaps::NONE,
         budget,
         members,
+        local,
     )?;
     Ok((
         PacketRealm::from_owners(scopes, workers == 2 && members == 1)?,
@@ -345,7 +296,12 @@ pub(super) fn capture_partition(
     caps: TxCaps,
     budget: &Arc<MemoryBudget>,
     members: usize,
+    local: bool,
 ) -> anyhow::Result<(Vec<PacketScope>, Vec<PacketOwner>)> {
+    anyhow::ensure!(
+        !local || members == 1,
+        "local packet owners require one physical member"
+    );
     anyhow::ensure!(
         bulk_frames >= workers,
         "each capture owner requires bulk progress credit"
@@ -357,20 +313,46 @@ pub(super) fn capture_partition(
     let scope = ScopeId::allocate().ok_or_else(|| invalid("scope identities exhausted"))?;
     let now = Instant::now();
     let physical = members != 0;
+    let slots = (4096 / realms).min(1024);
     let resources = if physical {
-        // Both RX callbacks can hold a claim in addition to all in-flight handoff cells.
-        let claims = if workers == 2 && members == 1 {
+        // An exported generation may overlap its replacement. Reserve both incarnations
+        // and the in-flight ingress claims before constructing either worker.
+        let directory_slots = if local {
+            let per_worker_outputs = bulk_frames
+                .checked_add(CAPTURE_CONTROL_FRAMES)
+                .ok_or_else(capacity)?;
+            per_worker_outputs
+                .checked_mul(workers)
+                .and_then(|n| n.checked_add(slots))
+                .and_then(|n| {
+                    n.checked_add(if workers == 2 {
+                        crate::xdp::worker::CELLS + workers
+                    } else {
+                        0
+                    })
+                })
+                .and_then(|n| n.checked_next_multiple_of(workers))
+                .ok_or_else(capacity)?
+        } else {
+            0
+        };
+        let shared_claims = if !local && members == 1 && workers == 2 {
             crate::xdp::worker::CELLS + workers
         } else {
             0
         };
-        Some(RealmResources::new(budget, now, claims)?)
+        Some(RealmResources::new(
+            budget,
+            now,
+            directory_slots,
+            workers,
+            shared_claims,
+        )?)
     } else {
         None
     };
     let partition =
         |total: usize, worker: usize| total / workers + usize::from(worker < total % workers);
-    let slots = (4096 / realms).min(1024);
     let mut scopes = Vec::with_capacity(workers);
     let mut owners = Vec::with_capacity(workers);
     for worker in 0..workers {
@@ -416,16 +398,87 @@ impl PacketRealm {
         let [first, second] = self.owners() else {
             return false;
         };
-        let Some(first_window) = OutputWindowGrowth::reserve(first) else {
+        let Some(first_window) = OutputWindowGrowth::reserve(first, &first.0.inner.lock()) else {
             return false;
         };
-        let Some(second_window) = OutputWindowGrowth::reserve(second) else {
+        let Some(second_window) = OutputWindowGrowth::reserve(second, &second.0.inner.lock())
+        else {
             return false;
         };
         let first_frames = first_window.layout.allocate(first_window.retained_frames);
         let second_frames = second_window.layout.allocate(second_window.retained_frames);
-        first_window.install(first, first_frames);
-        second_window.install(second, second_frames);
+        first_window.install(&mut first.0.inner.lock(), first_frames);
+        second_window.install(&mut second.0.inner.lock(), second_frames);
+        true
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PacketDriver {
+    pub(crate) fn widen_local_pair(
+        first: &mut Self,
+        second: &mut Self,
+        base_bulk_frames: usize,
+    ) -> bool {
+        if base_bulk_frames != CAPTURE_WIDE_BULK_FRAMES
+            || first.scope.scope() != second.scope.scope()
+            || first.scope.0.workers != 2
+            || second.scope.0.workers != 2
+            || first.scope.worker() != 0
+            || second.scope.worker() != 1
+        {
+            return false;
+        }
+        let (Some(one), Some(two)) = (first.local.as_deref_mut(), second.local.as_deref_mut())
+        else {
+            return false;
+        };
+        if !one
+            .inner
+            .resources
+            .as_ref()
+            .is_some_and(|resources| resources.tracks_tcp())
+        {
+            return false;
+        }
+        // The parked scopes own the externally held SourceWork table. Keep both empty
+        // tables and shutdown fenced until both replacement sets have been installed.
+        let mut parked_one = first.scope.0.inner.lock();
+        let mut parked_two = second.scope.0.inner.lock();
+        if parked_one.closing
+            || parked_two.closing
+            || !parked_one.source_work.is_empty()
+            || !parked_two.source_work.is_empty()
+        {
+            return false;
+        }
+        let prepare = |scope: &PacketScope, owner: &local::LocalOwner| {
+            let window = OutputWindowGrowth::reserve(scope, &owner.inner)?;
+            let layout = &window.layout;
+            let metadata = owner.prepare_wide(
+                scope,
+                layout.aliases,
+                layout.config.tx_capacity,
+                layout.peer_capacity,
+            )?;
+            Some((window, metadata))
+        };
+        let Some(first_growth) = prepare(&first.scope, one) else {
+            return false;
+        };
+        let Some(second_growth) = prepare(&second.scope, two) else {
+            return false;
+        };
+        for ((window, metadata), owner, scope, parked) in [
+            (first_growth, one, &first.scope, &mut *parked_one),
+            (second_growth, two, &second.scope, &mut *parked_two),
+        ] {
+            let frames = window.layout.allocate(window.retained_frames);
+            std::mem::swap(&mut owner.inner.source_work, &mut parked.source_work);
+            window.install(&mut owner.inner, frames);
+            std::mem::swap(&mut owner.inner.source_work, &mut parked.source_work);
+            metadata.install(owner, scope);
+        }
         true
     }
 }
@@ -441,38 +494,33 @@ struct OutputWindowGrowth {
 
 #[cfg(target_os = "linux")]
 impl OutputWindowGrowth {
-    fn reserve(scope: &PacketScope) -> Option<Self> {
-        let (limits, frame_size, retained_frames, original_bytes) = {
-            let inner = scope.0.inner.lock();
-            let ledger = inner.ledger.drain_state();
-            if inner
-                .capture_admission
-                .as_ref()
-                .is_none_or(|gate| gate.load(Ordering::Acquire))
-                || inner.closing
-                || !inner.stack.as_ref().is_some_and(Stack::is_quiescent)
-                || inner.queued != 0
-                || inner.slots.iter().any(Option::is_some)
-                || inner.peer_end != 0
-                || !inner.source_work.is_empty()
-                || ledger.control_free != CAPTURE_CONTROL_FRAMES / 2
-                || ledger.bulk_free != CAPTURE_WIDE_BULK_FRAMES / 2
-                || !ledger.is_drained()
-            {
-                return None;
-            }
-            (
-                RuntimeLimits {
-                    max_slots: inner.half_open.len(),
-                    control_frames: CAPTURE_CONTROL_FRAMES,
-                    bulk_frames: CAPTURE_WIDE_BULK_FRAMES,
-                    max_waiters: inner.waiters.len(),
-                },
-                inner.frame_size,
-                inner.frames.len(),
-                inner._storage.bytes(),
-            )
+    fn reserve(scope: &PacketScope, inner: &Inner) -> Option<Self> {
+        let ledger = inner.ledger.drain_state();
+        if inner
+            .capture_admission
+            .as_ref()
+            .is_none_or(|gate| gate.load(Ordering::Acquire))
+            || inner.closing
+            || !inner.stack.as_ref().is_some_and(Stack::is_quiescent)
+            || inner.queued != 0
+            || inner.slots.iter().any(Option::is_some)
+            || inner.peer_end != 0
+            || !inner.source_work.is_empty()
+            || ledger.control_free != CAPTURE_CONTROL_FRAMES / 2
+            || ledger.bulk_free != CAPTURE_WIDE_BULK_FRAMES / 2
+            || !ledger.is_drained()
+        {
+            return None;
+        }
+        let limits = RuntimeLimits {
+            max_slots: inner.half_open.len(),
+            control_frames: CAPTURE_CONTROL_FRAMES,
+            bulk_frames: CAPTURE_WIDE_BULK_FRAMES,
+            max_waiters: inner.waiters.len(),
         };
+        let frame_size = inner.frame_size;
+        let retained_frames = inner.frames.len();
+        let original_bytes = inner._storage.bytes();
         let layout = ScopeFrameLayout::new(limits, frame_size, scope.worker(), 2, true).ok()?;
         let old_frame_bytes = retained_frames * frame_size;
         let old_metadata_bytes = original_bytes - old_frame_bytes;
@@ -480,9 +528,19 @@ impl OutputWindowGrowth {
         let budget = &scope.0.budget;
         // The original CPU byte boxes move to the replacement. At the allocation peak
         // both ledgers and the old and new arrays coexist.
-        let growth = budget.reserve(growth_bytes)?;
-        let overlap = budget.reserve(old_metadata_bytes)?;
-        let ledger = FrameLedger::new(layout.config, budget).ok()?;
+        let growth = scope.reserve_memory(growth_bytes)?;
+        let overlap = scope.reserve_memory(old_metadata_bytes)?;
+        let ledger = FrameLedger::new(layout.config, budget)
+            .or_else(|error| {
+                if error == honk_datapath::buffer::LedgerError::BudgetExhausted
+                    && let Some(local) = scope.0.local.get()
+                {
+                    local.drain_pool();
+                    return FrameLedger::new(layout.config, budget);
+                }
+                Err(error)
+            })
+            .ok()?;
         Some(Self {
             layout,
             retained_frames,
@@ -492,19 +550,15 @@ impl OutputWindowGrowth {
         })
     }
 
-    fn install(self, scope: &PacketScope, frames: ScopeFrames) {
+    fn install(self, inner: &mut Inner, frames: ScopeFrames) {
         let mut ledger = self.ledger;
-        let (old_frames, old_ledger) = {
-            let mut inner = scope.0.inner.lock();
-            // The coordinator alone opens capture. Shutdown can still finish this empty scope.
-            if inner.finished {
-                ledger.close();
-            }
-            let old_frames = frames.exchange(&mut inner);
-            let old_ledger = std::mem::replace(&mut inner.ledger, ledger);
-            inner._storage.absorb(self.growth);
-            (old_frames, old_ledger)
-        };
+        // Shutdown may finish the shared scope before the coordinator opens capture.
+        if inner.finished {
+            ledger.close();
+        }
+        let old_frames = frames.exchange(inner);
+        let old_ledger = std::mem::replace(&mut inner.ledger, ledger);
+        inner._storage.absorb(self.growth);
         drop((old_frames, old_ledger, self.overlap));
     }
 }

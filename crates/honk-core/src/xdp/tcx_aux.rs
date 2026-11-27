@@ -729,7 +729,7 @@ impl PreparedAux {
             owner
                 .endpoints
                 .resume_auxiliary(&mut owner.driver, private_mtu)?;
-            let scope = owner.driver.sole_owner().expect("auxiliary scope");
+            let scope = owner.driver.owner_scope();
             let stamp = scope.binding();
             b.resumed = Some(stamp);
             #[cfg(feature = "packet-ebpf")]

@@ -273,116 +273,167 @@ impl PacketScope {
         )>,
         DropReason,
     > {
-        if self.worker() != 0 {
-            return Err(DropReason::NotForUs);
-        }
         self.0.with(|inner| {
-            if inner.aborted
-                || inner
-                    .capture_admission
-                    .as_ref()
-                    .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
-            {
-                return Err(DropReason::Stale);
-            }
-            inner.advance(service_at);
-            inner.reap_peers();
-            if let Some(peer) = peer.as_ref().filter(|peer| peer.learned()) {
-                if honk_netstack::wire::packet_addresses(packet)
-                    .ok()
-                    .map(|(source, _)| source)
-                    != Some(peer.address())
-                {
-                    return Err(DropReason::NotForUs);
-                }
-                inner.remember_peer(peer);
-            }
-            let input = packet;
-            let (packet, fragment, failure) = match inner
-                .stack
-                .as_mut()
-                .ok_or(DropReason::Stale)?
-                .reassemble_for_dispatch(ingress_at, service_at, packet)
-            {
-                Ok(report) => (report.packet, report.fragment, None),
-                Err(error) => match error.fragment {
-                    Some(fragment) => (None, fragment, Some(error.reason)),
-                    None => return Err(error.reason),
-                },
-            };
-            if fragment.incarnation.is_none() {
-                return match packet {
-                    Some(packet) => Ok(Some((packet, peer))),
-                    None => match failure {
-                        Some(reason) => Err(reason),
-                        None => Ok(None),
-                    },
-                };
-            }
-            let previous = if inner.fragment_peer_count == 0 {
-                None
-            } else {
-                inner.fragment_peers.iter().position(|entry| {
-                    entry
-                        .as_ref()
-                        .is_some_and(|entry| entry.info.incarnation == fragment.incarnation)
-                })
-            };
-            if peer.is_none() && previous.is_none() {
-                return match packet {
-                    Some(packet) => Ok(Some((packet, None))),
-                    None => match failure {
-                        Some(reason) => Err(reason),
-                        None => Ok(None),
-                    },
-                };
-            }
-            let is_offset_zero = super::fragment_peer::fragment_offset_zero(&[input])
-                .ok_or(DropReason::Malformed)?;
-            let mut entry = match previous {
-                Some(index) => {
-                    inner.fragment_peer_count -= 1;
-                    inner.fragment_peers[index]
-                        .take()
-                        .expect("exact fragment return snapshot")
-                }
-                None => FragmentPeer::new(fragment, None),
-            };
-            let poisoned = entry.observe(fragment, is_offset_zero, peer).is_err();
-            inner.reap_fragment_peers();
-            if let Some(packet) = packet {
-                if poisoned {
-                    return Err(DropReason::NotForUs);
-                }
-                return Ok(Some((packet, entry.peer)));
-            }
-            if inner
-                .stack
-                .as_ref()
-                .expect("live reassembler")
-                .retains_fragment(fragment)
-            {
-                let cell = inner
-                    .fragment_peers
-                    .iter_mut()
-                    .find(|cell| cell.is_none())
-                    .ok_or(DropReason::Capacity)?;
-                *cell = Some(entry);
-                inner.fragment_peer_count += 1;
-            }
-            if poisoned {
-                return Err(DropReason::NotForUs);
-            }
-            match failure {
-                Some(reason) => Err(reason),
-                None => Ok(None),
-            }
+            inner.reassemble_for_dispatch_with_peer(packet, ingress_at, service_at, peer)
         })
     }
 
     #[cfg(target_os = "linux")]
     pub(in crate::control) fn receive_realm_timed(
         &self,
+        packet: &[u8],
+        ingress_at: Instant,
+        service_at: Instant,
+        admission: &mut Option<super::super::packet_endpoint::EndpointAdmission>,
+        check_output: bool,
+        on_source: impl FnMut(
+            honk_netstack::ValidatedSource,
+            bool,
+        ) -> Option<crate::xdp::worker::PeerHold>,
+    ) -> io::Result<(
+        Rx,
+        super::super::packet_endpoint::PacketReceive,
+        Option<SourceWork>,
+    )> {
+        self.0.with_silent(|inner| {
+            inner.receive_realm_timed(
+                self,
+                packet,
+                ingress_at,
+                service_at,
+                admission,
+                check_output,
+                on_source,
+            )
+        })
+    }
+}
+
+impl Inner {
+    #[cfg(target_os = "linux")]
+    pub(super) fn reassemble_for_dispatch_with_peer(
+        &mut self,
+        packet: &[u8],
+        ingress_at: Instant,
+        service_at: Instant,
+        peer: Option<crate::xdp::worker::PeerHold>,
+    ) -> Result<
+        Option<(
+            honk_netstack::OwnedPacket,
+            Option<crate::xdp::worker::PeerHold>,
+        )>,
+        DropReason,
+    > {
+        if self.worker != 0 {
+            return Err(DropReason::NotForUs);
+        }
+        if self.aborted
+            || self
+                .capture_admission
+                .as_ref()
+                .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(DropReason::Stale);
+        }
+        self.advance(service_at);
+        self.reap_peers();
+        if let Some(peer) = peer.as_ref().filter(|peer| peer.learned()) {
+            if honk_netstack::wire::packet_addresses(packet)
+                .ok()
+                .map(|(source, _)| source)
+                != Some(peer.address())
+            {
+                return Err(DropReason::NotForUs);
+            }
+            self.remember_peer(peer);
+        }
+        let input = packet;
+        let (packet, fragment, failure) = match self
+            .stack
+            .as_mut()
+            .ok_or(DropReason::Stale)?
+            .reassemble_for_dispatch(ingress_at, service_at, packet)
+        {
+            Ok(report) => (report.packet, report.fragment, None),
+            Err(error) => match error.fragment {
+                Some(fragment) => (None, fragment, Some(error.reason)),
+                None => return Err(error.reason),
+            },
+        };
+        if fragment.incarnation.is_none() {
+            return match packet {
+                Some(packet) => Ok(Some((packet, peer))),
+                None => match failure {
+                    Some(reason) => Err(reason),
+                    None => Ok(None),
+                },
+            };
+        }
+        let previous = if self.fragment_peer_count == 0 {
+            None
+        } else {
+            self.fragment_peers.iter().position(|entry| {
+                entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.info.incarnation == fragment.incarnation)
+            })
+        };
+        if peer.is_none() && previous.is_none() {
+            return match packet {
+                Some(packet) => Ok(Some((packet, None))),
+                None => match failure {
+                    Some(reason) => Err(reason),
+                    None => Ok(None),
+                },
+            };
+        }
+        let is_offset_zero =
+            super::fragment_peer::fragment_offset_zero(&[input]).ok_or(DropReason::Malformed)?;
+        let mut entry = match previous {
+            Some(index) => {
+                self.fragment_peer_count -= 1;
+                self.fragment_peers[index]
+                    .take()
+                    .expect("exact fragment return snapshot")
+            }
+            None => FragmentPeer::new(fragment, None),
+        };
+        let poisoned = entry.observe(fragment, is_offset_zero, peer).is_err();
+        self.reap_fragment_peers();
+        if let Some(packet) = packet {
+            if poisoned {
+                return Err(DropReason::NotForUs);
+            }
+            return Ok(Some((packet, entry.peer)));
+        }
+        if self
+            .stack
+            .as_ref()
+            .expect("live reassembler")
+            .retains_fragment(fragment)
+        {
+            let cell = self
+                .fragment_peers
+                .iter_mut()
+                .find(|cell| cell.is_none())
+                .ok_or(DropReason::Capacity)?;
+            *cell = Some(entry);
+            self.fragment_peer_count += 1;
+        }
+        if poisoned {
+            return Err(DropReason::NotForUs);
+        }
+        match failure {
+            Some(reason) => Err(reason),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn receive_realm_timed(
+        &mut self,
+        scope: &PacketScope,
         packet: &[u8],
         ingress_at: Instant,
         service_at: Instant,
@@ -397,53 +448,57 @@ impl PacketScope {
         super::super::packet_endpoint::PacketReceive,
         Option<SourceWork>,
     )> {
-        self.0.with_silent(|inner| {
-            inner.advance(service_at);
-            inner.drain_half_open();
-            inner.reap_peers();
-            let pending = check_output && inner.pending_source_output(packet);
-            let peer_slot =
-                honk_netstack::wire::packet_addresses(packet)
-                    .ok()
-                    .and_then(|(address, _)| {
-                        inner
-                            .peers
-                            .iter()
-                            .position(|peer| {
-                                peer.as_ref().is_some_and(|peer| peer.address() == address)
-                            })
-                            .or_else(|| inner.peers.iter().position(Option::is_none))
-                    });
-            let mut peer = None;
-            let (rx, report) =
-                inner.receive_checked(packet, RxMeta::VERIFY, ingress_at, service_at, |source| {
-                    peer = on_source(source, pending);
-                    if peer.as_ref().is_some_and(|peer| peer.learned()) && peer_slot.is_none() {
-                        peer.take();
-                    }
-                    peer.is_some()
-                });
-            if let Some(hold) = peer.as_ref().filter(|peer| peer.learned()) {
-                inner.remember_peer(hold);
-            }
-            inner.register_tcp_new(&report, admission, None);
-            inner.advance(service_at);
-            inner.drain_half_open();
-            // Shutdown can abort the scope as soon as this receive releases its lock.
-            let physical = match &rx {
-                Rx::Transparent { src, .. }
-                | Rx::TransparentOwned { src, .. }
-                | Rx::TransparentSplit { src, .. } => {
-                    let work = SourceWork::plain(self, inner, src.ip())?;
-                    Some(match peer.filter(|peer| peer.learned()) {
-                        Some(peer) => work.with_peer(peer),
-                        None => work,
-                    })
+        self.advance(service_at);
+        self.drain_half_open();
+        self.reap_peers();
+        let pending = check_output && self.pending_source_output(packet);
+        let has_peer_slot = honk_netstack::wire::packet_addresses(packet)
+            .is_ok_and(|(address, _)| self.peer_cell(address).is_some());
+        let mut peer = None;
+        let (rx, report) = self.receive_checked(
+            packet,
+            RxMeta::VERIFY,
+            ingress_at,
+            service_at,
+            Some(admission),
+            |source| {
+                peer = on_source(source, pending);
+                if peer.as_ref().is_some_and(|peer| peer.learned()) && !has_peer_slot {
+                    peer.take();
                 }
-                _ => None,
-            };
-            Ok((rx, inner.receive_result(report), physical))
-        })
+                peer.is_some()
+            },
+        );
+        if let Some(hold) = peer.as_ref().filter(|peer| peer.learned()) {
+            self.remember_peer(hold);
+        }
+        self.advance(service_at);
+        self.drain_half_open();
+        // Shutdown can abort the scope as soon as this receive releases its lock.
+        let physical = match &rx {
+            Rx::Transparent { src, .. }
+            | Rx::TransparentOwned { src, .. }
+            | Rx::TransparentSplit { src, .. } => {
+                let work = if scope.is_local() {
+                    let Some(work) = scope.local_source_work(src.ip())? else {
+                        return Ok((
+                            Rx::Dropped(DropReason::Stale),
+                            self.receive_result(report),
+                            None,
+                        ));
+                    };
+                    work
+                } else {
+                    SourceWork::plain(scope, self, src.ip())?
+                };
+                Some(match peer.filter(|peer| peer.learned()) {
+                    Some(peer) => work.with_peer(peer),
+                    None => work,
+                })
+            }
+            _ => None,
+        };
+        Ok((rx, self.receive_result(report), physical))
     }
 }
 
@@ -483,17 +538,125 @@ impl Inner {
         let honk_netstack::ReceiveOutcome::TcpNew(id) = report.outcome else {
             return;
         };
-        let Some(vacant) = self.slots.iter_mut().find(|slot| slot.is_none()) else {
-            self.stack
-                .as_mut()
-                .expect("new TCP flow")
-                .tcp_refuse(id, honk_netstack::Refuse::Drop);
-            return;
+        let vacant = self.slots.iter().position(Option::is_none);
+        self.bind_new_flow(id, report, Some(admission), vacant, process);
+    }
+
+    pub(super) fn receive_checked(
+        &mut self,
+        packet: &[u8],
+        meta: RxMeta,
+        ingress_at: Instant,
+        service_at: Instant,
+        routing: Option<&mut Option<super::super::packet_endpoint::EndpointAdmission>>,
+        mut on_source: impl FnMut(honk_netstack::ValidatedSource) -> bool,
+    ) -> (Rx, honk_netstack::ReceiveReport) {
+        if self.aborted
+            || self
+                .capture_admission
+                .as_ref()
+                .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return (Rx::Dropped(DropReason::Stale), Default::default());
+        }
+        if self.resources.is_none() {
+            let Some(stack) = &mut self.stack else {
+                return (Rx::Dropped(DropReason::Stale), Default::default());
+            };
+            let (rx, report) =
+                stack.receive_with_meta_tcp_admission(ingress_at, packet, meta, on_source);
+            if let Some(routing) = routing
+                && let honk_netstack::ReceiveOutcome::TcpNew(id) = report.outcome
+            {
+                let vacant = self.slots.iter().position(Option::is_none);
+                self.bind_new_flow(id, &report, Some(routing), vacant, None);
+            }
+            return (rx, report);
+        }
+        self.advance(service_at);
+        let resources = self.resources.as_ref().expect("accounted realm resources");
+        let track = resources.tracks_tcp();
+        let tuple = std::cell::Cell::new(None);
+        let mut claim = None;
+        let mut grant = None;
+        let mut vacant_flow = None;
+        let Some(stack) = &mut self.stack else {
+            return (Rx::Dropped(DropReason::Stale), Default::default());
         };
+        let (rx, report) = {
+            let _unwind = AdmissionUnwind(self.capture_admission.as_deref());
+            stack.receive_with_realm_admission(
+                ingress_at,
+                service_at,
+                packet,
+                meta,
+                |source| {
+                    if track
+                        && source
+                            .tcp_flags
+                            .is_some_and(|flags| flags & honk_netstack::wire::tcp::SYN != 0)
+                    {
+                        tuple.set(Some((source.src, source.dst)));
+                    }
+                    on_source(source)
+                },
+                |address| {
+                    let Some(index) = self.half_open.iter().position(Option::is_none) else {
+                        return false;
+                    };
+                    if track || routing.is_some() {
+                        vacant_flow = self.slots.iter().position(Option::is_none);
+                        if track && vacant_flow.is_none() {
+                            return false;
+                        }
+                    }
+                    let Some(hold) = resources.reserve(address) else {
+                        return false;
+                    };
+                    if track {
+                        let (src, dst) = tuple.get().expect("checked SYN before passive admission");
+                        let Ok(reserved) = resources.reserve_tcp(self.worker, src, dst) else {
+                            return false;
+                        };
+                        claim = reserved;
+                    }
+                    grant = Some((index, hold));
+                    true
+                },
+            )
+        };
+        if let honk_netstack::ReceiveOutcome::TcpNew(id) = report.outcome {
+            let (index, hold) = grant.expect("realm passive open has half-open credit");
+            self.half_open[index] = Some((id, hold));
+            if let Some(claim) = claim {
+                claim.publish(id);
+            }
+            if track || routing.is_some() {
+                self.bind_new_flow(id, &report, routing, vacant_flow, None);
+            }
+        }
+        (rx, report)
+    }
+
+    fn bind_new_flow(
+        &mut self,
+        id: FlowId,
+        report: &honk_netstack::ReceiveReport,
+        routing: Option<&mut Option<super::super::packet_endpoint::EndpointAdmission>>,
+        vacant: Option<usize>,
+        process: Option<ProcessMeta>,
+    ) {
         let source = report
             .source
             .expect("new TCP admission has a validated tuple");
-        *vacant = Some(FlowSlot {
+        let Some(index) = vacant else {
+            self.stack
+                .as_mut()
+                .expect("live scope stack")
+                .tcp_refuse(id, honk_netstack::Refuse::Drop);
+            return;
+        };
+        self.slots[index] = Some(FlowSlot {
             id,
             client: source.src,
             destination: source.dst,
@@ -506,62 +669,18 @@ impl Inner {
             callback: None,
             accepted: false,
             rx_admitted: false,
-            routing: admission.take(),
-            process,
+            routing: routing.and_then(Option::take),
             source: report.source_context,
+            process,
         });
+        #[cfg(target_os = "linux")]
+        if let Some(indexes) = &mut self.local_slots {
+            indexes.insert(id, index);
+            self.local_pending.push(id);
+        }
+        #[cfg(target_os = "linux")]
+        self.pin_local_tcp(source.src.ip());
         self.pending_routing += 1;
-    }
-
-    pub(super) fn receive_checked(
-        &mut self,
-        packet: &[u8],
-        meta: RxMeta,
-        ingress_at: Instant,
-        service_at: Instant,
-        on_source: impl FnMut(honk_netstack::ValidatedSource) -> bool,
-    ) -> (Rx, honk_netstack::ReceiveReport) {
-        if self.aborted
-            || self
-                .capture_admission
-                .as_ref()
-                .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
-        {
-            return (Rx::Dropped(DropReason::Stale), Default::default());
-        }
-        if self.resources.is_none() {
-            return match &mut self.stack {
-                Some(stack) => {
-                    stack.receive_with_meta_tcp_admission(ingress_at, packet, meta, on_source)
-                }
-                None => (Rx::Dropped(DropReason::Stale), Default::default()),
-            };
-        }
-        self.advance(service_at);
-        let resources = self.resources.clone().expect("accounted realm resources");
-        let vacant = self.half_open.iter().position(Option::is_none);
-        let mut grant = None;
-        let _unwind = AdmissionUnwind(self.capture_admission.as_deref());
-        let Some(stack) = &mut self.stack else {
-            return (Rx::Dropped(DropReason::Stale), Default::default());
-        };
-        let (rx, report) = stack.receive_with_realm_admission(
-            ingress_at,
-            service_at,
-            packet,
-            meta,
-            on_source,
-            |source| {
-                grant = vacant.and_then(|_| resources.reserve(source));
-                grant.is_some()
-            },
-        );
-        if let honk_netstack::ReceiveOutcome::TcpNew(id) = report.outcome
-            && let Some(grant) = grant
-        {
-            self.half_open[vacant.expect("funded half-open cell")] = Some((id, grant));
-        }
-        (rx, report)
     }
 
     #[cfg(target_os = "linux")]
@@ -569,16 +688,10 @@ impl Inner {
         if !hold.learned() {
             return;
         }
-        let index = self
-            .peers
-            .iter()
-            .position(|entry| {
-                entry
-                    .as_ref()
-                    .is_some_and(|old| old.address() == hold.address())
-            })
-            .or_else(|| self.peers.iter().position(Option::is_none));
-        if let Some(index) = index {
+        if let Some(index) = self.peer_cell(hold.address()) {
+            if let Some(local) = &mut self.local_peers {
+                local.install_peer(hold.address(), index);
+            }
             self.peers[index] = Some(hold.clone());
             self.peer_end = self.peer_end.max(index + 1);
         }
@@ -599,6 +712,9 @@ impl Inner {
     #[cfg(target_os = "linux")]
     pub(super) fn reap_peers(&mut self) {
         self.reap_fragment_peers();
+        if self.local_peers.is_some() {
+            return;
+        }
         for peer in &mut self.peers[..self.peer_end] {
             let Some(held) = peer else { continue };
             let address = held.address();
@@ -623,7 +739,7 @@ impl Inner {
     }
 
     #[cfg(target_os = "linux")]
-    fn reap_fragment_peers(&mut self) {
+    pub(super) fn reap_fragment_peers(&mut self) {
         if self.fragment_peer_count == 0 {
             return;
         }
@@ -723,7 +839,7 @@ mod fragment_tests {
 
     fn physical_scope(budget: &Arc<MemoryBudget>) -> (PacketScope, PacketOwner) {
         let (mut scopes, mut owners) =
-            realm::capture_partition(1280, 1, 16, 1, 1280, TxCaps::NONE, budget, 1).unwrap();
+            realm::capture_partition(1280, 1, 16, 1, 1280, TxCaps::NONE, budget, 1, false).unwrap();
         (scopes.pop().unwrap(), owners.pop().unwrap())
     }
 

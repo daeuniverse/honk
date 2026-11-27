@@ -80,7 +80,7 @@ impl PacketFlow {
             ack,
         };
         self.stream
-            .set_retirement_callback_with_credit(credit, move || completion.finish())
+            .set_retirement_callback_with_credit(credit, None, move || completion.finish())
     }
 }
 
