@@ -147,7 +147,7 @@ impl VLessHandler {
             Arc::new(StreamUotTransport::new(
                 stream,
                 target,
-                domain,
+                domain.map(Box::from),
                 request,
                 native_udp_writer_handoff(&runtime.node),
                 None,

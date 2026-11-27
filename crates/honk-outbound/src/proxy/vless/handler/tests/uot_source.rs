@@ -46,7 +46,7 @@ fn uot_pair(
     let transport = StreamUotTransport::new(
         Box::new(client),
         sock(target),
-        domain,
+        domain.map(Box::from),
         bytes::Bytes::from_static(request),
         Some(false),
         None,

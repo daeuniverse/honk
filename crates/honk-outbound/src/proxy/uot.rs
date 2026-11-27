@@ -337,7 +337,7 @@ impl AddrDecoder {
 }
 
 #[cfg(any(feature = "rprx", test))]
-pub(crate) use stream::StreamUotTransport;
+pub(in crate::proxy) use stream::StreamUotTransport;
 
 #[cfg(any(feature = "rprx", test))]
 mod stream {
@@ -358,7 +358,7 @@ mod stream {
 
     /// A non-connect UoT v2 association. The request precedes the first datagram;
     /// all datagrams carry their own address, including replies from other peers.
-    pub(crate) struct StreamUotTransport {
+    pub(in crate::proxy) struct StreamUotTransport {
         reader: Mutex<(ReadHalf<Stream>, AddrDecoder)>,
         writer: Mutex<(WriteHalf<Stream>, Bytes)>,
         poison: FramePoison,
@@ -372,7 +372,7 @@ mod stream {
         pub(in crate::proxy) fn new(
             stream: Stream,
             target: SocketAddr,
-            target_domain: Option<&str>,
+            target_domain: Option<Box<str>>,
             request: Bytes,
             native_tls_handoff: Option<bool>,
             exit: Option<UdpExit>,
@@ -383,7 +383,7 @@ mod stream {
                 writer: Mutex::new((writer, request)),
                 poison: FramePoison::default(),
                 target,
-                target_domain: target_domain.map(Box::from),
+                target_domain,
                 tls_handoff: exit.map(|exit| exit.tls_handoff).or(native_tls_handoff),
                 exit,
             }

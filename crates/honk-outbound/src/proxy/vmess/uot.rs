@@ -71,7 +71,7 @@ impl VmessHandler {
             Ok(project(Arc::new(StreamUotTransport::new(
                 Box::new(stream),
                 target,
-                domain.as_deref(),
+                domain,
                 request,
                 handoff,
                 None,
@@ -96,7 +96,12 @@ impl VmessHandler {
         let stream = VmessStream::start_uot(carrier, header, None)?;
         let stream = chain::locate_udp_exit_stream(Box::new(stream));
         Ok(Arc::new(StreamUotTransport::new(
-            stream, target, domain, request, None, exit,
+            stream,
+            target,
+            domain.map(Box::from),
+            request,
+            None,
+            exit,
         )))
     }
 }
