@@ -542,6 +542,21 @@ fn test_validate_redacts_vless_path_context_name() {
 }
 
 #[test]
+fn ws_tls_server_name_handles_ipv6_literals() {
+    let mut node = Node::from_share_link("trojan://password@edge.example:443?type=ws").unwrap();
+    for (endpoint, ws_host, expected) in [
+        ("edge.example", Some("2001:db8::1"), "2001:db8::1"),
+        ("edge.example", Some("[::1]:8443"), "::1"),
+        ("[2001:db8::1]", None, "2001:db8::1"),
+        ("[not-ipv6]", None, "[not-ipv6]"),
+    ] {
+        node.host = endpoint.into();
+        node.transport_mut().unwrap().ws_host = ws_host.map(str::to_owned);
+        assert_eq!(node.tls_server_name(), expected, "{endpoint}, {ws_host:?}");
+    }
+}
+
+#[test]
 fn tunneled_udp_follows_the_exit_protocol_and_vless_path() {
     let link = |link: &str| Node::from_share_link(link).unwrap();
     let vless = |change: &dyn Fn(&mut VlessConfig)| {

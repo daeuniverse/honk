@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::net::Ipv6Addr;
 
 use serde::{Deserialize, Serialize};
 
@@ -195,22 +196,24 @@ impl Node {
         if let Some(sni) = self.tls().and_then(|tls| tls.sni.as_deref()) {
             return Cow::Borrowed(sni);
         }
-        if let Some(authority) = self
+        if let Some(host) = self
             .transport()
             .filter(|transport| transport.transport == "ws")
             .and_then(|transport| transport.ws_host.as_deref())
-            .and_then(|host| host.parse::<http::uri::Authority>().ok())
         {
-            // The TLS connector recognizes an IPv6 literal only without brackets.
-            return Cow::Owned(
-                authority
-                    .host()
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .to_owned(),
-            );
+            if host.parse::<Ipv6Addr>().is_ok() {
+                return Cow::Borrowed(host);
+            }
+            if let Ok(authority) = host.parse::<http::uri::Authority>() {
+                return Cow::Owned(authority.host().trim_matches(['[', ']']).to_owned());
+            }
         }
-        Cow::Borrowed(self.host())
+        let host = self.host();
+        let ipv6 = host
+            .strip_prefix('[')
+            .and_then(|name| name.strip_suffix(']'))
+            .filter(|name| name.parse::<Ipv6Addr>().is_ok());
+        Cow::Borrowed(ipv6.unwrap_or(host))
     }
 
     pub fn is_xhttp(&self) -> bool {

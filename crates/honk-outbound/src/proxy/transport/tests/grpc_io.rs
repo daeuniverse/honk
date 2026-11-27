@@ -306,6 +306,8 @@ async fn grpc_request_path_and_authority_length_boundaries() {
         (1, long_authority.as_str(), long_authority.as_str()),
         (1, "::1", "[::1]"),
         (1, "[::1]", "[::1]"),
+        (1, "2001:0DB8:0:0::1", "[2001:db8::1]"),
+        (1, "CDN.example:8443", "CDN.example:8443"),
     ] {
         let mut node = grpc_node();
         node.host = host.to_owned();

@@ -16,6 +16,7 @@
 //! - [`grpc`]: gRPC gun framing over a connection-owned HTTP/2 client.
 //! - [`xhttp`]: raw XHTTP bodies over bounded node-owned HTTP/2 carriers.
 
+use std::borrow::Cow;
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
@@ -318,6 +319,15 @@ pub(crate) async fn wrap_tunnel(
     wrap_after_tls(node, stream).await
 }
 
+fn bracket_ipv6_host(host: &str, canonical: bool) -> Cow<'_, str> {
+    match host.parse::<std::net::Ipv6Addr>() {
+        // gRPC has always formatted the parsed address; WS and XHTTP keep its spelling.
+        Ok(ip) if canonical => format!("[{ip}]").into(),
+        Ok(_) => format!("[{host}]").into(),
+        Err(_) => host.into(),
+    }
+}
+
 fn encode_uri_path(path: &str) -> PercentEncode<'_> {
     // Paths may already contain escapes and query delimiters; preserve both.
     const ENCODE_SET: &AsciiSet = &CONTROLS
@@ -412,25 +422,26 @@ async fn wrap_ws<S: WsCarrier>(
 
     let transport = node.transport().unwrap();
     let ws_path = transport.ws_path.as_deref().unwrap_or("/");
-    let ws_host = transport
-        .ws_host
-        .as_deref()
-        .unwrap_or(node.host())
-        .to_string();
+    let slash = if ws_path.starts_with('/') { "" } else { "/" };
+    let host = bracket_ipv6_host(node.host(), false);
 
     // Build the request from the URI so tungstenite generates the full
     // handshake header set (Sec-WebSocket-Key, Upgrade, ...); a bare
     // `http::Request` passed to `client_async` is sent as-is and real
     // servers reject the missing key.
     let uri = format!(
-        "ws://{}:{}{}",
-        node.host(),
+        "ws://{host}:{}{slash}{}",
         node.port,
         encode_uri_path(ws_path)
     );
     let mut request = uri
         .into_client_request()
         .map_err(|e| anyhow::anyhow!("WebSocket request build failed: {}", e))?;
+    let ws_host = transport
+        .ws_host
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .map_or(host, |name| bracket_ipv6_host(name, false));
     request.headers_mut().insert(
         tokio_tungstenite::tungstenite::http::header::HOST,
         ws_host

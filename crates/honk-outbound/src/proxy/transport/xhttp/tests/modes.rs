@@ -133,6 +133,23 @@ async fn stream_up_drains_large_upload_response_padding_without_exposing_it() {
 }
 
 #[test]
+fn xhttp_ipv6_authority_preserves_configured_spelling_and_port() {
+    let mut node = node(XhttpMode::StreamUp, 32);
+    node.host = "2001:0DB8:0:0::1".into();
+    node.tls_mut().unwrap().sni = None;
+    for (host, expected) in [
+        (None, "[2001:0DB8:0:0::1]"),
+        (Some("[::1]:8443"), "[::1]:8443"),
+        (Some("CDN.example:8443"), "CDN.example:8443"),
+    ] {
+        node.transport_mut().unwrap().xhttp.as_mut().unwrap().host = host.map(str::to_owned);
+        let template = super::super::request::RequestTemplate::new(&node).unwrap();
+        let request = template.request("session", None, false, None).unwrap();
+        assert_eq!(request.uri().authority().unwrap().as_str(), expected);
+    }
+}
+
+#[test]
 fn referer_replaces_configured_padding_query_with_sampled_padding() {
     let mut node = node(XhttpMode::StreamUp, 32);
     let options = node.transport_mut().unwrap().xhttp.as_mut().unwrap();

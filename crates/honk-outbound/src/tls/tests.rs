@@ -258,22 +258,33 @@ async fn ws_tls_dial_offers_the_host_header_as_sni() {
 
     tokio::time::timeout(Duration::from_secs(5), async {
         let (cert, key) = server_cert();
-        let (port, server) = spawn_sni_server(&cert, &key);
-        let mut node = test_node();
-        node.host = "127.0.0.1".into();
-        node.port = port;
-        node.tls_mut().unwrap().enabled = true;
-        let transport = node.transport_mut().unwrap();
-        transport.transport = "ws".into();
-        transport.ws_host = Some("cdn.example:8443".into());
-        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
-        let stream = maybe_tls_wrap_concrete(&node, Some(tcp), Duration::from_secs(3))
-            .await
-            .unwrap();
-        assert_eq!(server.join().unwrap().as_deref(), Some("cdn.example"));
-        drop(stream);
+        for (endpoint, ws_host, expected_sni) in [
+            ("127.0.0.1", Some("cdn.example:8443"), Some("cdn.example")),
+            ("edge.example", Some("2001:db8::1"), None),
+            ("[2001:db8::1]", None, None),
+            ("edge.example", Some("[::1]:8443"), None),
+        ] {
+            let (port, server) = spawn_sni_server(&cert, &key);
+            let mut node = test_node();
+            node.host = endpoint.into();
+            node.port = port;
+            node.tls_mut().unwrap().enabled = true;
+            let transport = node.transport_mut().unwrap();
+            transport.transport = "ws".into();
+            transport.ws_host = ws_host.map(str::to_owned);
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let stream = maybe_tls_wrap_concrete(&node, Some(tcp), Duration::from_secs(3))
+                .await
+                .unwrap();
+            assert_eq!(
+                server.join().unwrap().as_deref(),
+                expected_sni,
+                "{endpoint}, {ws_host:?}"
+            );
+            drop(stream);
+        }
     })
     .await
     .unwrap();
