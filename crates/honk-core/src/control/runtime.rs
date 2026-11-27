@@ -303,53 +303,6 @@ impl ControlPlane {
         disable_nfqueue_for_startup(Arc::make_mut(&mut config), enabled);
     }
 
-    #[cfg(feature = "ebpf")]
-    pub(in crate::control) async fn warn_lan_self_protection(&self) {
-        if !daens_netns_exists() {
-            return;
-        }
-        // The caller holds reload_lock; never retain Config's guard while awaiting Router.
-        let config = self.config.read().await.clone();
-        let planned_config = Arc::clone(&config);
-        let interfaces = match tokio::task::spawn_blocking(move || {
-            crate::ebpf::interface::read_and_plan(
-                &planned_config.global.lan_interface,
-                &planned_config.global.wan_interface,
-            )
-            .map(|(_, plan)| plan.lan_roots)
-        })
-        .await
-        {
-            Ok(Ok(interfaces)) => interfaces,
-            result => {
-                debug!(
-                    ?result,
-                    "skip LAN self-protection warning: interface plan unavailable"
-                );
-                return;
-            }
-        };
-        if interfaces.is_empty() {
-            return;
-        }
-        let addresses = config.local_direct_cidrs();
-        let router = self.router.read().await;
-        let unconfirmed: Vec<_> = addresses
-            .into_iter()
-            .filter(|cidr| {
-                crate::routing::parse_ip_net_str(cidr)
-                    .is_some_and(|network| !router.confirms_lan_self_protection(network.addr()))
-            })
-            .collect();
-        if !unconfirmed.is_empty() {
-            warn!(
-                lan_interfaces = ?interfaces,
-                local_addresses = ?unconfirmed,
-                "LAN self-protection coverage could not be confirmed; review explicit direct(must) rules for management access, excluding port 53 if transparent DNS is intended; configured routing is unchanged"
-            );
-        }
-    }
-
     pub(in crate::control) async fn dispatch_control_command(
         &mut self,
         command: ControlCommand,

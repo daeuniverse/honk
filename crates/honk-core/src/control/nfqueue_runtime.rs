@@ -1,12 +1,11 @@
 use super::*;
 
-#[cfg(feature = "ebpf")]
 const NFQUEUE_STATS_INTERVAL: Duration = Duration::from_secs(1);
-#[cfg(feature = "ebpf")]
+
 pub(super) const NFQUEUE_INGEST_QUEUE_LEN: usize = 256;
-#[cfg(feature = "ebpf")]
+
 pub(super) const NFQUEUE_INGEST_BYTE_BUDGET: usize = 8 * 1024 * 1024;
-#[cfg(feature = "ebpf")]
+
 const NFQUEUE_TOKEN_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
@@ -14,13 +13,11 @@ const NFQUEUE_TOKEN_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_secs(30),
 ];
 
-#[cfg(feature = "ebpf")]
 #[derive(Debug, Default)]
 pub(super) struct NfqueueTokenRetryBackoff {
     failures: usize,
 }
 
-#[cfg(feature = "ebpf")]
 impl NfqueueTokenRetryBackoff {
     pub(super) fn failed(&mut self) -> Duration {
         let delay =
@@ -34,21 +31,18 @@ impl NfqueueTokenRetryBackoff {
     }
 }
 
-#[cfg(feature = "ebpf")]
 #[derive(Debug)]
 struct NfqueueActorQueueEntry {
     received_at: Instant,
     payload_bytes: usize,
 }
 
-#[cfg(feature = "ebpf")]
 #[derive(Debug, Default)]
 struct NfqueueActorQueueState {
     entries: std::collections::VecDeque<NfqueueActorQueueEntry>,
     payload_bytes: usize,
 }
 
-#[cfg(feature = "ebpf")]
 #[derive(Debug)]
 pub(super) struct NfqueueActorQueue {
     state: parking_lot::Mutex<NfqueueActorQueueState>,
@@ -56,7 +50,6 @@ pub(super) struct NfqueueActorQueue {
     slow_limit: Arc<tokio::sync::Semaphore>,
 }
 
-#[cfg(feature = "ebpf")]
 impl NfqueueActorQueue {
     pub(super) fn new(stats: Arc<StatsManager>, slow_limit: Arc<tokio::sync::Semaphore>) -> Self {
         Self {
@@ -117,7 +110,6 @@ impl NfqueueActorQueue {
     }
 }
 
-#[cfg(feature = "ebpf")]
 #[derive(Debug, thiserror::Error)]
 pub(super) enum NfqueueRuntimeFatal {
     #[error("NFQUEUE listener failed: {0}")]
@@ -138,13 +130,11 @@ pub(super) enum NfqueueRuntimeFatal {
     StatsSampler(String),
 }
 
-#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
 pub(super) enum NfqueueRuntimeEvent {
     Fatal(anyhow::Error),
     TokenExhausted,
 }
 
-#[cfg(feature = "ebpf")]
 pub(super) struct NfqueueRuntime {
     pub(super) service: Option<honk_nfqueue::NfqueueService>,
     pub(super) listener_fatal: honk_nfqueue::FatalReceiver,
@@ -160,7 +150,6 @@ pub(super) struct NfqueueRuntime {
     pub(super) sequence_ready: bool,
 }
 
-#[cfg(feature = "ebpf")]
 impl NfqueueRuntime {
     pub(super) async fn next_event(
         &mut self,
@@ -424,7 +413,7 @@ impl NfqueueRuntime {
         self.token_backstop.reset_after(nfqueue::WATCHDOG_INTERVAL);
     }
 }
-#[cfg(feature = "ebpf")]
+
 pub(super) async fn wait_nfqueue_event(
     runtime: &mut Option<NfqueueRuntime>,
     ebpf: &Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
@@ -436,7 +425,6 @@ pub(super) async fn wait_nfqueue_event(
 }
 
 impl ControlPlane {
-    #[cfg(feature = "ebpf")]
     pub(super) async fn rotate_udp_decision_generation(&self) -> anyhow::Result<bool> {
         let mut backend = self.ebpf.write().await;
         let backend = backend.tc_mut()?;
@@ -462,7 +450,6 @@ impl ControlPlane {
         Ok(false)
     }
 
-    #[cfg(feature = "ebpf")]
     pub(super) async fn recover_nfqueue_token_exhaustion(
         &self,
         runtime: &mut NfqueueRuntime,
@@ -506,7 +493,6 @@ impl ControlPlane {
         Ok(())
     }
 
-    #[cfg(feature = "ebpf")]
     pub(super) async fn start_nfqueue_runtime(
         &mut self,
         enabled: bool,

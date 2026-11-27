@@ -65,30 +65,39 @@ pub(super) fn bind_tproxy_tcp(
     addr: SocketAddr,
     _mark: u32,
 ) -> anyhow::Result<std::net::TcpListener> {
-    #[cfg(target_os = "linux")]
+    Ok(in_listener_namespace(
+        "bind TPROXY TCP listener",
+        |transparent| build_tproxy_tcp(addr, transparent),
+    )?)
+}
+
+pub(super) fn daens_netns_exists() -> bool {
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    {
+        crate::daens::DAENS_READY.load(std::sync::atomic::Ordering::Acquire)
+    }
+    #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
+    {
+        false
+    }
+}
+
+fn in_listener_namespace<T>(
+    _operation: &str,
+    build: impl FnOnce(bool) -> io::Result<T>,
+) -> io::Result<T> {
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
     if daens_netns_exists() {
-        return crate::daens::with_daens_netns("bind TPROXY TCP listener", || {
-            build_tproxy_tcp(addr, true)
+        return crate::daens::with_daens_netns(_operation, || Ok(build(true)?)).map_err(|error| {
+            error
+                .downcast::<io::Error>()
+                .unwrap_or_else(io::Error::other)
         });
     }
-    build_tproxy_tcp(addr, false)
+    build(false)
 }
 
-/// Whether the daens namespace is fully set up (FD-owned namespace +
-/// policy routing live). Only real eBPF mode creates it (mock mode and
-/// tests stay entirely in the host netns), so this flag is the switch
-/// between "bind inside daens" and "bind here".
-#[cfg(target_os = "linux")]
-pub(super) fn daens_netns_exists() -> bool {
-    crate::daens::DAENS_READY.load(std::sync::atomic::Ordering::Acquire)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(super) fn daens_netns_exists() -> bool {
-    false
-}
-
-fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<std::net::TcpListener> {
+fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> io::Result<std::net::TcpListener> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -167,17 +176,14 @@ pub(super) fn bind_tproxy_udp_listeners(
     addr: SocketAddr,
     count: usize,
 ) -> anyhow::Result<Vec<UdpSocket>> {
-    #[cfg(target_os = "linux")]
-    if daens_netns_exists() {
-        return crate::daens::with_daens_netns("bind TPROXY UDP listener group", || {
+    Ok(in_listener_namespace(
+        "bind TPROXY UDP listener group",
+        |transparent| {
             (0..count)
-                .map(|_| build_tproxy_udp(addr, true, true))
+                .map(|_| build_tproxy_udp(addr, true, transparent))
                 .collect()
-        });
-    }
-    (0..count)
-        .map(|_| build_tproxy_udp(addr, true, false))
-        .collect()
+        },
+    )?)
 }
 
 pub(super) fn new_udp_listener_socket(domain: Domain, reuse_port: bool) -> io::Result<Socket> {
@@ -218,7 +224,7 @@ fn build_tproxy_udp(
     addr: SocketAddr,
     reuse_port: bool,
     transparent: bool,
-) -> anyhow::Result<UdpSocket> {
+) -> io::Result<UdpSocket> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -271,7 +277,7 @@ fn build_tproxy_udp(
     let _ = transparent;
 
     socket.bind(&addr.into())?;
-    Ok(UdpSocket::from_std(socket.into())?)
+    UdpSocket::from_std(socket.into())
 }
 
 /// Send a UDP reply for a TPROXY-received datagram using the original
@@ -344,31 +350,10 @@ pub(super) async fn send_udp_reply_from_orig_dst(
 /// in, so after creation it may be used from any (host-netns) worker thread.
 /// In mock mode there is no daens and the socket is created in the current
 /// (host) netns.
-#[cfg(target_os = "linux")]
 pub(super) fn new_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
-    if daens_netns_exists() {
-        return crate::daens::with_daens_netns("create UDP reply socket", || {
-            build_udp_reply_socket(original_dst).map_err(anyhow::Error::from)
-        })
-        .map_err(into_io_error);
-    }
-    build_udp_reply_socket(original_dst)
-}
-
-/// Non-Linux fallback: no daens netns exists; create the socket in the
-/// current namespace.
-#[cfg(not(target_os = "linux"))]
-pub(super) fn new_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
-    build_udp_reply_socket(original_dst)
-}
-
-/// Flatten a `with_daens_netns` error back into an `io::Error`, preserving
-/// the original `io::Error` (and its kind) when the scoped closure produced
-/// one.
-#[cfg(target_os = "linux")]
-fn into_io_error(e: anyhow::Error) -> io::Error {
-    e.downcast::<io::Error>()
-        .unwrap_or_else(|e| io::Error::other(e.to_string()))
+    in_listener_namespace("create UDP reply socket", |_| {
+        build_udp_reply_socket(original_dst)
+    })
 }
 
 fn build_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
@@ -440,13 +425,9 @@ fn dns_reply_socket_cache(is_v6: bool) -> &'static Mutex<Option<Arc<UdpSocket>>>
 /// Mock mode has no daens and creates the socket in the current netns.
 #[cfg(target_os = "linux")]
 fn new_dns_reply_socket(is_v6: bool) -> io::Result<UdpSocket> {
-    if daens_netns_exists() {
-        return crate::daens::with_daens_netns("create cached DNS reply socket", || {
-            build_dns_reply_socket(is_v6).map_err(anyhow::Error::from)
-        })
-        .map_err(into_io_error);
-    }
-    build_dns_reply_socket(is_v6)
+    in_listener_namespace("create cached DNS reply socket", |_| {
+        build_dns_reply_socket(is_v6)
+    })
 }
 
 #[cfg(target_os = "linux")]

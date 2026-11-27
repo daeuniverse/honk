@@ -20,6 +20,9 @@ pub mod config_diagnostics;
 pub(crate) mod configuration;
 pub mod connection_tracker;
 pub mod control;
+#[cfg(any(feature = "ebpf", test))]
+mod dae0_addresses;
+#[cfg(feature = "ebpf")]
 pub mod daens;
 pub(crate) mod degradations;
 pub mod dns;

@@ -1286,10 +1286,10 @@ fn dae0_internal_addr_covers_real_dae0_addresses() {
     // addresses assigned by the netns setup; this pins the crate-root
     // DAENS_* strings to the DAE0_* constants in honk-ebpf-common.
     for s in [
-        crate::daens::DAENS_HOST_IPV6,
-        crate::daens::DAENS_PEER_IPV6,
-        crate::daens::DAENS_HOST_IP,
-        crate::daens::DAENS_PEER_IP,
+        crate::dae0_addresses::DAENS_HOST_IPV6,
+        crate::dae0_addresses::DAENS_PEER_IPV6,
+        crate::dae0_addresses::DAENS_HOST_IP,
+        crate::dae0_addresses::DAENS_PEER_IP,
     ] {
         let ip: std::net::IpAddr = s.parse().unwrap();
         assert!(

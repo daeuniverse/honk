@@ -368,7 +368,7 @@ async fn a_socket_without_any_receive_trace_is_untraced() {
     let tc = controller.unwrap();
     let mut batch = sockets::UdpRecvBatch::new().unwrap();
     assert!(
-        super::enable_receive_trace(&tc, &mut batch, &socket)
+        super::tc::enable_receive_trace(&tc, &mut batch, &socket)
             .await
             .is_err()
     );
@@ -388,11 +388,11 @@ fn udp_trace_is_reported_until_a_listener_generation_traces() {
         ([false, true], "ipv6_unavailable"),
         ([true, true], "unavailable"),
     ] {
-        assert!(super::record_udp_trace(&degradations, unavailable));
-        assert!(!super::record_udp_trace(&degradations, unavailable));
+        assert!(super::tc::record_udp_trace(&degradations, unavailable));
+        assert!(!super::tc::record_udp_trace(&degradations, unavailable));
         assert_eq!(reason(), Some(expected));
     }
-    super::record_udp_trace(&degradations, [false, false]);
+    super::tc::record_udp_trace(&degradations, [false, false]);
     assert_eq!(reason(), None);
 }
 
