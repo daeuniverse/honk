@@ -74,11 +74,20 @@ pub(super) fn parse_uot(mapping: &Mapping, protocol: NodeProtocol) -> Result<boo
                 })
                 .transpose()?
                 .unwrap_or(false);
-            if enabled
-                && let Some(version) = yaml_value(options, "version")
-                && !matches!(version.as_u64(), Some(0 | 2))
-            {
-                return Err("unsupported udp-over-tcp version");
+            if enabled {
+                for (key, value) in options {
+                    if !matches!(key.as_str(), Some("enabled" | "version")) && active(value) {
+                        return Err("unsupported udp-over-tcp setting");
+                    }
+                }
+                if let Some(version) = yaml_value(options, "version") {
+                    let version = version
+                        .as_u64()
+                        .ok_or("udp-over-tcp.version must be an integer")?;
+                    if !matches!(version, 0 | 2) {
+                        return Err("unsupported udp-over-tcp version");
+                    }
+                }
             }
             Ok(enabled)
         }

@@ -570,10 +570,14 @@ fn vmess_uot_subscription_keeps_distinct_ids_and_salvages_valid_entries() {
         "name: uot, udp-over-tcp: true",
         "name: copy, udp_over_tcp: {enabled: true, version: 2}",
         "name: restricted, udp-over-tcp: true, udp: false",
+        "name: legacy-uot, udp-over-tcp: true, alterId: 64",
+        "name: typo, udp-over-tcp: {enabled: true, verison: 1}",
+        "name: vmess-string-version, udp-over-tcp: {enabled: true, version: '2'}",
     ] {
         use std::fmt::Write;
         writeln!(body, "  - {{type: vmess, server: example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111, {fields}}}").unwrap();
     }
+    body.push_str("  - {type: vless, name: vless-string-version, server: example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111, udp-over-tcp: {enabled: true, version: '2'}}\n");
     let mut diagnostics = Vec::new();
     let nodes = parse_subscription_content_with_diagnostics(
         &Subscription::default(),
@@ -595,7 +599,11 @@ fn vmess_uot_subscription_keeps_distinct_ids_and_salvages_valid_entries() {
             .collect::<Vec<_>>(),
         [
             (Some(2), "unsupported-subscription-entry"),
-            (Some(4), "duplicate-subscription-entry")
+            (Some(4), "duplicate-subscription-entry"),
+            (Some(6), "unsupported-subscription-entry"),
+            (Some(7), "unsupported-subscription-entry"),
+            (Some(8), "malformed-subscription-entry"),
+            (Some(9), "malformed-subscription-entry"),
         ]
     );
 }

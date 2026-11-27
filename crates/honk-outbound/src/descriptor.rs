@@ -243,7 +243,7 @@ pub fn carries_udp(path: UdpPath<'_>) -> bool {
     }
 }
 
-/// Whether `node` carries UDP itself or through its bound chain exit.
+/// Whether the built-in handlers can carry UDP for `node` or its bound chain.
 #[inline]
 pub fn node_carries_udp<'a>(
     node: &Node,
@@ -254,7 +254,7 @@ pub fn node_carries_udp<'a>(
             .resolved_chain_hops()
             .is_some_and(|hops| builtin_tunneled_udp_available(hops, lookup));
     }
-    carries_udp(UdpPath::Own(node))
+    builtin_udp_available(UdpPath::Own(node))
 }
 
 /// Composed UDP requires each prefix, including the first hop, to support a

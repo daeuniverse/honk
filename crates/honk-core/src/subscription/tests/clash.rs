@@ -63,10 +63,16 @@ fn clash_vmess_uot_only_imports_supported_wrappers() {
     };
     for (options, uot, udp) in [
         ("udp: true", false, false),
+        ("alterId: 64", false, false),
         ("udp-over-tcp: false", false, false),
         ("udp-over-tcp: true", true, true),
         ("udp_over_tcp: {enabled: true, version: 0}", true, true),
         ("udp-over-tcp: {enabled: true, version: 2}", true, true),
+        (
+            "udp-over-tcp: {enabled: true, verison: 0}, alter-id: 0",
+            true,
+            true,
+        ),
         ("udp-over-tcp: true, udp: false", true, false),
     ] {
         let nodes = parse(options).unwrap();

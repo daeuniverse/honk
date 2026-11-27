@@ -74,7 +74,11 @@ async fn assert_no_vless_backend(node: Node) {
 }
 
 #[tokio::test]
-async fn vmess_uot_opt_in_without_rprx_has_no_executable_handler() {
+async fn vmess_uot_without_rprx_is_unavailable_for_dial_and_udp_selection() {
+    use honk_config::group::{Group, GroupPolicy};
+    use honk_outbound::alive::{IpVersion, ProbeDomain};
+    use honk_outbound::group::GroupManager;
+
     let mut node = Node {
         name: "vmess".into(),
         host: "127.0.0.1".into(),
@@ -102,6 +106,21 @@ async fn vmess_uot_opt_in_without_rprx_has_no_executable_handler() {
     assert_eq!(
         error.downcast_ref::<MissingProtocolHandler>().unwrap().0,
         node.protocol()
+    );
+
+    let socks = Node::from_share_link("socks5://127.0.0.1:1080#socks").unwrap();
+    let group = Group {
+        name: "fallback".into(),
+        policy: GroupPolicy::Fallback,
+        nodes: vec![node.id, socks.id],
+        ..Default::default()
+    };
+    let socks_id = socks.id;
+    let manager = GroupManager::new(&[group], &[node, socks]);
+    let plan = manager.selection_plan_for_domain("fallback", ProbeDomain::DataUdp, IpVersion::V4);
+    assert_eq!(
+        plan.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+        [socks_id]
     );
 }
 

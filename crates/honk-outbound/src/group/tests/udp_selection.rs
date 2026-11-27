@@ -230,11 +230,16 @@ fn udp_incapable_nodes() -> [Node; 2] {
 fn score_udp_capability_filters_selection_verification_and_nested_finals() {
     use honk_config::node::{Udp443Policy, VlessMultiplex};
 
-    let mut capable =
-        Node::from_share_link("vless://00000000-0000-0000-0000-000000000002@127.0.0.1:443#udp")
-            .unwrap();
-    capable.vless_mut().unwrap().multiplex = VlessMultiplex::xray(8, 0, Udp443Policy::Reject);
-    capable.id = capable.derive_id();
+    let capable = if cfg!(feature = "rprx") {
+        let mut node =
+            Node::from_share_link("vless://00000000-0000-0000-0000-000000000002@127.0.0.1:443#udp")
+                .unwrap();
+        node.vless_mut().unwrap().multiplex = VlessMultiplex::xray(8, 0, Udp443Policy::Reject);
+        node.id = node.derive_id();
+        node
+    } else {
+        Node::from_share_link("socks5://127.0.0.1:1080#udp").unwrap()
+    };
     let mut nodes = udp_incapable_nodes().to_vec();
     let incapable_ids: Vec<_> = nodes.iter().map(|node| node.id).collect();
     nodes.push(capable);

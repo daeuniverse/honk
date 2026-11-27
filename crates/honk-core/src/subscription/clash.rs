@@ -322,6 +322,12 @@ fn apply_protocol(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str
             config.uuid = yaml_text_alias(mapping, &["uuid"])?.or(password);
             config.encryption = fields::vmess_cipher_alias(mapping, &["encryption", "cipher"])?;
             config.udp_over_tcp = options::parse_uot(mapping, NodeProtocol::VMess)?;
+            if config.udp_over_tcp
+                && yaml_u64_alias(mapping, &["alterId", "alter_id", "alter-id"])?
+                    .is_some_and(|id| id != 0)
+            {
+                return Err("unsupported legacy VMess alterId with udp-over-tcp");
+            }
         }
         OutboundConfig::Vless(config) => {
             config.uuid = yaml_text_alias(mapping, &["uuid"])?.or(password);
