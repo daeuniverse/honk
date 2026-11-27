@@ -1401,16 +1401,8 @@ jobs:
           echo "$BPF_LINKER_SHA256  $archive" | sha256sum -c -
           zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
           bpf-linker --version
-      - name: Prepare eBPF object
-        working-directory: crates/honk-ebpf
-        env:
-          EBPF_TOOLCHAIN: ${{ steps.toolchain.outputs.ebpf }}
-        run: |
-          set -euo pipefail
-          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
-          readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
-          # build.rs requires the compiler identity as well as source freshness.
-          printf '%s' "$EBPF_TOOLCHAIN" > target/bpfel-unknown-none/release/honk-ebpf.toolchain
+      - name: Prepare eBPF objects
+        run: sh ci/ebpf-objects.sh build legacy-tc
       - run: cargo check -p honk-core --no-default-features
       - run: cargo check -p honk-core --no-default-features --features udp-bench --bench udp_io
       - run: cargo check -p honk-core --no-default-features --features dns-syslog
@@ -1547,16 +1539,8 @@ jobs:
           echo "$BPF_LINKER_SHA256  $archive" | sha256sum -c -
           zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
           bpf-linker --version
-      - name: Prepare eBPF object
-        working-directory: crates/honk-ebpf
-        env:
-          EBPF_TOOLCHAIN: ${{ steps.toolchain.outputs.ebpf }}
-        run: |
-          set -euo pipefail
-          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
-          readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
-          # build.rs requires the compiler identity as well as source freshness.
-          printf '%s' "$EBPF_TOOLCHAIN" > target/bpfel-unknown-none/release/honk-ebpf.toolchain
+      - name: Prepare eBPF objects
+        run: sh ci/ebpf-objects.sh build legacy-tc
       - name: Build core and toolbox in Alpine 3.24
         run: |
           set -euo pipefail

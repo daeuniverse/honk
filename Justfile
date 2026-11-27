@@ -24,8 +24,13 @@ build-core:
 build-musl features="ebpf,native-api":
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ ",{{features}}," == *,ebpf,* ]]; then
-        {{just_executable()}} build-ebpf
+    features="{{features}}"
+    if [[ -z "${HONK_EBPF_PREBUILT_DIR:-}" ]]; then
+        features=${features//honk-core\//}
+        case ",${features// /,}," in
+            *,ebpf,*|*,legacy-tc,*) {{just_executable()}} build-ebpf legacy-tc ;;
+            *,packet-ebpf,*) {{just_executable()}} build-ebpf packet-ebpf ;;
+        esac
     fi
     ci/build-musl.sh honk-core --features "{{features}}"
 
@@ -39,23 +44,19 @@ build-musl-embedded-ui:
 
 # Native-api-only musl build (no clash-api), matching the release asset.
 # Unlike build-musl, this passes --no-default-features for an exact set.
-build-musl-native: build-ebpf
+build-musl-native:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${HONK_EBPF_PREBUILT_DIR:-}" ]]; then {{just_executable()}} build-ebpf; fi
     ci/build-musl.sh honk-core --no-default-features --features "ebpf,native-api,rprx,jemalloc"
 
 # Static musl build of honk-tool for gateway deployment (requires docker or podman).
 build-musl-tool:
     ci/build-musl.sh honk-tool
 
-# Build eBPF object standalone (optional; honk-core build.rs auto-builds it)
-# NOTE: an environment RUSTFLAGS overrides crates/honk-ebpf/.cargo/config.toml
-# rustflags (--btf, debuginfo) — the object then silently loses its .BTF
-# section and aya refuses to load it ("no BTF parsed for object").
-build-ebpf:
-    @test -z "${RUSTFLAGS:-}" || echo "warning: RUSTFLAGS is set and overrides crates/honk-ebpf/.cargo/config.toml (--btf) — the object may lack .BTF"
-    cd crates/honk-ebpf && cargo +{{ebpf_toolchain}} build --release -Zbuild-std=core --target bpfel-unknown-none
-    @readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF' \
-        || (echo "error: eBPF object has no .BTF section (see RUSTFLAGS note above)" && exit 1)
-    @printf '%s' '{{ebpf_toolchain}}' > crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf.toolchain
+# Build the selected objects and portable receipts before a stable-only consumer.
+build-ebpf profile="legacy-tc":
+    sh ci/ebpf-objects.sh build "{{profile}}"
 
 # Build all (core with embedded ebpf)
 build-all: build-core

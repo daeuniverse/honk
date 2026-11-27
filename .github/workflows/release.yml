@@ -122,25 +122,13 @@ jobs:
           bpf-linker --version
       # The eBPF object is target-independent; build it once on x86_64 so all
       # downstream matrix jobs (including native arm64) reuse the verified object.
-      - name: Build and verify eBPF object
-        working-directory: crates/honk-ebpf
-        env:
-          EBPF_TOOLCHAIN: ${{ steps.toolchain.outputs.ebpf }}
-        run: |
-          set -euo pipefail
-          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
-          # aya refuses objects without BTF ("no BTF parsed for object") — fail
-          # the build here instead of at runtime on a gateway.
-          readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
-          # build.rs requires the exact compiler channel without a trailing newline.
-          printf '%s' "$EBPF_TOOLCHAIN" > target/bpfel-unknown-none/release/honk-ebpf.toolchain
+      - name: Build and verify eBPF objects
+        run: sh ci/ebpf-objects.sh build legacy-tc
       - name: Upload eBPF object
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: honk-ebpf
-          path: |
-            crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf
-            crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf.toolchain
+          path: crates/honk-ebpf/target/bpfel-unknown-none/release/prebuilt/
           retention-days: 1
           if-no-files-found: error
 
@@ -210,18 +198,12 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: honk-ebpf
-          path: crates/honk-ebpf/target/bpfel-unknown-none/release
+          path: crates/honk-ebpf/target/bpfel-unknown-none/release/prebuilt
 
-      - name: Verify and stamp eBPF object
+      - name: Verify prebuilt eBPF objects
         run: |
-          set -euo pipefail
-          ebpf=crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf
-          expected=$(grep -oP '^channel\s*=\s*"\K[^"]+' crates/honk-ebpf/rust-toolchain.toml)
-          readelf -S "$ebpf" | grep -q '\.BTF'
-          cmp -s "${ebpf}.toolchain" <(printf '%s' "$expected")
-          # Download preserves no mtime newer than checkout; stamp both so build.rs
-          # embeds this object without invoking nightly cargo.
-          touch "$ebpf" "${ebpf}.toolchain"
+          sh ci/ebpf-objects.sh verify legacy-tc
+          echo "HONK_EBPF_PREBUILT_DIR=crates/honk-ebpf/target/bpfel-unknown-none/release/prebuilt" >> "$GITHUB_ENV"
 
       - name: Install boring-sys build deps (gnu)
         if: endsWith(matrix.target, '-gnu')
