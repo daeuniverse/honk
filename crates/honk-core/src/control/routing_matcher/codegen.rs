@@ -550,7 +550,7 @@ fn emit_routing_program_inner(
                 }
             }
             let pass = asm.label();
-            if plan.trace_enabled {
+            if asm.trace_layout.is_some() {
                 let missed = asm.label();
                 emit_condition(&mut asm, condition, pass, missed, &fds)?;
                 asm.bind(missed);

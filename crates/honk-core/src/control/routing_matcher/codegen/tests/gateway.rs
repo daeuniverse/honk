@@ -63,7 +63,7 @@ fn execute(
     domain: Option<DomainRouting>,
     gateway: bool,
 ) -> (i64, RoutingDecision, Vec<i32>) {
-    execute_with_pointers(insns, plan, input, domain, gateway, [INPUT, OUTPUT])
+    execute_with_pointers(insns, plan, input, domain, gateway, [INPUT, OUTPUT], None)
 }
 
 fn execute_with_pointers(
@@ -73,9 +73,18 @@ fn execute_with_pointers(
     domain: Option<DomainRouting>,
     gateway: bool,
     [in_ptr, out_ptr]: [usize; 2],
+    trace: Option<&mut [u32; 2]>,
 ) -> (i64, RoutingDecision, Vec<i32>) {
     let mut memory = [0xa5; 4096];
     memory[INPUT..INPUT + 128].fill(0);
+    if trace.is_some() {
+        store(
+            &mut memory,
+            OUTPUT + TRACE_FLAGS as usize,
+            ROUTE_TRACE_ENABLED.into(),
+            4,
+        );
+    }
     for (offset, bytes) in [
         (INPUT_SRC_IP, input.src_ip.as_slice()),
         (INPUT_DST_IP, input.dst_ip.as_slice()),
@@ -184,6 +193,9 @@ fn execute_with_pointers(
                 BPF_EXIT => {
                     assert_eq!(&memory[INPUT..INPUT + 128], original_input.as_slice());
                     let field = |offset: i16| load(&memory, OUTPUT + offset as usize, 4) as u32;
+                    if let Some(trace) = trace {
+                        *trace = [field(TRACE_FLAGS), field(TRACE_OUTCOMES)];
+                    }
                     return (
                         registers[0] as i64,
                         RoutingDecision {
@@ -839,6 +851,46 @@ fn gateway_dns_shadow_without_domains_emits_identical_instructions() {
 }
 
 #[test]
+fn tc_trace_records_complete_hits_and_misses_without_changing_decisions() {
+    let policy = router("dport(443) -> block\n fallback: direct");
+    let mut plan = RoutingPushPlan::compile(&policy, &ids(), DialMode::Ip).unwrap();
+    let plain = emit_routing_program(&plan, FDS).unwrap();
+    plan.enable_trace(true);
+    let traced = emit_routing_program(&plan, FDS).unwrap();
+    for (port, id, outcomes) in [
+        (443, 0, ROUTE_TRACE_MATCHED | (ROUTE_TRACE_MATCHED << 2)),
+        (
+            80,
+            u32::MAX,
+            ROUTE_TRACE_NOT_MATCHED | (ROUTE_TRACE_NOT_MATCHED << 2) | (ROUTE_TRACE_MATCHED << 4),
+        ),
+    ] {
+        let mut packet = input(&sample(), true);
+        packet.dst_port = port;
+        let expected = execute(&plain.insns, &plan, &packet, None, false);
+        assert_eq!(expected.1.rule_id, id);
+        let mut trace = [0; 2];
+        let actual = execute_with_pointers(
+            &traced.insns,
+            &plan,
+            &packet,
+            None,
+            false,
+            [INPUT, OUTPUT],
+            Some(&mut trace),
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(
+            trace,
+            [
+                ROUTE_TRACE_VERSION | ROUTE_TRACE_ENABLED | ROUTE_TRACE_COMPLETE,
+                outcomes
+            ]
+        );
+    }
+}
+
+#[test]
 fn gateway_dns_shadow_retains_negative_null_pointer_error_in_both_passes() {
     let router = router("domain(full:lab.test) -> direct(must)\ndefault: block");
     let plan = RoutingPushPlan::compile(&router, &ids(), DialMode::Ip).unwrap();
@@ -847,7 +899,7 @@ fn gateway_dns_shadow_retains_negative_null_pointer_error_in_both_passes() {
     for bitmap in [None, router.domain_bitmap("lab.test")] {
         for args in [[0, OUTPUT], [INPUT, 0]] {
             let (status, _, calls) =
-                execute_with_pointers(&gateway.insns, &plan, &input, bitmap, true, args);
+                execute_with_pointers(&gateway.insns, &plan, &input, bitmap, true, args, None);
             assert_eq!(status, -i64::from(libc::EFAULT));
             assert!(calls.is_empty());
         }

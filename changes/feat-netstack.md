@@ -48,3 +48,4 @@ Added
 - Consolidate reported packet input in `Stack::receive_reported` and expose TCP retention through the lineage-aware query.
 - Add restart-only `datapath.tun.queues` for standalone Linux TUN Endpoint capture, from 1 to 8 queues with a default of 1. Startup requires one plain DNS realm with one owner per configured queue. Multi-queue capture uses bounded handoff and device-wide readiness and failure handling. HostFacts requires one queue. Real-device and scaling measurements are separate from the native tests.
 - Emit one equality jump per singleton source or destination port so longer port lists fit the native routing branch range.
+- Keep gateway and Host routing bytecode independent of the TC flow-recording setting.

@@ -8,6 +8,42 @@ use honk_ebpf_common::{
 use honk_xsk::{ConntrackKfuncs, GatewayLoad, GatewayMaps, GeneralCapture, Programs};
 use std::os::{fd::BorrowedFd, unix::fs::MetadataExt};
 
+#[test]
+fn trace_configuration_preserves_gateway_code() -> anyhow::Result<()> {
+    let config = honk_config::parser::parse_dae_config(
+        "routing {\n dport(443) && pname(curl) -> block\n domain(full:lab.test) -> direct(must)\n fallback: direct\n}",
+    )?;
+    let router = Router::from_config(&config.routing)?;
+    let mut plan = ControlPlane::compile_routing_plan(&config, &router)?;
+    let fds = RoutingMapFds {
+        destination_v4: 11,
+        destination_v6: 12,
+        source_v4: 13,
+        source_v6: 14,
+        mac: 15,
+        domain: -1,
+    };
+    for shadow in [false, true] {
+        for host in [false, true] {
+            plan.enable_trace(false);
+            let plain = emit_gateway_routing_program(&plan, fds, shadow, host)?;
+            plan.enable_trace(true);
+            let traced = emit_gateway_routing_program(&plan, fds, shadow, host)?;
+            let fields =
+                |i: &aya_obj::generated::bpf_insn| (i.code, i.dst_reg(), i.src_reg(), i.off, i.imm);
+            assert!(
+                plain
+                    .insns
+                    .iter()
+                    .map(fields)
+                    .eq(traced.insns.iter().map(fields)),
+                "no-layout bytecode changed: shadow={shadow}, host={host}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[repr(C)]
 #[derive(Default)]
 struct TestRun {
