@@ -2985,6 +2985,27 @@ impl LocalPeers {
 }
 
 impl Inner {
+    pub(super) fn output_peer_hold(&mut self, target: OutputTarget) -> Option<PeerHold> {
+        let (Some(local), Some(index)) = (&self.local_peers, target.slot) else {
+            return self.peer_hold_at(target.address).cloned();
+        };
+        let cell = &mut self.slots[index]
+            .as_mut()
+            .expect("original output slot")
+            .peer_cell;
+        let matching = |index: usize| {
+            self.peers
+                .get(index)?
+                .as_ref()
+                .filter(|p| p.learned() && p.address() == target.address)
+        };
+        if let Some(held) = cell.and_then(matching) {
+            return Some(held.clone());
+        }
+        *cell = local.existing(target.address);
+        cell.and_then(matching).cloned()
+    }
+
     pub(super) fn peer_hold_at(&self, address: IpAddr) -> Option<&PeerHold> {
         if let Some(local) = &self.local_peers {
             return self.peers[local.existing(address)?].as_ref();
@@ -3191,12 +3212,75 @@ mod source_work_tests {
         };
         assert_eq!(output.owner.flow_id(), Some(syn.id));
         let ip = wire::parse_ip(&bytes[..output.owner.len()]).unwrap();
+        assert_eq!(output.destination, ip.dst);
+        assert_eq!(ip.dst, client.ip());
         let (synack, _) = tcp::parse(&bytes[ip.payload]).unwrap();
         assert_eq!(synack.flags, tcp::SYN | tcp::ACK);
         assert_eq!(synack.ack, 101);
         let ack = synack.seq.wrapping_add(1);
         assert!(driver.complete_local(&mut output.owner));
         (flow, ack)
+    }
+
+    #[tokio::test]
+    async fn cached_output_cell_never_selects_another_clients_path() {
+        let now = Instant::now();
+        let budget = MemoryBudget::new(32 << 20);
+        let (realm, mut owners) = capture_realm(1280, 64, 16, 1, 1, &budget).unwrap();
+        let owner = owners.pop().unwrap();
+        let scope = realm.owners()[0].clone();
+        let mut driver = owner.hand_off();
+        driver.make_local(1).unwrap();
+        let authority = PeerAuthority::new(Arc::new(AtomicBool::new(true)), &budget).unwrap();
+        let mut flows = Vec::new();
+        for (client, destination) in [
+            ("192.0.2.3:44000", "198.51.100.7:443"),
+            ("[2001:db8::1]:44000", "[2001:db8::9]:443"),
+        ] {
+            let (flow, _) = accept(
+                &mut driver,
+                &authority,
+                client.parse().unwrap(),
+                destination.parse().unwrap(),
+                now,
+            );
+            let inner = &mut driver.local.as_mut().unwrap().inner;
+            let slot = inner.slot_index(flow.flow_id()).unwrap();
+            let cell = inner.slots[slot].as_ref().unwrap().peer_cell.unwrap();
+            flows.push((flow, slot, cell));
+        }
+        let (flow, slot, cell) = &flows[0];
+        let target = OutputTarget {
+            slot: Some(*slot),
+            address: flow.peer_addr().ip(),
+        };
+        let inner = &mut driver.local.as_mut().unwrap().inner;
+        for stale in [flows[1].2, usize::MAX] {
+            inner.slots[*slot].as_mut().unwrap().peer_cell = Some(stale);
+            let peer = inner.output_peer_hold(target).unwrap();
+            assert_eq!(peer.address(), target.address);
+            assert_eq!(inner.slots[*slot].as_ref().unwrap().peer_cell, Some(*cell));
+        }
+        let local = inner.local_peers.as_ref().unwrap();
+        let lookups = local.lookup_steps.load(Ordering::Relaxed);
+        assert_eq!(
+            inner.output_peer_hold(target).unwrap().address(),
+            target.address
+        );
+        assert_eq!(
+            inner
+                .local_peers
+                .as_ref()
+                .unwrap()
+                .lookup_steps
+                .load(Ordering::Relaxed),
+            lookups
+        );
+        drop(flows);
+        scope.shutdown(true);
+        driver.service_closing(&mut Context::from_waker(Waker::noop()), now);
+        assert!(owner.reclaim().await);
+        owner.run().await;
     }
 
     #[tokio::test]

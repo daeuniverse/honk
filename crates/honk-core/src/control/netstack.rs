@@ -299,6 +299,8 @@ struct FlowSlot {
     close_pending: bool,
     retiring: bool,
     outputs: usize,
+    #[cfg(target_os = "linux")]
+    peer_cell: Option<usize>,
     rx: Option<Waker>,
     tx: Option<Waker>,
     callback: Option<RetirementCallback>,
@@ -312,6 +314,12 @@ struct FlowSlot {
 struct RetirementCallback {
     callback: Box<dyn FnOnce() + Send>,
     _memory: MemoryReservation,
+}
+
+#[derive(Clone, Copy)]
+struct OutputTarget {
+    slot: Option<usize>,
+    address: IpAddr,
 }
 
 #[derive(Clone, Copy)]
@@ -1075,6 +1083,8 @@ impl PacketScope {
                     close_pending: false,
                     retiring: false,
                     outputs: 0,
+                    #[cfg(target_os = "linux")]
+                    peer_cell: None,
                     rx: None,
                     tx: None,
                     callback: None,
@@ -1660,12 +1670,33 @@ impl Inner {
         queued
     }
 
+    fn output_target(
+        &self,
+        flow: Option<FlowId>,
+        packet: &[u8],
+    ) -> Result<OutputTarget, honk_netstack::wire::ParseError> {
+        let slot = flow.and_then(|id| self.slot_index(id));
+        let address = match slot.and_then(|i| self.slots[i].as_ref()) {
+            // Accepted passive TCP emits toward its original client. Retiring aliases still own credit.
+            Some(s) if s.accepted && s.app_open && !s.retiring => {
+                debug_assert_eq!(
+                    honk_netstack::wire::packet_addresses(packet)?.1,
+                    s.client.ip()
+                );
+                s.client.ip()
+            }
+            _ => honk_netstack::wire::packet_addresses(packet)?.1,
+        };
+        Ok(OutputTarget { slot, address })
+    }
+
     fn submit_output(
         &mut self,
         lease: FrameLease,
         tx: Transmit,
         class: TxClass,
-    ) -> io::Result<(Queued, bool)> {
+        slot: Option<usize>,
+    ) -> io::Result<Queued> {
         if let Some(context) = tx.source {
             assert!(
                 self.source_work.facts(context).is_some(),
@@ -1678,11 +1709,13 @@ impl Inner {
         if let Some(context) = tx.source {
             self.source_work.retain_output(context);
         }
-        let flow_bound = tx.flow.and_then(|id| self.slot(id)).is_some_and(|slot| {
-            slot.outputs += 1;
-            true
-        });
-        Ok((Queued { lease, tx, class }, flow_bound))
+        if let Some(index) = slot {
+            self.slots[index]
+                .as_mut()
+                .expect("original output slot")
+                .outputs += 1;
+        }
+        Ok(Queued { lease, tx, class })
     }
 
     fn install(
@@ -1691,20 +1724,20 @@ impl Inner {
         index: usize,
         tx: Transmit,
         class: TxClass,
-        destination: IpAddr,
+        target: OutputTarget,
         fragment: Option<honk_netstack::FragmentInfo>,
-    ) -> io::Result<(Queued, bool)> {
+    ) -> io::Result<Queued> {
         #[cfg(not(target_os = "linux"))]
         let _ = fragment;
-        let (queued, flow_bound) = self.submit_output(lease, tx, class)?;
-        self.output_peers[index] = Some(destination);
+        let queued = self.submit_output(lease, tx, class, target.slot)?;
+        self.output_peers[index] = Some(target.address);
         #[cfg(target_os = "linux")]
-        if !flow_bound {
-            self.pin_local_output(destination);
+        if target.slot.is_none() {
+            self.pin_local_output(target.address);
         }
         #[cfg(target_os = "linux")]
         let held = if fragment.is_none() && index < self.output_peer_holds.len() {
-            self.peer_hold_at(destination).cloned()
+            self.output_peer_hold(target)
         } else {
             None
         };
@@ -1723,7 +1756,7 @@ impl Inner {
                 None => held,
             };
         }
-        Ok((queued, flow_bound))
+        Ok(queued)
     }
 
     fn publish(
@@ -1734,13 +1767,14 @@ impl Inner {
         fragment: Option<honk_netstack::FragmentInfo>,
     ) {
         let index = self.index(lease);
-        let destination = honk_netstack::wire::packet_addresses(
-            &self.frames[index]
-                .as_ref()
-                .expect("reserved output storage")[..tx.len],
-        )
-        .expect("stack output has IP addresses")
-        .1;
+        let target = self
+            .output_target(
+                tx.flow,
+                &self.frames[index]
+                    .as_ref()
+                    .expect("reserved output storage")[..tx.len],
+            )
+            .expect("stack output has IP addresses");
         #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
         if tx.flow.is_none()
             && let Some(binding) = &mut self.host_process
@@ -1748,12 +1782,12 @@ impl Inner {
             let bytes = &self.frames[index].as_ref().expect("reserved Host output")[..tx.len];
             binding.outputs[index] = host::HostOutput::from_packet(bytes, fragment);
         }
-        let (queued, _flow_bound) = self
-            .install(lease, index, tx, class, destination, fragment)
+        let queued = self
+            .install(lease, index, tx, class, target, fragment)
             .expect("reserved complete output frame");
         self.push(queued);
         #[cfg(target_os = "linux")]
-        if !_flow_bound {
+        if target.slot.is_none() {
             self.refresh_local_pending();
         }
     }
@@ -2431,14 +2465,14 @@ impl PacketDriver {
         if tx.len == 0 || tx.len > frame_size {
             return Err(io::Error::other("invalid direct output extent"));
         }
-        let destination = honk_netstack::wire::packet_addresses(&packet[..tx.len])
-            .map_err(io::Error::other)?
-            .1;
+        let target = reservation
+            .inner
+            .output_target(tx.flow, &packet[..tx.len])
+            .map_err(io::Error::other)?;
         let index = reservation.inner.index(lease);
-        let (queued, _flow_bound) =
-            reservation
-                .inner
-                .install(lease, index, tx, class, destination, fragment)?;
+        let queued = reservation
+            .inner
+            .install(lease, index, tx, class, target, fragment)?;
         #[cfg(all(target_os = "linux", feature = "packet-ebpf"))]
         if tx.flow.is_none()
             && let Some(binding) = &mut reservation.inner.host_process
@@ -2447,7 +2481,7 @@ impl PacketDriver {
         }
         reservation.lease = None;
         #[cfg(target_os = "linux")]
-        if !_flow_bound {
+        if target.slot.is_none() {
             reservation.inner.refresh_local_pending();
         }
         #[cfg(target_os = "linux")]
@@ -2481,9 +2515,9 @@ impl PacketDriver {
             #[cfg(target_os = "linux")]
             path,
             #[cfg(target_os = "linux")]
-            ipv6: destination.is_ipv6(),
+            ipv6: target.address.is_ipv6(),
             #[cfg(all(target_os = "linux", test))]
-            destination,
+            destination: target.address,
         }))
     }
 
@@ -2573,8 +2607,9 @@ impl PacketDriver {
             IovTransmit::Packet(tx) => {
                 // The protocol owner stayed live under this lock through the write. Record
                 // its exact identity and return the credit before any stream/source reap.
-                let (queued, _) = state
-                    .submit_output(lease, tx, class)
+                let slot = tx.flow.and_then(|id| state.slot_index(id));
+                let queued = state
+                    .submit_output(lease, tx, class, slot)
                     .expect("complete reserved TUN output");
                 reservation.lease = None;
                 reservation.inner.release(queued);

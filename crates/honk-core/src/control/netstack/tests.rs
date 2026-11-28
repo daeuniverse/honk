@@ -165,10 +165,64 @@ fn materialized(
     else {
         panic!("expected actual direct stack output");
     };
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        output.destination,
+        wire::packet_addresses(&packet[..output.owner.len()])
+            .unwrap()
+            .1
+    );
     let owner = output.owner;
     assert_eq!(owner.class(), class);
     assert!(owner.packet().is_none());
     owner
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn refused_tcp_outputs_target_the_wire_destination_after_slot_removal() {
+    let now = Instant::now();
+    let client: SocketAddr = "192.0.2.3:44000".parse().unwrap();
+    for how in [
+        honk_netstack::Refuse::Rst,
+        honk_netstack::Refuse::IcmpAdminProhibited,
+    ] {
+        for generated in [false, true] {
+            let (scope, owner, _) = runtime(now);
+            let id = scope.0.with_silent(|inner| {
+                let stack = inner.stack.as_mut().unwrap();
+                assert_eq!(
+                    stack.receive(now, &segment(client, 77, 0, tcp::SYN, &[])),
+                    Rx::Consumed
+                );
+                let id = stack.poll_accept().unwrap().id;
+                stack.tcp_refuse(id, how);
+                assert_eq!(inner.slot_index(id), None);
+                id
+            });
+            if generated {
+                let mut driver = owner.hand_off();
+                let mut frame = [0; 1280];
+                let output = materialized(&mut driver, now, TxClass::Control, &mut frame);
+                assert_eq!(output.flow_id(), Some(id));
+                assert_eq!(
+                    wire::packet_addresses(&frame[..output.len()]).unwrap().1,
+                    client.ip()
+                );
+            } else {
+                scope.drive(now);
+                let output = output(&scope);
+                assert_eq!(output.flow_id(), Some(id));
+                let dst = wire::packet_addresses(output.packet()).unwrap().1;
+                let inner = scope.0.inner.lock();
+                assert_eq!(
+                    inner.output_peers[inner.index(output.0.queued.unwrap().lease)],
+                    Some(dst)
+                );
+                assert_eq!(dst, client.ip());
+            }
+        }
+    }
 }
 
 fn handshake(scope: &PacketScope, now: Instant, client: SocketAddr, seq: u32) -> (FlowIo, u32) {

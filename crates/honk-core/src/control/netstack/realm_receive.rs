@@ -662,6 +662,8 @@ impl Inner {
             close_pending: false,
             retiring: false,
             outputs: 0,
+            #[cfg(target_os = "linux")]
+            peer_cell: None,
             rx: None,
             tx: None,
             callback: None,
