@@ -350,8 +350,8 @@ impl<T: Copy> Ring<T> {
         unsafe { self.flags.as_ref() }.load(Ordering::Acquire) & libc::XDP_RING_NEED_WAKEUP != 0
     }
 
-    pub(super) fn publish_producer(&mut self, producer: u32) {
-        // SAFETY: Port is the sole userspace producer and has finished descriptor writes.
+    pub(super) fn publish_producer(&self, producer: u32) {
+        // SAFETY: the sole userspace owner publishes only completed writes to this atomic.
         unsafe { self.producer.as_ref() }.store(producer, Ordering::Release);
     }
 

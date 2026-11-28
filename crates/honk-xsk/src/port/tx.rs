@@ -138,6 +138,7 @@ struct TxBatchGuard<'a, L> {
 impl<L> Drop for TxBatchGuard<'_, L> {
     fn drop(&mut self) {
         if self.port.tx_batch_active {
+            self.port.publish_tx_prefix();
             self.port.tx_batch_active = false;
             self.port.close();
         }
@@ -145,12 +146,13 @@ impl<L> Drop for TxBatchGuard<'_, L> {
 }
 
 impl<L> Port<L> {
-    /// Defer per-packet wakeups only until this synchronous operation returns.
+    /// Publish complete TX chains at the batch boundary or an intervening observation.
     /// Work and final wakeup results are independent, including after work fails.
     /// Panicking work closes admission without I/O or releasing published owners.
     /// Scopes on the same Port must not nest or span an asynchronous suspension.
     pub fn transmit_batch<R>(&mut self, work: impl FnOnce(&mut Self) -> R) -> (R, io::Result<()>) {
         assert!(!self.tx_batch_active, "nested Port transmit scope");
+        self.tx_cached_consumer.set(self.rings.tx.consumer());
         self.tx_batch_active = true;
         let guard = TxBatchGuard { port: self };
         let result = work(guard.port);
@@ -201,12 +203,7 @@ impl<L> Port<L> {
         writer: impl FnOnce(&L, &mut [&mut [u8]]) -> io::Result<()>,
     ) -> io::Result<()> {
         let (wire_length, count) = self.tx_packet_layout(length)?;
-        let used = ring::distance(
-            self.tx_producer,
-            self.rings.tx.consumer(),
-            self.config.ring_size,
-        )
-        .map_err(|error| self.invalid(error))?;
+        let used = self.tx_used(count).map_err(|error| self.invalid(error))?;
         if !self.tx_chain_credit(class, count, used) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -269,16 +266,7 @@ impl<L> Port<L> {
                 },
             );
         }
-        self.tx_free[class_index(class)] -= count;
-        self.tx_producer = self.tx_producer.wrapping_add(count as u32);
-        self.counters.submitted += count as u64;
-        self.rings.tx.publish_producer(self.tx_producer);
-        self.counters.published();
-        if self.tx_batch_active {
-            Ok(())
-        } else {
-            self.kick_tx()
-        }
+        self.commit_tx_packet(class, count)
     }
 
     /// Generate one complete L2 packet directly in an unpublished UMEM frame.
@@ -333,30 +321,57 @@ impl<L> Port<L> {
         let Ok((_, count)) = self.tx_packet_layout(length) else {
             return false;
         };
-        ring::distance(
-            self.tx_producer,
-            self.rings.tx.consumer(),
-            self.config.ring_size,
-        )
-        .is_ok_and(|used| self.tx_chain_credit(class, count, used))
+        self.tx_used(count)
+            .is_ok_and(|used| self.tx_chain_credit(class, count, used))
     }
 
     /// Conservative packet count for this port's largest admitted Ethernet frame.
     /// A zero count can still leave credit for one shorter packet.
     pub fn tx_packet_capacity(&mut self, class: TxClass) -> io::Result<usize> {
         let (_, count) = self.tx_packet_layout(self.mtu as usize + 22)?;
-        let used = ring::distance(
-            self.tx_producer,
-            self.rings.tx.consumer(),
-            self.config.ring_size,
-        )
-        .map_err(|error| self.invalid(error))?;
+        let used = self.tx_used(count).map_err(|error| self.invalid(error))?;
         Ok(if self.closed.get() {
             0
         } else {
             self.tx_free[class_index(class)].min(self.config.ring_size as usize - used as usize)
                 / count
         })
+    }
+
+    fn tx_used(&self, count: usize) -> io::Result<u32> {
+        let size = self.config.ring_size;
+        if self.tx_batch_active {
+            let used = ring::distance(self.tx_producer, self.tx_cached_consumer.get(), size)?;
+            if count <= (size - used) as usize {
+                return Ok(used);
+            }
+        }
+        let consumer = self.rings.tx.consumer();
+        if self.tx_batch_active {
+            self.tx_cached_consumer.set(consumer);
+        }
+        ring::distance(self.tx_producer, consumer, size)
+    }
+
+    pub(super) fn publish_tx_prefix(&self) {
+        if self.tx_unpublished.get() {
+            self.rings.tx.publish_producer(self.tx_producer);
+            self.tx_unpublished.set(false);
+        }
+    }
+
+    fn commit_tx_packet(&mut self, class: TxClass, count: usize) -> io::Result<()> {
+        self.tx_free[class_index(class)] -= count;
+        self.tx_producer = self.tx_producer.wrapping_add(count as u32);
+        self.counters.submitted += count as u64;
+        self.counters.published();
+        if self.tx_batch_active {
+            self.tx_unpublished.set(true);
+            Ok(())
+        } else {
+            self.rings.tx.publish_producer(self.tx_producer);
+            self.kick_tx()
+        }
     }
 
     fn tx_packet_layout(&self, length: usize) -> io::Result<(usize, usize)> {
@@ -378,12 +393,7 @@ impl<L> Port<L> {
     }
 
     pub(super) fn reserve_single_tx(&mut self, class: TxClass) -> io::Result<PreparedTx> {
-        let used = ring::distance(
-            self.tx_producer,
-            self.rings.tx.consumer(),
-            self.config.ring_size,
-        )
-        .map_err(|error| self.invalid(error))?;
+        let used = self.tx_used(1).map_err(|error| self.invalid(error))?;
         let blocked = || io::Error::new(io::ErrorKind::WouldBlock, "single TX frame unavailable");
         if !self.tx_chain_credit(class, 1, used) || self.sidecar.free == NO_TX_OWNER {
             return Err(blocked());
@@ -439,16 +449,7 @@ impl<L> Port<L> {
                 options: 0,
             },
         );
-        self.tx_producer = self.tx_producer.wrapping_add(1);
-        self.tx_free[class_index(prepared.class)] -= 1;
-        self.counters.submitted += 1;
-        self.rings.tx.publish_producer(self.tx_producer);
-        self.counters.published();
-        if self.tx_batch_active {
-            Ok(())
-        } else {
-            self.kick_tx()
-        }
+        self.commit_tx_packet(prepared.class, 1)
     }
 
     pub fn transmit(
@@ -479,6 +480,7 @@ impl<L> Port<L> {
     /// Lend only owners whose final descriptor returned; sidecars are dropped afterward.
     /// A later invalid CQ still commits and releases the validated prefix.
     pub fn complete(&mut self, release: impl FnOnce(&mut [Option<&mut L>])) -> io::Result<usize> {
+        self.publish_tx_prefix();
         ring::distance(
             self.tx_producer,
             self.rings.tx.consumer(),

@@ -168,7 +168,7 @@ realm 的半开、UDP 与 ICMP 限额仍共享；各 owner 分摊流槽、Stack 
 
 XDP owner 先注册 readiness，再重查设备与输出状态，按本轮服务后计算的最早实际义务等待。未归还 CQ、TX consumer 可见性延迟及未读/不完整 RX 保留有条件的 1ms 重试；仅已投递 FILL 不产生该重试。需要 metadata 的设备保留每秒故障检查，仍持有状态的 Core/firewall history 保留有界维护。阻塞 scope 保留原有 100ms 共享预算后备，已设期限直到服务才重置，不被无关轮询延后。shutdown intent 在阻塞的控制命令完成前即可唤醒 capture；不承诺整个进程零唤醒。
 
-AF_XDP TX 仍逐包立即发布。具体的同步设备轮次只把逐包 NEED_WAKEUP 检查合并到轮次出口，独立发送仍立即 kick。每个正常出口保留工作错误和最终 kick 错误，批次不跨 await。panic 只关闭准入，不在析构中执行 I/O 或释放已发布 owner；这些 owner 只能由真实 CQ 归还。
+AF_XDP TX 在同步批次内暂存完整报文的描述符，在批末检查 NEED_WAKEUP 前发布完整前缀。读取 ring 或归属、显式 kick 和处理 CQ 也会先发布前缀。独立发送立即发布并 kick。工作错误与唤醒错误独立返回。panic 时发布已完成前缀并关闭准入，真实 CQ 完成后才释放相应 owner。
 
 按类别导出输出时，最多填充调用者提供的 64 个空 lease 槽，保持类别内 FIFO 顺序，不复制载荷。XDP daemon 每轮每 realm 每类别最多考虑 32 个输出，暂存/已导出的 CPU 输出、直接生成包及已生成但被处置的包共用该上限。实际端口 MTU、类别 credit 和 TX ring 空间继续决定容量；CPU 批量保留短包 singleton 后备。一个类别阻塞不妨碍另一个类别；无输出或容量探测失败不算进展，也不能据此 busy-poll。CQ 每轮最多验证 64 个 descriptor，只借出全部 descriptor 已完成的包 owner，按真实 scope 分组归还。后续 CQ 非法也不阻止已验证完成前缀的释放；未完整归还的 SG owner 继续保留。退休回调和非 Endpoint sidecar 析构在解锁后执行，TCP ACK 持有与设备完成相互独立。
 

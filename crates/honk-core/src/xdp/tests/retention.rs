@@ -2143,7 +2143,7 @@ pub(super) async fn gateway_g17_port_outputs(
         .send_to(b"G17/early-release", client)
         .await?;
     let output = scope.next_output().await.unwrap();
-    scope.shutdown(true);
+    endpoints.close();
     assert!(endpoints.retains_source(scope.scope(), client.ip()));
     let before = port.counters();
     let error = port
@@ -2209,7 +2209,7 @@ sock.close()
     let mut lines =
         tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(child.stdout.take().unwrap()));
     assert_eq!(lines.next_line().await?.as_deref(), Some("READY"));
-    scope.shutdown(true);
+    endpoints.close();
     let before = port.counters();
     assert_eq!(
         before.submitted, before.completed,
@@ -2274,6 +2274,5 @@ sock.close()
             "NOT_RUN: G17 nic_wire: real AF_PACKET peer did not observe the exact submitted frame in its bounded interval"
         );
     }
-    endpoints.close();
     Ok((endpoints, owner))
 }

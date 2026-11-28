@@ -195,6 +195,8 @@ pub struct Port<L> {
     sidecar: Sidecar<L>,
     rx_consumer: u32,
     tx_producer: u32,
+    tx_unpublished: Cell<bool>,
+    tx_cached_consumer: Cell<u32>,
     fill_producer: u32,
     fill_consumer: u32,
     cq_consumer: u32,
@@ -302,6 +304,8 @@ impl<L> Port<L> {
             sidecar,
             rx_consumer: 0,
             tx_producer: 0,
+            tx_unpublished: Cell::new(false),
+            tx_cached_consumer: Cell::new(0),
             fill_producer: 0,
             fill_consumer: 0,
             cq_consumer: 0,
@@ -375,6 +379,7 @@ impl<L> Port<L> {
 
     /// Reinspect both NEED_WAKEUP flags even when no new descriptors were published.
     pub fn kick(&mut self) -> io::Result<()> {
+        self.publish_tx_prefix();
         let rx = self.kick_rx();
         let tx = self.kick_tx();
         rx.and(tx)
@@ -383,6 +388,7 @@ impl<L> Port<L> {
     /// Service only TX NEED_WAKEUP after consuming available CQ entries.
     /// Published descriptors awaiting completion remain eligible after [`Self::close`].
     pub fn kick_outstanding_tx(&mut self) -> io::Result<()> {
+        self.publish_tx_prefix();
         if self.counters.submitted == self.counters.completed {
             return Ok(());
         }
@@ -390,10 +396,12 @@ impl<L> Port<L> {
     }
 
     pub fn outstanding(&self) -> impl Iterator<Item = OutstandingTx<u32>> + '_ {
+        self.publish_tx_prefix();
         self.ledger.outstanding_tx()
     }
 
     pub fn drain_state(&self) -> DrainState {
+        self.publish_tx_prefix();
         let mut state = self.ledger.drain_state();
         state.closed |= self.closed.get();
         state.rx_completions = self.retained_rx.completions;
@@ -407,6 +415,7 @@ impl<L> Port<L> {
     }
 
     pub fn counters(&self) -> PortCounters {
+        self.publish_tx_prefix();
         self.counters
     }
 
@@ -418,12 +427,14 @@ impl<L> Port<L> {
     /// Retry published TX/CQ work or RX blocked by a partial chain/FILL visibility.
     /// A populated FILL ring without queued RX is an ordinary idle receive reservation.
     pub fn needs_service_retry(&self) -> bool {
+        self.publish_tx_prefix();
         self.counters.submitted != self.counters.completed
             || self.tx_producer != self.rings.tx.consumer()
             || self.has_pending_rx()
     }
 
     pub fn stats(&self) -> io::Result<SocketStats> {
+        self.publish_tx_prefix();
         self.socket
             .as_ref()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))
@@ -431,11 +442,13 @@ impl<L> Port<L> {
     }
 
     pub fn rings(&self) -> RingSnapshot {
+        self.publish_tx_prefix();
         self.rings.snapshot()
     }
 
     /// Close only the socket. This does not unmap/refund UMEM or dispose outstanding TX.
     pub fn close_socket(&mut self) {
+        self.publish_tx_prefix();
         self.socket.take();
     }
 }
@@ -443,6 +456,7 @@ impl<L> Port<L> {
 impl<L> AsFd for Port<L> {
     /// Panics after close_socket; AsRawFd instead returns -1 for a closed socket.
     fn as_fd(&self) -> BorrowedFd<'_> {
+        self.publish_tx_prefix();
         self.socket
             .as_ref()
             .expect("AF_XDP socket is closed")
@@ -452,6 +466,7 @@ impl<L> AsFd for Port<L> {
 
 impl<L> AsRawFd for Port<L> {
     fn as_raw_fd(&self) -> RawFd {
+        self.publish_tx_prefix();
         self.socket.as_ref().map_or(-1, AsRawFd::as_raw_fd)
     }
 }

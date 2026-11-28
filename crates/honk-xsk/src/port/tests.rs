@@ -30,6 +30,8 @@ fn fake<L>(config: PortConfig, budget: &Arc<MemoryBudget>) -> Port<L> {
         sidecar: Sidecar::new(config, budget).unwrap(),
         rx_consumer: 0,
         tx_producer: 0,
+        tx_unpublished: Cell::new(false),
+        tx_cached_consumer: Cell::new(0),
         fill_producer: 0,
         fill_consumer: 0,
         cq_consumer: 0,
@@ -2753,6 +2755,86 @@ fn transmit_entry(
 }
 
 #[test]
+fn batch_sg_chain_wraps_and_completion_observes_only_whole_packets() {
+    let budget = MemoryBudget::new(1 << 20);
+    let mut port = fake(
+        PortConfig {
+            bulk_frames: 5,
+            ring_size: 8,
+            ..config()
+        },
+        &budget,
+    );
+    port.scatter_gather = true;
+    port.mtu = 9000;
+    let initial = u32::MAX - 1;
+    port.tx_producer = initial;
+    port.rings.tx.publish_producer(initial);
+    port.rings.tx.publish_consumer(initial);
+    let ((), kick) = port.transmit_batch(|port| {
+        port.transmit_segments(TxClass::Bulk, &[&[1; 9000]], 11)
+            .unwrap();
+        assert_eq!(port.rings.tx.producer(), initial);
+        assert!(
+            port.transmit_with(TxClass::Control, 60, 12, |_, _| Err(io::Error::other(
+                "materialization refused"
+            )))
+            .is_err()
+        );
+        assert_eq!(port.rings.tx.producer(), initial);
+        assert_eq!(
+            port.complete(|owners| assert!(owners.is_empty())).unwrap(),
+            0
+        );
+        assert_eq!(port.rings.tx.producer(), 1);
+        for part in 0..3 {
+            let desc = port.rings.tx.read(initial.wrapping_add(part));
+            assert_eq!(desc.options, u32::from(part != 2));
+            port.rings.cq.write(part, desc.addr);
+        }
+        port.rings.tx.publish_consumer(1);
+        port.rings.cq.publish_producer(3);
+        assert_eq!(
+            port.complete(|owners| assert_eq!(**owners[0].as_ref().unwrap(), 11))
+                .unwrap(),
+            3
+        );
+    });
+    kick.unwrap();
+}
+
+#[test]
+fn batch_refreshes_consumer_when_a_whole_chain_will_not_fit() {
+    let budget = MemoryBudget::new(1 << 20);
+    let mut port = fake::<()>(
+        PortConfig {
+            bulk_frames: 4,
+            ring_size: 8,
+            ..config()
+        },
+        &budget,
+    );
+    port.scatter_gather = true;
+    port.mtu = 9000;
+    // Six published descriptors precede this turn. The kernel consumes them during it.
+    port.tx_producer = 6;
+    port.rings.tx.publish_producer(6);
+    let (work, kick) = port.transmit_batch(|port| {
+        assert!(!port.tx_packet_credit(TxClass::Bulk, 9000));
+        port.rings.tx.publish_consumer(6);
+        assert!(port.tx_packet_credit(TxClass::Bulk, 60));
+        assert_eq!(port.tx_cached_consumer.get(), 0);
+        port.transmit_segments(TxClass::Bulk, &[&[1; 9000]], ())?;
+        assert_eq!(port.tx_cached_consumer.get(), 6);
+        assert_eq!(port.rings.tx.producer(), 6);
+        Ok::<_, io::Error>(())
+    });
+    work.unwrap();
+    kick.unwrap();
+    assert_eq!(port.rings.tx.producer(), 9);
+}
+
+#[test]
 fn batch_tx_entries_publish_the_whole_prefix_before_terminal_wakeup() {
     let budget = MemoryBudget::new(1 << 20);
     let drops = Arc::new(AtomicUsize::new(0));
@@ -2768,8 +2850,9 @@ fn batch_tx_entries_publish_the_whole_prefix_before_terminal_wakeup() {
     let (work, kick) = port.transmit_batch(|port| {
         for entry in 0..5 {
             transmit_entry(port, entry, &drops)?;
-            assert_eq!(port.counters().published_packets, entry as u64 + 1);
+            assert_eq!(port.rings.tx.producer(), 0);
         }
+        assert_eq!(port.counters().published_packets, 5);
         assert!(!port.drain_state().closed);
         assert_eq!(port.rings().tx_producer, 5);
         Ok::<_, io::Error>(())
@@ -3110,6 +3193,7 @@ fn batch_panic_closes_admission_and_retains_published_and_reserved_ownership() {
         });
     }));
     assert!(panic.is_err());
+    assert_eq!(port.rings.tx.producer(), 1);
     let state = port.drain_state();
     assert!(state.closed);
     assert_eq!(state.control_reserved, 1);
