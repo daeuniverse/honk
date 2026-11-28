@@ -135,30 +135,143 @@ fn tuic_alpn_defaults_follow_the_subscription_dialect() {
 }
 
 #[test]
-fn tuic_source_default_preserves_runtime_reuse_until_alpn_changes() {
+fn clash_imports_tuic_mtu_discovery() {
+    let yaml = r#"proxies:
+  - name: tuic
+    type: tuic
+    server: edge.example
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    password: secret
+    disable-mtu-discovery: true
+    udp-relay-mode: native
+    reduce-rtt: false
+    alpn: [h3]
+    congestion-controller: bbr
+    udp: true
+"#;
+    let json: serde_json::Value = serde_yaml::from_str(yaml).unwrap();
+    for body in [yaml, &json.to_string()] {
+        let nodes = parse_subscription_content(&Subscription::default(), body).unwrap();
+        let tuic = nodes[0].tuic().unwrap();
+        assert!(tuic.quic.disable_mtu_discovery);
+    }
+}
+
+#[test]
+fn clash_mtu_discovery_checks_protocol_and_boolean_aliases() {
+    let parse = |protocol, fields: &str| {
+        let body = format!(
+            "proxies:\n  - {{type: {protocol}, server: edge.example, port: 443, uuid: 11111111-1111-4111-8111-111111111111, password: p, {fields}}}\n  - {{type: socks5, name: neighbor, server: other.example, port: 1080}}"
+        );
+        let mut diagnostics = Vec::new();
+        let mut nodes = parse_subscription_content_with_diagnostics(
+            &Subscription::default(),
+            &body,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(nodes.pop().unwrap().name, "neighbor");
+        match (nodes.as_slice(), diagnostics.as_slice()) {
+            ([node], []) => Ok(node.quic().map(|quic| quic.disable_mtu_discovery)),
+            ([], [error]) => {
+                assert_eq!(error.entry_index, Some(1));
+                Err((error.code, error.message))
+            }
+            _ => panic!("{body}: {diagnostics:?}"),
+        }
+    };
+    for protocol in ["tuic", "juicity", "hysteria2", "vless", "socks5"] {
+        let quic = matches!(protocol, "tuic" | "juicity" | "hysteria2");
+        for key in [
+            "disable-mtu-discovery",
+            "disable_mtu_discovery",
+            "disable-path-mtu-discovery",
+            "disable_path_mtu_discovery",
+            "disablePathMTUDiscovery",
+        ] {
+            let result = parse(protocol, &format!("{key}: true"));
+            if quic {
+                assert_eq!(result, Ok(Some(true)), "{protocol}: {key}");
+            } else {
+                assert_eq!(
+                    result,
+                    Err((
+                        "unsupported-subscription-entry",
+                        "QUIC MTU discovery options are unsupported for this protocol"
+                    ))
+                );
+            }
+        }
+        for value in ["false", "null"] {
+            assert_eq!(
+                parse(protocol, &format!("disable-mtu-discovery: {value}")),
+                Ok(quic.then_some(false))
+            );
+        }
+        if quic {
+            assert_eq!(
+                parse(
+                    protocol,
+                    "disable_mtu_discovery: true, disablePathMTUDiscovery: true"
+                ),
+                Ok(Some(true))
+            );
+            for fields in [
+                "disable_mtu_discovery: false, disable-mtu-discovery: true",
+                "disable_mtu_discovery: 'true'",
+                "disable_mtu_discovery: 1",
+                "disable_mtu_discovery: ''",
+            ] {
+                assert_eq!(
+                    parse(protocol, fields).unwrap_err().0,
+                    "malformed-subscription-entry",
+                    "{fields}"
+                );
+            }
+        } else {
+            for value in ["''", "0"] {
+                assert_eq!(
+                    parse(protocol, &format!("disable_mtu_discovery: {value}")),
+                    Ok(None)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn tuic_runtime_reuse_compares_effective_alpn_and_mtu_discovery() {
     use honk_outbound::runtime::OutboundRuntimeRegistry;
     use std::sync::Arc;
 
-    let parse = |alpn| {
+    let parse = |field| {
         parse_clash_subscription(
             &format!(
-                "proxies:\n  - name: tuic\n    type: tuic\n    server: 127.0.0.1\n    port: 443\n    uuid: 11111111-1111-4111-8111-111111111111\n    password: secret\n{alpn}"
+                "proxies:\n  - name: tuic\n    type: tuic\n    server: 127.0.0.1\n    port: 443\n    uuid: 11111111-1111-4111-8111-111111111111\n    password: secret\n    {field}\n"
             ),
             None,
         )
         .unwrap()
         .remove(0)
     };
-    let explicit = parse("    alpn: [h3]\n");
-    let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&explicit)).unwrap();
-    let original = first.get(&explicit.id).unwrap();
-    for (alpn, should_reuse) in [
-        ("", true),
-        ("    alpn: null\n", true),
-        ("    alpn: [tuic]\n", false),
+    let off = "disable-mtu-discovery: false";
+    let on = "disable-mtu-discovery: true";
+    for (before, after, should_reuse) in [
+        ("alpn: [h3]", "", true),
+        ("alpn: [h3]", "alpn: null", true),
+        ("alpn: [h3]", "alpn: [tuic]", false),
+        ("", off, true),
+        (off, "", true),
+        (off, on, false),
+        (on, off, false),
+        (on, "disable_path_mtu_discovery: true", true),
     ] {
-        let imported = parse(alpn);
-        assert_eq!(imported.id, explicit.id);
+        let initial = parse(before);
+        let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&initial)).unwrap();
+        let original = first.get(&initial.id).unwrap();
+        let imported = parse(after);
+        assert_eq!(imported.id, initial.id);
         let (next, reused) = OutboundRuntimeRegistry::build_reusing(
             std::slice::from_ref(&imported),
             64,

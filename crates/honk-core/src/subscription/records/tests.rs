@@ -207,6 +207,95 @@ fn tuic_empty_password_and_h3_alpn_are_returned() {
 }
 
 #[test]
+fn record_mtu_discovery_folds_all_boolean_claims() {
+    for protocol in ["hysteria2", "tuic", "juicity"] {
+        let credentials = if protocol == "hysteria2" {
+            "password=p"
+        } else {
+            "uuid=11111111-1111-4111-8111-111111111111,password=p"
+        };
+        for header in [
+            format!("named={protocol},edge.example,443,{credentials}"),
+            format!("{protocol}=edge.example:443,{credentials},tag=qx"),
+        ] {
+            for (options, expected) in [
+                (
+                    "disable-mtu-discovery=YES,disable_mtu_discovery=1",
+                    Ok(true),
+                ),
+                (
+                    "disablePathMTUDiscovery=on,disable-path-mtu-discovery=true,disable_path_mtu_discovery=1",
+                    Ok(true),
+                ),
+                (
+                    "disable_mtu_discovery=no,disable-mtu-discovery=0",
+                    Ok(false),
+                ),
+                (
+                    "disable_mtu_discovery=1,disable-mtu-discovery=off",
+                    Err("record boolean aliases conflict"),
+                ),
+                (
+                    "disable_mtu_discovery=invalid,disable_mtu_discovery=false",
+                    Err("record boolean option is invalid"),
+                ),
+            ] {
+                let body = format!("{header},{options}\nsurvivor=socks5,other.example,1080");
+                let mut diagnostics = Vec::new();
+                let mut nodes = crate::subscription::parse_subscription_content_with_diagnostics(
+                    &Default::default(),
+                    &body,
+                    &mut diagnostics,
+                )
+                .unwrap();
+                assert_eq!(nodes.pop().unwrap().name, "survivor");
+                let actual = match (nodes.as_slice(), diagnostics.as_slice()) {
+                    ([node], []) => Ok(node.quic().unwrap().disable_mtu_discovery),
+                    ([], [error]) => {
+                        assert_eq!(error.code, "malformed-subscription-entry");
+                        Err(error.message)
+                    }
+                    _ => panic!("unexpected nodes or diagnostics for {header},{options}"),
+                };
+                assert_eq!(actual, expected, "{header},{options}");
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_mtu_assignment_is_rejected_and_quoted_credentials_survive() {
+    let body = r#"named=hysteria2,edge.example,443,password=p,disablePathMTUDiscovery=
+hysteria2=qx.example:443,password=p,disablePathMTUDiscovery=,tag=qx
+quoted=hysteria2,other.example,443,"disablePathMTUDiscovery=""#;
+    let mut diagnostics = Vec::new();
+    let nodes = crate::subscription::parse_subscription_content_with_diagnostics(
+        &Default::default(),
+        body,
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["quoted"]
+    );
+    assert_eq!(
+        nodes[0].hysteria2().unwrap().auth.as_deref(),
+        Some("disablePathMTUDiscovery=")
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|d| (d.line, d.code))
+            .collect::<Vec<_>>(),
+        [1, 2].map(|line| (Some(line), "malformed-subscription-entry"))
+    );
+}
+
+#[test]
 fn reality_does_not_override_explicit_tls_disable() {
     let nodes = parse_records_subscription(
             "vless=example.com:443,password=33333333-3333-4333-8333-333333333333,obfs=over-tls,tls=false,reality-base64-pubkey=key,reality-hex-shortid=sid,tag=contradiction\n\

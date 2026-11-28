@@ -54,7 +54,8 @@ Node 模型包含下列字段。分享链接会从协议方案、userinfo、地�
 | `hy2_up_mbps` / `hy2_down_mbps` | u32? | `null` | Hysteria2 brutal 发送端与接收端带宽提示。 |
 | `hy2_port_hopping` / `hy2_hop_interval` | string? / u64? | `null` | Hysteria2 `mport` 端口列表与 `mhop` 跳跃秒数。见 [`hy2_port_hopping` / `hy2_hop_interval`](#hy2_port_hopping--hy2_hop_interval)。 |
 | `hy2_init_stream_recv_window` / `hy2_init_conn_recv_window` | u64? | `null` | Hysteria2 QUIC 接收窗口。见 [`hy2_init_stream_recv_window` / `hy2_init_conn_recv_window`](#hy2_init_stream_recv_window--hy2_init_conn_recv_window)。 |
-| `hy2_disable_mtu_discovery` | bool? | `null` | Hysteria2 `disablePathMTUDiscovery`。 |
+| `hy2_disable_mtu_discovery` | bool? | `null` | Hysteria2 专用的 `quic_disable_mtu_discovery` 兼容别名。两个布尔值冲突时，honk 拒绝该节点。值为 `true` 时输出两个键。值为 `false` 时，JSON 和 YAML 只输出值为 `null` 的旧键，TOML 省略两个键。 |
+| `quic_disable_mtu_discovery` | bool | `false`（输出时省略） | 关闭 Hysteria2、TUIC 和 Juicity 的 QUIC 路径 MTU 发现。 |
 | `quic_mtu` | u16? | `null` | 来自 `mtu` 的 QUIC UDP 载荷大小。见 [`quic_mtu`](#quic_mtu)。 |
 | `tls_pin_sha256` | string? | `null` | 来自 `pinSHA256` 或 `pin_sha256` 的叶证书 SHA-256 pin。见 [`tls_pin_sha256`](#tls_pin_sha256)。 |
 | `tuic_uuid` / `tuic_password` | string? | `null` | TUIC 凭据；扁平字段须与 `username` / `password` 一致。 |
@@ -145,11 +146,13 @@ conn 窗口同时是每连接内存预算，因此慢消费者最多缓冲约 3 
 
 用 `mtu` 设置 QUIC UDP 载荷大小。取 1200 到 65527 之间的整数。通告的接收大小默认为 `1252`，范围相同。
 
-发送 MTU 从 1200 开始，通过路径 MTU 发现增长。显式 `mtu` 同时设置初始发送 MTU 和发现上限。
+默认发送 MTU 从 1200 字节开始，可通过路径 MTU 发现增大。显式设置 `mtu` 会同时指定初始 UDP 载荷大小和探测上限。将 `quic_disable_mtu_discovery` 设为 `true` 后，客户端停止发送路径 MTU 探测包。
 
 大于 1252 时在常规 socket 上启用 GSO，但不包括 Hysteria2 混淆和跳端口 socket。`HONK_QUIC_GSO=0` 强制关闭 GSO。
 
 分享链接里格式错误或超出范围的 `mtu` 会被忽略，不会使链接被拒绝。
+
+Hysteria2、TUIC 和 Juicity 分享链接依次查找 `disablePathMTUDiscovery`、`disable_mtu_discovery` 和 `disable-mtu-discovery`。优先使用第一个存在的参数名，同名参数取最后一次出现的值。值为 `1` 或 `true` 时关闭发现，`true` 忽略 ASCII 大小写。其他值均按 `false` 接受，包括空字符串和带首尾空白的 `true`。
 
 ```dae
 node {
@@ -183,16 +186,18 @@ VMess 和 VLESS 从 `password` 读取用户 UUID；`id` 是节点身份，不是
 
 VLESS 扁平输入已删除 `vless_mode`，改用 `network` 表示数据包权限、`packet_encoding` 表示回退、`multiplex` 表示 carrier 选择。只要原始输入中出现该字段，节点就会被拒绝，包括值为 `null` 或任一旧版已知拼写。唯一保留的 `vless_mode: "legacy"` 是非 VLESS 扁平格式序列化时使用的兼容占位字段。它不配置 VLESS，非 VLESS 行为与身份保持不变。
 
-扁平凭据别名在移除不兼容字段前比较：
+honk 在移除不兼容字段前比较以下扁平字段别名。
 
 | 协议 | 必须一致的别名 |
 | --- | --- |
-| Hysteria2 | `hy2_auth` / `password` |
+| Hysteria2 | `hy2_auth` / `password`，`hy2_disable_mtu_discovery` / `quic_disable_mtu_discovery` |
 | TUIC | `tuic_uuid` / `username`；`tuic_password` / `password` |
 | Juicity | `juicity_uuid` / `username`；`juicity_password` / `password` |
 | AnyTLS | `password` / `anytls_password` |
 
 缺失或 null 表示未提供。已提供的字符串须逐字节一致，空字符串和首尾空格也参与比较。空凭据仍须满足对应协议的要求。扁平凭据字段仍须使用字符串；数字转换仅适用于订阅导入。
+
+TUIC 和 Juicity 会移除 `hy2_disable_mtu_discovery`。非 QUIC 协议会移除两个 MTU 发现字段。即使字段值为 `false`，`incompatible-node-fields` 警告也会列出被移除的布尔字段。
 
 新增 `tls_alpn` 字段不沿用旧字段剥离规则；见 [`tls_alpn`](#tls_alpn)。
 
@@ -587,7 +592,7 @@ Clash 导入会比较 `servername`、`server-name` 和 `sni`；记录格式还�
 | `mport` / `mhop` | `hy2_port_hopping` / `hy2_hop_interval`；见 [`hy2_port_hopping` / `hy2_hop_interval`](#hy2_port_hopping--hy2_hop_interval)。 |
 | `pinSHA256` | `tls_pin_sha256`，替代 PKI/主机名校验 |
 | `initStreamReceiveWindow` / `initConnReceiveWindow` | QUIC 接收窗口覆盖值，单位为字节 |
-| `disablePathMTUDiscovery` | 值为 `1`/`true` 时关闭 QUIC PMTU 发现 |
+| `disablePathMTUDiscovery`（及别名） | 设置 `quic_disable_mtu_discovery`；见 [`quic_mtu`](#quic_mtu)。 |
 | `mtu` | 共用 QUIC UDP-payload 上限；只接受 1200–65527 |
 | `sni` / `peer`、insecure 别名、ECH 参数 | 共用 TLS 行为；非空的显式 SNI 别名必须一致 |
 
@@ -611,6 +616,7 @@ node {
 | Juicity | 协议默认值 | ALPN `h3`、BBR，以及 8 MiB / 8 MiB 的初始接收窗口（共享自适应流控可使其增长） |
 | Juicity | UDP | 每个客户端源一条 QUIC bi 流承载所有目的地；回复返回真实的远端对端，取决于服务端自身的 UDP socket 与出口策略 |
 | 两者 | `mtu`、`sni`、insecure 别名、pin、ECH | 共用 QUIC/TLS 参数 |
+| 两者 | `disablePathMTUDiscovery`（及别名） | 设置 `quic_disable_mtu_discovery`；见 [`quic_mtu`](#quic_mtu)。 |
 
 ```dae
 node {

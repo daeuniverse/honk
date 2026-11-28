@@ -54,7 +54,8 @@ Flat structured input requires `name`, `protocol`, `address` and `port`, even wh
 | `hy2_up_mbps` / `hy2_down_mbps` | u32? | `null` | Hysteria2 brutal sender and receiver bandwidth hints. |
 | `hy2_port_hopping` / `hy2_hop_interval` | string? / u64? | `null` | Hysteria2 `mport` port list and `mhop` hop seconds. See [`hy2_port_hopping` / `hy2_hop_interval`](#hy2_port_hopping--hy2_hop_interval). |
 | `hy2_init_stream_recv_window` / `hy2_init_conn_recv_window` | u64? | `null` | Hysteria2 QUIC receive windows. See [`hy2_init_stream_recv_window` / `hy2_init_conn_recv_window`](#hy2_init_stream_recv_window--hy2_init_conn_recv_window). |
-| `hy2_disable_mtu_discovery` | bool? | `null` | Hysteria2 `disablePathMTUDiscovery`. |
+| `hy2_disable_mtu_discovery` | bool? | `null` | Hysteria2 compatibility alias for `quic_disable_mtu_discovery`. Conflicting booleans reject the node. Hysteria2 writes both keys when `true`. When `false`, JSON and YAML write only the old key as `null`, and TOML omits both keys. |
+| `quic_disable_mtu_discovery` | bool | `false` (omitted on output) | Disables QUIC path MTU discovery for Hysteria2, TUIC, and Juicity. |
 | `quic_mtu` | u16? | `null` | QUIC UDP payload size from `mtu`. See [`quic_mtu`](#quic_mtu). |
 | `tls_pin_sha256` | string? | `null` | Leaf-certificate SHA-256 pin from `pinSHA256` or `pin_sha256`. See [`tls_pin_sha256`](#tls_pin_sha256). |
 | `tuic_uuid` / `tuic_password` | string? | `null` | TUIC credentials; flat aliases must agree with `username` / `password`. |
@@ -145,11 +146,13 @@ In a share link, a malformed or out-of-range value is ignored rather than reject
 
 Sets the QUIC UDP payload size from `mtu`. Takes an integer from 1200 to 65527. The advertised receive size defaults to `1252` and shares that range.
 
-Send MTU starts at 1200 and grows through path-MTU discovery. An explicit `mtu` sets both the initial send MTU and the discovery bound.
+By default, the send MTU starts at 1200 bytes and can grow through path MTU discovery. An explicit `mtu` sets both the initial UDP payload size and the upper bound for discovery. Setting `quic_disable_mtu_discovery` to `true` stops the client from sending path MTU probes.
 
 A value above 1252 enables GSO on regular sockets, excluding the Hysteria2 obfuscation and hopping socket. `HONK_QUIC_GSO=0` disables GSO.
 
 In a share link, a malformed or out-of-range `mtu` is ignored rather than rejecting the link.
+
+Hysteria2, TUIC, and Juicity share links check `disablePathMTUDiscovery`, `disable_mtu_discovery`, then `disable-mtu-discovery`. The first spelling present wins, using its last occurrence. `1` or ASCII case-insensitive `true` disables discovery. All other values, including an empty string or `true` with surrounding whitespace, are accepted as `false`.
 
 ```dae
 node {
@@ -183,16 +186,18 @@ Values used by the selected protocol still undergo normal parsing and validation
 
 `vless_mode` is removed from VLESS flat input; use `network` for packet permission, `packet_encoding` for fallback, and `multiplex` for carrier selection. Its raw presence rejects the node even when its value is `null` or an old recognized spelling. The only remaining `vless_mode: "legacy"` field is a non-VLESS serialization placeholder retained for flat-format compatibility. It does not configure VLESS, and non-VLESS behavior and identity are unchanged.
 
-Flat credential aliases are compared before incompatible fields are stripped:
+honk compares these flat aliases before stripping incompatible fields.
 
 | Protocol | Aliases that must agree |
 | --- | --- |
-| Hysteria2 | `hy2_auth` / `password` |
+| Hysteria2 | `hy2_auth` / `password`, `hy2_disable_mtu_discovery` / `quic_disable_mtu_discovery` |
 | TUIC | `tuic_uuid` / `username`; `tuic_password` / `password` |
 | Juicity | `juicity_uuid` / `username`; `juicity_password` / `password` |
 | AnyTLS | `password` / `anytls_password` |
 
 Missing or null claims are absent. Supplied strings must agree byte for byte, including empty strings and surrounding spaces. An empty credential remains subject to its protocol's requirements. Flat credential fields remain strings; numeric coercion applies only to subscription feeds.
+
+TUIC and Juicity strip `hy2_disable_mtu_discovery`. Non-QUIC protocols strip both MTU discovery keys. The `incompatible-node-fields` warning lists discarded boolean fields even when set to `false`.
 
 `tls_alpn` is deliberately excluded from legacy stripping; see [`tls_alpn`](#tls_alpn).
 
@@ -601,7 +606,7 @@ Both `hysteria2://` and `hy2://` are accepted. The entire percent-decoded userin
 | `mport` / `mhop` | `hy2_port_hopping` / `hy2_hop_interval`; see [`hy2_port_hopping` / `hy2_hop_interval`](#hy2_port_hopping--hy2_hop_interval) |
 | `pinSHA256` | `tls_pin_sha256`, replacing PKI/hostname verification |
 | `initStreamReceiveWindow` / `initConnReceiveWindow` | QUIC receive-window overrides in bytes |
-| `disablePathMTUDiscovery` | Disables QUIC PMTU discovery when `1`/`true` |
+| `disablePathMTUDiscovery` (and aliases) | Sets `quic_disable_mtu_discovery`; see [`quic_mtu`](#quic_mtu). |
 | `mtu` | Shared QUIC UDP-payload cap, accepted only in 1200–65527 |
 | `sni` / `peer`, insecure aliases, ECH parameters | Shared TLS behavior; nonempty explicit SNI aliases must agree |
 
@@ -625,6 +630,7 @@ node {
 | Juicity | protocol defaults | ALPN `h3`, BBR, and 8 MiB / 8 MiB initial receive windows that the shared adaptive flow control can grow |
 | Juicity | UDP | One QUIC bi stream per client source carries every destination; replies return the real remote peer, subject to the server's own UDP socket and egress policy |
 | Both | `mtu`, `sni`, insecure aliases, pin, ECH | Shared QUIC/TLS parameters |
+| Both | `disablePathMTUDiscovery` (and aliases) | Sets `quic_disable_mtu_discovery`; see [`quic_mtu`](#quic_mtu). |
 
 ```dae
 node {

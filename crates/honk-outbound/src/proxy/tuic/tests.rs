@@ -173,6 +173,24 @@ async fn test_dial_tcp_echo() {
 }
 
 #[tokio::test]
+async fn pmtud_follows_node_setting() {
+    let addr = start_server(true, TEST_PASSWORD).await;
+    let handler = TuicHandler::new();
+    let timeout = Duration::from_secs(5);
+    for disabled in [false, true] {
+        let mut node = test_node(addr.port(), TEST_PASSWORD);
+        node.quic_mut().unwrap().disable_mtu_discovery = disabled;
+        let client = handler.build_client(&node, None).await.unwrap();
+        let stream = handler
+            .dial_via_client(Arc::clone(&client), addr, None, timeout)
+            .await
+            .unwrap();
+        let (conn, _) = client.connection(timeout).await.unwrap();
+        crate::proxy::tests::assert_pmtud_after_echo(&conn, stream, disabled).await;
+    }
+}
+
+#[tokio::test]
 async fn test_dial_tcp_domain_echo() {
     let server_addr = start_server(true, TEST_PASSWORD).await;
     let node = test_node(server_addr.port(), TEST_PASSWORD);

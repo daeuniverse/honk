@@ -629,7 +629,7 @@ impl Hysteria2Handler {
                 // application drains it faster than four RTTs per window.
                 stream_receive_window: hy2.init_stream_recv_window.or(Some(8 << 20)),
                 conn_receive_window: hy2.init_conn_recv_window.or(Some(8 << 20)),
-                disable_mtu_discovery: hy2.disable_mtu_discovery == Some(true),
+                disable_mtu_discovery: hy2.quic.disable_mtu_discovery,
                 max_udp_payload_size: hy2.quic.mtu,
             },
         )

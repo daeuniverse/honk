@@ -289,9 +289,12 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 | 协议 | 导入的选项 |
 | --- | --- |
 | Hysteria2 | `password`/`auth`，以及 `obfs: salamander` 与 `obfs-password`。支持上传/下载带宽、`ports`/`mport`/`port-hopping`/`port_hopping` 跳跃端口范围、`hop-interval`/`mhop`、接收窗口、MTU 与 MTU 发现设置。 |
-| TUIC | UUID/密码、拥塞控制、ALPN、接收窗口、MTU。 |
+| TUIC | UUID 和密码、拥塞控制、ALPN、接收窗口、MTU 和路径 MTU 发现。 |
+| Juicity | UUID 和密码、MTU 和路径 MTU 发现。 |
 | AnyTLS | `idle-session-check-interval`、`idle-session-timeout`、`min-idle-session`。 |
 | VMess | `udp-over-tcp` 和 `udp_over_tcp` 均接受布尔值或对象。`true` 或 `{enabled: true, version: 2}` 开启 UoT v2，版本可省略或设为 `0`、`2`。启用其他数据包编码、逐包地址封装或多路复用会导致条目被拒绝。 |
+
+Hysteria2、TUIC 和 Juicity 接受 `disable-mtu-discovery`、`disable_mtu_discovery`、`disable-path-mtu-discovery`、`disable_path_mtu_discovery` 和 `disablePathMTUDiscovery`。设为 `true` 即可关闭路径 MTU 发现。Clash 忽略 `null`，其余已设置的别名必须使用相同的布尔值。对于其他协议，活跃值会使条目以 `unsupported-subscription-entry` 被拒绝。`false`、`null`、`0` 和 `""` 等非活跃值会被忽略。
 
 显式关闭的 feature block 按禁用处理，honk 不会把它当成已启用的不支持的 feature。VMess 单独设置 `udp: true` 时仍仅启用 TCP。`udp: false` 即使在开启 UoT v2 时也会禁用 UDP。节点模型保留不了显式 UDP 限制时，honk 拒绝导入。
 
@@ -403,6 +406,7 @@ TLS/SNI、REALITY、WebSocket/gRPC 升级 header、VLESS 数据包选项，以�
 | VLESS 未启用 H2MUX/UoT 封装，且没有显式 `packet_encoding` 选择其他路径 | 使用 Single XUDP 并允许 UDP。这是 sing-box 导入的默认值，不是 Auto 的全局含义。 |
 | gRPC 服务名为空或省略 | 保留 sing-box 的空服务名，不使用 honk 的 `GunService` 默认值。 |
 | Hysteria2 提供 `server_ports`，未提供 `server_port` | 以第一个跳跃端口作为名义 endpoint。 |
+| Hysteria2、TUIC 或 Juicity 的 `disable_path_mtu_discovery` / `disable_mtu_discovery` | 可选；提供时任选一个键并填写布尔值。`true` 关闭路径 MTU 发现。同时提供两个键（即使值相同），或填写 `null` 等非布尔值时，honk 会跳过该条目。 |
 | 节点级 uTLS 指纹提示 | 不覆盖 honk 的进程级 TLS 选择。 |
 
 不支持的链式代理、wire feature 或认证要求，honk 会报错，不会直接忽略。
@@ -422,6 +426,8 @@ TLS/SNI、REALITY、WebSocket/gRPC 升级 header、VLESS 数据包选项，以�
 显式凭据和加密方法别名在转换前必须一致。具名记录只有在对应的具名值缺失时，才使用位置参数；有效的显式值不会因为位置参数不同而冲突。Quantumult X 不用位置参数回退。显式空凭据也参与别名比较，不会触发回退。
 
 允许为空的可选记录凭据会逐字节保留空字符串和带引号的空白，包括 SOCKS 用户名和密码、Hysteria2 认证值、TUIC 密码。显式空值仍优先于位置参数；要求非空凭据的协议仍然拒绝空值。
+
+`hysteria2`、`tuic` 和 `juicity` 文本记录接受 [Clash 的五个 MTU 发现别名](#协议专属选项)，参数名和值均不区分大小写。`1`、`true`、`yes`、`on` 关闭发现，`0`、`false`、`no`、`off` 保持开启。任一值为空或无效，或重复设置的值转换后不一致时，honk 会跳过该条记录。
 
 honk 在赋值前比较记录里的 `transport`/`network` 流传输声明，重复 key 也比。空文本和 `tcp` 都表示裸 TCP。声明冲突或含不支持的传输方式时，honk 拒绝该条目。
 

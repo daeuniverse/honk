@@ -485,7 +485,7 @@ pub(super) fn apply_protocol(
                     emit(warning);
                 }
             }
-            apply_mtu(&mut config.quic, query);
+            apply_quic(&mut config.quic, query);
         }
         OutboundConfig::Tuic(config) => {
             for value in query
@@ -514,9 +514,9 @@ pub(super) fn apply_protocol(
                 .map(|value| value.trim())
                 .filter(|value| !value.is_empty())
                 .map(str::to_string);
-            apply_mtu(&mut config.quic, query);
+            apply_quic(&mut config.quic, query);
         }
-        OutboundConfig::Juicity(config) => apply_mtu(&mut config.quic, query),
+        OutboundConfig::Juicity(config) => apply_quic(&mut config.quic, query),
         OutboundConfig::AnyTls(config) => {
             config.idle_session_check_interval = query
                 .get("idle_session_check_interval")
@@ -584,13 +584,10 @@ fn apply_hysteria2(
     config.init_conn_recv_window = query
         .get("initConnReceiveWindow")
         .and_then(|value| value.parse().ok());
-    config.disable_mtu_discovery = query
-        .get("disablePathMTUDiscovery")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"));
     Ok(())
 }
 
-fn apply_mtu(quic: &mut QuicOptions, query: &Query) {
+fn apply_quic(quic: &mut QuicOptions, query: &Query) {
     if let Some(mtu) = query
         .get("mtu")
         .and_then(|value| value.parse::<u16>().ok())
@@ -598,6 +595,11 @@ fn apply_mtu(quic: &mut QuicOptions, query: &Query) {
     {
         quic.mtu = Some(mtu);
     }
+    quic.disable_mtu_discovery = query
+        .get("disablePathMTUDiscovery")
+        .or_else(|| query.get("disable_mtu_discovery"))
+        .or_else(|| query.get("disable-mtu-discovery"))
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
 }
 
 fn udp_permission(query: &Query) -> Result<Option<bool>, &'static str> {

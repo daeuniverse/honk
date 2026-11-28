@@ -89,6 +89,14 @@ fn is_record_section(name: &str) -> bool {
     matches!(name, "proxy" | "server_local")
 }
 
+const QUIC_RECORD_DISABLE_MTU_DISCOVERY_KEYS: &[&str] = &[
+    "disable-mtu-discovery",
+    "disable_mtu_discovery",
+    "disable-path-mtu-discovery",
+    "disable_path_mtu_discovery",
+    "disablepathmtudiscovery",
+];
+
 type RecordResult<T> = Result<T, &'static str>;
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Dialect {
@@ -265,6 +273,7 @@ fn positional_options(
 ) -> RecordResult<(Vec<String>, RecordOptions)> {
     let mut positions = Vec::new();
     let mut options = RecordOptions::default();
+    let quic = matches!(protocol, "hysteria2" | "tuic" | "juicity");
     for field in fields.iter().skip(start) {
         if field.value.trim().is_empty() {
             continue;
@@ -273,7 +282,8 @@ fn positional_options(
         if field.quoted
             || (dialect == Dialect::Named
                 && protocol != "vless"
-                && looks_like_base64_credential(&field.value))
+                && looks_like_base64_credential(&field.value)
+                && !(quic && is_quic_mtu_assignment(field)))
         {
             positions.push(if field.quoted {
                 field.value.clone()
@@ -301,6 +311,15 @@ fn positional_options(
         options.insert(key, value);
     }
     Ok((positions, options))
+}
+
+// An empty disablePathMTUDiscovery= assignment also looks like a padded credential.
+fn is_quic_mtu_assignment(field: &Field) -> bool {
+    record_header(field).is_some_and(|(key, _)| {
+        QUIC_RECORD_DISABLE_MTU_DISCOVERY_KEYS
+            .iter()
+            .any(|alias| key.eq_ignore_ascii_case(alias))
+    })
 }
 
 fn looks_like_base64_credential(value: &str) -> bool {
@@ -460,7 +479,7 @@ fn apply_protocol(
             });
             set_credential(map, "auth", auth);
             apply_hysteria(map, options)?;
-            apply_quic_common(map, options);
+            apply_quic_common(map, options)?;
         }
         "tuic" => {
             let uuid = take_credential_alias(options, &["uuid", "username"])?.or_else(|| {
@@ -475,7 +494,7 @@ fn apply_protocol(
             });
             set_required(map, "uuid", uuid)?;
             set_credential(map, "password", password);
-            apply_quic_common(map, options);
+            apply_quic_common(map, options)?;
         }
         "juicity" => {
             let uuid = take_credential_alias(options, &["uuid", "username"])?.or_else(|| {
@@ -490,7 +509,7 @@ fn apply_protocol(
             });
             set_required(map, "uuid", uuid)?;
             set_required(map, "password", password)?;
-            apply_quic_common(map, options);
+            apply_quic_common(map, options)?;
         }
         "anytls" => {
             let password = take_credential_alias(options, &["password"])?.or_else(|| {
@@ -799,7 +818,7 @@ fn apply_hysteria(map: &mut Mapping, options: &mut RecordOptions) -> RecordResul
     Ok(())
 }
 
-fn apply_quic_common(map: &mut Mapping, options: &mut RecordOptions) {
+fn apply_quic_common(map: &mut Mapping, options: &mut RecordOptions) -> RecordResult<()> {
     set_optional(
         map,
         "congestion-control",
@@ -807,6 +826,10 @@ fn apply_quic_common(map: &mut Mapping, options: &mut RecordOptions) {
     );
     set_optional(map, "alpn", take_option(options, &["alpn"]));
     set_optional(map, "mtu", take_option(options, &["mtu"]));
+    if let Some(disabled) = take_bool_alias(options, QUIC_RECORD_DISABLE_MTU_DISCOVERY_KEYS)? {
+        put_bool(map, "disable-mtu-discovery", disabled);
+    }
+    Ok(())
 }
 
 fn canonical_type(value: &str) -> Option<&'static str> {

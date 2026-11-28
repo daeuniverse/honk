@@ -25,8 +25,8 @@ fn test_node(port: u16, password: &str) -> Node {
         outbound: honk_config::node::OutboundConfig::Hysteria2(
             honk_config::node::Hysteria2Config {
                 auth: Some(password.to_string()),
-                disable_mtu_discovery: Some(true),
                 quic: honk_config::node::QuicOptions {
+                    disable_mtu_discovery: true,
                     tls: honk_config::node::TlsOptions {
                         skip_cert_verify: true,
                         ..Default::default()
@@ -1179,11 +1179,11 @@ fn e2e_node() -> Option<Node> {
                 init_conn_recv_window: std::env::var("HONK_HY2_CONN_RWND")
                     .ok()
                     .and_then(|v| v.parse().ok()),
-                disable_mtu_discovery: std::env::var("HONK_HY2_DISABLE_PMTUD")
-                    .ok()
-                    .and_then(|v| v.parse::<u8>().ok())
-                    .map(|v| v == 1),
                 quic: honk_config::node::QuicOptions {
+                    disable_mtu_discovery: std::env::var("HONK_HY2_DISABLE_PMTUD")
+                        .ok()
+                        .and_then(|v| v.parse::<u8>().ok())
+                        .is_some_and(|v| v == 1),
                     mtu: std::env::var("HONK_HY2_MTU")
                         .ok()
                         .and_then(|value| value.parse().ok()),

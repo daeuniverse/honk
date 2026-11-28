@@ -204,7 +204,9 @@ impl JuicityHandler {
             node,
             &[b"h3"],
             crate::quic::QuicClientOptions {
+                congestion: Some(crate::quic::congestion_factory(Some("bbr"))),
                 keep_alive: Some(KEEP_ALIVE_INTERVAL),
+                disable_mtu_discovery: juicity.quic.disable_mtu_discovery,
                 max_udp_payload_size: juicity.quic.mtu,
                 // Same receive-window rationale as hy2/tuic: quinn's
                 // 1.25 MiB stream default caps downloads around 2 Gbps
@@ -212,7 +214,6 @@ impl JuicityHandler {
                 // memory budget (see hy2).
                 stream_receive_window: Some(8 << 20),
                 conn_receive_window: Some(8 << 20),
-                ..crate::quic::QuicClientOptions::with_congestion(Some("bbr"))
             },
         )
         .await?;

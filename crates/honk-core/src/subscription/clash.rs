@@ -33,6 +33,13 @@ const CONN_WINDOW_KEYS: &[&str] = &[
     "initConnReceiveWindow",
 ];
 const QUIC_MTU_KEYS: &[&str] = &["mtu", "quic-mtu", "quic_mtu"];
+const QUIC_DISABLE_MTU_DISCOVERY_KEYS: &[&str] = &[
+    "disable-mtu-discovery",
+    "disable_mtu_discovery",
+    "disable-path-mtu-discovery",
+    "disable_path_mtu_discovery",
+    "disablePathMTUDiscovery",
+];
 
 struct ProxySource {
     protocol: NodeProtocol,
@@ -253,13 +260,9 @@ fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
     )?;
     reject_active_unless(
         mapping,
-        &[
-            "disable-mtu-discovery",
-            "disable-path-mtu-discovery",
-            "disablePathMTUDiscovery",
-        ],
-        protocol == NodeProtocol::Hysteria2,
-        "Hysteria2 MTU discovery options are unsupported",
+        QUIC_DISABLE_MTU_DISCOVERY_KEYS,
+        supports_quic(protocol),
+        "QUIC MTU discovery options are unsupported for this protocol",
     )?;
     if !supports_quic(protocol)
         && (has_active(mapping, QUIC_MTU_KEYS)
@@ -621,14 +624,6 @@ fn apply_quic(
                 yaml_duration_alias(mapping, &["hop-interval", "hop_interval", "mhop"])?;
             config.init_stream_recv_window = yaml_u64_alias(mapping, STREAM_WINDOW_KEYS)?;
             config.init_conn_recv_window = yaml_u64_alias(mapping, CONN_WINDOW_KEYS)?;
-            config.disable_mtu_discovery = yaml_bool_alias(
-                mapping,
-                &[
-                    "disable-mtu-discovery",
-                    "disable-path-mtu-discovery",
-                    "disablePathMTUDiscovery",
-                ],
-            )?;
         }
         OutboundConfig::Tuic(config) => {
             config.congestion = yaml_text_alias(
@@ -648,16 +643,18 @@ fn apply_quic(
         _ => {}
     }
 
+    if let Some(quic) = node.quic_mut()
+        && let Some(disabled) = yaml_bool_alias(mapping, QUIC_DISABLE_MTU_DISCOVERY_KEYS)?
+    {
+        quic.disable_mtu_discovery = disabled;
+    }
     if let Some(mtu) = yaml_u64_alias(mapping, QUIC_MTU_KEYS)? {
         let mtu = u16::try_from(mtu).map_err(|_| "QUIC MTU is invalid")?;
         if !(1200..=65527).contains(&mtu) {
             return Err("QUIC MTU is invalid");
         }
-        match &mut node.outbound {
-            OutboundConfig::Hysteria2(config) => config.quic.mtu = Some(mtu),
-            OutboundConfig::Tuic(config) => config.quic.mtu = Some(mtu),
-            OutboundConfig::Juicity(config) => config.quic.mtu = Some(mtu),
-            _ => {}
+        if let Some(quic) = node.quic_mut() {
+            quic.mtu = Some(mtu);
         }
     }
     Ok(())
