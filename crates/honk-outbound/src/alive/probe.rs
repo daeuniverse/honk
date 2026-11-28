@@ -226,13 +226,7 @@ impl AliveDialerSet {
             return;
         }
         let changed = match latency {
-            Some(latency) => self.record_probe_latency_state(
-                node_id,
-                domain,
-                ipver,
-                latency,
-                domain != ProbeDomain::Tcp,
-            ),
+            Some(latency) => self.record_probe_latency_state(node_id, domain, ipver, latency),
             None => self.unavailable_change(node_id, domain, ipver, false, false),
         };
         // Removal and result mutation have one order. Notifications run unlocked;
@@ -778,13 +772,14 @@ impl AliveDialerSet {
     /// for Score group members with an HTTPS check URL — independently runs a
     /// real TLS-in-QUIC handshake against the check target.
     ///
-    /// DNS success marks BOTH UDP domains (DataUdp + DnsUdp, v4+v6) alive and
-    /// records the round-trip latency for URLTest ranking. When the DNS
-    /// target is unreachable but the data-path handshake succeeded, only
-    /// DnsUdp records a probe failure and DataUdp is marked alive from the
-    /// handshake — a blocked `:53` check target must not condemn a working
-    /// UDP path, because excluded nodes receive no traffic that could revive
-    /// them. Total failure records one probe failure against each domain
+    /// DNS success records a probe success for BOTH UDP domains (DataUdp +
+    /// DnsUdp, v4+v6), applying recovery hysteresis when dead and feeding
+    /// URLTest ranking once alive. When the DNS target is unreachable but the
+    /// data-path handshake succeeded, only DnsUdp records a probe failure and
+    /// DataUdp records a probe success from the handshake — a blocked `:53`
+    /// check target must not condemn a working UDP path, because excluded
+    /// nodes receive no traffic that could revive them. Total failure records
+    /// one probe failure against each domain
     /// (probe threshold 3, exponential backoff via `mark_unavailable_internal`).
     /// TCP state is never touched. Without an installed prober this is a
     /// no-op returning `false`, and no state is recorded — nodes keep the

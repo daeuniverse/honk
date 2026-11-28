@@ -214,25 +214,6 @@ impl AliveDialerSet {
                 || self.routed_udp_node_proven(node_id, sibling, family))
     }
 
-    #[cfg(test)]
-    pub(super) fn mark_alive_for(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
-        self.mark_alive_for_latency(node_id, domain, ipver, Duration::ZERO);
-    }
-
-    /// Mark a node as alive for a specific domain/IP version, recording the
-    /// probe latency so `Latencies10` and `MovingAverage` are updated.
-    #[cfg(test)]
-    pub(super) fn mark_alive_for_latency(
-        &self,
-        node_id: Uuid,
-        domain: ProbeDomain,
-        ipver: IpVersion,
-        latency: Duration,
-    ) {
-        let change = self.record_probe_latency_state(node_id, domain, ipver, latency, true);
-        self.notify_probe_change(change, node_id, domain, ipver, true, || true);
-    }
-
     /// Check if a node is within its grace period.
     pub(super) fn is_in_grace_period(&self, node_id: Uuid) -> bool {
         self.node_registered_at
@@ -518,7 +499,7 @@ impl AliveDialerSet {
         ipver: IpVersion,
         latency: Duration,
     ) {
-        let change = self.record_probe_latency_state(node_id, domain, ipver, latency, false);
+        let change = self.record_probe_latency_state(node_id, domain, ipver, latency);
         self.notify_probe_change(change, node_id, domain, ipver, true, || true);
     }
 
@@ -528,23 +509,22 @@ impl AliveDialerSet {
         domain: ProbeDomain,
         ipver: IpVersion,
         latency: Duration,
-        immediate: bool,
     ) -> ProbeChange {
         let idx = alive_index(domain, ipver);
         let revived = self.with_state(node_id, idx, |e| {
             let was = e.alive;
-            if was || immediate {
+            if was {
                 e.reset_on_success();
-                !was
+                false
             } else {
                 e.consecutive_successes += 1;
                 e.consecutive_failures = 0;
                 e.traffic_failures = 0;
+                e.cooldown_until = Instant::now();
                 if e.consecutive_successes >= RECOVERY_SUCCESSES_NEEDED {
                     e.alive = true;
                     e.route_down_at = 0;
                     e.stopped = false;
-                    e.cooldown_until = Instant::now();
                     e.consecutive_successes = 0;
                     true
                 } else {
@@ -560,9 +540,7 @@ impl AliveDialerSet {
                 }
             }
         });
-        if (!immediate || latency > Duration::ZERO)
-            && (revived || self.read_state(node_id, idx).alive)
-        {
+        if revived || self.read_state(node_id, idx).alive {
             self.get_or_create_collection(node_id, idx)
                 .mark_available(latency);
         }

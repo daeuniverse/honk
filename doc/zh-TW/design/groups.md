@@ -242,7 +242,7 @@ Selector 在候選展開和健康過濾前繫結具體節點或子群組成員�
 | 探測路徑 | 行為 |
 | --- | --- |
 | TCP | 透過節點向 `tcp_check_url` 傳送設定的 HTTP 方法；HTTP 探測不適用時，改成裸 TCP 連線。`ProxyHttpProber` 把 HTTP 的執行交給 outbound 的共享測量路徑。只有 `NodeRuntime::is_warm_or_stateless_for(WarmRequirement::Session)` 成立時才重用 runtime，否則探測結束後關閉 guarded cold runtime。只有成功的 warm-path RTT 會進入對應 TCP 位址族的狀態；setup 和目標交換失敗只更新 liveness/cooldown，不貢獻 latency，也不記 ranking strike。 |
-| UDP 健康 | 透過節點的 packet path，向第一個 `udp_check_dns` 目標送出一個最小的 DNS query。它單獨檢查 `NodeRuntime::is_warm_or_stateless_for(WarmRequirement::Udp)`；這個 requirement 沒有預熱時，探測結束後關閉 guarded cold runtime。成功時記錄 RTT，並把 `DnsUdp` 和 `DataUdp` 標為存活。失敗時給兩個 UDP 域各加一次 probe failure，除非同一週期裡獨立的 Score QUIC handshake 成功；那種情況下只讓 `DnsUdp` 失敗，`DataUdp` 保持存活。它絕不改動 TCP state。 |
+| UDP 健康 | 透過節點的 packet path，向第一個 `udp_check_dns` 目標送出一個最小的 DNS query。它單獨檢查 `NodeRuntime::is_warm_or_stateless_for(WarmRequirement::Udp)`；這個 requirement 沒有預熱時，探測結束後關閉 guarded cold runtime。成功時為 `DnsUdp` 和 `DataUdp` 各記一次探測成功，死亡狀態下同樣需要連續兩次成功才恢復，存活後記錄排名 RTT。失敗時給兩個 UDP 域各加一次 probe failure，除非同一週期裡獨立的 Score QUIC handshake 成功；那種情況下只讓 `DnsUdp` 失敗，`DataUdp` 依該握手記一次探測成功。它絕不改動 TCP state。 |
 | Score QUIC 品質 | 每次週期性 UDP 探測，都會透過每個 Score 葉節點單獨做一次 ALPN 為 `h3` 的真實 TLS-in-QUIC 握手，目標是第一個設定的 `global.tcp_check_url`，而且必須是有效的 HTTPS URL。測得的時長提供獨立的 `DataUdp` 探測品質，既不增加業務成功，也不虛構吞吐；DNS 探測失敗、但握手成功時，仍可恢復 `DataUdp` 活性。沒有 URL，或 URL 不是 HTTPS 時，這個探測停用；非 Score 的葉節點既不建這次握手，也不建 Score cell。 |
 | 依群組 URL | 用和全域 TCP 探測相同的臨時暖路徑計時，探測動態解析出的 `(member tag, current leaf)` 對。狀態是 TCP-only，連續三次失敗即死亡，冷卻和恢復規則同上，連續兩次成功才恢復。reload 時 `sync_group_check_urls` 替換有效的群組/URL 登錄表。 |
 

@@ -432,13 +432,8 @@ impl AliveDialerSet {
         };
         let domain = ProbeDomain::Tcp;
         let family = IpVersion::V4;
-        let revived = self.record_probe_latency_state(
-            ticket.node,
-            domain,
-            family,
-            measurement.latency,
-            false,
-        );
+        let revived =
+            self.record_probe_latency_state(ticket.node, domain, family, measurement.latency);
         drop(authority);
         self.notify_probe_change(revived, ticket.node, domain, family, true, || {
             current().is_some()
