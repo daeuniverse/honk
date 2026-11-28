@@ -406,7 +406,7 @@ TLS/SNI、REALITY、WebSocket/gRPC 升級 header、VLESS 封包選項，以及�
 | VLESS 未啟用 H2MUX/UoT 封裝，且沒有明確 `packet_encoding` 選擇其他路徑 | 使用 Single XUDP 並允許 UDP。這是 sing-box 匯入的預設值，不是 Auto 的全域意義。 |
 | gRPC 服務名為空或省略 | 保留 sing-box 的空服務名，不使用 honk 的 `GunService` 預設值。 |
 | Hysteria2 提供 `server_ports`，未提供 `server_port` | 以第一個跳躍埠作為名義 endpoint。 |
-| Hysteria2、TUIC 或 Juicity 的 `disable_path_mtu_discovery` / `disable_mtu_discovery` | 任選一個鍵並填入布林值。`true` 會停用路徑 MTU 探索。同時提供兩個鍵（即使值相同），或填入 `null` 等非布林值時，honk 會略過該項目。 |
+| Hysteria2、TUIC 或 Juicity 的 `disable_path_mtu_discovery` / `disable_mtu_discovery` | 選用；提供時任選一個鍵並填入布林值。`true` 會停用路徑 MTU 探索。同時提供兩個鍵（即使值相同），或填入 `null` 等非布林值時，honk 會略過該項目。 |
 | 節點級 uTLS 指紋提示 | 不覆寫 honk 的行程級 TLS 選擇。 |
 
 不支援的鏈式代理、wire feature 或認證要求，honk 會報錯，不會直接忽略。

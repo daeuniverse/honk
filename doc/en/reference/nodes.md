@@ -197,7 +197,7 @@ honk compares these flat aliases before stripping incompatible fields.
 
 Missing or null claims are absent. Supplied strings must agree byte for byte, including empty strings and surrounding spaces. An empty credential remains subject to its protocol's requirements. Flat credential fields remain strings; numeric coercion applies only to subscription feeds.
 
-TUIC and Juicity strip `hy2_disable_mtu_discovery`. Non-QUIC protocols strip both MTU discovery keys. The `incompatible-node-fields` warning lists discarded boolean fields even when set to `false`. A `null` value counts as absent.
+TUIC and Juicity strip `hy2_disable_mtu_discovery`. Non-QUIC protocols strip both MTU discovery keys. The `incompatible-node-fields` warning lists discarded boolean fields even when set to `false`.
 
 `tls_alpn` is deliberately excluded from legacy stripping; see [`tls_alpn`](#tls_alpn).
 
@@ -606,7 +606,7 @@ Both `hysteria2://` and `hy2://` are accepted. The entire percent-decoded userin
 | `mport` / `mhop` | `hy2_port_hopping` / `hy2_hop_interval`; see [`hy2_port_hopping` / `hy2_hop_interval`](#hy2_port_hopping--hy2_hop_interval) |
 | `pinSHA256` | `tls_pin_sha256`, replacing PKI/hostname verification |
 | `initStreamReceiveWindow` / `initConnReceiveWindow` | QUIC receive-window overrides in bytes |
-| `disablePathMTUDiscovery` / `disable_mtu_discovery` / `disable-mtu-discovery` | Set `quic_disable_mtu_discovery`. See [share-link precedence and values](#quic_mtu). |
+| `disablePathMTUDiscovery` (and aliases) | Sets `quic_disable_mtu_discovery`; see [`quic_mtu`](#quic_mtu). |
 | `mtu` | Shared QUIC UDP-payload cap, accepted only in 1200–65527 |
 | `sni` / `peer`, insecure aliases, ECH parameters | Shared TLS behavior; nonempty explicit SNI aliases must agree |
 
@@ -630,7 +630,7 @@ node {
 | Juicity | protocol defaults | ALPN `h3`, BBR, and 8 MiB / 8 MiB initial receive windows that the shared adaptive flow control can grow |
 | Juicity | UDP | One QUIC bi stream per client source carries every destination; replies return the real remote peer, subject to the server's own UDP socket and egress policy |
 | Both | `mtu`, `sni`, insecure aliases, pin, ECH | Shared QUIC/TLS parameters |
-| Both | `disablePathMTUDiscovery` / `disable_mtu_discovery` / `disable-mtu-discovery` | Set `quic_disable_mtu_discovery`. See [share-link precedence and values](#quic_mtu). |
+| Both | `disablePathMTUDiscovery` (and aliases) | Sets `quic_disable_mtu_discovery`; see [`quic_mtu`](#quic_mtu). |
 
 ```dae
 node {

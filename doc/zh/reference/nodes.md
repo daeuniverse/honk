@@ -197,7 +197,7 @@ honk 在移除不兼容字段前比较以下扁平字段别名。
 
 缺失或 null 表示未提供。已提供的字符串须逐字节一致，空字符串和首尾空格也参与比较。空凭据仍须满足对应协议的要求。扁平凭据字段仍须使用字符串；数字转换仅适用于订阅导入。
 
-TUIC 和 Juicity 会移除 `hy2_disable_mtu_discovery`。非 QUIC 协议会移除两个 MTU 发现字段。即使字段值为 `false`，`incompatible-node-fields` 警告也会列出被移除的布尔字段。`null` 视为未设置。
+TUIC 和 Juicity 会移除 `hy2_disable_mtu_discovery`。非 QUIC 协议会移除两个 MTU 发现字段。即使字段值为 `false`，`incompatible-node-fields` 警告也会列出被移除的布尔字段。
 
 新增 `tls_alpn` 字段不沿用旧字段剥离规则；见 [`tls_alpn`](#tls_alpn)。
 
@@ -592,7 +592,7 @@ Clash 导入会比较 `servername`、`server-name` 和 `sni`；记录格式还�
 | `mport` / `mhop` | `hy2_port_hopping` / `hy2_hop_interval`；见 [`hy2_port_hopping` / `hy2_hop_interval`](#hy2_port_hopping--hy2_hop_interval)。 |
 | `pinSHA256` | `tls_pin_sha256`，替代 PKI/主机名校验 |
 | `initStreamReceiveWindow` / `initConnReceiveWindow` | QUIC 接收窗口覆盖值，单位为字节 |
-| `disablePathMTUDiscovery` / `disable_mtu_discovery` / `disable-mtu-discovery` | 设置 `quic_disable_mtu_discovery`。见[分享链接的优先级与取值](#quic_mtu)。 |
+| `disablePathMTUDiscovery`（及别名） | 设置 `quic_disable_mtu_discovery`；见 [`quic_mtu`](#quic_mtu)。 |
 | `mtu` | 共用 QUIC UDP-payload 上限；只接受 1200–65527 |
 | `sni` / `peer`、insecure 别名、ECH 参数 | 共用 TLS 行为；非空的显式 SNI 别名必须一致 |
 
@@ -616,7 +616,7 @@ node {
 | Juicity | 协议默认值 | ALPN `h3`、BBR，以及 8 MiB / 8 MiB 的初始接收窗口（共享自适应流控可使其增长） |
 | Juicity | UDP | 每个客户端源一条 QUIC bi 流承载所有目的地；回复返回真实的远端对端，取决于服务端自身的 UDP socket 与出口策略 |
 | 两者 | `mtu`、`sni`、insecure 别名、pin、ECH | 共用 QUIC/TLS 参数 |
-| 两者 | `disablePathMTUDiscovery` / `disable_mtu_discovery` / `disable-mtu-discovery` | 设置 `quic_disable_mtu_discovery`。见[分享链接的优先级与取值](#quic_mtu)。 |
+| 两者 | `disablePathMTUDiscovery`（及别名） | 设置 `quic_disable_mtu_discovery`；见 [`quic_mtu`](#quic_mtu)。 |
 
 ```dae
 node {

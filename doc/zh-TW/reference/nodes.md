@@ -146,13 +146,13 @@ conn 視窗同時是每連線記憶體預算，因此慢消費者最多緩衝約
 
 用 `mtu` 設定 QUIC UDP 酬載大小。取 1200 到 65527 之間的整數。通告的接收大小預設為 `1252`，範圍相同。
 
-預設傳送 MTU 從 1200 位元組開始，可透過路徑 MTU 探索增大。明確設定 `mtu` 會同時指定初始 UDP 酬載大小與探測上限。將 `quic_disable_mtu_discovery` 設為 `true` 後，用戶端會停止傳送路徑 MTU 探測封包。
+預設傳送 MTU 從 1200 位元組開始，可透過路徑 MTU 探索增大。明確設定 `mtu` 會同時指定初始 UDP 酬載大小與探索上限。將 `quic_disable_mtu_discovery` 設為 `true` 後，用戶端會停止傳送路徑 MTU 探測封包。
 
 大於 1252 時在常規 socket 上啟用 GSO，但不包括 Hysteria2 混淆和跳埠 socket。`HONK_QUIC_GSO=0` 強制關閉 GSO。
 
 分享連結裡格式錯誤或超出範圍的 `mtu` 會被忽略，不會使連結被拒絕。
 
-Hysteria2、TUIC 和 Juicity 分享連結依序查找 `disablePathMTUDiscovery`、`disable_mtu_discovery` 和 `disable-mtu-discovery`。優先採用第一個存在的參數名稱，同名參數取最後一次出現的值。值為 `1` 或 `true` 時停用探索，`true` 不區分 ASCII 大小寫。其他值均視為 `false` 並接受連結，包括空字串及前後帶有空白的 `true`。
+Hysteria2、TUIC 和 Juicity 分享連結依序檢查 `disablePathMTUDiscovery`、`disable_mtu_discovery` 和 `disable-mtu-discovery`。優先採用第一個存在的參數名稱，同名參數取最後一次出現的值。值為 `1` 或 `true` 時停用探索，`true` 不區分 ASCII 大小寫。其他值均視為 `false` 並接受連結，包括空字串及前後帶有空白的 `true`。
 
 ```dae
 node {
@@ -197,7 +197,7 @@ honk 會在移除不相容欄位前比對以下扁平欄位別名。
 
 缺失或 null 表示未提供。已提供的字串須逐位元組一致，空字串和首尾空格也參與比較。空憑據仍須滿足對應協定的要求。扁平憑據欄位仍須使用字串；數字轉換僅適用於訂閱匯入。
 
-TUIC 和 Juicity 會移除 `hy2_disable_mtu_discovery`。非 QUIC 協定會移除兩個 MTU 探索欄位。即使欄位值為 `false`，`incompatible-node-fields` 警告也會列出移除的布林欄位。`null` 視為未設定。
+TUIC 和 Juicity 會移除 `hy2_disable_mtu_discovery`。非 QUIC 協定會移除兩個 MTU 探索欄位。即使欄位值為 `false`，`incompatible-node-fields` 警告也會列出移除的布林欄位。
 
 新增 `tls_alpn` 欄位不沿用舊欄位剝離規則；見 [`tls_alpn`](#tls_alpn)。
 
@@ -592,7 +592,7 @@ Clash 匯入會比較 `servername`、`server-name` 和 `sni`；記錄格式還�
 | `mport` / `mhop` | `hy2_port_hopping` / `hy2_hop_interval`；見 [`hy2_port_hopping` / `hy2_hop_interval`](#hy2_port_hopping--hy2_hop_interval)。 |
 | `pinSHA256` | `tls_pin_sha256`，替代 PKI/主機名稱驗證 |
 | `initStreamReceiveWindow` / `initConnReceiveWindow` | QUIC 接收視窗覆蓋值，單位為位元組 |
-| `disablePathMTUDiscovery` / `disable_mtu_discovery` / `disable-mtu-discovery` | 設定 `quic_disable_mtu_discovery`。見[分享連結的優先順序與參數值](#quic_mtu)。 |
+| `disablePathMTUDiscovery`（及別名） | 設定 `quic_disable_mtu_discovery`；見 [`quic_mtu`](#quic_mtu)。 |
 | `mtu` | 共用 QUIC UDP-payload 上限；只接受 1200–65527 |
 | `sni` / `peer`、insecure 別名、ECH 參數 | 共用 TLS 行為；非空的明確 SNI 別名必須一致 |
 
@@ -616,7 +616,7 @@ node {
 | Juicity | 協定預設值 | ALPN `h3`、BBR，以及 8 MiB / 8 MiB 的初始接收視窗（共享自適應流控可使其增長） |
 | Juicity | UDP | 每個用戶端源一條 QUIC bi 流承載所有目的地；回覆傳回真實的遠端 peer，取決於伺服器端自身的 UDP socket 與出口策略 |
 | 兩者 | `mtu`、`sni`、insecure 別名、pin、ECH | 共用 QUIC/TLS 參數 |
-| 兩者 | `disablePathMTUDiscovery` / `disable_mtu_discovery` / `disable-mtu-discovery` | 設定 `quic_disable_mtu_discovery`。見[分享連結的優先順序與參數值](#quic_mtu)。 |
+| 兩者 | `disablePathMTUDiscovery`（及別名） | 設定 `quic_disable_mtu_discovery`；見 [`quic_mtu`](#quic_mtu)。 |
 
 ```dae
 node {

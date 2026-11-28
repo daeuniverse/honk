@@ -399,7 +399,7 @@ sing-box TLS is off when `tls` or `tls.enabled` is absent, so Trojan, Hysteria2,
 | VLESS without an enabled H2MUX/UoT wrapper or explicit `packet_encoding` selecting another path | Single XUDP with UDP permitted. This is a sing-box import default, not the global meaning of Auto. |
 | Empty or omitted gRPC service name | Retain sing-box's empty service, not honk's `GunService` default. |
 | Hysteria2 `server_ports` without `server_port` | Use the first hopping port as the nominal endpoint. |
-| Hysteria2, TUIC, or Juicity `disable_path_mtu_discovery` / `disable_mtu_discovery` | Supply one boolean key. `true` disables path MTU discovery. Supplying both keys, even with equal values, or a non-boolean value such as `null` skips the entry. |
+| Hysteria2, TUIC, or Juicity `disable_path_mtu_discovery` / `disable_mtu_discovery` | Optional; when present, supply one boolean key. `true` disables path MTU discovery. Supplying both keys, even with equal values, or a non-boolean value such as `null` skips the entry. |
 | Per-node uTLS fingerprint hint | Does not override honk's process-wide TLS selection. |
 
 Unsupported chaining, wire features, and authentication requirements are not silently discarded.
