@@ -320,6 +320,55 @@ mod tests {
     }
 
     #[test]
+    fn sing_box_imports_tuic_mtu_discovery_and_juicity_aliases() {
+        use serde_json::json;
+        for protocol in ["tuic", "juicity"] {
+            let short = "disable_mtu_discovery";
+            let path = "disable_path_mtu_discovery";
+            let peer = |port: u16, key: &str, value: serde_json::Value| {
+                json!({
+                    "type": protocol, "server": "edge.example", "server_port": port,
+                    "uuid": "11111111-1111-4111-8111-111111111111", "password": "p",
+                    "tls": {"enabled": true}, (key): value,
+                })
+            };
+            let mut conflict = peer(444, short, false.into());
+            conflict[path] = true.into();
+            let mut equal = peer(447, path, true.into());
+            equal[short] = true.into();
+            let feed = json!({"outbounds": [
+                peer(443, short, true.into()), conflict, peer(445, path, true.into()),
+                peer(446, short, "true".into()), equal, peer(448, path, serde_json::Value::Null),
+                peer(449, path, false.into()), peer(450, short, false.into()),
+            ]});
+            for body in [feed.to_string(), serde_yaml::to_string(&feed).unwrap()] {
+                let mut diagnostics = Vec::new();
+                let nodes = crate::subscription::parse_subscription_content_with_diagnostics(
+                    &Default::default(),
+                    &body,
+                    &mut diagnostics,
+                )
+                .unwrap();
+                assert_eq!(
+                    nodes
+                        .iter()
+                        .map(|n| (n.port, n.quic().unwrap().disable_mtu_discovery))
+                        .collect::<Vec<_>>(),
+                    [(443, true), (445, true), (449, false), (450, false)],
+                    "{protocol}"
+                );
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .map(|d| (d.entry_index.unwrap(), d.code))
+                        .collect::<Vec<_>>(),
+                    [2, 4, 5, 6].map(|index| (index, "malformed-subscription-entry"))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn sing_box_websocket_headers_are_imported() {
         let nodes = parse_json_subscription(
             json(
