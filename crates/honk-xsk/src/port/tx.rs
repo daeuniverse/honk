@@ -156,9 +156,15 @@ impl<L> Port<L> {
         self.tx_batch_active = true;
         let guard = TxBatchGuard { port: self };
         let result = work(guard.port);
-        let kick = guard.port.kick();
+        guard.port.publish_tx_prefix();
+        let rx = guard.port.kick_rx();
+        let tx = if guard.port.counters.submitted != guard.port.counters.completed {
+            guard.port.kick_tx()
+        } else {
+            Ok(())
+        };
         guard.port.tx_batch_active = false;
-        (result, kick)
+        (result, rx.and(tx))
     }
 
     /// Copy borrowed L2 segments directly to reserved UMEM chunks, then publish once.

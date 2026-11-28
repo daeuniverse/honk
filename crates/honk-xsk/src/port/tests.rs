@@ -2930,6 +2930,28 @@ fn batch_writer_errors_and_credit_pressure_keep_the_final_kick_separate() {
 }
 
 #[test]
+fn empty_tx_batch_only_wakes_fill_after_the_last_completion() {
+    let budget = MemoryBudget::new(1 << 20);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut port = fake(config(), &budget);
+    port.transmit_retained(TxClass::Bulk, &[0; 14], Retained::new(&drops))
+        .unwrap();
+    port.rings.tx.publish_consumer(1);
+    port.rings.cq.write(0, port.rings.tx.read(0).addr);
+    port.rings.cq.publish_producer(1);
+    assert_eq!(port.complete(|_| {}).unwrap(), 1);
+    port.rings.tx.set_wakeup();
+    port.transmit_batch(|_| ()).1.unwrap();
+    port.rings.fill.set_wakeup();
+    assert_eq!(
+        port.transmit_batch(|_| ()).1.unwrap_err().raw_os_error(),
+        Some(libc::EBADF)
+    );
+    assert_eq!((port.counters().rx_kicks, port.counters().tx_kicks), (1, 0));
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn batch_early_and_pending_returns_reinspect_wakeup_without_new_publication() {
     let budget = MemoryBudget::new(1 << 20);
     let drops = Arc::new(AtomicUsize::new(0));
