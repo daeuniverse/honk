@@ -1789,6 +1789,52 @@ fn retains_class_credit_and_padded_packet_until_real_fake_cq() {
 }
 
 #[test]
+fn wrapped_cq_lends_each_complete_owner_in_sidecar_order() {
+    for order in [[0u32, 1, 2], [2, 0, 1]] {
+        let budget = MemoryBudget::new(1 << 20);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut port = fake(
+            PortConfig {
+                bulk_frames: 3,
+                ring_size: 8,
+                ..config()
+            },
+            &budget,
+        );
+        let start = u32::MAX - 1;
+        port.cq_consumer = start;
+        port.rings.cq.publish_consumer(start);
+        port.rings.cq.publish_producer(start);
+        for tag in 0..3 {
+            let mut retained = Retained::new(&drops);
+            retained.bytes[0] = tag;
+            port.transmit_retained(TxClass::Bulk, &[0; 14], retained)
+                .unwrap();
+        }
+        port.rings.tx.publish_consumer(3);
+        for (i, sent) in order.into_iter().enumerate() {
+            port.rings
+                .cq
+                .write(start.wrapping_add(i as u32), port.rings.tx.read(sent).addr);
+        }
+        port.rings.cq.publish_producer(start.wrapping_add(3));
+        assert_eq!(
+            port.complete(|owners| {
+                let tags: Vec<_> = owners
+                    .iter()
+                    .map(|owner| owner.as_ref().unwrap().bytes[0])
+                    .collect();
+                assert_eq!(tags, [0, 1, 2]);
+            })
+            .unwrap(),
+            3
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 3);
+        assert!(port.outstanding().next().is_none());
+    }
+}
+
+#[test]
 fn completes_at_most_sixty_four_cq_entries_per_turn() {
     let budget = MemoryBudget::new(1 << 20);
     let drops = Arc::new(AtomicUsize::new(0));

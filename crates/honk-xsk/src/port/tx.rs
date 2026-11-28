@@ -499,6 +499,7 @@ impl<L> Port<L> {
             .min(64);
         let mut indices = [0; 64];
         let mut owners = 0;
+        let mut sorted = true;
         let mut completed = 0;
         let mut failure = None;
         for _ in 0..count {
@@ -519,6 +520,9 @@ impl<L> Port<L> {
             };
             *remaining -= 1;
             if *remaining == 0 {
+                if owners != 0 && owner <= indices[owners - 1] {
+                    sorted = false;
+                }
                 indices[owners] = owner;
                 owners += 1;
             }
@@ -530,7 +534,9 @@ impl<L> Port<L> {
         }
         self.rings.cq.publish_consumer(self.cq_consumer);
         let indices = &mut indices[..owners];
-        indices.sort_unstable();
+        if !sorted {
+            indices.sort_unstable();
+        }
         let cleanup = CompletedOwners {
             sidecar: &mut self.sidecar,
             indices,
