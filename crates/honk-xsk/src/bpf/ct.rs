@@ -10,6 +10,10 @@ const BTF_RECORD_HEADER: usize = 12;
 const VMLINUX: &str = "/sys/kernel/btf/vmlinux";
 const CONNTRACK: &str = "/sys/kernel/btf/nf_conntrack";
 static TCX_STRUCT_SIZES: OnceLock<[usize; 3]> = OnceLock::new();
+static CT_TCP_STATE: OnceLock<i16> = OnceLock::new();
+
+pub(super) const TCP_TIME_WAIT: i32 = 7;
+pub(super) const TCP_CLOSE: i32 = 8;
 
 struct Bounds {
     base: usize,
@@ -279,6 +283,18 @@ impl ConntrackKfuncs {
         Self::read_lookup(Bounds::read()?, "bpf_xdp_ct_lookup", "xdp_md")
     }
 
+    pub(super) fn tcp_state_offset(&self) -> io::Result<i16> {
+        if let Some(&offset) = CT_TCP_STATE.get() {
+            return Ok(offset);
+        }
+        // Callers may construct the public kfunc descriptor themselves.
+        Self::read()?;
+        CT_TCP_STATE
+            .get()
+            .copied()
+            .ok_or_else(|| invalid_data("missing CT TCP layout"))
+    }
+
     fn read_lookup(bounds: Bounds, lookup_name: &str, context: &str) -> io::Result<Self> {
         let base = Types::parse(read_bounded(VMLINUX, bounds.base)?)?;
         if context == "__sk_buff"
@@ -312,6 +328,10 @@ impl ConntrackKfuncs {
         }
         let lookup = btf.function(lookup_name, Some(context))?;
         let release = btf.function("bpf_ct_release", None)?;
+        let state = btf.ct_tcp_state()?;
+        if *CT_TCP_STATE.get_or_init(|| state) != state {
+            return Err(invalid_data("kernel CT TCP layout changed"));
+        }
         Ok(Self {
             lookup,
             release,
@@ -387,6 +407,72 @@ impl Types {
             io::ErrorKind::Unsupported,
             format!("conntrack requires kernel BTF {name}"),
         ))
+    }
+
+    fn ct_tcp_state(&self) -> io::Result<i16> {
+        for (kind, stride) in [(6, 8), (19, 12)] {
+            let at = match self.named("tcp_conntrack", kind) {
+                Ok((_, at)) => at,
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => continue,
+                Err(error) => return Err(error),
+            };
+            for (name, expected) in [
+                ("TCP_CONNTRACK_TIME_WAIT", TCP_TIME_WAIT),
+                ("TCP_CONNTRACK_CLOSE", TCP_CLOSE),
+            ] {
+                let mut found = false;
+                for i in 0..(self.word(at + 4)? & 0xffff) as usize {
+                    let entry = at + 12 + i * stride;
+                    if self.name(self.word(entry)?)? == name {
+                        if found
+                            || self.word(entry + 4)? != expected as u32
+                            || (kind == 19 && self.word(entry + 8)? != 0)
+                        {
+                            return Err(invalid_data(
+                                "kernel TCP conntrack enum conflicts with UAPI",
+                            ));
+                        }
+                        found = true;
+                    }
+                }
+                if !found {
+                    return Err(invalid_data("incomplete kernel TCP conntrack enum"));
+                }
+            }
+        }
+
+        let (_, mut parent) = self.named("nf_conn", 4)?;
+        let mut offset = 0u32;
+        for (field, kind, name) in [
+            ("proto", 5, "nf_conntrack_proto"),
+            ("tcp", 4, "ip_ct_tcp"),
+            ("state", 1, ""),
+        ] {
+            let (member_offset, id) = self
+                .member(parent, field, 0)?
+                .ok_or_else(|| invalid_data("missing CT TCP state member"))?;
+            let child = self.resolve(id)?;
+            let size = self.word(child + 8)?;
+            let parent_size = self.word(parent + 8)?;
+            if self.word(child + 4)? >> 24 & 31 != kind
+                || (!name.is_empty() && self.name(self.word(child)?)? != name)
+                || size == 0
+                || member_offset
+                    .checked_add(size)
+                    .is_none_or(|end| end > parent_size)
+            {
+                return Err(invalid_data("incompatible CT TCP state member"));
+            }
+            offset = offset
+                .checked_add(member_offset)
+                .ok_or_else(|| invalid_data("CT TCP state offset overflow"))?;
+            parent = child;
+        }
+        if self.word(parent + 8)? != 1 || self.word(parent + 12)? & !(2 << 24) != 8 {
+            return Err(invalid_data("CT TCP state requires a full unsigned byte"));
+        }
+        i16::try_from(offset)
+            .map_err(|_| invalid_data("CT TCP state outside BPF instruction range"))
     }
 
     fn tcx_struct_sizes(&self) -> io::Result<[usize; 3]> {
@@ -856,6 +942,84 @@ fn module_fd(expected: &[u8]) -> io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_state_requires_a_bounded_unsigned_byte_and_known_enum_values() {
+        fn layout(width: u32, field: &str, proto_at: u32, close: Option<u32>) -> io::Result<i16> {
+            let strings = b"\0u8\0state\0other\0ip_ct_tcp\0tcp\0nf_conntrack_proto\0proto\0nf_conn\0tcp_conntrack\0TCP_CONNTRACK_TIME_WAIT\0TCP_CONNTRACK_CLOSE\0";
+            let name = |s: &str| {
+                strings
+                    .windows(s.len() + 1)
+                    .position(|v| v.starts_with(s.as_bytes()) && v[s.len()] == 0)
+                    .unwrap() as u32
+            };
+            let mut words = vec![
+                name("u8"),
+                1 << 24,
+                width,
+                width * 8,
+                name("ip_ct_tcp"),
+                (4 << 24) | 1,
+                16,
+                name(field),
+                1,
+                24,
+                name("nf_conntrack_proto"),
+                (5 << 24) | 1,
+                16,
+                name("tcp"),
+                2,
+                0,
+                name("nf_conn"),
+                (4 << 24) | 1,
+                proto_at + 16,
+                name("proto"),
+                3,
+                proto_at * 8,
+            ];
+            if let Some(close) = close {
+                words.extend([
+                    name("tcp_conntrack"),
+                    (6 << 24) | 2,
+                    4,
+                    name("TCP_CONNTRACK_CLOSE"),
+                    close,
+                    name("TCP_CONNTRACK_TIME_WAIT"),
+                    7,
+                ]);
+            }
+            let len = (4 * words.len()) as u32;
+            let mut bytes = vec![0x9f, 0xeb, 1, 0];
+            for word in [24, 0, len, len, strings.len() as u32]
+                .into_iter()
+                .chain(words)
+            {
+                bytes.extend_from_slice(&word.to_ne_bytes());
+            }
+            bytes.extend_from_slice(strings);
+            Types::parse(bytes)?.ct_tcp_state()
+        }
+        assert_eq!(layout(1, "state", 12, None).unwrap(), 15);
+        assert_eq!(layout(1, "state", 32, Some(8)).unwrap(), 35);
+        assert!(layout(2, "state", 12, Some(8)).is_err());
+        assert!(layout(1, "other", 12, None).is_err());
+        assert!(layout(1, "state", 32766, None).is_err());
+        assert!(layout(1, "state", 12, Some(7)).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a disposable guest with nf_conntrack BTF"]
+    fn guest_tcp_state_layout_matches_both_gateway_hooks() {
+        super::super::gateway::tests::require_vm();
+        let xdp = ConntrackKfuncs::read().unwrap().tcp_state_offset().unwrap();
+        let skb = SkbConntrackKfuncs::read()
+            .unwrap()
+            .0
+            .tcp_state_offset()
+            .unwrap();
+        assert_eq!(xdp, skb);
+        println!("gateway_tcp_state_offset={xdp}");
+    }
 
     #[test]
     fn pointer_array_field_uses_pointer_width_not_pointee_id() {

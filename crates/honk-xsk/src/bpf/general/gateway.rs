@@ -52,6 +52,8 @@ const L2_LEN: i16 = -264;
 const FULL_LEN: i16 = -268;
 const IS_QUOTE: i16 = -272;
 const HOP_LIMIT: i16 = -276;
+// Routing calls discard parser scratch; guarded insertion retries still need this packet's flags.
+const CT_OPEN_FLAGS: i16 = -284;
 const REASON: i16 = -292;
 const VERDICT: i16 = -296;
 const MAC: i16 = -304;
@@ -817,20 +819,40 @@ fn refresh_hold(b: &mut GatewayBuilder, done: Target) {
     b.goto(done);
 }
 
+#[derive(Clone, Copy)]
+struct GatewayCt<'a> {
+    funcs: &'a ConntrackKfuncs,
+    tcp_state: i16,
+}
+
 fn conntrack(
     b: &mut GatewayBuilder,
-    ct: &ConntrackKfuncs,
+    ct: GatewayCt<'_>,
     miss: Target,
     error: Target,
     original: Target,
     reply: Target,
 ) {
-    lookup_conntrack(b, ct, false);
+    lookup_conntrack(b, ct.funcs, false);
     let missing = b.target();
     b.jump(JEQ_K, 0, 0, 0, missing);
     b.mov(1, 0);
-    b.emit(CALL, 0, 2, ct.release_offset, ct.release as i32);
-    b.load(LDX_B, 0, 10, OPTS + 9);
+    let release = b.target();
+    let terminal = b.target();
+    b.load(LDX_B, 2, 10, OPTS + 9);
+    b.jump(JNE_K, 2, 0, 0, release);
+    b.load(LDX_W, 3, 10, CT_OPEN_FLAGS);
+    b.jump(JNE_K, 3, 0, 2, release);
+    b.load(LDX_B, 3, 1, ct.tcp_state);
+    b.jump(JEQ_K, 3, 0, crate::bpf::ct::TCP_TIME_WAIT, terminal);
+    b.jump(JNE_K, 3, 0, crate::bpf::ct::TCP_CLOSE, release);
+    b.bind(terminal);
+    b.imm(2, 256); // Distinct from every direction byte returned by the kernel.
+    b.bind(release);
+    b.store(STX_W, 10, TUPLE, 2);
+    b.emit(CALL, 0, 2, ct.funcs.release_offset, ct.funcs.release as i32);
+    b.load(LDX_W, 0, 10, TUPLE);
+    b.jump(JEQ_K, 0, 0, 256, miss);
     b.jump(JEQ_K, 0, 0, 0, original);
     b.jump(JEQ_K, 0, 0, 1, reply);
     b.goto(error);
@@ -1217,9 +1239,14 @@ fn build_ingress(
     let fragment_pass = b.target();
     let fragment_xsk = b.target();
     let nd = b.target();
+    let gateway_ct = GatewayCt {
+        funcs: conntrack_kfuncs,
+        tcp_state: conntrack_kfuncs.tcp_state_offset()?,
+    };
     let owner = gateway
         .arbitration
-        .map(|arb| ownership::Owner::new(&mut b, arb, conntrack_kfuncs));
+        .map(|arb| ownership::Owner::new(&mut b, arb, gateway_ct));
+    b.word(CT_OPEN_FLAGS, 0);
     b.mov(9, 1);
     match ingress {
         Ingress::Xdp {
@@ -1341,6 +1368,8 @@ fn build_ingress(
     b.bind(tcp_fragment);
     b.load(LDX_B, 0, 6, 13);
     b.store(STX_W, 10, TCP_FLAGS, 0);
+    b.emit(AND_K, 0, 0, 0, 0x17);
+    b.store(STX_W, 10, CT_OPEN_FLAGS, 0);
     b.goto(ports);
     b.bind(udp);
     b.prefix(8, REMAIN, bad);
@@ -1442,14 +1471,7 @@ fn build_ingress(
         b.jump(JNE_K, 0, 0, 0, held);
         b.goto(ct);
         b.bind(ct);
-        conntrack(
-            &mut b,
-            conntrack_kfuncs,
-            ct_miss,
-            ct_error,
-            ct_original,
-            ct_reply,
-        );
+        conntrack(&mut b, gateway_ct, ct_miss, ct_error, ct_original, ct_reply);
         b.bind(ct_miss);
         b.load(LDX_W, 0, 10, IS_QUOTE);
         b.jump(JNE_K, 0, 0, 0, quote_unresolved);
@@ -1719,6 +1741,99 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_endian = "little")]
+    fn terminal_state_only_reclassifies_opening_tcp_in_the_original_direction() {
+        let funcs = ConntrackKfuncs {
+            lookup: 91,
+            release: 92,
+            lookup_offset: 1,
+            release_offset: 1,
+            btf: None,
+        };
+        let ct = GatewayCt {
+            funcs: &funcs,
+            tcp_state: 37,
+        };
+        let mut b = GatewayBuilder::new();
+        let [miss, error, original, reply] = std::array::from_fn(|_| b.target());
+        conntrack(&mut b, ct, miss, error, original, reply);
+        for (code, target) in [miss, error, original, reply].into_iter().enumerate() {
+            b.bind(target);
+            b.imm(0, code as i32);
+            b.emit(EXIT, 0, 0, 0, 0);
+        }
+        let after_lookup = b.program.insns.iter().position(|i| i.code == CALL).unwrap() + 1;
+        for direction in [0, 1, 2, 255] {
+            for flags in [0, 2, 0x10, 0x12] {
+                for state in 0..=9 {
+                    let mut regs = [0i32; 11];
+                    regs[0] = 1;
+                    let (mut pc, mut releases, mut saved) = (after_lookup, 0, None);
+                    loop {
+                        let i = b.program.insns[pc];
+                        let (dst, src) = (usize::from(i.regs & 15), usize::from(i.regs >> 4));
+                        let branch = match i.code {
+                            JEQ_K => regs[dst] == i.imm,
+                            JNE_K => regs[dst] != i.imm,
+                            JA => true,
+                            MOV_K => {
+                                regs[dst] = i.imm;
+                                false
+                            }
+                            MOV_X => {
+                                regs[dst] = regs[src];
+                                false
+                            }
+                            LDX_B if src == 10 && i.off == OPTS + 9 => {
+                                regs[dst] = direction;
+                                false
+                            }
+                            LDX_W if src == 10 && i.off == CT_OPEN_FLAGS => {
+                                regs[dst] = flags;
+                                false
+                            }
+                            LDX_B if src == 1 && i.off == ct.tcp_state => {
+                                assert_eq!((regs[src], releases, direction, flags), (1, 0, 0, 2));
+                                regs[dst] = state;
+                                false
+                            }
+                            STX_W if dst == 10 && i.off == TUPLE => {
+                                saved = Some(regs[src]);
+                                false
+                            }
+                            LDX_W if src == 10 && i.off == TUPLE => {
+                                regs[dst] = saved.unwrap();
+                                false
+                            }
+                            CALL if i.imm == funcs.release as i32 => {
+                                assert_eq!(regs[1], 1);
+                                releases += 1;
+                                regs[..6].fill(-1);
+                                false
+                            }
+                            EXIT => break,
+                            _ => panic!("unexpected CT decision instruction {i:?}"),
+                        };
+                        pc = if branch {
+                            let (_, target) = b.jumps.iter().find(|(at, _)| *at == pc).unwrap();
+                            b.labels[target.0].unwrap()
+                        } else {
+                            pc + 1
+                        };
+                    }
+                    let expected = match direction {
+                        0 if flags == 2 && matches!(state, 7 | 8) => 0,
+                        0 => 2,
+                        1 => 3,
+                        _ => 1,
+                    };
+                    assert_eq!((regs[0], releases), (expected, 1));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn conntrack_calls_keep_independent_module_offsets() {
         for (lookup_offset, release_offset) in [(0, 1), (1, 0)] {
             let ct = ConntrackKfuncs {
@@ -1733,7 +1848,17 @@ mod tests {
             let error = b.target();
             let original = b.target();
             let reply = b.target();
-            conntrack(&mut b, &ct, miss, error, original, reply);
+            conntrack(
+                &mut b,
+                GatewayCt {
+                    funcs: &ct,
+                    tcp_state: 16,
+                },
+                miss,
+                error,
+                original,
+                reply,
+            );
             let calls: Vec<_> = b
                 .program
                 .insns

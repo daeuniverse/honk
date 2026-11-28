@@ -11,7 +11,7 @@ const FETCH_ADD: i32 = 1;
 
 pub(super) struct Owner<'a> {
     arb: &'a crate::GatewayArbitration,
-    ct: &'a ConntrackKfuncs,
+    ct: GatewayCt<'a>,
     pub(super) bad: Target,
     pub(super) stale: Option<Target>,
     pub(super) qualified: Target,
@@ -28,7 +28,7 @@ impl<'a> Owner<'a> {
     pub(super) fn new(
         b: &mut GatewayBuilder,
         arb: &'a crate::GatewayArbitration,
-        ct: &'a ConntrackKfuncs,
+        ct: GatewayCt<'a>,
     ) -> Self {
         Self {
             arb,
