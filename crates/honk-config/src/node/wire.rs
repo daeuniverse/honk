@@ -526,6 +526,14 @@ impl FlatNode {
             xhttp: self.xhttp.take(),
         }
     }
+
+    fn take_quic(&mut self) -> QuicOptions {
+        QuicOptions {
+            tls: self.take_tls(),
+            mtu: self.quic_mtu,
+            disable_mtu_discovery: self.quic_disable_mtu_discovery.unwrap_or(false),
+        }
+    }
 }
 
 impl FlatNode {
@@ -659,52 +667,31 @@ impl FlatNode {
                 username: flat.username.take(),
                 password: flat.password.take(),
             }),
-            NodeProtocol::Hysteria2 => {
-                let tls = flat.take_tls();
-                OutboundConfig::Hysteria2(Hysteria2Config {
-                    auth: flat.hy2_auth.take(),
-                    obfs: flat.hy2_obfs.take(),
-                    up_mbps: flat.hy2_up_mbps,
-                    down_mbps: flat.hy2_down_mbps,
-                    port_hopping: flat.hy2_port_hopping.take(),
-                    hop_interval: flat.hy2_hop_interval,
-                    init_stream_recv_window: flat.hy2_init_stream_recv_window,
-                    init_conn_recv_window: flat.hy2_init_conn_recv_window,
-                    quic: QuicOptions {
-                        tls,
-                        mtu: flat.quic_mtu,
-                        disable_mtu_discovery: flat.quic_disable_mtu_discovery.unwrap_or(false),
-                    },
-                })
-            }
-            NodeProtocol::Tuic => {
-                let tls = flat.take_tls();
-                OutboundConfig::Tuic(TuicConfig {
-                    uuid: flat.tuic_uuid.take(),
-                    password: flat.tuic_password.take(),
-                    congestion: flat.tuic_congestion.take(),
-                    alpn: flat.tuic_alpn.take(),
-                    init_stream_recv_window: flat.tuic_init_stream_recv_window,
-                    init_conn_recv_window: flat.tuic_init_conn_recv_window,
-                    quic: QuicOptions {
-                        tls,
-                        mtu: flat.quic_mtu,
-                        disable_mtu_discovery: flat.quic_disable_mtu_discovery.unwrap_or(false),
-                    },
-                })
-            }
-            NodeProtocol::Juicity => {
-                let tls = flat.take_tls();
-                OutboundConfig::Juicity(JuicityConfig {
-                    uuid: flat.juicity_uuid.take(),
-                    password: flat.juicity_password.take(),
-                    quic: QuicOptions {
-                        tls,
-                        mtu: flat.quic_mtu,
-                        disable_mtu_discovery: flat.quic_disable_mtu_discovery.unwrap_or(false),
-                    },
-                })
-            }
+            NodeProtocol::Hysteria2 => OutboundConfig::Hysteria2(Hysteria2Config {
+                auth: flat.hy2_auth.take(),
+                obfs: flat.hy2_obfs.take(),
+                up_mbps: flat.hy2_up_mbps,
+                down_mbps: flat.hy2_down_mbps,
+                port_hopping: flat.hy2_port_hopping.take(),
+                hop_interval: flat.hy2_hop_interval,
+                init_stream_recv_window: flat.hy2_init_stream_recv_window,
+                init_conn_recv_window: flat.hy2_init_conn_recv_window,
+                quic: flat.take_quic(),
+            }),
+            NodeProtocol::Tuic => OutboundConfig::Tuic(TuicConfig {
+                uuid: flat.tuic_uuid.take(),
+                password: flat.tuic_password.take(),
+                congestion: flat.tuic_congestion.take(),
+                alpn: flat.tuic_alpn.take(),
+                init_stream_recv_window: flat.tuic_init_stream_recv_window,
+                init_conn_recv_window: flat.tuic_init_conn_recv_window,
+                quic: flat.take_quic(),
+            }),
+            NodeProtocol::Juicity => OutboundConfig::Juicity(JuicityConfig {
+                uuid: flat.juicity_uuid.take(),
+                password: flat.juicity_password.take(),
+                quic: flat.take_quic(),
+            }),
             NodeProtocol::AnyTLS => {
                 let tls = flat.take_tls();
                 OutboundConfig::AnyTls(AnyTlsConfig {
@@ -924,9 +911,6 @@ impl<'a> WireOptions<'a> {
                 wire.hy2_init_stream_recv_window = config.init_stream_recv_window;
                 wire.hy2_init_conn_recv_window = config.init_conn_recv_window;
                 wire.hy2_disable_mtu_discovery = config.quic.disable_mtu_discovery.then_some(true);
-                wire.quic_disable_mtu_discovery = wire.hy2_disable_mtu_discovery;
-                wire.quic_mtu = config.quic.mtu;
-                wire.set_tls(&config.quic.tls);
             }
             OutboundConfig::Tuic(config) => {
                 wire.username = config.uuid.as_deref();
@@ -937,18 +921,12 @@ impl<'a> WireOptions<'a> {
                 wire.tuic_alpn = config.alpn.as_deref();
                 wire.tuic_init_stream_recv_window = config.init_stream_recv_window;
                 wire.tuic_init_conn_recv_window = config.init_conn_recv_window;
-                wire.quic_mtu = config.quic.mtu;
-                wire.quic_disable_mtu_discovery = config.quic.disable_mtu_discovery.then_some(true);
-                wire.set_tls(&config.quic.tls);
             }
             OutboundConfig::Juicity(config) => {
                 wire.username = config.uuid.as_deref();
                 wire.password = config.password.as_deref();
                 wire.juicity_uuid = config.uuid.as_deref();
                 wire.juicity_password = config.password.as_deref();
-                wire.quic_mtu = config.quic.mtu;
-                wire.quic_disable_mtu_discovery = config.quic.disable_mtu_discovery.then_some(true);
-                wire.set_tls(&config.quic.tls);
             }
             OutboundConfig::AnyTls(config) => {
                 wire.username = config.password.as_deref();
@@ -962,6 +940,11 @@ impl<'a> WireOptions<'a> {
             }
             OutboundConfig::Chain(config) => wire.hops = Some(&config.hops),
             OutboundConfig::Direct | OutboundConfig::Block => {}
+        }
+        if let Some(quic) = node.quic() {
+            wire.quic_mtu = quic.mtu;
+            wire.quic_disable_mtu_discovery = quic.disable_mtu_discovery.then_some(true);
+            wire.set_tls(&quic.tls);
         }
         wire
     }

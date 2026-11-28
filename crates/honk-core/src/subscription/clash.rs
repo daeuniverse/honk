@@ -653,11 +653,8 @@ fn apply_quic(
         if !(1200..=65527).contains(&mtu) {
             return Err("QUIC MTU is invalid");
         }
-        match &mut node.outbound {
-            OutboundConfig::Hysteria2(config) => config.quic.mtu = Some(mtu),
-            OutboundConfig::Tuic(config) => config.quic.mtu = Some(mtu),
-            OutboundConfig::Juicity(config) => config.quic.mtu = Some(mtu),
-            _ => {}
+        if let Some(quic) = node.quic_mut() {
+            quic.mtu = Some(mtu);
         }
     }
     Ok(())
