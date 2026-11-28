@@ -311,6 +311,8 @@ struct VmessLinkJson {
     security: Option<String>,
     /// Transport: tcp / ws / grpc / xhttp / splithttp.
     net: Option<String>,
+    #[serde(default)]
+    udp_over_tcp: bool,
     /// Legacy header type; XHTTP exporters use this field for the mode.
     r#type: Option<String>,
     /// HTTP host for WS/XHTTP; lower-priority TLS SNI on other transports.
@@ -413,6 +415,7 @@ impl VmessLinkJson {
                 .map_err(|reason| ConfigError::Parse(reason.into()))?
                 .map(str::to_owned),
                 network: None,
+                udp_over_tcp: self.udp_over_tcp,
                 transport: stream,
                 tls,
             }),

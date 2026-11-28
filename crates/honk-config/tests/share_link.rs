@@ -1984,6 +1984,66 @@ fn hy2_alias_preserves_userpass_and_hopping_identity() {
 }
 
 #[test]
+fn shadowrocket_vmess_uot_requires_explicit_encoding() {
+    let authority = b64(&format!("auto:{UUID_A}@vmess.example.com:443"));
+    let parse = |query: &str| Node::from_share_link(&format!("vmess://{authority}?{query}"));
+    for (query, uot, udp) in [
+        ("udp=1", false, false),
+        ("packetEncoding=none", false, false),
+        ("packetEncoding=uot-v2", true, true),
+        ("packetEncoding=uot-v2&udp=1&udp=1", true, true),
+        ("packetEncoding=uot-v2&udp=1&udp=true", true, true),
+        ("packetEncoding=uot-v2&udp=true", true, true),
+        ("packetEncoding=uot-v2&udp=0", true, false),
+        ("packetEncoding=uot-v2&udp=0&udp=false", true, false),
+    ] {
+        let node = parse(query).unwrap();
+        let config = node.vmess().unwrap();
+        assert_eq!(
+            (config.udp_over_tcp, config.udp_enabled()),
+            (uot, udp),
+            "{query}"
+        );
+    }
+    for query in [
+        "packetEncoding=xudp",
+        "packetEncoding=auto",
+        "udp=2",
+        "udp=1&udp=0",
+        "packetEncoding=none&packetEncoding=uot-v2",
+        "vless_mode=legacy",
+    ] {
+        assert!(parse(query).is_err(), "{query}");
+    }
+}
+
+#[test]
+fn vmess_json_uot_accepts_only_explicit_booleans_including_xhttp() {
+    for net in ["tcp", "xhttp"] {
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(&vmess_transport_fixture(Some(net))).unwrap();
+        let parse =
+            |value: &serde_json::Value| Node::from_share_link(&vmess_link(&value.to_string()));
+        let old = parse(&fixture).unwrap();
+        fixture["udp_over_tcp"] = false.into();
+        assert_eq!(parse(&fixture).unwrap().id, old.id);
+        fixture["udp_over_tcp"] = true.into();
+        let enabled = parse(&fixture).unwrap();
+        assert!(enabled.vmess().unwrap().udp_enabled());
+        assert_ne!(enabled.id, old.id);
+        for bad in [
+            serde_json::Value::Null,
+            "true".into(),
+            1.into(),
+            serde_json::json!({"enabled":true}),
+        ] {
+            fixture["udp_over_tcp"] = bad;
+            assert!(parse(&fixture).is_err(), "{net}: {fixture}");
+        }
+    }
+}
+
+#[test]
 fn shadowrocket_vmess_ws_and_grpc_match_v2rayn_json() {
     let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
     let authority = b64(&format!("auto:{uuid}@vmess.example.com:443"));

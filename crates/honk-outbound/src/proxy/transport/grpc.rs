@@ -35,10 +35,8 @@ pub(super) async fn wrap_grpc(
     } else {
         "http"
     };
-    let authority = match node.host().parse::<std::net::Ipv6Addr>() {
-        Ok(address) => http::uri::Authority::try_from(format!("[{address}]"))?,
-        Err(_) => http::uri::Authority::try_from(node.host())?,
-    };
+    let authority =
+        http::uri::Authority::try_from(super::bracket_ipv6_host(node.host(), true).into_owned())?;
     let uri = http::Uri::builder()
         .scheme(scheme)
         .authority(authority)

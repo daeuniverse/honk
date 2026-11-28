@@ -704,14 +704,14 @@ cargo run --release -p honk-core -- \
 
 ## 当前 capability 和限制
 
-- 出站支持 Direct、Block、SOCKS5、Shadowsocks/2022、Trojan、AnyTLS、Hysteria2、TUIC、Juicity、VMess 和 VLESS。[链式节点](reference/nodes.md#链式节点)仅支持 TCP，由两到四个代理节点组成，各跳须符合链接所列的协议和位置限制。
-- UDP 支持 Direct、SOCKS5、Shadowsocks、Trojan、AnyTLS、Hysteria2、TUIC、Juicity，以及独立 packet permission 已开启的 VLESS。VLESS 的回退编码和多路复用 carrier 是两个独立选择；VMess 仍只支持 TCP。见 [VLESS 节点参考](reference/nodes.md#vless-udp-and-multiplexing)。
+- 出站支持 Direct、Block、SOCKS5、Shadowsocks/2022、Trojan、AnyTLS、Hysteria2、TUIC、Juicity、VMess 和 VLESS。[链式节点](reference/nodes.md#链式节点)由两到四个代理节点组成。符合条件的出口可承载 UDP，各跳须符合链接所列的协议和位置限制。
+- UDP 支持 Direct、SOCKS5、Shadowsocks、Trojan、AnyTLS、Hysteria2、TUIC、Juicity，显式开启 UoT v2 的 VMess，以及允许 UDP 的 VLESS。VLESS 的回退编码和多路复用 carrier 是两个独立选择。见 [VLESS 节点参考](reference/nodes.md#vless-udp-and-multiplexing)。
 - 组支持 Selector、URLTest、LoadBalance、Fallback 和 Score。
 - DNS 上游支持 UDP、TCP、DoT、DoH、DoH3 和 DoQ，也可经 node/group 出站。
 - `direct` 和 `block` 是内置节点，不要在配置中重复声明。
 - `nfqueue_enable` 默认开启，固定使用队列 320，并独占 `inet honk_nfqueue` / `udp_decision`。同一网络命名空间中的防火墙管理器不能改动这些对象。
 - mock 构建，以及没有启用 Cargo `ebpf` feature 的构建，都不提供透明代理。普通 `cargo build --release` 不含真实数据路径，必须加 `--features ebpf`。
-- 当前没有 VMess UDP 和无 root 数据路径，也不支持非 Linux 系统。
+- 当前没有 VMess 原生 UDP（`CMD_UDP` 或 XUDP） 和无 root 数据路径，也不支持非 Linux 系统。
 
 ## 常见问题
 

@@ -93,6 +93,8 @@ struct FlatNode {
     #[serde(default)]
     packet_encoding: Option<VlessUdpEncoding>,
     #[serde(default)]
+    udp_over_tcp: bool,
+    #[serde(default)]
     multiplex: Option<VlessMultiplex>,
     #[serde(default)]
     plugin: Option<String>,
@@ -353,6 +355,10 @@ impl FlatNode {
             packet_encoding
         );
         strip!(
+            self.udp_over_tcp && self.protocol != NodeProtocol::VMess,
+            udp_over_tcp
+        );
+        strip!(
             self.protocol != NodeProtocol::VLess
                 && self
                     .multiplex
@@ -611,6 +617,7 @@ impl FlatNode {
                     uuid: flat.password.take(),
                     encryption: flat.encryption.take(),
                     network: flat.network.take(),
+                    udp_over_tcp: flat.udp_over_tcp,
                     transport,
                     tls,
                 })
@@ -744,6 +751,8 @@ struct WireOptions<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     packet_encoding: Option<VlessUdpEncoding>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    udp_over_tcp: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     multiplex: Option<&'a VlessMultiplex>,
     plugin: Option<&'a str>,
     plugin_opts: Option<&'a str>,
@@ -861,6 +870,7 @@ impl<'a> WireOptions<'a> {
                 wire.password = config.uuid.as_deref();
                 wire.encryption = config.encryption.as_deref();
                 wire.network = config.network.as_deref();
+                wire.udp_over_tcp = config.udp_over_tcp.then_some(true);
                 wire.set_transport(&config.transport);
                 wire.set_tls(&config.tls);
             }

@@ -15,6 +15,10 @@ pub(crate) const MAX_ADDR_LEN: usize = 1 + 1 + u8::MAX as usize + 2;
 #[cfg(any(feature = "rprx", test))]
 const MAX_ADDR_BUFFERED_BYTES: usize = 2 * (MAX_ADDR_LEN + 2 + MAX_PACKET_SIZE);
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct UotFramingError(&'static str);
+
 /// Per-datagram addressed framing `[ATYP][address][port][u16 len][payload]`,
 /// shared by non-connect UoT v2 (UoT v1 ATYPs: IPv4=0, IPv6=1, domain=2) and
 /// sing-mux PacketAddr (SOCKS5 ATYPs). The v2 request address is SOCKS5-encoded
@@ -47,7 +51,7 @@ impl AddrFraming {
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid UoT packet address type",
+                UotFramingError("invalid UoT packet address type"),
             ));
         };
         let payload_start = 1 + address_len + 2 + 2;
@@ -314,7 +318,7 @@ impl AddrDecoder {
         if self.buffered.len().saturating_add(data.len()) > MAX_ADDR_BUFFERED_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "UoT stream frame exceeds buffer limit",
+                UotFramingError("UoT stream frame exceeds buffer limit"),
             ));
         }
         self.buffered.extend_from_slice(data);
@@ -332,9 +336,330 @@ impl AddrDecoder {
     }
 }
 
+#[cfg(any(feature = "rprx", test))]
+pub(in crate::proxy) use stream::StreamUotTransport;
+
+#[cfg(any(feature = "rprx", test))]
+mod stream {
+    use super::*;
+    use crate::proxy::chain::UdpExit;
+    use crate::proxy::error::HopIoFailure;
+    use crate::proxy::{
+        AsyncReadWrite, FramePoison, MultiTargetTransport, NodeFailure, PacketRejection,
+        PacketTransport,
+    };
+    use crate::runtime::flow_observation::request_write;
+    use async_trait::async_trait;
+    use std::sync::atomic::AtomicBool;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+    use tokio::sync::Mutex;
+
+    type Stream = Box<dyn AsyncReadWrite>;
+
+    /// A non-connect UoT v2 association. The request precedes the first datagram;
+    /// all datagrams carry their own address, including replies from other peers.
+    pub(in crate::proxy) struct StreamUotTransport {
+        reader: Mutex<(ReadHalf<Stream>, AddrDecoder)>,
+        writer: Mutex<(WriteHalf<Stream>, Bytes)>,
+        poison: FramePoison,
+        target: SocketAddr,
+        target_domain: Option<Box<str>>,
+        tls_handoff: Option<bool>,
+        exit: Option<UdpExit>,
+    }
+
+    impl StreamUotTransport {
+        pub(in crate::proxy) fn new(
+            stream: Stream,
+            target: SocketAddr,
+            target_domain: Option<Box<str>>,
+            request: Bytes,
+            native_tls_handoff: Option<bool>,
+            exit: Option<UdpExit>,
+        ) -> Self {
+            let (reader, writer) = tokio::io::split(stream);
+            Self {
+                reader: Mutex::new((reader, AddrDecoder::new(AddrFraming::UOT_V1))),
+                writer: Mutex::new((writer, request)),
+                poison: FramePoison::default(),
+                target,
+                target_domain,
+                tls_handoff: exit.map(|exit| exit.tls_handoff).or(native_tls_handoff),
+                exit,
+            }
+        }
+
+        async fn send_inner(
+            &self,
+            target: SocketAddr,
+            domain: Option<&str>,
+            data: &[u8],
+            confirmed: bool,
+            admitted: Option<&AtomicBool>,
+            current: Option<&(dyn Fn() -> bool + Send + Sync)>,
+        ) -> io::Result<()> {
+            let mut writer = self.writer.lock().await;
+            let (stream, setup) = &mut *writer;
+            let frame = AddrFraming::UOT_V1.encode(setup, target, domain, data, MAX_PACKET_SIZE)?;
+            let write = async {
+                if let Some(current) = current {
+                    let tls_handoff = self.tls_handoff.ok_or(PacketRejection::Policy)?;
+                    return self
+                        .poison
+                        .write_checked(stream, &frame, admitted, tls_handoff, current)
+                        .await;
+                }
+                let guard = self.poison.begin(admitted)?;
+                stream.write_all(&frame).await?;
+                stream.flush().await?;
+                guard.complete();
+                Ok(())
+            };
+            if confirmed {
+                request_write(std::pin::pin!(write)).await?;
+            } else {
+                write.await?;
+            }
+            // A withdrawn first send leaves the request available to the next view.
+            *setup = Bytes::new();
+            Ok(())
+        }
+
+        fn framing_error(&self, error: io::Error) -> io::Error {
+            if let Some(exit) = self.exit
+                && error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<UotFramingError>())
+            {
+                let error = io::Error::new(error.kind(), NodeFailure(error.into()));
+                return HopIoFailure::io(exit.index, error, false);
+            }
+            error
+        }
+    }
+
+    impl std::fmt::Debug for StreamUotTransport {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("StreamUotTransport")
+                .field("target", &self.target)
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[async_trait]
+    impl PacketTransport for StreamUotTransport {
+        fn relay_addr(&self) -> SocketAddr {
+            self.target
+        }
+
+        fn allows_full_cone_replies(&self) -> bool {
+            true
+        }
+
+        async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
+            self.send_inner(
+                self.target,
+                self.target_domain.as_deref(),
+                data,
+                false,
+                None,
+                None,
+            )
+            .await
+        }
+
+        async fn send_packet_confirmed(&self, data: &[u8]) -> io::Result<()> {
+            self.send_inner(
+                self.target,
+                self.target_domain.as_deref(),
+                data,
+                true,
+                None,
+                None,
+            )
+            .await
+        }
+
+        async fn send_packet_checked(
+            &self,
+            data: &[u8],
+            current: &(dyn Fn() -> bool + Send + Sync),
+        ) -> io::Result<()> {
+            self.send_inner(
+                self.target,
+                self.target_domain.as_deref(),
+                data,
+                true,
+                None,
+                Some(current),
+            )
+            .await
+        }
+
+        async fn recv_packet(&self, output: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            let mut reader = self.reader.lock().await;
+            let (stream, decoder) = &mut *reader;
+            loop {
+                if let Some(frame) = decoder
+                    .next_packet(output, self.target, self.target_domain.as_deref())
+                    .map_err(|e| self.framing_error(e))?
+                {
+                    if let Some(packet) = frame.packet {
+                        return Ok(packet);
+                    }
+                    continue;
+                }
+                let mut chunk = [0; 16 * 1024];
+                let size = stream.read(&mut chunk).await?;
+                if size == 0 {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+                decoder
+                    .push(&chunk[..size])
+                    .map_err(|e| self.framing_error(e))?;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MultiTargetTransport for StreamUotTransport {
+        async fn send_to(
+            &self,
+            target: SocketAddr,
+            domain: Option<&str>,
+            data: &[u8],
+            confirmed: bool,
+            admitted: Option<&AtomicBool>,
+        ) -> io::Result<()> {
+            let domain = addr::dialed_name(self.target_domain.as_deref(), domain);
+            self.send_inner(target, domain, data, confirmed, admitted, None)
+                .await
+        }
+
+        async fn send_to_checked(
+            &self,
+            target: SocketAddr,
+            domain: Option<&str>,
+            data: &[u8],
+            admitted: Option<&AtomicBool>,
+            current: &(dyn Fn() -> bool + Send + Sync),
+        ) -> io::Result<()> {
+            let domain = addr::dialed_name(self.target_domain.as_deref(), domain);
+            self.send_inner(target, domain, data, true, admitted, Some(current))
+                .await
+        }
+
+        fn frame_stream_torn(&self) -> bool {
+            self.poison.is_set()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::chain::UdpExit;
+    use crate::proxy::error::{HopIoFailure, io_node_failure};
+    use crate::proxy::{
+        AsyncReadWrite, DialFailureScope, NodeFailure, PacketRejection, PacketTransport,
+        dial_failure_scope, io_packet_rejection, is_frame_interrupted,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn exit_transport(stream: impl AsyncReadWrite + 'static) -> StreamUotTransport {
+        let target = SocketAddr::from(([192, 0, 2, 1], 53));
+        StreamUotTransport::new(
+            Box::new(stream),
+            target,
+            None,
+            request(false, target, None).unwrap(),
+            None,
+            Some(UdpExit {
+                index: 1,
+                tls_handoff: false,
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn checked_packet_preserves_setup_and_fences_partial_writes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const FIRST: &[u8] = &[
+            0, 1, 192, 0, 2, 1, 0, 53, 0, 192, 0, 2, 1, 0, 53, 0, 1, b'x',
+        ];
+        for (free, interrupt) in [(0, false), (1, false), (1, true)] {
+            let (mut stream, mut peer) = tokio::io::duplex(32);
+            stream.write_all(&[0; 32][free..]).await.unwrap();
+            let transport = exit_transport(stream);
+            let current = AtomicBool::new(true);
+            let allowed = || current.load(Ordering::Relaxed);
+            let mut send = transport.send_packet_checked(b"x", &allowed);
+            assert!(futures_util::poll!(send.as_mut()).is_pending());
+            current.store(false, Ordering::Relaxed);
+            if interrupt {
+                drop(send);
+                let error = transport.send_packet(b"y").await.unwrap_err();
+                assert!(is_frame_interrupted(&error));
+                continue;
+            }
+            peer.read_exact(&mut [0; 32][free..]).await.unwrap();
+            if free == 0 {
+                assert_eq!(
+                    io_packet_rejection(&send.await.unwrap_err()),
+                    Some(PacketRejection::Cancelled)
+                );
+                transport.send_packet_checked(b"x", &|| true).await.unwrap();
+            } else {
+                send.await.unwrap();
+            }
+            let mut frame = [0; FIRST.len()];
+            peer.read_exact(&mut frame).await.unwrap();
+            assert_eq!(frame, FIRST);
+        }
+    }
+
+    #[tokio::test]
+    async fn only_wire_framing_faults_belong_to_the_exit() {
+        let (stream, mut peer) = tokio::io::duplex(32);
+        let transport = exit_transport(stream);
+        peer.write_all(&[0, 192, 0, 2, 7, 0, 53, 0, 1, b'x', 0xff])
+            .await
+            .unwrap();
+        let short = transport.recv_packet(&mut []).await.unwrap_err();
+        assert_eq!(short.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(dial_failure_scope(&short), DialFailureScope::Unattributed);
+        assert!(!io_node_failure(&short));
+        let mut data = [0];
+        assert_eq!(
+            transport.recv_packet(&mut data).await.unwrap(),
+            (1, SocketAddr::from(([192, 0, 2, 7], 53)))
+        );
+        assert_eq!(&data, b"x");
+        let invalid = transport.recv_packet(&mut data).await.unwrap_err();
+        assert_eq!(dial_failure_scope(&invalid), DialFailureScope::Hop(1));
+        assert!(io_node_failure(&invalid));
+    }
+
+    #[tokio::test]
+    async fn carrier_read_failure_keeps_its_original_hop() {
+        #[derive(Debug)]
+        struct FailedRead;
+        impl tokio::io::AsyncRead for FailedRead {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                let cause = io::Error::other(NodeFailure(anyhow::anyhow!("entry failure")));
+                std::task::Poll::Ready(Err(HopIoFailure::io(0, cause, false)))
+            }
+        }
+        let transport = exit_transport(tokio::io::join(FailedRead, tokio::io::sink()));
+        let error = transport.recv_packet(&mut [0]).await.unwrap_err();
+        assert_eq!(dial_failure_scope(&error), DialFailureScope::Hop(0));
+        assert!(io_node_failure(&error));
+    }
 
     #[test]
     fn request_rejects_overlong_domain() {

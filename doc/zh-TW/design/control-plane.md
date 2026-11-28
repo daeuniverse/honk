@@ -148,7 +148,7 @@ identity、正規化 client、協定/UDP path，以及 `ActualPeer` 或
 會合並 kernel/NFQUEUE 的 flow ownership：每個標準 endpoint 仍保有獨立的 decision
 token、generation、terminal transition 和五元組 retirement fence。
 
-關閉 `rprx` 時，共用的 source admission 和 shutdown join 仍然啟用，只有 VLESS 分
+關閉 `rprx` 時，共用的 source admission 和 shutdown join 仍然啟用，只有 VLESS 和 VMess 分
 支受 feature gate 限制。Hy2/TUIC 經有界重組保留真實來源；它們的 QUIC send guard
 在 source gate admission 之後開始，並由 driver 保留到最終 I/O 結果分類完成。
 

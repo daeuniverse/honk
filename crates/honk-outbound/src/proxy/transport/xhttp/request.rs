@@ -35,11 +35,9 @@ impl RequestTemplate {
             .as_deref()
             .or(tls.sni.as_deref())
             .unwrap_or(node.host());
-        let authority: http::uri::Authority = if host.parse::<std::net::Ipv6Addr>().is_ok() {
-            format!("[{host}]").parse()?
-        } else {
-            host.parse()?
-        };
+        let authority = http::uri::Authority::try_from(
+            super::super::bracket_ipv6_host(host, false).into_owned(),
+        )?;
         let (prefix, query) = options
             .path
             .split_once('?')

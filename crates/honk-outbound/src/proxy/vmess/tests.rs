@@ -1,5 +1,6 @@
 use super::test_support::{HEADER_WIRE, fixed_session, hex};
 use super::*;
+use futures_util::FutureExt;
 use std::io;
 
 // Byte-level regression vectors produced by running the actual
@@ -74,9 +75,9 @@ fn test_request_header_wire_vector() {
 fn test_body_chunk_vectors() {
     let session = fixed_session();
     let mut body = BodyChunks::new(&session.req_key, &session.req_iv).unwrap();
-    let c0 = body.seal_chunk(b"hello vmess");
-    let c1 = body.seal_chunk(b"hello vmess");
-    let term = body.seal_chunk(b"");
+    let c0 = body.seal_chunk(b"hello vmess").unwrap();
+    let c1 = body.seal_chunk(b"hello vmess").unwrap();
+    let term = body.seal_chunk(b"").unwrap();
     assert_eq!(c0, hex(CHUNK0));
     assert_eq!(c1, hex(CHUNK1));
     assert_eq!(term, hex(CHUNK_TERM));
@@ -100,10 +101,7 @@ async fn test_response_decode_vectors() {
         let mut len_buf = [0u8; 2];
         cursor.read_exact(&mut len_buf).await.unwrap();
         let chunk_len = body.decode_len(len_buf) as usize;
-        let mut ct = vec![0u8; chunk_len];
-        cursor.read_exact(&mut ct).await.unwrap();
-        let n = body.open_chunk(&mut ct).unwrap();
-        out.extend_from_slice(&ct[..n]);
+        out.extend(body.read_chunk(&mut cursor, chunk_len).await.unwrap());
     }
     assert_eq!(out, b"HTTP/1.1 200 OKHTTP/1.1 200 OK");
     assert!(cursor.is_empty());
@@ -162,19 +160,57 @@ fn test_chunk_nonce_layout() {
     assert_eq!(nonce[2..], [0x22; 10]);
 }
 
-#[test]
-fn test_body_chunk_roundtrip() {
+#[tokio::test]
+async fn test_body_chunk_roundtrip() {
     let session = fixed_session();
     let mut tx = BodyChunks::new(&session.req_key, &session.req_iv).unwrap();
     let mut rx = BodyChunks::new(&session.req_key, &session.req_iv).unwrap();
     for payload in [&b"hello vmess aead"[..], &vec![0xAB; CHUNK_MAX_LEN][..]] {
-        let wire = tx.seal_chunk(payload);
+        let wire = tx.seal_chunk(payload).unwrap();
         let len = rx.decode_len([wire[0], wire[1]]) as usize;
         assert_eq!(len, payload.len() + GCM_TAG_LEN);
-        let mut ct = wire[2..].to_vec();
-        let n = rx.open_chunk(&mut ct).unwrap();
-        assert_eq!(&ct[..n], payload);
+        let plain = rx.read_chunk(&mut &wire[2..], len).await.unwrap();
+        assert_eq!(plain, payload);
     }
+}
+
+#[tokio::test]
+async fn vmess_last_nonce_covers_data_and_termination_without_reuse() {
+    let session = fixed_session();
+    let last = || {
+        let mut body = BodyChunks::new(&session.req_key, &session.req_iv).unwrap();
+        body.next = Some(u16::MAX);
+        body
+    };
+    let mut tx = last();
+    let wire = tx.seal_chunk(b"last").unwrap();
+    let mut rx = last();
+    let len = rx.decode_len(wire[..2].try_into().unwrap()) as usize;
+    assert_eq!(rx.read_chunk(&mut &wire[2..], len).await.unwrap(), b"last");
+    for payload in [&b"next"[..], b""] {
+        assert_eq!(
+            tx.seal_chunk(payload).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+    let mut unread = &wire[2..];
+    let exhausted = rx.read_chunk(&mut unread, len).await.unwrap_err();
+    assert_eq!(unread, &wire[2..]);
+    assert_eq!(
+        exhausted.downcast_ref::<io::Error>().unwrap().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert!(!crate::proxy::node_failure(&exhausted));
+    let exhausted = rx.into_terminator().err().unwrap();
+    assert_eq!(exhausted.kind(), io::ErrorKind::BrokenPipe);
+    assert!(!crate::proxy::node_failure(&exhausted.into()));
+
+    let term = last().seal_chunk(&[]).unwrap();
+    let (nonce, decoder) = last().into_terminator().unwrap();
+    assert_eq!(nonce, chunk_nonce(&session.req_iv, u16::MAX));
+    decoder
+        .open_in_place(&nonce, &mut [], &term[2..], b"")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -266,14 +302,14 @@ async fn upload_batches_a_queued_burst_and_flushes_when_input_goes_idle() {
     let transport = RecordingTransport(recording.clone(), changed.clone());
     let header = b"request-header";
     let relay = tokio::spawn(async move {
-        vmess_relay(
+        relay::run(
             Box::new(transport),
             &mut relay_client,
-            header.to_vec(),
-            fixed_session(),
+            (header.to_vec(), fixed_session()),
             &super::super::transport::relay_upload::pipe().1,
             &mut None,
             &mut Vec::new(),
+            None,
         )
         .await
     });
@@ -310,10 +346,13 @@ async fn upload_batches_a_queued_burst_and_flushes_when_input_goes_idle() {
         let mut decoded = Vec::new();
         while !wire.is_empty() {
             let length = body.decode_len(wire[..2].try_into().unwrap()) as usize;
-            let mut chunk = wire[2..2 + length].to_vec();
-            let length = body.open_chunk(&mut chunk).unwrap();
-            decoded.extend_from_slice(&chunk[..length]);
-            wire = &wire[2 + chunk.len()..];
+            wire = &wire[2..];
+            decoded.extend(
+                body.read_chunk(&mut wire, length)
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap(),
+            );
         }
         assert_eq!(decoded, payload);
         recording.flushes
@@ -680,15 +719,19 @@ async fn response_chunk_length_preserves_typed_carrier_failures_after_payload() 
             let session = fixed_session();
             let mut body = BodyChunks::new(&session.resp_key, &session.resp_iv).unwrap();
             let payload = b"HTTP/1.1 200 OK";
-            peer.write_all(&body.seal_chunk(payload)).await.unwrap();
+            peer.write_all(&body.seal_chunk(payload).unwrap())
+                .await
+                .unwrap();
             let mut received = [0; b"HTTP/1.1 200 OK".len()];
             stream.read_exact(&mut received).await.unwrap();
             assert_eq!(&received, payload);
 
             if terminal_chunk {
-                peer.write_all(&body.seal_chunk(b"")).await.unwrap();
+                peer.write_all(&body.seal_chunk(b"").unwrap())
+                    .await
+                    .unwrap();
             } else if length_prefix {
-                peer.write_all(&body.seal_chunk(b"next")[..1])
+                peer.write_all(&body.seal_chunk(b"next").unwrap()[..1])
                     .await
                     .unwrap();
             }
@@ -705,7 +748,7 @@ async fn response_chunk_length_preserves_typed_carrier_failures_after_payload() 
                 stream.shutdown().await.unwrap();
                 let mut expected = hex(HEADER_WIRE);
                 let mut upload = BodyChunks::new(&session.req_key, &session.req_iv).unwrap();
-                expected.extend(upload.seal_chunk(&[]));
+                expected.extend(upload.seal_chunk(&[]).unwrap());
                 let mut sent = Vec::new();
                 peer.read_to_end(&mut sent).await.unwrap();
                 assert_eq!(sent, expected);
@@ -790,18 +833,51 @@ async fn read_request_header(wire: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
 }
 
 async fn read_first_chunk(wire: &mut (impl AsyncRead + Unpin), header: &[u8]) -> Vec<u8> {
-    let mut upload = BodyChunks::new(
+    let mut upload = upload_chunks(header);
+    read_upload_chunk(wire, &mut upload).await
+}
+
+fn upload_chunks(header: &[u8]) -> BodyChunks {
+    BodyChunks::new(
         header[17..33].try_into().unwrap(),
         header[1..17].try_into().unwrap(),
     )
-    .unwrap();
+    .unwrap()
+}
+
+async fn read_upload_chunk(
+    wire: &mut (impl AsyncRead + Unpin),
+    upload: &mut BodyChunks,
+) -> Vec<u8> {
     let mut len = [0u8; 2];
     wire.read_exact(&mut len).await.unwrap();
-    let mut chunk = vec![0u8; upload.decode_len(len) as usize];
-    wire.read_exact(&mut chunk).await.unwrap();
-    let size = upload.open_chunk(&mut chunk).unwrap();
-    chunk.truncate(size);
-    chunk
+    let length = upload.decode_len(len) as usize;
+    upload.read_chunk(wire, length).await.unwrap()
+}
+
+fn response_wire(header: &[u8], payload: &[u8]) -> Vec<u8> {
+    let resp_key: [u8; 16] = Sha256::digest(&header[17..33])[..16].try_into().unwrap();
+    let resp_iv: [u8; 16] = Sha256::digest(&header[1..17])[..16].try_into().unwrap();
+    let response = [header[33], 0, 0, 0];
+    let mut reply = VmessHandler::seal_aad(
+        &kdf16(&resp_key, KDF_SALT_RESP_LEN_KEY, &[]),
+        &kdf12(&resp_iv, KDF_SALT_RESP_LEN_IV, &[]),
+        &(response.len() as u16).to_be_bytes(),
+        &[],
+    );
+    reply.extend(VmessHandler::seal_aad(
+        &kdf16(&resp_key, KDF_SALT_RESP_KEY, &[]),
+        &kdf12(&resp_iv, KDF_SALT_RESP_IV, &[]),
+        &response,
+        &[],
+    ));
+    reply.extend(
+        BodyChunks::new(&resp_key, &resp_iv)
+            .unwrap()
+            .seal_chunk(payload)
+            .unwrap(),
+    );
+    reply
 }
 
 /// A minimal AEAD server on the far end of a tunneled carrier: it opens the
@@ -816,32 +892,12 @@ async fn dial_over_relays_through_the_carrier() {
             &header[37..45],
             &[CMD_TCP, 0x00, 0x50, addr::ATYP_VMESS.ipv4, 93, 184, 216, 34]
         );
-        let req_iv: [u8; 16] = header[1..17].try_into().unwrap();
-        let req_key: [u8; 16] = header[17..33].try_into().unwrap();
-        let resp_key: [u8; 16] = Sha256::digest(req_key)[..16].try_into().unwrap();
-        let resp_iv: [u8; 16] = Sha256::digest(req_iv)[..16].try_into().unwrap();
-
         assert_eq!(read_first_chunk(&mut server, &header).await, *b"ping");
 
-        let response = [header[33], 0, 0, 0];
-        let mut reply = VmessHandler::seal_aad(
-            &kdf16(&resp_key, KDF_SALT_RESP_LEN_KEY, &[]),
-            &kdf12(&resp_iv, KDF_SALT_RESP_LEN_IV, &[]),
-            &(response.len() as u16).to_be_bytes(),
-            &[],
-        );
-        reply.extend(VmessHandler::seal_aad(
-            &kdf16(&resp_key, KDF_SALT_RESP_KEY, &[]),
-            &kdf12(&resp_iv, KDF_SALT_RESP_IV, &[]),
-            &response,
-            &[],
-        ));
-        reply.extend(
-            BodyChunks::new(&resp_key, &resp_iv)
-                .unwrap()
-                .seal_chunk(b"pong"),
-        );
-        server.write_all(&reply).await.unwrap();
+        server
+            .write_all(&response_wire(&header, b"pong"))
+            .await
+            .unwrap();
         let mut rest = Vec::new();
         server.read_to_end(&mut rest).await.ok();
     });
@@ -1080,4 +1136,5 @@ async fn three_hop_vmess_attributes_a_bad_header_but_not_a_socks_carrier_reset()
     }
 }
 
+mod vmess_uot;
 mod websocket;

@@ -29,7 +29,7 @@ macro_rules! rprx_handlers {
         $emit! {
             $($registry;)?
             VLess, VLessHandler, [with_tunneled_tcp, with_packet, with_tunneled_packet, with_shared, with_warmable];
-            VMess, VmessHandler, [with_tunneled_tcp, with_warmable];
+            VMess, VmessHandler, [with_tunneled_tcp, with_packet, with_tunneled_packet, with_shared, with_tunneled_shared, with_warmable];
         }
     };
 }

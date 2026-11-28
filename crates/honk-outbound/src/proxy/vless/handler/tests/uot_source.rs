@@ -1,4 +1,5 @@
 use super::*;
+use crate::proxy::uot::StreamUotTransport;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // An independent UoT v2 non-connect peer: every byte is spelled out from the
@@ -40,14 +41,15 @@ fn uot_pair(
     target: &str,
     domain: Option<&str>,
     request: &'static [u8],
-) -> (Arc<VlessUotTransport>, tokio::io::DuplexStream) {
+) -> (Arc<StreamUotTransport>, tokio::io::DuplexStream) {
     let (client, server) = tokio::io::duplex(1 << 20);
-    let transport = VlessUotTransport::new(
+    let transport = StreamUotTransport::new(
         Box::new(client),
         sock(target),
-        domain,
+        domain.map(Box::from),
         bytes::Bytes::from_static(request),
         Some(false),
+        None,
     );
     (Arc::new(transport), server)
 }
@@ -64,7 +66,7 @@ async fn read_exact(wire: &mut tokio::io::DuplexStream, len: usize) -> Vec<u8> {
     buffer
 }
 
-async fn recv(transport: &VlessUotTransport) -> (Vec<u8>, SocketAddr) {
+async fn recv(transport: &StreamUotTransport) -> (Vec<u8>, SocketAddr) {
     let mut buffer = vec![0; u16::MAX as usize];
     let (size, peer) = tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -126,12 +128,13 @@ async fn checked_uot_send_retains_setup_before_custody_and_completes_after_custo
         let (mut client, mut wire) = tokio::io::duplex(32);
         let prior = vec![0xee; 32 - free];
         client.write_all(&prior).await.unwrap();
-        let transport = VlessUotTransport::new(
+        let transport = StreamUotTransport::new(
             Box::new(client),
             sock(A),
             None,
             bytes::Bytes::from_static(&A_REQUEST),
             Some(false),
+            None,
         );
         let current = AtomicBool::new(true);
         let allowed = || current.load(Ordering::Acquire);
@@ -179,12 +182,13 @@ async fn checked_uot_first_range_carries_confirmed_request_observation() {
 
     let (client, mut wire) = tokio::io::duplex(64);
     let (carrier, pending) = DeferringCarrier::new(client);
-    let transport = VlessUotTransport::new(
+    let transport = StreamUotTransport::new(
         Box::new(carrier),
         sock(A),
         None,
         bytes::Bytes::from_static(&A_REQUEST),
         Some(false),
+        None,
     );
     let (observer, events) = observed();
     observer
@@ -356,12 +360,13 @@ async fn dropping_a_uot_transport_closes_its_stream() {
 #[tokio::test]
 async fn uot_cancelled_partial_write_poisons_the_shared_stream() {
     let (client, mut wire) = tokio::io::duplex(16);
-    let transport = VlessUotTransport::new(
+    let transport = StreamUotTransport::new(
         Box::new(client),
         sock(A),
         None,
         bytes::Bytes::from_static(&A_REQUEST),
         Some(false),
+        None,
     );
     let stalled = tokio::time::timeout(
         std::time::Duration::from_millis(50),

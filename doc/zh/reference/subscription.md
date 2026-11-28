@@ -291,8 +291,11 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 | Hysteria2 | `password`/`auth`，以及 `obfs: salamander` 与 `obfs-password`。支持上传/下载带宽、`ports`/`mport`/`port-hopping`/`port_hopping` 跳跃端口范围、`hop-interval`/`mhop`、接收窗口、MTU 与 MTU 发现设置。 |
 | TUIC | UUID/密码、拥塞控制、ALPN、接收窗口、MTU。 |
 | AnyTLS | `idle-session-check-interval`、`idle-session-timeout`、`min-idle-session`。 |
+| VMess | `udp-over-tcp` 和 `udp_over_tcp` 均接受布尔值或对象。`true` 或 `{enabled: true, version: 2}` 开启 UoT v2，版本可省略或设为 `0`、`2`。启用其他数据包编码、逐包地址封装或多路复用会导致条目被拒绝。 |
 
-显式关闭的 feature block 按禁用处理，honk 不会把它当成已启用的不支持的 feature。原生支持 UDP 的协议接受 `udp: true`；VMess 没有 UDP 路径，honk 忽略这个声明，节点仍按 TCP 导入。节点模型保留不了显式 UDP 限制时，honk 拒绝导入。
+显式关闭的 feature block 按禁用处理，honk 不会把它当成已启用的不支持的 feature。VMess 单独设置 `udp: true` 时仍仅启用 TCP。`udp: false` 即使在开启 UoT v2 时也会禁用 UDP。节点模型保留不了显式 UDP 限制时，honk 拒绝导入。
+
+启用 VMess UoT 时，非零 `alterId`（别名为 `alter_id`、`alter-id`）或 UoT 对象中生效的未知选项会使条目以 `unsupported-subscription-entry` 跳过。非整数 `version`（包括字符串 `"2"`）会得到 `malformed-subscription-entry`。关闭 UoT 时，带旧版 `alterId` 的 Clash 条目仍可作为纯 TCP 节点导入。v2rayN JSON 导入器仍忽略 `aid`。
 
 TUIC 允许省略密码或使用空密码。Hysteria2 和 Juicity 接受与运行时固定选择一致的 `h3` ALPN。
 
@@ -396,6 +399,7 @@ TLS/SNI、REALITY、WebSocket/gRPC 升级 header、VLESS 数据包选项，以�
 | 来源特有情况 | 导入行为 |
 | --- | --- |
 | WebSocket `transport.headers` | `Host` 保留为独立的 string 字段，重复的 Host 别名会被拒绝。其他 string 值原样保留，空字符串也算；null 忽略，其他类型会让条目被拒绝。名称和值遵循[节点 header 约定](./nodes.md#字段)。 |
+| VMess `udp_over_tcp` | 这是 honk 导入 sing-box 格式条目时接受的扩展。`true` 或含 `enabled: true` 的对象开启 UoT v2，版本可省略或设为整数 `2`。`network: tcp` 禁用 UDP。sing-box 1.12 的 VMess 入站支持 UoT v2，官方 1.12 VMess 出站配置没有这个字段。 |
 | VLESS 未启用 H2MUX/UoT 封装，且没有显式 `packet_encoding` 选择其他路径 | 使用 Single XUDP 并允许 UDP。这是 sing-box 导入的默认值，不是 Auto 的全局含义。 |
 | gRPC 服务名为空或省略 | 保留 sing-box 的空服务名，不使用 honk 的 `GunService` 默认值。 |
 | Hysteria2 提供 `server_ports`，未提供 `server_port` | 以第一个跳跃端口作为名义 endpoint。 |

@@ -45,7 +45,8 @@ Node 模型包含下列字段。分享链接会从协议方案、userinfo、地�
 | `reality_spider_x` | string? | `null` | 存储的 `spx`；REALITY 链接默认设为 `/`。 |
 | `flow` | string? | `null` | VLESS `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`；Shadowrocket `xtls=2` 选择基础 flow。 |
 | `network` | string? | `null` | 受支持协议的数据包 capability；与 VMess JSON `net` 等流传输字段独立。 |
-| `ws_path` / `ws_host` | string? | `null` | WebSocket `path` 与 Host header。 |
+| `udp_over_tcp` | bool | `false`（输出时省略） | 仅用于 VMess。开启且 `network` 允许 UDP 时，使用非连接模式 UoT v2。 |
+| `ws_path` / `ws_host` | string? | `null` | WebSocket 握手时，空路径使用 `/`，相对路径补前导 `/`，保留已有转义和查询串。请求 URI 和 Host 头会给裸 IPv6 地址加上方括号，显式 Host 保留端口。 |
 | `ws_headers` | object | `{}`；输出时省略空 map | 附加的 WebSocket 升级 header。见 [`ws_headers`](#ws_headers)。 |
 | `grpc_service` | string? | `null` | gRPC `serviceName` 或 `service_name`。 |
 | `xhttp` | object? | 省略 | 扁平结构化输入与输出中的规范 XHTTP 参数。见 [`xhttp`](#xhttp)。 |
@@ -283,6 +284,8 @@ protocol|host|port|credential-fingerprint|dial-shape
 
 调优参数与显示元数据不参与派生；例外是改变物理路径的 VLESS 多路复用上限。
 
+VMess 省略 `udp_over_tcp` 或设为 `false` 时沿用原节点 ID，包括 `network: tcp` 的节点。启用 UoT v2 会改变 ID。启用后仅允许 TCP 的节点与允许 UDP 的节点具有不同 ID。
+
 XHTTP 身份还包含有效的 TLS/明文安全配置，以及全部已接受的规范 XHTTP 参数，包括 header、填充和 POST 间隔。输入别名、header 名称大小写与等价范围表示会在派生前规范化。新增 XHTTP 不改变已有 TCP/WS/gRPC 身份材料。
 
 WebSocket 的非空规范 header map 也参与身份派生。header 名称大小写、插入顺序与等值别名不改变身份，值不同则改变身份；省略或空 map 保留原有身份。
@@ -313,7 +316,7 @@ Auto、native、XUDP、Mux.Cool 与关闭 UDP 的节点 ID 不变。直接选择
 | --- | --- | --- | --- | --- |
 | `ss` | `shadowsocks`，仅限 Clash 与 sing-box `type` | 是 | 是 | AEAD 与 Shadowsocks 2022 |
 | `trojan` | — | 是 | 是* | TLS；TCP/WS/gRPC/XHTTP 传输 |
-| `vmess` | — | 是 | 否 | AEAD；TCP/WS/gRPC/XHTTP 与 REALITY；handler 需要 `rprx` |
+| `vmess` | — | 是 | 可配置* | AEAD，可显式开启 UoT v2；TCP/WS/gRPC/XHTTP 与 REALITY；handler 需要 `rprx` |
 | `vless` | — | 是 | 可配置* | 原生 UDP、UoT v2、H2MUX、XUDP、Mux.Cool、Encryption、REALITY 与 Vision；handler 需要 `rprx` |
 | `socks5` | — | 是 | 是 | CONNECT 与 UDP ASSOCIATE |
 | `hysteria2` | — | 是 | 是 | QUIC/H3、salamander、brutal/BBR 与端口跳跃 |
@@ -324,19 +327,20 @@ Auto、native、XUDP、Mux.Cool 与关闭 UDP 的节点 ID 不变。直接选择
 | `block` | — | 否 | 否 | 保留的内置拒绝出站；没有分享链接协议方案 |
 | `chain` | — | 是 | 需要合格的前序跳和出口 | 按顺序经过两个至四个节点拨号。见[链式节点](#链式节点)。 |
 
-`network` 可独立于流传输方式关闭 Trojan、AnyTLS 和 VLESS 的数据包拨号。VMess UDP 尚未实现。
+`network` 可独立于流传输方式关闭 Trojan、AnyTLS、VLESS 和 VMess 的 UDP。VMess 默认只使用 TCP。对端为支持 UoT v2 的 sing-box 或 mihomo 时才应开启此选项。原版 Xray 和 v2ray 的 VMess 使用不同的 UDP 封装，应保持关闭。honk 的 VMess 不支持原生 `CMD_UDP` 或 XUDP。
 
 | 协议 | UDP 行为 |
 | --- | --- |
 | AnyTLS | 拒绝超过 16 KiB 的载荷，与 anytls-go 0.0.13 的中继缓冲区一致。非连接模式 UoT v2 逐数据报携带目的地和服务端的真实源地址。一条流服务一个客户端源的全部目的地；未经请求的回复也保留真实源地址。 |
 | Trojan | 每个客户端源使用一条 associate 流承载全部目的地，返回每个回复的真实源地址。配合服务端可获得 EIM/EIF 行为。各目的地共享队头阻塞，且流故障会影响全部目的地。 |
+| VMess UoT v2 | 带地址的数据报通过 VMess TCP 流传输。与 sing-box 1.12.4 入站的回环测试覆盖单跳 VMess 和 SOCKS5 → VMess 链。 |
 
 SOCKS5 UDP ASSOCIATE 为每个客户端源保持一条控制 TCP 连接和一个中继 socket，该源的所有目的地共用它，并返回每个应答头中的真实远端对端。从未联系过的对端能否到达客户端取决于服务器：Dante 默认的 `udp.connectdst: yes` 仅在只使用过单一目的地期间才会连接其出站 socket。
 
 以下支持 UDP 的代理协议实现 UDP 全锥形：一个客户端源的全部目的地共用一个 association，每个回复都带上真实的远端地址。
 
 - Hysteria2、TUIC、Juicity、SOCKS5，以及 AEAD 与 2022 两种 Shadowsocks；
-- Trojan、AnyTLS；
+- Trojan、AnyTLS，以及开启 UoT v2 的 VMess；
 - VLESS XUDP/Mux.Cool、UoT v2、H2MUX。
 
 VLESS 原生 UDP 是例外，其流只指定一个目标。这包括显式 `native`，以及未启用 Vision 时 UDP/53 和 UDP/443 上的 `auto`。
@@ -348,11 +352,10 @@ VLESS 原生 UDP 是例外，其流只指定一个目标。这包括显式 `nati
 - 协议回退路径不由 H2MUX 或 Xray UDP 池承载。未启用 Vision 的节点里，`packetEncoding=auto` 在 53 和 443 端口使用已连接的原生 UDP。这类流只指定一个目标，所以这两个端口无法实现全锥形。Vision 节点和其他端口使用 Single XUDP。设置 `packetEncoding=xudp`，可以在原本走原生路径的地方显式启用 Single XUDP。
 - Single XUDP 未设为默认值，原因是测得的性能成本。在 loopback 环境中对 sing-box 1.12.4 使用不限速的 1200 字节数据报时，吞吐约为原生路径的一半。每 MB 客户端 CPU 消耗是原生路径的 1.9–3.3 倍，p99.9 尾延迟也更高。中位数与冷启动延迟没有可测量差异。XUDP 还会拒绝超过 7,526 字节的数据报。
 - 当 VLESS 源在不同端口上选了不同路径时，即使在同一节点上，也会按所选路径各有一条 association。例如 Xray UDP 池加上 UDP/443 的 `skip`，443 就走协议回退，而不是池。
-- Trojan、Juicity 和 AnyTLS 把一个源的全部目的地放在一条可靠流上。某个目的地停滞会拖慢同流的其他目的地，写失败会终止所有目的地。数据报 carrier 没有这个问题，例如 Hysteria2、TUIC、Shadowsocks 和 SOCKS5。
+- Trojan、Juicity、AnyTLS 和 VMess UoT v2 把一个源的全部目的地放在一条可靠流上。某个目的地停滞会拖慢同流的其他目的地，写失败会终止所有目的地。数据报 carrier 没有这个问题，例如 Hysteria2、TUIC、Shadowsocks 和 SOCKS5。
 - 53 端口的流不会在数据路径里发布客户端回复的 framing，因此针对 53 端口流的主动回复要靠宿主机转发。
 - 所有客户端源共用一个进程级的外来回复 socket 池，每个对端地址一个 socket。上限按 endpoint 容量算，每个 endpoint 对应七个 socket。达到上限后，新的外来对端会淘汰最久未使用的 socket。清理任务会关闭超过一个 NAT 超时时间未使用的 socket。
 - 一个源最近关闭的 64 个目的地，其回复会被丢弃，honk 不会把它们当作外来回复投递。连接关闭和不可用节点清理都算在内。重新绑定会把目的地移出列表；第 65 次关闭会移除最早的记录。空闲超时和传输错误不加入记录，因此只要源仍存在，这些对端仍可发送外来回复。仍绑定的流不受影响。
-- VMess 没有 UDP 后端。
 
 在支持 `network` 的协议中，扁平结构化输入接受逗号分隔的 `tcp`/`udp`，忽略各项首尾空白和 ASCII 大小写。`tcp` 关闭 UDP；`udp` 与 `tcp,udp` 都允许 UDP。空文本或纯空白规范化为未指定，保留协议的默认 capability。`quic` 等未知值，或非空列表中的空项，会使节点被拒绝。该字段只控制 UDP admission；`udp` 不会额外禁止 TCP。
 
@@ -420,7 +423,9 @@ v2rayN JSON 形式要求 `add`、UUID 格式的 `id`，以及 1 到 65535 之间
 
 用 Base64 编码整个对象，接在 `vmess://` 之后。Base64 后再接 `?query` 或 `#fragment` 会使链接无效；节点名称用 `ps` 或 dae 标签指定。
 
-VMess JSON 的 `net` 和 Shadowrocket 传输参数只选择流传输方式，不再写入数据包网络 capability 字段。未指定数据包限制时，对有 UDP 后端的协议保留原有默认 UDP capability，VMess 没有 UDP 后端。已有的有效空传输字段也保留原始写法。非 XHTTP 传输仍沿用旧行为，忽略无关的导出字段 `mode`、`extra`；这些字段不会选择 XHTTP。传输声明显式冲突时仍会拒绝节点。
+VMess JSON 的 `net` 和 Shadowrocket 的传输参数只选择流传输方式。v2rayN JSON 可用 honk 扩展 `"udp_over_tcp": true` 开启 UoT。省略或设为 `false` 时关闭，其他类型（含 `null`）会导致链接被拒绝。Shadowrocket 的编码地址链接用 `packetEncoding=uot-v2` 开启 UoT，`packetEncoding=none` 保持关闭。`udp=0` 即使在开启 UoT 时也会禁用 UDP。单独设置 `udp=1` 或 Clash 的 `udp: true` 都不会开启 UoT。
+
+已有的有效空传输字段保留原始写法。非 XHTTP 传输忽略无关的导出字段 `mode`、`extra`。传输声明显式冲突时仍会拒绝节点。
 
 VLESS 支持 TCP+REALITY+Vision、TCP+REALITY、TCP+WS、TCP+WS+TLS、TCP+gRPC 与下述 H2 XHTTP 配置方案。未加密 Vision 的 direct-copy 要求使用 TLS 1.3 或 REALITY 的裸 TCP，不能使用 WS/gRPC/XHTTP；加密 Vision 遵循下文的组合规则。
 
@@ -428,7 +433,7 @@ Vision 添加上行填充并移除下行填充。上行 Direct 要求在第一�
 
 #### H2 上的 XHTTP
 
-Trojan、VMess 与 VLESS 共用该出站传输。VMess 仍仅支持 TCP。本实现只支持 H2 上的 XHTTP，不提供完整的 Xray 或 mihomo 配置兼容性。
+Trojan、VMess 与 VLESS 共用该出站传输。单跳 VMess 节点可通过 XHTTP 承载 UoT v2。本实现只支持 H2 上的 XHTTP，不提供完整的 Xray 或 mihomo 配置兼容性。
 
 | 安全模式 | H2 要求 |
 | --- | --- |
@@ -568,7 +573,7 @@ XHTTP 禁止 TCP Mux.Cool，但保留 UDP-only XUDP carrier。已有 VLESS UDP �
 
 TLS/REALITY、flow 或传输声明相互冲突时会拒绝链接，不会静默降级。VLESS 的 `obfs` 仅接受空值/`none`、`websocket` 或 `grpc`，不会把不支持的传输方式当作 TCP。`host` 和 `serviceName`/`service_name` 保留原有回退顺序。显式 SNI 别名在赋值前按原始字节比较：相同值合并，不同值报错，不转换大小写。空值或纯空白的 SNI 和 flow 在派生节点 ID 前规范化为未指定；非空 flow 必须为 `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`。
 
-Clash 导入会比较 `servername`、`server-name` 和 `sni`；记录格式还会比较 `tls-name` 和 `tls-host`，并保留较低优先级的 `obfs_sni` 回退值，包括 Quantumult X 的 WSS Host。记录中的 `off` 仍为无效值。分享链接和 VMess JSON 的 WebSocket `host` 仅作为 Host header 保存；非 WebSocket 传输则将其作为较低优先级的 SNI 回退值。普通 TLS 拨号在连接时按顺序使用显式 `sni`、非空的 WebSocket `Host` 授权（去掉端口）、节点主机名，因此 CDN 前置节点校验的是 header 中的分发域名证书，而不是它的边缘地址。
+Clash 导入会比较 `servername`、`server-name` 和 `sni`；记录格式还会比较 `tls-name` 和 `tls-host`，并保留较低优先级的 `obfs_sni` 回退值，包括 Quantumult X 的 WSS Host。记录中的 `off` 仍为无效值。分享链接和 VMess JSON 的 WebSocket `host` 仅作为 Host header 保存；非 WebSocket 传输则将其作为较低优先级的 SNI 回退值。普通 TLS 依次使用显式 `sni`、去掉端口的非空 WebSocket `Host`、节点主机名。从 `Host` 或节点地址取得 IPv6 字面量时，TLS 使用不带方括号的地址校验证书，并省略 SNI 扩展。使用 CDN 的节点可据此校验 `Host` 中分发域名的证书。
 
 ### Hysteria2
 
@@ -717,7 +722,7 @@ node {
 
 旧版 `vless_mode` URI 语法会被拒绝。解析器也拒绝 `smux`、`multiplex`、`udp-over-tcp`、`packet-encoding`、`packet_encoding`、`packet-addr`、`xudp`、`only-tcp`、Brutal 控制项与 H2 流数量调优等含义不明确的第三方 URI 拼写；只有上表中的精确规范参数会配置这些选择。
 
-非 VLESS 链接把 `packetEncoding=none` 当作不生效的兼容值接受。其他 `packetEncoding` 值或 `vless_mode` key 会使链接被拒绝。
+编码地址形式的 VMess 链接也接受 `packetEncoding=uot-v2`。其他非 VLESS 链接只把 `packetEncoding=none` 当作不生效的兼容值接受。其他 `packetEncoding` 值或 `vless_mode` key 会使链接被拒绝。
 
 #### 目标选择与组合
 
@@ -863,9 +868,9 @@ honk 像连接其他节点一样连接入口的服务器。之后每一跳都在
 限制：
 
 - 多跳 UDP 的每个实体跳都必须满足上文对 **TCP 后续跳**的要求，包括入口。普通 TLS 按域名发现 ECH 配置也受同样限制。仅支持 TCP 的链只要每个实体跳均符合这些要求，就可以作为[组出口路由](./groups.md#经出口的-udp)的前缀。
-- 最后一跳还必须支持隧道内的 UDP。可用的出口是允许 UDP 的 Trojan，或允许 UDP、关闭多路复用且 UDP 编码为 `auto` 或 `native` 的 VLESS。
+- 出口还必须能封装 UDP。可用出口包括允许 UDP 的 Trojan、开启 UoT v2 且允许 UDP 的 VMess，以及允许 UDP、关闭多路复用且编码为 `auto` 或 `native` 的 VLESS。VMess 出口须能经隧道拨号，因此不能使用 XHTTP 或需要按主机名发现 ECH 配置的 TLS。
 - VLESS 隧道出口即使配置为 `auto`，也对所有获准的端口使用原生 UDP。每条流使用独立传输，只接受来自该流目的对端的回复。
-- 配置链使用 Trojan 出口时，同一链运行时内、同一回复地址模式下，同一客户端源的多个目的地可以共用一个关联和接收器。由组出口组成的多跳路由为每条流使用独立传输。折叠成单个节点的路由使用该节点的常规 UDP 传输。
+- 配置链使用 Trojan 或符合条件的 VMess UoT v2 出口时，同一链运行时内、同一回复地址模式下，同一客户端源的多个目的地可以共用一个关联和接收器。由组出口组成的多跳路由为每条流使用独立传输。折叠成单个节点的路由使用该节点的常规 UDP 传输。
 - 链本身没有连接池，也不预热。每次拨号都会经入口打开一个新的逻辑流，入口仍可按自身协议复用已有物理会话。后续各跳（包括出口）会重新握手。
 - 入口服务器按普通节点的规则解析。后续跳的服务器域名随连接请求交给前一跳的服务器解析，honk 不会在本地查找这些地址。
 - dae 中既无节点过滤器、也无子组的组默认纳入全部代理节点，其中也包括链和各实体跳。出口不能直连时，用 `filter` 把它排除。

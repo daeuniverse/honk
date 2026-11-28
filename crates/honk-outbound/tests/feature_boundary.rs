@@ -15,15 +15,22 @@ use tokio::net::TcpListener;
 // Integration tests link the normal library: cfg(test) must not enable its backend.
 #[tokio::test]
 async fn parsed_vless_has_no_backend_without_rprx() {
+    use base64::Engine as _;
+    let vmess_xhttp = format!(
+        "vmess://{}?security=none&type=xhttp&packetEncoding=uot-v2",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode("auto:00000000-0000-4000-8000-000000000001@127.0.0.1:9")
+    );
     for link in [
         "vless://00000000-0000-4000-8000-000000000001@127.0.0.1:9?security=none&mux=h2mux&udp=1",
         "vless://00000000-0000-4000-8000-000000000001@127.0.0.1:9?security=none&type=xhttp",
+        vmess_xhttp.as_str(),
     ] {
-        assert_no_vless_backend(Node::from_share_link(link).unwrap()).await;
+        assert_no_rprx_backend(Node::from_share_link(link).unwrap()).await;
     }
 }
 
-async fn assert_no_vless_backend(node: Node) {
+async fn assert_no_rprx_backend(node: Node) {
     let generation = Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap());
     let fork = generation.fork_for_dns().unwrap();
     let mut ephemeral = NodeRuntime::try_ephemeral_guarded(&node).unwrap();
@@ -71,6 +78,57 @@ async fn assert_no_vless_backend(node: Node) {
     fork.shutdown().await;
     generation.shutdown().await;
     successor.shutdown().await;
+}
+
+#[tokio::test]
+async fn vmess_uot_without_rprx_is_unavailable_for_dial_and_udp_selection() {
+    use honk_config::group::{Group, GroupPolicy};
+    use honk_outbound::alive::{IpVersion, ProbeDomain};
+    use honk_outbound::group::GroupManager;
+
+    let mut node = Node {
+        name: "vmess".into(),
+        host: "127.0.0.1".into(),
+        port: 9,
+        outbound: OutboundConfig::Vmess(VmessConfig {
+            uuid: Some("00000000-0000-4000-8000-000000000001".into()),
+            udp_over_tcp: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    assert!(node.supports_tunneled_udp());
+    assert!(!registry.has_shared_source(node.protocol()));
+    let error = registry
+        .dial_udp_transport(
+            &node,
+            "127.0.0.1:53".parse().unwrap(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<MissingProtocolHandler>().unwrap().0,
+        node.protocol()
+    );
+
+    let socks = Node::from_share_link("socks5://127.0.0.1:1080#socks").unwrap();
+    let group = Group {
+        name: "fallback".into(),
+        policy: GroupPolicy::Fallback,
+        nodes: vec![node.id, socks.id],
+        ..Default::default()
+    };
+    let socks_id = socks.id;
+    let manager = GroupManager::new(&[group], &[node, socks]);
+    let plan = manager.selection_plan_for_domain("fallback", ProbeDomain::DataUdp, IpVersion::V4);
+    assert_eq!(
+        plan.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+        [socks_id]
+    );
 }
 
 #[tokio::test]

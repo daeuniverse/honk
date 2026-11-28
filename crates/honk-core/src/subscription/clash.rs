@@ -205,17 +205,19 @@ fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
                 "mux",
                 "smux",
                 "multiplex",
-                "udp-over-tcp",
-                "udp_over_tcp",
             ],
         )
     {
         return Err("VLESS packet wrappers are unsupported for this protocol");
     }
+    reject_active_unless(
+        mapping,
+        &["udp-over-tcp", "udp_over_tcp"],
+        matches!(protocol, NodeProtocol::VMess | NodeProtocol::VLess),
+        "UDP-over-TCP is unsupported for this protocol",
+    )?;
 
     let udp = yaml_bool_alias(mapping, &["udp"])?;
-    // VMess has no UDP path: `udp: true` there is a capability claim honk
-    // cannot honor, not a restriction, so the node still imports for TCP.
     let udp_restrictable = matches!(
         protocol,
         NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess | NodeProtocol::AnyTLS
@@ -319,6 +321,13 @@ fn apply_protocol(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str
         OutboundConfig::Vmess(config) => {
             config.uuid = yaml_text_alias(mapping, &["uuid"])?.or(password);
             config.encryption = fields::vmess_cipher_alias(mapping, &["encryption", "cipher"])?;
+            config.udp_over_tcp = options::parse_uot(mapping, NodeProtocol::VMess)?;
+            if config.udp_over_tcp
+                && yaml_u64_alias(mapping, &["alterId", "alter_id", "alter-id"])?
+                    .is_some_and(|id| id != 0)
+            {
+                return Err("unsupported legacy VMess alterId with udp-over-tcp");
+            }
         }
         OutboundConfig::Vless(config) => {
             config.uuid = yaml_text_alias(mapping, &["uuid"])?.or(password);
@@ -430,8 +439,7 @@ fn apply_stream(mapping: &Mapping, node: &mut Node, udp: Option<bool>) -> Result
             let network = if udp { "tcp,udp" } else { "tcp" }.to_string();
             match &mut node.outbound {
                 OutboundConfig::Trojan(config) => config.network = Some(network),
-                // VMess has no UDP path, so only an explicit restriction is
-                // representable; `udp: true` keeps the TCP node as-is.
+                // A general UDP capability claim does not opt a VMess peer into UoT.
                 OutboundConfig::Vmess(config) if !udp => config.network = Some(network),
                 OutboundConfig::Vless(config) => config.network = Some(network),
                 _ => {}

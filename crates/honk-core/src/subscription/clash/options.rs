@@ -1,4 +1,5 @@
 use honk_config::node::{Udp443Policy, VlessMultiplex, VlessUdpEncoding};
+use honk_config::types::NodeProtocol;
 use serde_yaml::{Mapping, Value};
 
 use super::super::yaml_value;
@@ -57,6 +58,41 @@ fn parse_xray_multiplex(mapping: &Mapping) -> Result<Option<VlessMultiplex>, &'s
         signed_i16(options, "xudpConcurrency")?,
         udp443,
     )))
+}
+
+pub(super) fn parse_uot(mapping: &Mapping, protocol: NodeProtocol) -> Result<bool, &'static str> {
+    match raw_alias(mapping, &["udp-over-tcp", "udp_over_tcp"])? {
+        None => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(value) if protocol == NodeProtocol::VLess && !active(value) => Ok(false),
+        Some(Value::Mapping(options)) => {
+            let enabled = yaml_value(options, "enabled")
+                .map(|value| {
+                    value
+                        .as_bool()
+                        .ok_or("udp-over-tcp.enabled must be boolean")
+                })
+                .transpose()?
+                .unwrap_or(false);
+            if enabled {
+                for (key, value) in options {
+                    if !matches!(key.as_str(), Some("enabled" | "version")) && active(value) {
+                        return Err("unsupported udp-over-tcp setting");
+                    }
+                }
+                if let Some(version) = yaml_value(options, "version") {
+                    let version = version
+                        .as_u64()
+                        .ok_or("udp-over-tcp.version must be an integer")?;
+                    if !matches!(version, 0 | 2) {
+                        return Err("unsupported udp-over-tcp version");
+                    }
+                }
+            }
+            Ok(enabled)
+        }
+        Some(_) => Err("udp-over-tcp must be boolean or a mapping"),
+    }
 }
 
 pub(in crate::subscription) fn parse_vless_external_options(
@@ -183,38 +219,7 @@ pub(in crate::subscription) fn parse_vless_external_options(
         }
     }
 
-    let mut uot_enabled = false;
-    if let Some(value) =
-        raw_alias(mapping, &["udp-over-tcp", "udp_over_tcp"])?.filter(|value| active(value))
-    {
-        match value {
-            Value::Bool(enabled) => uot_enabled = *enabled,
-            Value::Mapping(options) => {
-                uot_enabled = yaml_value(options, "enabled")
-                    .map(|value| {
-                        value
-                            .as_bool()
-                            .ok_or("VLESS udp-over-tcp.enabled must be boolean")
-                    })
-                    .transpose()?
-                    .unwrap_or(false);
-                if uot_enabled {
-                    let version = yaml_value(options, "version")
-                        .map(|value| {
-                            value
-                                .as_u64()
-                                .ok_or("VLESS udp-over-tcp.version must be an integer")
-                        })
-                        .transpose()?
-                        .unwrap_or(0);
-                    if !matches!(version, 0 | 2) {
-                        return Err("unsupported VLESS udp-over-tcp version");
-                    }
-                }
-            }
-            _ => return Err("VLESS udp-over-tcp must be boolean or a mapping"),
-        }
-    }
+    let uot_enabled = parse_uot(mapping, NodeProtocol::VLess)?;
 
     if h2_multiplex.is_some() && xray_multiplex.is_some() {
         return Err("VLESS H2 and Xray multiplex cannot both be enabled");

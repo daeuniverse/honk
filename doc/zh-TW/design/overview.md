@@ -108,7 +108,7 @@ flowchart TB
 - bypass mark 紀律：撥號、探測、DNS 上游、HTTP 下載、QUIC endpoint 和透明 listener 都會攜帶行程設定的 bypass mark。非零直連規則 mark 會替換 bypass mark 的低 30 位元，並攜帶 `CLASSIFIED_MARK`；策略路由必須使用 `0x3fffffff` 遮罩。accept 之後的 TCP socket 會清除 listener 標記；一般 host-netns `dns.bind` 入口 socket 則有意保持無標記。
 - Anyfrom UDP 回包：代理 UDP 和透明 53 埠的 DNS 回包，使用在 `daens` 中建立並繫結到流量原始目的位址的透明 socket。直接從 TPROXY listener 回包會暴露 `dae0` 源位址，並在返回路徑上失敗。來自其他 full-cone 來源的回覆透過僅含用戶端的 `CLIENT_REPLY_TRACK` 訊框資訊返回，不經過主機轉送。資料路徑也不會因此為用戶端隨後發往該來源的封包學到原生反向方向。
 - DNS 來源邊界：透明入口和 `dns.bind` adapter 從 socket peer 得到邏輯用戶端來源；流關聯查詢使用已通過 admission 的流的來源。快取只有在路由選出與來源無關的 scope 之後才重複使用。每個 policy generation 的網域謂詞投影仍是全域的，不區分來源。
-- UDP source 邊界：來源共享協定的重複使用按以下四項區分：沿用的 runtime、正規化後的 client、協定與 UDP path，以及 actual-peer 或 original-destination 的 reply projection。完整五元組 endpoint map 仍持有 route、token/generation 與逐 flow Score；source association 持有唯一的 receiver 和 transport health。關閉 `rprx` 時，除 VLESS 外各協定的 source ownership 仍可用。
+- UDP source 邊界：來源共享協定的重複使用按以下四項區分：沿用的 runtime、正規化後的 client、協定與 UDP path，以及 actual-peer 或 original-destination 的 reply projection。完整五元組 endpoint map 仍持有 route、token/generation 與逐 flow Score；source association 持有唯一的 receiver 和 transport health。關閉 `rprx` 時，除 VLESS 和 VMess 外各協定的 source ownership 仍可用。
 - 網路名稱空間紀律：行程常駐 host netns。它只透過有作用域且完全同步的 `with_daens_netns` 呼叫進入 `daens`。`setns` 跨度內不得出現 `.await`；還原原名稱空間失敗時，行程必須中止。
 - 資料路徑 admission：在全部 listener FD 釋出、全部接收迴圈執行之前，`DATAPATH_STATE_MAP[0]` 保持關閉；拆除 listener 之前它也會關閉。gate 關閉期間，TC 原樣放行流量。
 - NFQUEUE readiness 與所有權：啟用但尚未 ready 時，只丟棄需要暫存的新流。honk 獨佔佇列 `320` 和 nftables `inet honk_nfqueue` / `udp_decision`。ready 變更必須經過 fence，生命週期有歧義就是 fatal，同一 netns 的防火牆管理器不得修改這些物件。

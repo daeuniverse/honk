@@ -156,7 +156,6 @@ async fn ws_transport_roundtrip(path: &str, expected: &str, with_headers: bool) 
     server.await.unwrap();
 }
 
-#[allow(clippy::result_large_err)]
 #[tokio::test]
 async fn vmess_json_empty_ws_host_uses_endpoint_in_handshake() {
     use base64::Engine as _;
@@ -174,23 +173,64 @@ async fn vmess_json_empty_ws_host_uses_endpoint_in_handshake() {
         base64::engine::general_purpose::STANDARD.encode(payload),
     );
     let node = Node::from_share_link(&link).unwrap();
+    assert_eq!(ws_upgrade_target_and_host(&node).await.1, "example.invalid");
+}
+
+#[tokio::test]
+async fn ws_ipv6_upgrade_preserves_host_and_request_target() {
+    for (endpoint, ws_host, path, expected_target, expected_host) in [
+        ("2001:db8::1", None, "/ws", "/ws", "[2001:db8::1]"),
+        ("[::1]", Some(""), "", "/", "[::1]"),
+        (
+            "edge.example",
+            Some("2001:0DB8::1"),
+            "/",
+            "/",
+            "[2001:0DB8::1]",
+        ),
+        ("[::1]", Some("[::1]:8443"), "/ws", "/ws", "[::1]:8443"),
+        (
+            "edge.example",
+            Some("cdn.example:8443"),
+            "a%2Fb?ed=1&x=a b",
+            "/a%2Fb?ed=1&x=a%20b",
+            "cdn.example:8443",
+        ),
+    ] {
+        let mut node = transport_node(443);
+        node.host = endpoint.into();
+        let transport = node.transport_mut().unwrap();
+        transport.transport = "ws".into();
+        transport.ws_host = ws_host.map(str::to_owned);
+        transport.ws_path = Some(path.into());
+        let (target, host) = ws_upgrade_target_and_host(&node).await;
+        assert_eq!(
+            (target.as_str(), host.as_str()),
+            (expected_target, expected_host)
+        );
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn ws_upgrade_target_and_host(node: &Node) -> (String, String) {
     let (client, server) = tokio::io::duplex(4096);
     let receive = async {
-        let mut host = None;
+        let mut seen = None;
         let callback =
             |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
              response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                host = request.headers().get("host").cloned();
+                seen = Some((
+                    request.uri().path_and_query().unwrap().as_str().to_owned(),
+                    request.headers()["host"].to_str().unwrap().to_owned(),
+                ));
                 Ok(response)
             };
-        let _connection = tokio_tungstenite::accept_hdr_async(server, callback)
-            .await
-            .unwrap();
-        host.unwrap()
+        tokio_tungstenite::accept_hdr_async(server, callback).await?;
+        Ok::<_, anyhow::Error>(seen.unwrap())
     };
-    let (stream, host) = tokio::join!(wrap_ws(&node, Box::new(client), false), receive);
-    let _stream = stream.unwrap();
-    assert_eq!(host, "example.invalid");
+    let (_stream, seen) =
+        tokio::try_join!(wrap_ws(node, Box::new(client), false), receive).unwrap();
+    seen
 }
 
 #[cfg(all(feature = "rprx", feature = "flow-observation"))]

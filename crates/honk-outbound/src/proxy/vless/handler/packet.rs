@@ -1,50 +1,14 @@
 use async_trait::async_trait;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 use crate::proxy::chain::native_udp_writer_handoff;
-use crate::proxy::uot::{AddrDecoder, AddrFraming, Decoder, MAX_PACKET_SIZE};
+use crate::proxy::uot::{Decoder, MAX_PACKET_SIZE, StreamUotTransport};
 use crate::proxy::vless::cool;
 use crate::proxy::{AsyncReadWrite, FramePoison, MultiTargetTransport, PacketTransport};
 
 type Reader = tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>;
-
-struct VlessPacketWriter {
-    stream: tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>,
-    /// UoT request, sent in front of the first datagram.
-    setup: Option<bytes::Bytes>,
-}
-
-impl VlessPacketWriter {
-    /// A partially written frame cannot be resumed, so an interrupted write
-    /// poisons the stream. `observed` publishes the sending flow's first
-    /// request milestone once the frame is delivered; `admitted` is set when
-    /// the frame starts onto the wire.
-    async fn write_frame(
-        &mut self,
-        poison: &FramePoison,
-        frame: &[u8],
-        observed: bool,
-        admitted: Option<&AtomicBool>,
-    ) -> std::io::Result<()> {
-        let write = poison.begin(admitted)?;
-        let stream = &mut self.stream;
-        let write_all = async {
-            stream.write_all(frame).await?;
-            stream.flush().await
-        };
-        if observed {
-            crate::runtime::flow_observation::request_write(std::pin::pin!(write_all)).await?;
-        } else {
-            write_all.await?;
-        }
-        self.setup = None;
-        write.complete();
-        Ok(())
-    }
-}
 
 async fn read_chunk(stream: &mut Reader, chunk: &mut [u8]) -> std::io::Result<usize> {
     let size = stream.read(chunk).await?;
@@ -60,7 +24,7 @@ async fn read_chunk(stream: &mut Reader, chunk: &mut [u8]) -> std::io::Result<us
 /// Native command-UDP: one fixed target, bare `[u16 length][payload]` frames.
 pub(super) struct VlessConnectedTransport {
     reader: tokio::sync::Mutex<(Reader, Decoder)>,
-    writer: tokio::sync::Mutex<VlessPacketWriter>,
+    writer: tokio::sync::Mutex<tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>>,
     poison: FramePoison,
     target: SocketAddr,
     tls_handoff: Option<bool>,
@@ -75,10 +39,7 @@ impl VlessConnectedTransport {
         let (reader, writer) = tokio::io::split(stream);
         Self {
             reader: tokio::sync::Mutex::new((reader, Decoder::default())),
-            writer: tokio::sync::Mutex::new(VlessPacketWriter {
-                stream: writer,
-                setup: None,
-            }),
+            writer: tokio::sync::Mutex::new(writer),
             poison: FramePoison::default(),
             target,
             tls_handoff,
@@ -101,10 +62,14 @@ impl VlessConnectedTransport {
                 .ok_or(crate::proxy::PacketRejection::Policy)?;
             return self
                 .poison
-                .write_checked(&mut writer.stream, &packet, None, tls_handoff, current)
+                .write_checked(&mut *writer, &packet, None, tls_handoff, current)
                 .await;
         }
-        writer.write_frame(&self.poison, &packet, false, None).await
+        let write = self.poison.begin(None)?;
+        writer.write_all(&packet).await?;
+        writer.flush().await?;
+        write.complete();
+        Ok(())
     }
 }
 
@@ -152,176 +117,6 @@ impl PacketTransport for VlessConnectedTransport {
     }
 }
 
-/// Non-connect UoT v2 over a VLESS TCP command stream: the request names the
-/// first destination, then every datagram in both directions carries its own
-/// address, so one stream serves all destinations of a client source and
-/// replies keep their real source. The request and first datagram share one
-/// write; the open-time target is the default for ordinary sends and the only
-/// domain a reply source may project back to.
-pub(crate) struct VlessUotTransport {
-    reader: tokio::sync::Mutex<(Reader, AddrDecoder)>,
-    writer: tokio::sync::Mutex<VlessPacketWriter>,
-    poison: FramePoison,
-    target: SocketAddr,
-    target_domain: Option<Box<str>>,
-    tls_handoff: Option<bool>,
-}
-
-impl VlessUotTransport {
-    pub(super) fn new(
-        stream: Box<dyn AsyncReadWrite>,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        request: bytes::Bytes,
-        tls_handoff: Option<bool>,
-    ) -> Self {
-        let (reader, writer) = tokio::io::split(stream);
-        Self {
-            reader: tokio::sync::Mutex::new((reader, AddrDecoder::new(AddrFraming::UOT_V1))),
-            writer: tokio::sync::Mutex::new(VlessPacketWriter {
-                stream: writer,
-                setup: Some(request),
-            }),
-            poison: FramePoison::default(),
-            target,
-            target_domain: target_domain.map(Box::from),
-            tls_handoff,
-        }
-    }
-
-    /// All sends serialize here so a withdrawn first send leaves setup for the next view.
-    async fn send_inner(
-        &self,
-        target: SocketAddr,
-        domain: Option<&str>,
-        data: &[u8],
-        confirmed: bool,
-        admitted: Option<&AtomicBool>,
-        current: Option<&(dyn Fn() -> bool + Send + Sync)>,
-    ) -> std::io::Result<()> {
-        let mut writer = self.writer.lock().await;
-        let frame = AddrFraming::UOT_V1.encode(
-            writer.setup.as_deref().unwrap_or_default(),
-            target,
-            domain,
-            data,
-            MAX_PACKET_SIZE,
-        )?;
-        if let Some(current) = current {
-            let tls_handoff = self
-                .tls_handoff
-                .ok_or(crate::proxy::PacketRejection::Policy)?;
-            let write = self.poison.write_checked(
-                &mut writer.stream,
-                &frame,
-                admitted,
-                tls_handoff,
-                current,
-            );
-            crate::runtime::flow_observation::request_write(std::pin::pin!(write)).await?;
-            writer.setup = None;
-            return Ok(());
-        }
-        writer
-            .write_frame(&self.poison, &frame, confirmed, admitted)
-            .await
-    }
-}
-
-impl std::fmt::Debug for VlessUotTransport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VlessUotTransport")
-            .field("target", &self.target)
-            .finish_non_exhaustive()
-    }
-}
-
-#[async_trait]
-impl PacketTransport for VlessUotTransport {
-    fn relay_addr(&self) -> SocketAddr {
-        self.target
-    }
-
-    fn allows_full_cone_replies(&self) -> bool {
-        true
-    }
-
-    async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
-        self.send_inner(
-            self.target,
-            self.target_domain.as_deref(),
-            data,
-            false,
-            None,
-            None,
-        )
-        .await
-    }
-
-    async fn send_packet_confirmed(&self, data: &[u8]) -> std::io::Result<()> {
-        self.send_inner(
-            self.target,
-            self.target_domain.as_deref(),
-            data,
-            true,
-            None,
-            None,
-        )
-        .await
-    }
-
-    async fn recv_packet(&self, output: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-        let mut reader = self.reader.lock().await;
-        let (stream, decoder) = &mut *reader;
-        loop {
-            if let Some(frame) =
-                decoder.next_packet(output, self.target, self.target_domain.as_deref())?
-            {
-                match frame.packet {
-                    Some(packet) => return Ok(packet),
-                    None => continue,
-                }
-            }
-            let mut chunk = [0; 16 * 1024];
-            let size = read_chunk(stream, &mut chunk).await?;
-            decoder.push(&chunk[..size])?;
-        }
-    }
-}
-
-#[async_trait]
-impl MultiTargetTransport for VlessUotTransport {
-    async fn send_to(
-        &self,
-        target: SocketAddr,
-        domain: Option<&str>,
-        data: &[u8],
-        confirmed: bool,
-        admitted: Option<&AtomicBool>,
-    ) -> std::io::Result<()> {
-        let domain = crate::proxy::addr::dialed_name(self.target_domain.as_deref(), domain);
-        self.send_inner(target, domain, data, confirmed, admitted, None)
-            .await
-    }
-
-    async fn send_to_checked(
-        &self,
-        target: SocketAddr,
-        domain: Option<&str>,
-        data: &[u8],
-        admitted: Option<&AtomicBool>,
-        current: &(dyn Fn() -> bool + Send + Sync),
-    ) -> std::io::Result<()> {
-        let domain = crate::proxy::addr::dialed_name(self.target_domain.as_deref(), domain);
-        self.send_inner(target, domain, data, true, admitted, Some(current))
-            .await
-    }
-
-    fn frame_stream_torn(&self) -> bool {
-        self.poison.is_set()
-    }
-}
-
 impl VLessHandler {
     /// Non-connect UoT v2 over the retained carrier. Nothing is published
     /// until the returned preparation commits.
@@ -332,7 +127,7 @@ impl VLessHandler {
         domain: Option<&str>,
         timeout: std::time::Duration,
     ) -> anyhow::Result<(
-        Arc<VlessUotTransport>,
+        Arc<StreamUotTransport>,
         crate::proxy::transport::TransportPreparation,
     )> {
         let vless = runtime.node.vless().unwrap();
@@ -349,12 +144,13 @@ impl VLessHandler {
             .prepare_retained_carrier(runtime, uuid, header, timeout)
             .await?;
         Ok((
-            Arc::new(VlessUotTransport::new(
+            Arc::new(StreamUotTransport::new(
                 stream,
                 target,
-                domain,
+                domain.map(Box::from),
                 request,
                 native_udp_writer_handoff(&runtime.node),
+                None,
             )),
             preparation,
         ))

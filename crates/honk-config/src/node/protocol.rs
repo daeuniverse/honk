@@ -208,8 +208,21 @@ pub struct VmessConfig {
     pub uuid: Option<String>,
     pub encryption: Option<String>,
     pub network: Option<String>,
+    pub udp_over_tcp: bool,
     pub transport: StreamTransportOptions,
     pub tls: TlsOptions,
+}
+
+impl VmessConfig {
+    pub fn udp_enabled(&self) -> bool {
+        self.udp_over_tcp
+            && self.network.as_deref().is_none_or(|network| {
+                matches!(
+                    crate::options::vocab::packet_network(network),
+                    Ok(Some(true))
+                )
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -501,6 +514,14 @@ impl OutboundConfig {
             } else {
                 "|xhttp-tls:0"
             });
+        }
+        if let Self::Vmess(config) = self
+            && config.udp_over_tcp
+        {
+            fingerprint.push_str("|uot:v2");
+            if !config.udp_enabled() {
+                fingerprint.push_str("|net:tcp");
+            }
         }
         fingerprint
     }

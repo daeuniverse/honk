@@ -1680,6 +1680,7 @@ fn node_schema_field(field: &str) -> Option<&'static str> {
         "encryption" => "encryption",
         "vless_mode" => "vless_mode",
         "packet_encoding" => "packet_encoding",
+        "udp_over_tcp" => "udp_over_tcp",
         "multiplex" => "multiplex",
         "plugin" => "plugin",
         "plugin_opts" => "plugin_opts",

@@ -40,7 +40,7 @@ fn source_path_selects_shared_exactly_for_the_registered_slots() {
     for (protocol, shared) in [
         (NodeProtocol::SS, true),
         (NodeProtocol::Trojan, true),
-        (NodeProtocol::VMess, false),
+        (NodeProtocol::VMess, cfg!(feature = "rprx")),
         (NodeProtocol::Socks5, true),
         (NodeProtocol::Juicity, true),
         (NodeProtocol::AnyTLS, true),
@@ -53,6 +53,49 @@ fn source_path_selects_shared_exactly_for_the_registered_slots() {
             "{protocol:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn vmess_uot_requires_an_enabled_node_even_with_a_shared_slot() {
+    let vmess = exit_node(
+        "vmess",
+        9,
+        OutboundConfig::Vmess(honk_config::node::VmessConfig {
+            uuid: Some("00000000-0000-4000-8000-000000000001".into()),
+            ..Default::default()
+        }),
+    );
+    let generation =
+        honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&vmess))
+            .unwrap();
+    let registry = production();
+    let target = "127.0.0.1:53".parse().unwrap();
+    let timeout = Duration::from_secs(1);
+    let direct = registry
+        .dial_udp_transport(&vmess, target, None, timeout)
+        .await
+        .unwrap_err();
+    let shared = registry
+        .prepare_shared_source(
+            generation.get(&vmess.id).unwrap(),
+            target,
+            None,
+            timeout,
+            false,
+        )
+        .await
+        .unwrap_err();
+    for error in [direct, shared] {
+        if cfg!(feature = "rprx") {
+            assert!(error.to_string().contains("UDP not supported"), "{error:#}");
+        } else {
+            assert!(
+                error.is::<honk_outbound::proxy::MissingProtocolHandler>(),
+                "{error:#}"
+            );
+        }
+    }
+    generation.shutdown().await;
 }
 
 #[test]

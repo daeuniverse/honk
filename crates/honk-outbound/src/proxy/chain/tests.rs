@@ -520,6 +520,51 @@ async fn an_earlier_hop_target_failure_fails_a_udp_chain_at_the_next_hop() {
 
 #[cfg(feature = "rprx")]
 #[tokio::test]
+async fn vmess_uot_route_checks_exit_before_connect_and_preserves_socks_refusal() {
+    let relay = socks5_relay(Vec::new(), true).await;
+    let front = socks5("front", "127.0.0.1", relay.addr.port());
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    for (enabled, transport, ech, expected) in [
+        (false, "tcp", false, DialFailureScope::LocalRejection),
+        (true, "xhttp", false, DialFailureScope::LocalRejection),
+        (true, "tcp", true, DialFailureScope::LocalRejection),
+        (true, "tcp", false, DialFailureScope::Prefix(1)),
+    ] {
+        let mut cfg = honk_config::node::VmessConfig {
+            uuid: Some("00000000-0000-4000-8000-000000000001".into()),
+            udp_over_tcp: enabled,
+            ..Default::default()
+        };
+        cfg.transport.transport = transport.into();
+        cfg.tls.ech_enabled = ech;
+        cfg.tls.enabled = ech;
+        cfg.tls.sni = ech.then(|| "exit.example".into());
+        let mut exit = node("exit", "127.0.0.1", 9, OutboundConfig::Vmess(cfg));
+        exit.normalize_stream_transport().unwrap();
+        exit.id = exit.derive_id();
+        let route = route(&front, &[&front, &exit]);
+        let generation = Arc::new(OutboundRuntimeRegistry::build(&[front.clone(), exit]).unwrap());
+        let error = registry
+            .dial_udp_route(
+                generation.clone(),
+                &route,
+                target(),
+                None,
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(dial_failure_scope(error.as_ref()), expected, "{error:#}");
+        assert_eq!(
+            relay.requests().len(),
+            usize::from(expected == DialFailureScope::Prefix(1))
+        );
+        generation.shutdown().await;
+    }
+}
+
+#[cfg(feature = "rprx")]
+#[tokio::test]
 async fn socks5_front_carries_a_vless_native_udp_exit() {
     use tokio::io::AsyncWriteExt;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

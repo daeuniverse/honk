@@ -32,6 +32,7 @@
 | --- | --- |
 | Proxy 契約 | `proxy/{error,packet,outbound,registry}.rs` |
 | 協定族 | `proxy/shadowsocks/{mod,aead2022,stream}.rs`；`proxy/vless/{mod,handler,mux,cool,encryption}.rs` |
+| VMess | `proxy/vmess/uot.rs` 準備 UoT 串流，`proxy/vmess/relay.rs` 轉送加密記錄。VMess 與 Trojan 共用 `transport::prepare_transport` 建立底層連線。 |
 | QUIC | `quic/{path_health,flow_control,metrics,endpoint,client,stream,boring}.rs` |
 | AnyTLS | `proxy/anytls/{padding,writer,overflow}.rs` |
 | Score 與健康 | `group/score/{evidence,ranking,feedback}.rs`；`alive/{health,urltest}.rs` |
@@ -102,14 +103,14 @@ native socket 包在 `PacketTransport` 後面；tunnel 協定在自己的真實 
 
 `src/descriptor.rs` 裡的 `ProtocolDescriptor` 是唯一的逐協定事實表。predicate 接
 收具體節點，因為 VLESS 的 `network` 和 TCP path，以及 Trojan 的 transport，會影
-響 capability 或 pooling。Trojan 與 AnyTLS 共用 `network_allows_udp`；VLESS 使用
-規範的 `VlessConfig::udp_enabled()`。
+響 capability 或 pooling。Trojan 與 AnyTLS 共用 `network_allows_udp`。VMess 與 VLESS
+分別使用各自的 `udp_enabled()` 判斷 UDP 能力。
 
 | 協定 | `supports_udp` | `pool_ready_streams` | `pool_bare_tcp` | Generation runtime | 分享連結 scheme |
 | --- | --- | --- | --- | --- | --- |
 | Shadowsocks（含 2022） | 是 | 否 | 是 | `None` | `ss` |
 | Trojan | `network` 預設或包含 `udp` 時 | 僅 `tcp`/空 transport | XHTTP 之外 | `None` | `trojan` |
-| VMess | 否 | 否 | XHTTP 之外 | `None` | `vmess` |
+| VMess | `udp_over_tcp` 為 `true` 且 `network` 允許 UDP 時 | 否 | XHTTP 之外 | `None` | `vmess` |
 | VLESS | `network` 允許 UDP 時 | 否 | direct TCP path 且非 XHTTP | `Vless` | `vless` |
 | SOCKS5 | 是 | 是 | 是 | `None` | `socks5`、`socks4`、`socks4a` |
 | Hysteria2 | 是 | 否 | 否 | `Quic` | `hysteria2`、`hysteria` |
@@ -156,13 +157,13 @@ capability 拒絕，呼叫方可以繼續回退到設定中的冷候選。顯式
 | `socks5` | SOCKS CONNECT | RFC 1928 UDP association。每個用戶端來源有一條控制流和一個連線到中繼的 socket，供其所有目的地共用。每個 header 寫入自己的目的地，每個應答返回真實線路來源（IPv4-mapped IPv6 規範化為 IPv4）。網域來源僅在等於撥號網域且埠一致時才投影為捕獲的目標，其他名字不經 DNS 直接丟棄。傳送時只寫入撥號網域，其他名字以數值目標發出。被截斷、RSV 非零、分片（`FRAG != 0`）或網域不是 UTF-8 的中繼 datagram 只丟棄該包並記 DEBUG；未知 ATYP 或控制流 EOF 結束 association。協商和認證、ASSOCIATE 請求和應答（含中繼網域解析）各有五秒逾時。 |
 | `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing；每個用戶端來源一個已連線的伺服器 socket 與加密狀態，可發往任意目的地（見下文） |
 | `trojan` | 共享 transport 上的 Trojan stream | `network` 允許 UDP 時使用 Trojan UDP framing；每個用戶端來源一條 associate 流，每個 frame 自帶對端位址 |
-| `vmess` | VMess stream | 未實作 |
+| `vmess` | VMess stream | 啟用時以 `CMD_TCP` 連至 `sp.v2.udp-over-tcp.arpa:0`，承載非連線模式的 UoT v2 |
 | `vless` | 由獨立 multiplex policy 選擇 direct、H2 或 Mux.Cool | `network` 允許 UDP 時可用；encoding 與可選 UDP multiplex 決定路徑 |
 | `hysteria2` | QUIC stream | Hysteria2 QUIC datagram |
 | `anytls` | AnyTLS 邏輯 stream | UoT v2 邏輯 stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagram 或 uni-stream fallback |
 | `juicity` | Juicity QUIC stream | 每個用戶端來源一條長度分幀 QUIC bi stream，承載所有目的地 |
-| `chain` | 經各跳的 handler 逐跳撥號；見[鏈式節點](#鏈式節點) | 出口的 `dial_udp_over`（Trojan、VLESS 原生 UDP）；出口為 Trojan 時也可用其 `prepare_shared_source_over` |
+| `chain` | 透過各跳的處理程式依序撥號。見[鏈式節點](#鏈式節點)。 | 符合條件的 Trojan、VMess UoT v2 與原生 UDP VLESS 出口使用 `dial_udp_over`。設定鏈的 Trojan 或 VMess UoT v2 出口也支援 `prepare_shared_source_over`。 |
 
 Shadowsocks 的傳統 AEAD 和 2022 版本用一個 `MultiTargetTransport` 承載同一用戶端
 source 的所有目的地。它只有一個連到伺服器的帶 mark socket 和一份加密狀態。2022
@@ -176,12 +177,9 @@ source 的所有目的地。它只有一個連到伺服器的帶 mark socket 和
 功後提交。外層 socket 仍連線伺服器，所以未經請求的對端能否到達用戶端，取決於伺服器
 端自己的 NAT 行為。
 
-VMess 和 VLESS entry 只在 `rprx` feature 下編譯，`honk-core` 和 `honk-tool` 的預
-設 feature 集啟用了它。不帶 `rprx` 時，這些節點形式仍能解析，但 registry 裡沒有
-對應的 entry，撥號會以普通的 `No handler for protocol` 拒絕。feature-off 建置不
-分配 VLESS runtime pool，也不分配 carrier semaphore。單元測試透過 `cfg(test)` 保
-留 backend 覆蓋；feature 邊界整合測試連結正常的 library，用來驗證這兩種建置的區
-別。
+`honk-core` 與 `honk-tool` 預設啟用 `rprx`。停用後仍可解析 VMess 與 VLESS 節點。
+一般 UDP 群組選路會略過這些葉節點，直接撥號會傳回 `MissingProtocolHandler`。
+此建置不會配置 VLESS 執行階段集區或載體號誌。`cfg(test)` 保留後端單元測試，功能邊界整合測試連結一般建置的函式庫。
 
 ## Runtime 所有權與 reload
 
@@ -294,6 +292,8 @@ TCP -> optional TLS or REALITY -> optional WebSocket, gRPC or XHTTP -> protocol 
 節點以邊緣 IP 為位址，發佈域名只出現在該 header 中。因此，同一條共享路徑為
 Trojan、VMess 和 VLESS 提供一致的 TLS、REALITY、WS、gRPC 和 XHTTP 建立過程。
 
+VMess 與 VLESS 共用 `src/proxy/uot.rs` 的 `StreamUotTransport` 來處理非連線模式的 UoT v2。第一次寫入會合併 UoT 請求與帶有目的位址的首個資料報。需要確認的 VMess 傳送會等到中繼程式對緊鄰的下層寫入端完成整個訊框的 `flush`。各條流分別記錄自己的請求。單跳 XHTTP 選定候選後，先准入中繼工作並發布連線，再送出 VMess 標頭。
+
 如果實體 WebSocket 連線的對端先正常關閉，VMess 就無法再送出空的上行結束記錄。
 只有在完整回應通過驗證、所有應用資料都已轉送時，中繼才會視為正常結束。
 未送出的結束記錄不會計為已傳送；連線仍可寫入時，仍須送出該記錄並清空寫入緩衝區。
@@ -341,6 +341,7 @@ protobuf 單 bytes 欄位 envelope。最多允許一個 16 KiB 的應用訊息�
 
 VMess 在關閉 duplex 半邊前記錄 relay 返回的錯誤，使回應標頭及訊息體解碼
 失敗傳遞到流 owner，而不是變成 EOF。
+VMess TCP 串流與 UoT 關聯在每個方向最多可用 65,536 個 AES-GCM 記錄 nonce。用完後，下一筆需要 nonce 的記錄會傳回 `BrokenPipe`。若要繼續傳輸，須建立新工作階段並使用新金鑰。
 
 #### XHTTP carrier 與邏輯流所有權
 
@@ -546,7 +547,7 @@ empty-first 或 poisoned-child 規則。request 和第一個 datagram 在一次�
 真實 sing-box 1.12.4 的 direct outbound 由第一個目的地決定形態。網域 request 之
 後，同名的逐包 FQDN 會被對映；數值 request 之後，逐包 FQDN 會報
 `invalid AddrPort: missing address`，並終止整個 association。H2MUX PacketAddr、
-AnyTLS、Trojan、SOCKS5 和 Shadowsocks 適用同一規則，即 `addr::dialed_name`。
+VMess UoT v2、AnyTLS、Trojan、SOCKS5 和 Shadowsocks 適用同一規則，即 `addr::dialed_name`。
 Juicity 未改動，也無法驗證，因為沒有 juicity-server 可用。
 
 型別化的 policy、size 和 carrier-capacity 拒絕都是終態的本地結果，與擁塞或
@@ -601,7 +602,7 @@ Mux.Cool 給各 scope 分配不同的 child SID，這些 SID 可以共享實體 
 Hysteria2 在 scope 的不同目的地之間複用一個 Session ID，TUIC 複用一個
 association ID。不同 scope 可以共用實體 QUIC connection，但不共用邏輯
 association。關閉 `rprx` 時，這些 QUIC source 路徑以及它們的 shutdown join 仍可
-用；只有 VLESS 分支依賴這個 feature。
+用。VMess 與 VLESS 都需要 `rprx`。
 
 Hysteria2 和 TUIC 的兩種接收模式都用既有的有界重組器保留實際回包來源。Hysteria2
 各分片的來源必須一致。TUIC 的後續分片可以省略位址，等第零片提供來源，即使第零片
@@ -610,7 +611,7 @@ Hysteria2 和 TUIC 的兩種接收模式都用既有的有界重組器保留實�
 foreign IP。TUIC 的零長度 payload 仍是 datagram；Hysteria2 保留既有的空入站
 payload 拒絕。保留來源並不保證遠端 NAT 的對映或過濾行為。
 
-`MultiTargetTransport` 是 Shadowsocks、Juicity、SOCKS5、Trojan、AnyTLS 和 VLESS
+`MultiTargetTransport` 是 Shadowsocks、Juicity、SOCKS5、Trojan、AnyTLS、VMess UoT v2 和 VLESS
 UoT v2/H2MUX 共用的通用 source transport。Hysteria2、TUIC 和 VLESS XUDP/Mux.Cool
 保留具體分支，使傳送路徑不被裝箱。每個用戶端來源為其所有目的地持有一條邏輯
 association：一個 Shadowsocks socket 與加密 session、一條 Juicity 雙向流、一條
@@ -1028,7 +1029,7 @@ runtime 准入會驗證這些繫結。`build_reusing_with_admission` 先建置�
 
 UDP 重複使用 `dial_chain` 的逐跳撥號，將最後一跳的載體交給 `PacketOutbound::dial_udp_over` 或 `SharedSourceOutbound::prepare_shared_source_over`。封裝節點會檢查 UDP 目的連接埠，並執行該協定的回覆驗證。符合條件的隧道 VLESS 即使使用 `auto`，也會採用原生封裝。
 
-`descriptor::carries_udp(UdpPath)` 對一般節點與單跳折疊使用 `Own(node)`，透過 `Tunneled { exit }` 檢查多跳路徑出口的封裝能力。前序每個實體跳點（包括入口）都必須符合 `Node::supports_tunneled_dial()`，繫結路徑上的處理程式也必須可執行。設定的 Trojan 出口鏈提供 `tunneled_shared` 槽，安裝後的來源關聯持有唯一接收器與建立時的路徑准入，各端點檢視結算各自的 Score。群組出口多跳路由和隧道 VLESS 會依流建立傳輸。單跳折疊沿用節點自己的來源關聯規則，路徑證據仍由選定該路徑的檢視持有。
+`descriptor::carries_udp(UdpPath)` 對一般節點與單跳折疊使用 `Own(node)`，透過 `Tunneled { exit }` 檢查多跳路徑出口的封裝能力。前序每個實體跳點（包括入口）都必須符合 `Node::supports_tunneled_dial()`，繫結路徑上的處理程式也必須可執行。設定鏈的 Trojan 或符合條件的 VMess UoT v2 出口提供 `tunneled_shared` 槽，安裝後的來源關聯持有唯一接收器與建立時的路徑准入，各端點檢視結算各自的 Score。群組出口多跳路由和隧道 VLESS 會依流建立傳輸。單跳折疊沿用節點自己的來源關聯規則，路徑證據仍由選定該路徑的檢視持有。
 
 UDP 健康狀態依准入的實體路徑、健康域和位址族判斷。準備及傳送完成都不會提供 UDP 成功證據，回覆送達後才能確認路徑。型別化傳輸故障可以定位到實體跳點或有序前綴，見[出口存活](../reference/groups.md#出口存活)。
 

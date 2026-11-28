@@ -448,6 +448,54 @@ mod tests {
     }
 
     #[test]
+    fn sing_box_vmess_uot_versions_and_restrictions() {
+        let parse = |fields: &str| {
+            let body = format!(
+                r#"{{"outbounds":[{{"type":"vmess","tag":"n","server":"example.com","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111",{fields}}}]}}"#
+            );
+            parse_json_subscription(json(&body), None)
+        };
+        for (fields, uot, udp) in [
+            (r#""network":"udp""#, false, false),
+            (r#""udp_over_tcp":false"#, false, false),
+            (r#""udp_over_tcp":true"#, true, true),
+            (r#""udp_over_tcp":{"enabled":true,"version":2}"#, true, true),
+            (r#""udp_over_tcp":true,"network":"tcp""#, true, false),
+        ] {
+            let nodes = parse(fields).unwrap();
+            let config = nodes[0].vmess().unwrap();
+            assert_eq!(
+                (config.udp_over_tcp, config.udp_enabled()),
+                (uot, udp),
+                "{fields}"
+            );
+        }
+        for value in [
+            r#"{"enabled":true,"version":1}"#,
+            r#"{"enabled":true,"version":0}"#,
+            r#"{"enabled":true,"other":false}"#,
+            r#""true""#,
+        ] {
+            assert!(
+                parse(&format!(r#""udp_over_tcp":{value}"#)).is_err(),
+                "{value}"
+            );
+        }
+        for field in [
+            r#""packet_encoding":"xudp""#,
+            r#""multiplex":{"enabled":true}"#,
+            r#""global_padding":true"#,
+            r#""authenticated_length":true"#,
+            r#""alter_id":1"#,
+        ] {
+            assert!(
+                parse(&format!(r#""udp_over_tcp":true,{field}"#)).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
     fn sing_box_rejects_removed_vless_mode_before_projection() {
         assert!(matches!(
             sing_box::normalize(json(r#"{"type":"vless","vless_mode":null}"#)),

@@ -394,7 +394,7 @@ impl NodeRuntime {
 
     fn build_xhttp(node: &Node) -> Option<Arc<crate::proxy::transport::xhttp::XhttpRuntime>> {
         #[cfg(not(any(feature = "rprx", test)))]
-        if node.protocol() == honk_config::types::NodeProtocol::VLess {
+        if !crate::proxy::ProxyRegistry::builtin_protocol_available(node.protocol()) {
             return None;
         }
         crate::proxy::transport::xhttp::XhttpRuntime::new(node)
