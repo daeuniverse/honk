@@ -221,32 +221,43 @@ fn record_mtu_discovery_folds_all_boolean_claims() {
             for (options, expected) in [
                 (
                     "disable-mtu-discovery=YES,disable_mtu_discovery=1",
-                    Some(true),
+                    Ok(true),
                 ),
                 (
                     "disablePathMTUDiscovery=on,disable-path-mtu-discovery=true,disable_path_mtu_discovery=1",
-                    Some(true),
+                    Ok(true),
                 ),
                 (
                     "disable_mtu_discovery=no,disable-mtu-discovery=0",
-                    Some(false),
+                    Ok(false),
                 ),
-                ("disable_mtu_discovery=1,disable-mtu-discovery=off", None),
+                (
+                    "disable_mtu_discovery=1,disable-mtu-discovery=off",
+                    Err("record boolean aliases conflict"),
+                ),
                 (
                     "disable_mtu_discovery=invalid,disable_mtu_discovery=false",
-                    None,
+                    Err("record boolean option is invalid"),
                 ),
             ] {
                 let body = format!("{header},{options}\nsurvivor=socks5,other.example,1080");
-                let mut nodes = parse_records_subscription(&body, None).unwrap();
+                let mut diagnostics = Vec::new();
+                let mut nodes = crate::subscription::parse_subscription_content_with_diagnostics(
+                    &Default::default(),
+                    &body,
+                    &mut diagnostics,
+                )
+                .unwrap();
                 assert_eq!(nodes.pop().unwrap().name, "survivor");
-                assert_eq!(
-                    nodes
-                        .first()
-                        .map(|n| n.quic().unwrap().disable_mtu_discovery),
-                    expected,
-                    "{header},{options}"
-                );
+                let actual = match (nodes.as_slice(), diagnostics.as_slice()) {
+                    ([node], []) => Ok(node.quic().unwrap().disable_mtu_discovery),
+                    ([], [error]) => {
+                        assert_eq!(error.code, "malformed-subscription-entry");
+                        Err(error.message)
+                    }
+                    _ => panic!("unexpected nodes or diagnostics for {header},{options}"),
+                };
+                assert_eq!(actual, expected, "{header},{options}");
             }
         }
     }

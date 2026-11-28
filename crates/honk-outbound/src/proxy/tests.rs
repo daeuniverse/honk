@@ -63,7 +63,7 @@ pub(super) async fn assert_pmtud_after_echo(
             stream.stream.write_u8(byte).await.unwrap();
             assert_eq!(stream.stream.read_u8().await.unwrap(), byte);
         }
-        // Wait for peer ACK progress before accepting a zero probe count.
+        // An idle connection can report zero probes; wait for peer ACK progress.
         loop {
             let path = conn.stats().path;
             if path.acked_ack_eliciting_packets > acked_before

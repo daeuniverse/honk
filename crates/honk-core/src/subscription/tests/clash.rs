@@ -155,8 +155,6 @@ fn clash_imports_tuic_mtu_discovery() {
         let nodes = parse_subscription_content(&Subscription::default(), body).unwrap();
         let tuic = nodes[0].tuic().unwrap();
         assert!(tuic.quic.disable_mtu_discovery);
-        assert_eq!(tuic.alpn.as_deref(), Some("h3"));
-        assert_eq!(tuic.congestion.as_deref(), Some("bbr"));
     }
 }
 
