@@ -36,6 +36,28 @@ impl Realm {
     }
 
     pub(super) fn output_header(
+        &mut self,
+        path: ReturnPath,
+        physical_ifindex: u32,
+        ipv6: bool,
+    ) -> io::Result<honk_datapath::forward::EthernetHeader> {
+        let single = self.members.len() == 1;
+        if single
+            && let Some((saved, ifindex, family, header)) = self.reply_header
+            && saved == path
+            && ifindex == physical_ifindex
+            && family == ipv6
+        {
+            return Ok(header);
+        }
+        let header = self.validated_output_header(path, physical_ifindex, ipv6)?;
+        if single {
+            self.reply_header = Some((path, physical_ifindex, ipv6, header));
+        }
+        Ok(header)
+    }
+
+    fn validated_output_header(
         &self,
         path: ReturnPath,
         physical_ifindex: u32,
@@ -275,7 +297,7 @@ pub(super) fn submit_member_output(
     path: ReturnPath,
     output: OutputLease,
 ) -> io::Result<Option<OutputLease>> {
-    let header = realm.output_header(path, ifindex, output.packet()[0] >> 4 == 6)?;
+    let header = realm.validated_output_header(path, ifindex, output.packet()[0] >> 4 == 6)?;
     let length = header.len() + output.packet().len();
     if !port.tx_packet_credit(class, length) {
         return Ok(Some(output));

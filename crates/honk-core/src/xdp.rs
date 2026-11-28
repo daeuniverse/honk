@@ -309,6 +309,12 @@ struct Realm {
     link: LogicalLink,
     driver: PacketDriver,
     generated: Option<(usize, usize)>,
+    reply_header: Option<(
+        ReturnPath,
+        u32,
+        bool,
+        honk_datapath::forward::EthernetHeader,
+    )>,
     pending: [Option<(OutputLease, ReturnPath)>; 2],
 }
 
@@ -1259,6 +1265,7 @@ async fn run_capture(
                 device,
                 link,
                 generated,
+                reply_header: None,
                 driver: drivers.swap_remove(index),
                 pending: [None, None],
             };

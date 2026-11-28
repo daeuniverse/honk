@@ -122,6 +122,7 @@ impl LinkPath {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct EthernetHeader {
     bytes: [u8; 22],
     len: usize,

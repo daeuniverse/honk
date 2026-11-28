@@ -387,6 +387,7 @@ async fn start_runtime(
                 device,
                 link,
                 generated,
+                reply_header: None,
                 driver: drivers.swap_remove(index),
                 pending: [None, None],
             };

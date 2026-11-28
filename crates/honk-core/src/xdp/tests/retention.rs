@@ -181,6 +181,7 @@ fn output_realm(driver: PacketDriver, reply: ReturnPath, mtu: usize) -> Realm {
         },
         device: reply.device,
         generated: generated_layout(link),
+        reply_header: None,
         link,
         driver,
         pending: [None, None],
@@ -1181,6 +1182,7 @@ async fn endpoint_realms_keep_each_output_on_its_actual_device_and_vlan_path() {
                 },
                 driver,
                 generated: Some((22, 1522)),
+                reply_header: None,
                 pending: [None, None],
             };
             let source: SocketAddr = "192.0.2.10:41000".parse().unwrap();
@@ -1217,6 +1219,37 @@ async fn endpoint_realms_keep_each_output_on_its_actual_device_and_vlan_path() {
                 assert_eq!(&header[6..12], &realm.link.mac);
                 assert_eq!(&header[14..16], &reply_path.vlan_tci[0].to_be_bytes());
                 assert_eq!(&header[18..20], &reply_path.vlan_tci[1].to_be_bytes());
+                let repeated = realm.output_header(selected, ifindex, false).unwrap();
+                assert_eq!(&*repeated, &*header);
+                let mut qos = selected;
+                qos.vlan_tci[0] ^= 0xb000;
+                let changed = realm.output_header(qos, ifindex, false).unwrap();
+                assert_eq!(&changed[14..16], &qos.vlan_tci[0].to_be_bytes());
+                let mut other = qos;
+                other.mac[5] ^= 2;
+                let v6 = realm.output_header(other, ifindex, true).unwrap();
+                assert_eq!(&v6[..6], &other.mac);
+                assert_eq!(&v6[20..22], &0x86ddu16.to_be_bytes());
+                let v4 = realm.output_header(other, ifindex, false).unwrap();
+                assert_eq!(&v4[20..22], &0x0800u16.to_be_bytes());
+                assert!(realm.output_header(other, ifindex + 1, false).is_err());
+                for invalid in [
+                    ReturnPath {
+                        vlan_count: 1,
+                        ..other
+                    },
+                    ReturnPath {
+                        vlan_proto: [0; 2],
+                        ..other
+                    },
+                    ReturnPath {
+                        vlan_tci: [0; 2],
+                        ..other
+                    },
+                ] {
+                    assert!(realm.output_header(invalid, ifindex, false).is_err());
+                }
+                assert_eq!(&*realm.output_header(other, ifindex, false).unwrap(), &*v4);
                 let mut wrong = selected;
                 wrong.device = 1 - device;
                 assert!(realm.output_header(wrong, ifindex, false).is_err());
@@ -1263,6 +1296,7 @@ async fn realm_capacity_fallback_and_pending_head_never_export_a_suffix() {
             },
             driver,
             generated: Some((22, 1522)),
+            reply_header: None,
             pending: [None, None],
         };
         let destination: SocketAddr = "192.0.2.10:41000".parse().unwrap();
