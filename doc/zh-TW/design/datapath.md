@@ -9,6 +9,7 @@
 單佇列以 `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR|IFF_TUN_EXCL` 建立非持久化介面。多佇列的第一個 FD 加上 `IFF_MULTI_QUEUE`，其餘 FD 以該位元附加到同一介面，且省略 `IFF_TUN_EXCL`。核對每個 FD 的名稱空間、介面名稱、ifindex、附加旗標與 10 位元組小端序 vnet 標頭。僅啟用 `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`。所有工作任務就緒且最終 FD 與 netlink 回讀通過（符合設定的佇列數且無停用佇列）後，才發布擷取路由。收據分別記錄建立、附加與佇列數回讀。
 
 多佇列由一個協調任務管理，每個佇列各有一個 Tokio 工作任務與一個 `PacketDriver`。非分片封包在其規範擁有者的佇列上直接處理，其他封包透過事先計入記憶體預算的有界 FIFO 交接。佇列 0 重組 IP 分片，完整封包攜帶 `RxMeta::VERIFY` 與重組完成時的接收時間。其他封包保留原接收中繼資料與時間。FIFO 滿時記錄容量丟棄。每個分片從自己的 FD 寫回，讓 Linux 可將已建立的流量導向該佇列。
+關閉時 `TUN handoff stopped` 按目的佇列及裝置彙總本地處理與成功跨佇列投遞的 TCP、UDP、分片、重組完成及其他輸入。`inbox_full` 與 `pool_empty` 分別統計收件佇列已滿及共享池耗盡，`max_inbox_depth` 與 `max_pool_in_use` 記錄尖峰用量。
 
 任何工作任務或 FD 發生致命錯誤時，關閉整個裝置的准入。停止時先撤下精確的擷取路由，等待工作任務結束並關閉所有 FD，確認介面消失後才移除防護與收據。清理未經確認時保留防護與收據。
 

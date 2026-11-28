@@ -255,6 +255,15 @@ impl PacketRealm {
         let Ok(ip) = view.parse_ip() else {
             return Ok((&self.owners()[0], None));
         };
+        self.dispatch_parsed_owner(local, view, &ip)
+    }
+
+    pub(crate) fn dispatch_parsed_owner(
+        &self,
+        local: usize,
+        view: PacketView<'_>,
+        ip: &wire::IpPacket,
+    ) -> io::Result<(&PacketScope, Option<TcpClaim>)> {
         let (worker, claim) = match ip.proto {
             wire::PROTO_UDP => {
                 let mut port = [0; 2];
@@ -290,7 +299,7 @@ impl PacketRealm {
                         == wire::tcp::SYN,
                 )?
             }
-            wire::PROTO_ICMP | wire::PROTO_ICMPV6 => (self.quoted_worker(view, &ip), None),
+            wire::PROTO_ICMP | wire::PROTO_ICMPV6 => (self.quoted_worker(view, ip), None),
             _ => (0, None),
         };
         Ok((&self.owners()[worker], claim))

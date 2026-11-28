@@ -109,6 +109,7 @@ Queue 0 owns IP reassembly and forwards completed packets to their canonical own
 `RxMeta::VERIFY` and the completion ingress timestamp. Ordinary packets preserve their RX
 metadata and ingress time. A full inbox counts a capacity drop. Each owner writes replies
 on its own FD, allowing Linux to steer established traffic toward that queue.
+At shutdown, `TUN handoff stopped` reports each destination queue and a device total. Local and successfully enqueued cross-queue dispatches distinguish TCP, UDP, fragments, reassembled packets and other input. `inbox_full` and `pool_empty` count distinct refusals. `max_inbox_depth` and `max_pool_in_use` record peak queue and shared-cell occupancy.
 
 TX funds 65,535-byte CPU frames separately from logical MTU; MSS/PMTU and ordinary
 UDP MTU behavior do not increase. Every output includes a 10-byte vnet header,

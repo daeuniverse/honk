@@ -268,6 +268,20 @@ async fn cross_queue_fragments_visit_owner_zero_then_deliver_once_on_canonical_f
                     .is_err()
             );
         }
+        let handoffs = &f.queues[0].handoffs;
+        assert_eq!(
+            handoffs.inboxes[0].cross[Dispatch::FragmentToOwner0 as usize].load(Ordering::Relaxed),
+            8
+        );
+        assert_eq!(
+            handoffs.inboxes[1].cross[Dispatch::ReassembledToOwner as usize]
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            handoffs.inboxes[1].local[Dispatch::Udp as usize].load(Ordering::Relaxed),
+            0
+        );
         f.finish().await;
     })
     .await
@@ -345,13 +359,21 @@ async fn same_queue_raw_is_inline_and_remote_raw_keeps_metadata_and_storage() {
             let (n, _) = upstream.recv_from(&mut received).await.unwrap();
             assert_eq!(&received[..n], body);
         }
+        assert_eq!(
+            f.queues[0].handoffs.inboxes[1].local[Dispatch::Udp as usize].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            f.queues[0].handoffs.inboxes[1].cross[Dispatch::Udp as usize].load(Ordering::Relaxed),
+            2
+        );
         // Fill the canonical inbox, then drive the foreign FD with a genuine datagram.
         // No FIFO head is evicted and no other Stack may deliver the refused input.
         let now = Instant::now();
         for i in 0..PER_QUEUE {
             f.queues[0]
                 .handoffs
-                .send(1, &[i as u8], None, RxMeta::VERIFY, now);
+                .send(1, Dispatch::Other, &[i as u8], None, RxMeta::VERIFY, now);
         }
         let len = wire::udp::emit_packet(
             &mut bytes,
@@ -375,6 +397,23 @@ async fn same_queue_raw_is_inline_and_remote_raw_keeps_metadata_and_storage() {
                 .capacity_drops
                 .load(Ordering::Relaxed),
             2
+        );
+        assert_eq!(
+            f.queues[0].handoffs.inboxes[1]
+                .inbox_full
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            f.queues[0].handoffs.inboxes[1]
+                .pool_empty
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            f.queues[0].handoffs.inboxes[0].local[Dispatch::FragmentToOwner0 as usize]
+                .load(Ordering::Relaxed),
+            1
         );
         assert_eq!(f.inbox(1).len(), PER_QUEUE);
         assert!(
@@ -417,11 +456,19 @@ fn queue_capacity_is_prepaid_shared_and_refunded_after_last_owner() {
     for target in 0..2 {
         for i in 0..PER_QUEUE {
             raw.fill(i as u8);
-            shared.send(target, &raw, None, RxMeta::VERIFY, now);
+            shared.send(target, Dispatch::Other, &raw, None, RxMeta::VERIFY, now);
         }
     }
-    shared.send(2, &raw, None, RxMeta::VERIFY, now);
+    shared.send(2, Dispatch::Other, &raw, None, RxMeta::VERIFY, now);
     assert_eq!(shared.inboxes[2].capacity_drops.load(Ordering::Relaxed), 1);
+    assert_eq!(shared.inboxes[2].pool_empty.load(Ordering::Relaxed), 1);
+    assert_eq!(shared.inboxes[2].inbox_full.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        shared.inboxes[0].max_inbox_depth.load(Ordering::Relaxed),
+        PER_QUEUE
+    );
+    assert_eq!(shared.inboxes[2].max_inbox_depth.load(Ordering::Relaxed), 0);
+    assert_eq!(shared.max_pool_in_use.load(Ordering::Relaxed), CELLS);
     assert!(shared.inboxes[2].records.lock().is_empty());
     assert!(shared.free.lock().is_empty());
     for target in 0..2 {
@@ -434,13 +481,71 @@ fn queue_capacity_is_prepaid_shared_and_refunded_after_last_owner() {
             shared.free.lock().push(record.cell);
         }
     }
-    shared.send(2, &raw, None, RxMeta::VERIFY, now);
+    shared.send(2, Dispatch::Other, &raw, None, RxMeta::VERIFY, now);
     assert_eq!(shared.inboxes[2].records.lock().len(), 1);
+    assert_eq!(
+        shared.inboxes[2].cross[Dispatch::Other as usize].load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(shared.inboxes[2].max_inbox_depth.load(Ordering::Relaxed), 1);
+    assert_eq!(shared.max_pool_in_use.load(Ordering::Relaxed), CELLS);
     drop(ceiling);
     drop(workers);
     assert_eq!(budget.used(), cost);
     drop(shared);
     assert_eq!(budget.used(), 0);
+}
+
+#[tokio::test]
+async fn tcp_and_local_reassembly_are_counted_at_the_dispatch_boundary() {
+    let mut f = Fixture::new().await;
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = peer.local_addr().unwrap();
+    let src = f.client(0);
+    let home = f.realm.worker_for_tcp(src, dst);
+    let mut bytes = [0; 64];
+    let n = wire::tcp::emit_packet(
+        &mut bytes,
+        src.ip(),
+        dst.ip(),
+        &wire::tcp::Header {
+            src_port: src.port(),
+            dst_port: dst.port(),
+            seq: 5,
+            ack: 1,
+            flags: wire::tcp::ACK,
+            window: 4096,
+            urgent: 0,
+            options: Default::default(),
+        },
+        [&[], &[]],
+    )
+    .unwrap();
+    let now = Instant::now();
+    f.input(home, &bytes[..n], now).await;
+    f.input((home + 1) % 3, &bytes[..n], now).await;
+    f.drain(home);
+    for packet in fragments(src, dst, &[0x41; 1800]) {
+        f.input(0, &packet, now).await;
+    }
+    let inboxes = &f.queues[0].handoffs.inboxes;
+    assert_eq!(
+        inboxes[home].local[Dispatch::Tcp as usize].load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        inboxes[home].cross[Dispatch::Tcp as usize].load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        inboxes[0].local[Dispatch::FragmentToOwner0 as usize].load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(
+        inboxes[0].local[Dispatch::ReassembledToOwner as usize].load(Ordering::Relaxed),
+        1
+    );
+    f.finish().await;
 }
 
 #[tokio::test]

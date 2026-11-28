@@ -15,7 +15,7 @@ use std::{
     os::fd::AsRawFd,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::Instant,
@@ -24,6 +24,17 @@ use tokio::io::unix::AsyncFd;
 
 const CELLS: usize = 64;
 const PER_QUEUE: usize = 32;
+
+#[derive(Clone, Copy)]
+enum Dispatch {
+    Tcp,
+    Udp,
+    FragmentToOwner0,
+    ReassembledToOwner,
+    Other,
+}
+
+const KINDS: usize = Dispatch::Other as usize + 1;
 
 struct Record {
     // A raw record owns its bytes. A completion moves its original funded packet and uses
@@ -37,19 +48,33 @@ struct Record {
 struct Inbox {
     records: Mutex<VecDeque<Record>>,
     ready: AtomicWaker,
-    capacity_drops: std::sync::atomic::AtomicU64,
+    capacity_drops: AtomicU64,
+    local: [AtomicU64; KINDS],
+    cross: [AtomicU64; KINDS],
+    inbox_full: AtomicU64,
+    pool_empty: AtomicU64,
+    max_inbox_depth: AtomicUsize,
 }
 
 struct Handoffs {
     free: Mutex<Vec<Vec<u8>>>,
     inboxes: Vec<Inbox>,
+    max_pool_in_use: AtomicUsize,
     _memory: MemoryReservation,
+}
+
+// Writers hold the same pool or inbox lock that supplied this depth.
+fn record_peak(peak: &AtomicUsize, depth: usize) {
+    if depth > peak.load(Ordering::Relaxed) {
+        peak.store(depth, Ordering::Relaxed);
+    }
 }
 
 impl Handoffs {
     fn send(
         &self,
         target: usize,
+        kind: Dispatch,
         raw: &[u8],
         complete: Option<OwnedPacket>,
         meta: RxMeta,
@@ -57,12 +82,14 @@ impl Handoffs {
     ) {
         let inbox = &self.inboxes[target];
         let mut records = inbox.records.lock();
-        let cell = if records.len() < PER_QUEUE {
-            self.free.lock().pop()
-        } else {
-            None
-        };
-        if let Some(mut cell) = cell {
+        let refused = if records.len() >= PER_QUEUE {
+            &inbox.inbox_full
+        } else if let Some(mut cell) = {
+            let mut free = self.free.lock();
+            let cell = free.pop();
+            record_peak(&self.max_pool_in_use, CELLS - free.len());
+            cell
+        } {
             cell.clear();
             cell.extend_from_slice(raw);
             let wake = records.is_empty();
@@ -72,12 +99,17 @@ impl Handoffs {
                 meta,
                 ingress_at,
             });
+            inbox.cross[kind as usize].fetch_add(1, Ordering::Relaxed);
+            record_peak(&inbox.max_inbox_depth, records.len());
             drop(records);
             if wake {
                 inbox.ready.wake();
             }
             return;
-        }
+        } else {
+            &inbox.pool_empty
+        };
+        refused.fetch_add(1, Ordering::Relaxed);
         drop(records);
         let count = inbox
             .capacity_drops
@@ -95,13 +127,82 @@ impl Handoffs {
 
 impl Drop for Handoffs {
     fn drop(&mut self) {
+        let mut total_local = [0u64; KINDS];
+        let mut total_cross = [0u64; KINDS];
+        let mut full = 0u64;
+        let mut empty = 0u64;
+        let mut peak = 0;
+        let pool_peak = *self.max_pool_in_use.get_mut();
         for (queue, inbox) in self.inboxes.iter_mut().enumerate() {
-            let capacity_drops = *inbox.capacity_drops.get_mut();
-            if capacity_drops != 0 {
-                tracing::info!(queue, capacity_drops, "TUN handoff stopped");
+            let local = std::array::from_fn(|k| *inbox.local[k].get_mut());
+            let cross = std::array::from_fn(|k| *inbox.cross[k].get_mut());
+            let inbox_full = *inbox.inbox_full.get_mut();
+            let pool_empty = *inbox.pool_empty.get_mut();
+            let depth = *inbox.max_inbox_depth.get_mut();
+            log_counts(
+                Some(queue),
+                local,
+                cross,
+                inbox_full,
+                pool_empty,
+                depth,
+                pool_peak,
+            );
+            for k in 0..KINDS {
+                total_local[k] = total_local[k].saturating_add(local[k]);
+                total_cross[k] = total_cross[k].saturating_add(cross[k]);
             }
+            full = full.saturating_add(inbox_full);
+            empty = empty.saturating_add(pool_empty);
+            peak = peak.max(depth);
         }
+        log_counts(None, total_local, total_cross, full, empty, peak, pool_peak);
     }
+}
+
+fn log_counts(
+    queue: Option<usize>,
+    local: [u64; KINDS],
+    cross: [u64; KINDS],
+    inbox_full: u64,
+    pool_empty: u64,
+    max_inbox_depth: usize,
+    max_pool_in_use: usize,
+) {
+    let [
+        local_tcp,
+        local_udp,
+        local_fragment_to_owner0,
+        local_reassembled_to_owner,
+        local_other,
+    ] = local;
+    let [
+        cross_tcp,
+        cross_udp,
+        cross_fragment_to_owner0,
+        cross_reassembled_to_owner,
+        cross_other,
+    ] = cross;
+    tracing::info!(
+        scope = if queue.is_some() { "queue" } else { "total" },
+        queue,
+        local_tcp,
+        local_udp,
+        local_fragment_to_owner0,
+        local_reassembled_to_owner,
+        local_other,
+        cross_tcp,
+        cross_udp,
+        cross_fragment_to_owner0,
+        cross_reassembled_to_owner,
+        cross_other,
+        inbox_full,
+        pool_empty,
+        capacity_drops = inbox_full.saturating_add(pool_empty),
+        max_inbox_depth,
+        max_pool_in_use,
+        "TUN handoff stopped"
+    );
 }
 
 pub(super) struct QueueIo {
@@ -144,11 +245,17 @@ impl QueueIo {
                 records: Mutex::new(records),
                 ready: AtomicWaker::new(),
                 capacity_drops: Default::default(),
+                local: Default::default(),
+                cross: Default::default(),
+                inbox_full: Default::default(),
+                pool_empty: Default::default(),
+                max_inbox_depth: Default::default(),
             });
         }
         let handoffs = Arc::new(Handoffs {
             free: Mutex::new(free),
             inboxes,
+            max_pool_in_use: Default::default(),
             _memory: memory,
         });
         let mut workers = Vec::new();
@@ -272,15 +379,26 @@ impl ReceiveTurn<'_> {
     }
 
     fn raw(&self, packet: &[u8], meta: RxMeta, ingress_at: Instant) -> io::Result<()> {
-        // dispatch_owner maps fragments (before transport parsing) to owner zero.
-        let (owner, _) = self
-            .realm
-            .dispatch_owner(self.index, wire::PacketView::from_slice(packet))?;
-        let target = owner.worker();
+        let view = wire::PacketView::from_slice(packet);
+        let (target, kind) = match view.parse_ip() {
+            Ok(ip) => {
+                let (owner, _) = self.realm.dispatch_parsed_owner(self.index, view, &ip)?;
+                let kind = match ip.proto {
+                    wire::PROTO_TCP => Dispatch::Tcp,
+                    wire::PROTO_UDP => Dispatch::Udp,
+                    _ => Dispatch::Other,
+                };
+                (owner.worker(), kind)
+            }
+            Err(wire::ParseError::Fragment) => (0, Dispatch::FragmentToOwner0),
+            Err(_) => (0, Dispatch::Other),
+        };
         if target != self.index {
-            self.handoffs.send(target, packet, None, meta, ingress_at);
+            self.handoffs
+                .send(target, kind, packet, None, meta, ingress_at);
             return Ok(());
         }
+        self.handoffs.inboxes[target].local[kind as usize].fetch_add(1, Ordering::Relaxed);
         if let Some(complete) = self.local(packet, meta, ingress_at)? {
             self.completed(complete)?;
         }
@@ -310,10 +428,13 @@ impl ReceiveTurn<'_> {
             .realm
             .dispatch_owner(0, wire::PacketView::from_slice(&packet))?;
         if owner.worker() == 0 {
+            self.handoffs.inboxes[0].local[Dispatch::ReassembledToOwner as usize]
+                .fetch_add(1, Ordering::Relaxed);
             self.admit(&packet, RxMeta::VERIFY, ingress_at, Instant::now())
         } else {
             self.handoffs.send(
                 owner.worker(),
+                Dispatch::ReassembledToOwner,
                 &[],
                 Some(packet),
                 RxMeta::VERIFY,

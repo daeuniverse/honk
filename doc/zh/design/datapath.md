@@ -88,6 +88,7 @@ Endpoint/WireGuard 信任规则不变。借用 UDP 在下一次 read 前经 fund
 有界 FIFO 传递自有报文。队列 0 负责 IP 重组，以 `RxMeta::VERIFY` 和重组完成入站时间
 将完整报文交给规范归属者。普通报文保留原 RX 元数据和入站时间。FIFO 满时计数并丢包。
 每个归属者用自己的 FD 写回，Linux 据此可将已建立的流导向该队列。
+关机时 `TUN handoff stopped` 按目标队列和整机汇总本地处理及成功跨队列投递的 TCP、UDP、分片、重组完成和其他输入。`inbox_full` 和 `pool_empty` 分别统计收件队列满和共享池空，`max_inbox_depth` 和 `max_pool_in_use` 记录峰值占用。
 
 TX 为 CPU frame 单独计费 65,535 字节容量，不放大逻辑 MTU、MSS/PMTU 或普通
 UDP MTU。所有输出均带 10 字节 vnet 头，包括普通 ACK/UDP/control；一次 writev

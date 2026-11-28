@@ -51,3 +51,4 @@ Added
 - Keep gateway and Host routing bytecode independent of the TC flow-recording setting.
 - Distribute UDP from one client IP across XDP and TUN workers by source port. Traffic from one client socket and its replies use the same worker across destinations.
 - Apply current gateway policy to opening TCP connections whose previous conntrack generation has ended.
+- Report TUN dispatch locality, inbox and shared pool refusals, and peak occupancy per queue and device at shutdown.
