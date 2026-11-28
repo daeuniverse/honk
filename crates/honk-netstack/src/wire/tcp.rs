@@ -273,7 +273,7 @@ pub(crate) fn emit_header_only(
     let checksum = if partial {
         ck.fold()
     } else {
-        ck.add(head);
+        sum_header(&mut ck, hdr, head);
         for part in parts {
             ck.add(part);
         }
@@ -311,7 +311,7 @@ fn emit_parts(
         }
         head[16..18].copy_from_slice(&ck.fold().to_be_bytes());
     } else {
-        ck.add(head);
+        sum_header(&mut ck, hdr, head);
         for part in payload {
             ck.copy_add(&mut body[offset..offset + part.len()], part);
             offset += part.len();
@@ -319,6 +319,25 @@ fn emit_parts(
         head[16..18].copy_from_slice(&ck.finish().to_be_bytes());
     }
     Some(total)
+}
+
+fn sum_header(ck: &mut Checksum, hdr: &Header, head: &[u8]) {
+    let offset_flags = ((head.len() as u16 / 4) << 12) | u16::from(hdr.flags);
+    let mut sum = u64::from(hdr.src_port)
+        + u64::from(hdr.dst_port)
+        + u64::from(hdr.seq)
+        + u64::from(hdr.ack)
+        + u64::from(offset_flags)
+        + u64::from(hdr.window)
+        + u64::from(hdr.urgent);
+    if hdr.flags & SYN == 0 && hdr.options.sack.is_empty() {
+        if let Some((val, echo)) = hdr.options.timestamps {
+            sum += 0x0101_080a + u64::from(val) + u64::from(echo);
+        }
+    } else {
+        ck.add(&head[FIXED_LEN..]);
+    }
+    ck.accumulate(sum);
 }
 
 fn write_header(head: &mut [u8], hdr: &Header, syn: bool) {
@@ -386,6 +405,38 @@ mod tests {
         assert!(!s.push(9, 10));
         assert_eq!(s.len(), 4);
         assert_eq!(s.as_slice()[3], (3, 4));
+    }
+
+    #[test]
+    fn full_header_checksum_matches_wire_for_every_flag_and_option_layout() {
+        let parts = [&b"abc"[..], &b"defg"[..]];
+        for (src, dst) in pairs() {
+            for flags in 0..=u8::MAX {
+                for timestamps in [None, Some((u32::MAX, 0x80ff_ff80))] {
+                    for sack in [SackBlocks::new(), sack3()] {
+                        let mut hdr = base();
+                        hdr.flags = flags;
+                        hdr.urgent = 0xfedc;
+                        hdr.options = Options {
+                            timestamps,
+                            sack,
+                            mss: Some(1460),
+                            wscale: Some(7),
+                            sack_permitted: true,
+                        };
+                        let packet = emit(src, dst, &hdr, parts);
+                        let seg = &packet[parse_ip(&packet).unwrap().payload];
+                        let mut reference = pseudo_bytes(src, dst, PROTO_TCP, seg.len());
+                        reference.extend_from_slice(seg);
+                        assert_eq!(naive_checksum(&reference), 0);
+                        let mut head = [0xa5; 128];
+                        let n =
+                            emit_header_only(&mut head, src, dst, &hdr, 7, &parts, false).unwrap();
+                        assert_eq!(&head[..n], &packet[..n]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

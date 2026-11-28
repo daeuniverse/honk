@@ -26,7 +26,7 @@ fn sum_blocks(blocks: &[[u8; BLOCK]]) -> u16 {
     fold16(low + u64::from(carry))
 }
 
-fn fold16(mut a: u64) -> u16 {
+pub(super) fn fold16(mut a: u64) -> u16 {
     while a >> 16 != 0 {
         a = (a & 0xFFFF) + (a >> 16);
     }
@@ -45,7 +45,7 @@ impl Checksum {
         Self::default()
     }
 
-    fn accumulate(&mut self, v: u64) {
+    pub(super) fn accumulate(&mut self, v: u64) {
         let (s, carry) = self.acc.overflowing_add(v);
         self.acc = s + u64::from(carry);
     }

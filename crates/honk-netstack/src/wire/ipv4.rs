@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr};
 
-use super::checksum::checksum;
+use super::checksum::{checksum, fold16};
 use super::{IpPacket, ParseError};
 
 pub const HEADER_LEN: usize = 20;
@@ -22,7 +22,18 @@ pub fn parse_prefix(pkt: &[u8], packet_len: usize) -> Result<IpPacket, ParseErro
     if ihl < HEADER_LEN || pkt.len() < ihl || total < ihl || total > packet_len {
         return Err(ParseError::Malformed);
     }
-    if checksum(&pkt[..ihl]) != 0 {
+    let valid = if ihl == HEADER_LEN {
+        let words = pkt.first_chunk::<HEADER_LEN>().unwrap().as_chunks::<4>().0;
+        fold16(
+            words
+                .iter()
+                .map(|&w| u64::from(u32::from_be_bytes(w)))
+                .sum(),
+        ) == u16::MAX
+    } else {
+        checksum(&pkt[..ihl]) == 0
+    };
+    if !valid {
         return Err(ParseError::Checksum);
     }
     if u16::from_be_bytes([pkt[6], pkt[7]]) & FRAGMENT_BITS != 0 {
@@ -81,10 +92,17 @@ fn emit_raw(
     h[6..8].copy_from_slice(&frag_field.to_be_bytes());
     h[8] = 64;
     h[9] = proto;
-    h[10..12].copy_from_slice(&[0, 0]);
     h[12..16].copy_from_slice(&src.octets());
     h[16..20].copy_from_slice(&dst.octets());
-    let ck = checksum(h);
+    let ck = !fold16(
+        0x4500
+            + u64::from(total)
+            + u64::from(id)
+            + u64::from(frag_field)
+            + u64::from(u16::from_be_bytes([64, proto]))
+            + u64::from(u32::from(src))
+            + u64::from(u32::from(dst)),
+    );
     h[10..12].copy_from_slice(&ck.to_be_bytes());
     Some(HEADER_LEN)
 }
@@ -112,6 +130,26 @@ mod tests {
         b[11] = 0;
         let ck = checksum(&b[..usize::from(b[0] & 0xF) * 4]);
         b[10..12].copy_from_slice(&ck.to_be_bytes());
+    }
+
+    #[test]
+    fn fixed_header_checksum_matches_wire_bytes() {
+        let mut header = [0xa5; HEADER_LEN];
+        for (id, field, proto, len) in [(0, DF, 6, 0), (0xffff, MF | 31, 255, 65_515)] {
+            emit_raw(
+                &mut header,
+                Ipv4Addr::BROADCAST,
+                Ipv4Addr::LOCALHOST,
+                proto,
+                len,
+                id,
+                field,
+            )
+            .unwrap();
+            let actual = u16::from_be_bytes([header[10], header[11]]);
+            header[10..12].fill(0);
+            assert_eq!(actual, super::super::testutil::naive_checksum(&header));
+        }
     }
 
     #[test]
