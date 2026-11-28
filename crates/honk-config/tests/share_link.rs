@@ -1251,6 +1251,82 @@ fn test_tuic_alpn_and_congestion_params() {
 }
 
 #[test]
+fn quic_mtu_discovery_share_link_aliases() {
+    for protocol in ["tuic", "juicity", "hysteria2"] {
+        for (query, expected) in [
+            ("disable-mtu-discovery=1", true),
+            ("disable_mtu_discovery=TrUe", true),
+            ("disablePathMTUDiscovery=true", true),
+            ("disablePathMTUDiscovery=0&disable_mtu_discovery=1", false),
+            ("disable-mtu-discovery=0&disable_mtu_discovery=1", true),
+            ("disable_mtu_discovery=1&disablePathMTUDiscovery=", false),
+            (
+                "disable_mtu_discovery=1&disable_mtu_discovery=invalid",
+                false,
+            ),
+            ("disable-mtu-discovery=false&disable-mtu-discovery=1", true),
+            ("disablePathMTUDiscovery=%20true%20", false),
+            ("", false),
+        ] {
+            let link = format!("{protocol}://{UUID_A}:secret@example.com:443?mtu=1300&{query}");
+            let node = Node::from_share_link(&link).unwrap();
+            let quic = node.quic().unwrap();
+            assert_eq!(quic.disable_mtu_discovery, expected, "{protocol}: {query}");
+            assert_eq!(quic.mtu, Some(1300));
+        }
+    }
+}
+
+#[test]
+fn quic_mtu_discovery_flat_round_trip() {
+    use serde_json::Value;
+    const OLD: &str = "hy2_disable_mtu_discovery";
+    const SHARED: &str = "quic_disable_mtu_discovery";
+
+    for protocol in ["hysteria2", "tuic", "juicity"] {
+        for (legacy, shared) in [
+            (None, None),
+            (None, Some(false)),
+            (None, Some(true)),
+            (Some(true), None),
+            (Some(false), Some(false)),
+            (Some(true), Some(true)),
+        ] {
+            let hy2 = protocol == "hysteria2";
+            if legacy.is_some() && !hy2 {
+                continue;
+            }
+            let mut input = flat_credential_fixture(protocol);
+            input["password"] = "secret".into();
+            if let Some(value) = legacy {
+                input[OLD] = Value::Bool(value);
+            }
+            if let Some(value) = shared {
+                input[SHARED] = Value::Bool(value);
+            }
+            let node: Node = serde_json::from_value(input).unwrap();
+            let disabled = shared.or(legacy).unwrap_or(false);
+            assert_eq!(node.quic().unwrap().disable_mtu_discovery, disabled);
+            let wire = serde_json::to_value(&node).unwrap();
+            assert_eq!(wire.get(SHARED), disabled.then_some(&Value::Bool(true)));
+            let old = if hy2 && disabled {
+                Value::Bool(true)
+            } else {
+                Value::Null
+            };
+            assert_eq!(wire.get(OLD), Some(&old));
+            for restored in [
+                serde_json::from_value::<Node>(wire).unwrap(),
+                serde_yaml::from_str(&serde_yaml::to_string(&node).unwrap()).unwrap(),
+                toml::from_str(&toml::to_string(&node).unwrap()).unwrap(),
+            ] {
+                assert_eq!(restored, node);
+            }
+        }
+    }
+}
+
+#[test]
 fn test_vless_packet_encoding_query() {
     for (query, expected) in [
         ("", VlessUdpEncoding::Auto),

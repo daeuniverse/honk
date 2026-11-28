@@ -621,14 +621,15 @@ fn apply_quic(
                 yaml_duration_alias(mapping, &["hop-interval", "hop_interval", "mhop"])?;
             config.init_stream_recv_window = yaml_u64_alias(mapping, STREAM_WINDOW_KEYS)?;
             config.init_conn_recv_window = yaml_u64_alias(mapping, CONN_WINDOW_KEYS)?;
-            config.disable_mtu_discovery = yaml_bool_alias(
+            config.quic.disable_mtu_discovery = yaml_bool_alias(
                 mapping,
                 &[
                     "disable-mtu-discovery",
                     "disable-path-mtu-discovery",
                     "disablePathMTUDiscovery",
                 ],
-            )?;
+            )?
+            .unwrap_or(false);
         }
         OutboundConfig::Tuic(config) => {
             config.congestion = yaml_text_alias(

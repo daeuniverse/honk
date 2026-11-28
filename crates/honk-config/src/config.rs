@@ -1711,6 +1711,7 @@ fn node_schema_field(field: &str) -> Option<&'static str> {
         "hy2_init_stream_recv_window" => "hy2_init_stream_recv_window",
         "hy2_init_conn_recv_window" => "hy2_init_conn_recv_window",
         "hy2_disable_mtu_discovery" => "hy2_disable_mtu_discovery",
+        "quic_disable_mtu_discovery" => "quic_disable_mtu_discovery",
         "quic_mtu" => "quic_mtu",
         "tuic_uuid" => "tuic_uuid",
         "tuic_password" => "tuic_password",

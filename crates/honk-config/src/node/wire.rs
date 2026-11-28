@@ -157,6 +157,8 @@ struct FlatNode {
     #[serde(default)]
     hy2_disable_mtu_discovery: Option<bool>,
     #[serde(default)]
+    quic_disable_mtu_discovery: Option<bool>,
+    #[serde(default)]
     quic_mtu: Option<u16>,
     #[serde(default)]
     tuic_uuid: Option<String>,
@@ -442,6 +444,10 @@ impl FlatNode {
         );
         strip!(self.tls_pin_sha256.is_some() && !tls, tls_pin_sha256);
         strip!(self.quic_mtu.is_some() && !quic, quic_mtu);
+        strip!(
+            self.quic_disable_mtu_discovery.is_some() && !quic,
+            quic_disable_mtu_discovery
+        );
 
         let tuic = self.protocol == NodeProtocol::Tuic;
         strip!(self.tuic_uuid.is_some() && !tuic, tuic_uuid);
@@ -553,6 +559,19 @@ impl FlatNode {
                 "XHTTP options require a stream protocol",
             ));
         }
+        if self.protocol == NodeProtocol::Hysteria2 {
+            self.quic_disable_mtu_discovery = coalesce_equal(
+                [
+                    Ok(self.hy2_disable_mtu_discovery.take()),
+                    Ok(self.quic_disable_mtu_discovery.take()),
+                ],
+                "MTU discovery aliases must agree",
+            )
+            .map_err(|message| {
+                ValidationFailure::new(Some("quic_disable_mtu_discovery"), message)
+                    .into_detailed(source.clone(), setting.clone())
+            })?;
+        }
         self.strip_protocol_incompatible_fields(diagnostics, source, setting);
         if self.protocol == NodeProtocol::VMess {
             self.encryption = crate::options::vocab::vmess_cipher(self.encryption.as_deref())
@@ -651,10 +670,10 @@ impl FlatNode {
                     hop_interval: flat.hy2_hop_interval,
                     init_stream_recv_window: flat.hy2_init_stream_recv_window,
                     init_conn_recv_window: flat.hy2_init_conn_recv_window,
-                    disable_mtu_discovery: flat.hy2_disable_mtu_discovery,
                     quic: QuicOptions {
                         tls,
                         mtu: flat.quic_mtu,
+                        disable_mtu_discovery: flat.quic_disable_mtu_discovery.unwrap_or(false),
                     },
                 })
             }
@@ -670,6 +689,7 @@ impl FlatNode {
                     quic: QuicOptions {
                         tls,
                         mtu: flat.quic_mtu,
+                        disable_mtu_discovery: flat.quic_disable_mtu_discovery.unwrap_or(false),
                     },
                 })
             }
@@ -681,6 +701,7 @@ impl FlatNode {
                     quic: QuicOptions {
                         tls,
                         mtu: flat.quic_mtu,
+                        disable_mtu_discovery: flat.quic_disable_mtu_discovery.unwrap_or(false),
                     },
                 })
             }
@@ -787,6 +808,8 @@ struct WireOptions<'a> {
     hy2_init_stream_recv_window: Option<u64>,
     hy2_init_conn_recv_window: Option<u64>,
     hy2_disable_mtu_discovery: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quic_disable_mtu_discovery: Option<bool>,
     quic_mtu: Option<u16>,
     tuic_uuid: Option<&'a str>,
     tuic_password: Option<&'a str>,
@@ -900,7 +923,8 @@ impl<'a> WireOptions<'a> {
                 wire.hy2_hop_interval = config.hop_interval;
                 wire.hy2_init_stream_recv_window = config.init_stream_recv_window;
                 wire.hy2_init_conn_recv_window = config.init_conn_recv_window;
-                wire.hy2_disable_mtu_discovery = config.disable_mtu_discovery;
+                wire.hy2_disable_mtu_discovery = config.quic.disable_mtu_discovery.then_some(true);
+                wire.quic_disable_mtu_discovery = wire.hy2_disable_mtu_discovery;
                 wire.quic_mtu = config.quic.mtu;
                 wire.set_tls(&config.quic.tls);
             }
@@ -914,6 +938,7 @@ impl<'a> WireOptions<'a> {
                 wire.tuic_init_stream_recv_window = config.init_stream_recv_window;
                 wire.tuic_init_conn_recv_window = config.init_conn_recv_window;
                 wire.quic_mtu = config.quic.mtu;
+                wire.quic_disable_mtu_discovery = config.quic.disable_mtu_discovery.then_some(true);
                 wire.set_tls(&config.quic.tls);
             }
             OutboundConfig::Juicity(config) => {
@@ -922,6 +947,7 @@ impl<'a> WireOptions<'a> {
                 wire.juicity_uuid = config.uuid.as_deref();
                 wire.juicity_password = config.password.as_deref();
                 wire.quic_mtu = config.quic.mtu;
+                wire.quic_disable_mtu_discovery = config.quic.disable_mtu_discovery.then_some(true);
                 wire.set_tls(&config.quic.tls);
             }
             OutboundConfig::AnyTls(config) => {

@@ -320,6 +320,34 @@ fn structured_node_failure_retains_its_semantic_field() {
 }
 
 #[test]
+fn quic_mtu_discovery_errors_name_the_shared_field() {
+    use serde_json::json;
+    for (shared, code) in [
+        (json!(false), "invalid-config-value"),
+        (json!("PRIVATE_INVALID"), "invalid-structured-config"),
+    ] {
+        let body = json!({"nodes": [{
+            "name": "hy2", "protocol": "hysteria2", "address": "example.invalid:443",
+            "port": 443, "password": "PRIVATE_SECRET", "hy2_disable_mtu_discovery": true,
+            "quic_disable_mtu_discovery": shared,
+        }]});
+        let mut diagnostics = Vec::new();
+        let error = honk_config::Config::from_json_str_with_detailed_diagnostics(
+            &body.to_string(),
+            &mut diagnostics,
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostic.code, code);
+        assert_eq!(
+            error.diagnostic.setting.to_string(),
+            "nodes[1].quic_disable_mtu_discovery"
+        );
+        assert_eq!(error.diagnostic.value, SafeValue::Redacted);
+        assert!(!format!("{diagnostics:?}{error}").contains("PRIVATE"));
+    }
+}
+
+#[test]
 fn node_entry_diagnostics_keep_coordinates_before_intrinsic_validation() {
     let first = " skip_cert_verify: 'socks5://127.0.0.1:1080'\n";
     let remaining = concat!(

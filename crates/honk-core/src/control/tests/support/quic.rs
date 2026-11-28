@@ -80,6 +80,7 @@ impl QuicUdpPeer {
         let endpoint = quinn::Endpoint::server(config, bind)?;
         let address = endpoint.local_addr()?;
         let quic = honk_config::node::QuicOptions {
+            disable_mtu_discovery: mode == QuicUdpMode::Hysteria2,
             tls: honk_config::node::TlsOptions {
                 skip_cert_verify: true,
                 ..Default::default()
@@ -94,7 +95,6 @@ impl QuicUdpPeer {
             outbound: if mode == QuicUdpMode::Hysteria2 {
                 OutboundConfig::Hysteria2(honk_config::node::Hysteria2Config {
                     auth: Some("source-test-password".into()),
-                    disable_mtu_discovery: Some(true),
                     quic,
                     ..Default::default()
                 })

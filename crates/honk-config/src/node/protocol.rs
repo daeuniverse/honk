@@ -179,6 +179,7 @@ impl StreamTransportOptions {
 pub struct QuicOptions {
     pub tls: TlsOptions,
     pub mtu: Option<u16>,
+    pub disable_mtu_discovery: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -235,7 +236,6 @@ pub struct Hysteria2Config {
     pub hop_interval: Option<u64>,
     pub init_stream_recv_window: Option<u64>,
     pub init_conn_recv_window: Option<u64>,
-    pub disable_mtu_discovery: Option<bool>,
     pub quic: QuicOptions,
 }
 
@@ -371,6 +371,24 @@ impl OutboundConfig {
             | Self::Direct
             | Self::Block
             | Self::Chain(_) => None,
+        }
+    }
+
+    pub fn quic(&self) -> Option<&QuicOptions> {
+        match self {
+            Self::Hysteria2(config) => Some(&config.quic),
+            Self::Tuic(config) => Some(&config.quic),
+            Self::Juicity(config) => Some(&config.quic),
+            _ => None,
+        }
+    }
+
+    pub fn quic_mut(&mut self) -> Option<&mut QuicOptions> {
+        match self {
+            Self::Hysteria2(config) => Some(&mut config.quic),
+            Self::Tuic(config) => Some(&mut config.quic),
+            Self::Juicity(config) => Some(&mut config.quic),
+            _ => None,
         }
     }
 

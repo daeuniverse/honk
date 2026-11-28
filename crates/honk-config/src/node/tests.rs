@@ -172,6 +172,10 @@ fn test_protocol_identity_goldens() {
             _ => {}
         }
         assert_eq!(node.derive_id().to_string(), expected, "{name}");
+        if let Some(quic) = node.quic_mut() {
+            quic.disable_mtu_discovery = true;
+            assert_eq!(node.derive_id().to_string(), expected, "{name}");
+        }
     }
 }
 

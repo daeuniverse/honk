@@ -401,6 +401,49 @@ mod node_collection_admission {
     }
 
     #[test]
+    fn incompatible_quic_mtu_discovery_fields_warn_only_for_present_claims() {
+        use honk_config::diagnostic::{DiagnosticSources, SettingPath};
+        use honk_config::node::NodeSeed;
+        use serde::de::DeserializeSeed as _;
+        use serde_json::json;
+
+        let old = "hy2_disable_mtu_discovery";
+        let shared = "quic_disable_mtu_discovery";
+        for (link, fields) in [
+            (
+                "tuic://00000000-0000-4000-8000-000000000001:p@h:443",
+                vec![old],
+            ),
+            ("socks5://h:1080", vec![old, shared]),
+        ] {
+            let node = Node::from_share_link(link).unwrap();
+            for claim in [Some(false), None] {
+                let mut input = serde_json::to_value(&node).unwrap();
+                input[old] = json!(claim);
+                input[shared] = json!(claim);
+                let mut diagnostics = Vec::new();
+                let restored = NodeSeed {
+                    diagnostics: &mut diagnostics,
+                    source: DiagnosticSources::new(None).root(),
+                    setting: SettingPath::new("nodes").index(1),
+                }
+                .deserialize(input)
+                .unwrap();
+                assert_eq!(restored, node);
+                if claim.is_some() {
+                    let [warning] = diagnostics.as_slice() else {
+                        panic!("{diagnostics:?}")
+                    };
+                    assert_eq!(warning.code, "incompatible-node-fields");
+                    assert_eq!(warning.value, SafeValue::Fields(fields.clone()));
+                } else {
+                    assert!(diagnostics.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn structured_vless_mux_rejects_invalid_limits_and_missing_shared_tcp() {
         use honk_config::diagnostic::Severity;
         use honk_config::node::{Udp443Policy, VlessMultiplex, VlessUdpMux};

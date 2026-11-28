@@ -405,6 +405,14 @@ impl Node {
         self.outbound.tls_mut()
     }
 
+    pub fn quic(&self) -> Option<&QuicOptions> {
+        self.outbound.quic()
+    }
+
+    pub fn quic_mut(&mut self) -> Option<&mut QuicOptions> {
+        self.outbound.quic_mut()
+    }
+
     pub fn transport(&self) -> Option<&StreamTransportOptions> {
         self.outbound.transport()
     }

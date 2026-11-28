@@ -304,7 +304,7 @@ mod tests {
         assert_eq!(hy2.hop_interval, Some(15));
         assert_eq!(hy2.init_stream_recv_window, Some(1_048_576));
         assert_eq!(hy2.init_conn_recv_window, Some(2_097_152));
-        assert_eq!(hy2.disable_mtu_discovery, Some(true));
+        assert!(hy2.quic.disable_mtu_discovery);
 
         let tuic = nodes[6].tuic().unwrap();
         assert_eq!(tuic.congestion.as_deref(), Some("bbr"));
