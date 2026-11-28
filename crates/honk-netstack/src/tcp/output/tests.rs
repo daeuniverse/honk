@@ -205,8 +205,10 @@ impl Rig {
     fn retry(&mut self, caps: TxCaps, payload_allowed: bool, borrowed: (usize, usize)) -> Packet {
         let before = self.snapshot();
         let expected_parts: Vec<_> = {
-            let (slices, n) = self.t.tx.slices(borrowed.0, borrowed.1);
-            slices[..n]
+            let mut parts = [&[][..]; crate::tcp::ring::MAX_PARTS];
+            self.t
+                .tx
+                .slices_into(borrowed.0, borrowed.1, &mut parts)
                 .iter()
                 .map(|slice| (slice.as_ptr(), slice.len()))
                 .collect()

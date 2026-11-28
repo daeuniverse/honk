@@ -345,8 +345,17 @@ impl Tcb {
         } else {
             TxCsum::Full
         };
-        let (payload, parts) = self.tx.slices(off, data_len);
-        if !send(&self.tuple, &hdr, &payload[..parts], tx, data_len)? {
+        let mut short;
+        let mut large;
+        let parts: &mut [&[u8]] = if data_len <= pool.chunk() {
+            short = [&[][..]; 2];
+            &mut short
+        } else {
+            large = [&[][..]; super::ring::MAX_PARTS];
+            &mut large
+        };
+        let payload = self.tx.slices_into(off, data_len, parts);
+        if !send(&self.tuple, &hdr, payload, tx, data_len)? {
             return Ok(IovTransmit::BufferTooSmall);
         }
         if IOV {

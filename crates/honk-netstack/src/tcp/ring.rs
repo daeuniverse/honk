@@ -447,11 +447,14 @@ impl SendRing {
         Some(filled.and_then(|n| spare.commit(n, offered)))
     }
 
-    /// A maximum-size IP packet spans at most [`MAX_PARTS`] chunks, including an unaligned first
-    /// chunk. The unused array slots never reach the checksum loop.
-    pub fn slices(&self, off: usize, len: usize) -> ([&[u8]; MAX_PARTS], usize) {
+    /// Lend the pieces of a wire payload. A payload no larger than one chunk spans at most two.
+    pub fn slices_into<'a, 'b>(
+        &'a self,
+        off: usize,
+        len: usize,
+        parts: &'b mut [&'a [u8]],
+    ) -> &'b [&'a [u8]] {
         debug_assert!(off + len <= self.len as usize && len <= usize::from(u16::MAX));
-        let mut parts: [&[u8]; MAX_PARTS] = [&[]; MAX_PARTS];
         let mut pos = self.head + off;
         let (mut left, mut count) = (len, 0);
         let chunk = self.chunks.front().map_or(1, |c| c.len());
@@ -463,7 +466,7 @@ impl SendRing {
             pos += n;
             left -= n;
         }
-        (parts, count)
+        &parts[..count]
     }
 
     pub fn consume(&mut self, pool: &mut Pool, n: usize) {
@@ -747,14 +750,20 @@ mod tests {
         assert_eq!(ring.write(&mut pool, &data), data.len());
         assert_eq!(ring.chunk_count(), 3);
         assert_eq!(pool.shared_used(), 2, "first chunk is the free floor");
-        let ([a, b, ..], count) = ring.slices(CHUNK - 10, 30);
-        assert_eq!(count, 2);
+        let mut parts = [&[][..]; 2];
+        let [a, b] = ring.slices_into(CHUNK - 10, 30, &mut parts) else {
+            panic!("unaligned payload spans two chunks")
+        };
         assert_eq!((a.len(), b.len()), (10, 20));
-        assert_eq!([a, b].concat(), data[CHUNK - 10..CHUNK + 20]);
+        assert_eq!([*a, *b].concat(), data[CHUNK - 10..CHUNK + 20]);
         ring.consume(&mut pool, CHUNK + 5);
         assert_eq!(ring.len(), data.len() - CHUNK - 5);
         assert_eq!(pool.shared_used(), 1);
-        assert_eq!(ring.slices(0, 50).0[0], &data[CHUNK + 5..CHUNK + 55]);
+        let mut parts = [&[][..]; 2];
+        assert_eq!(
+            ring.slices_into(0, 50, &mut parts),
+            &[&data[CHUNK + 5..CHUNK + 55]]
+        );
         ring.consume(&mut pool, ring.len());
         assert_eq!(
             (pool.shared_used(), pool.live_chunks(), ring.chunk_count()),
