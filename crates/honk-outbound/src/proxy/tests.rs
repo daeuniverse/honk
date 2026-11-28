@@ -50,6 +50,38 @@ pub(super) async fn assert_udp_carrier_close_is_node_failure(
     );
 }
 
+pub(super) async fn assert_pmtud_after_echo(
+    conn: &quinn::Connection,
+    mut stream: ProxyStream,
+    disabled: bool,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let acked_before = conn.stats().path.acked_ack_eliciting_packets;
+    let path = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        for byte in 1..=3 {
+            stream.stream.write_u8(byte).await.unwrap();
+            assert_eq!(stream.stream.read_u8().await.unwrap(), byte);
+        }
+        // Wait for peer ACK progress before accepting a zero probe count.
+        loop {
+            let path = conn.stats().path;
+            if path.acked_ack_eliciting_packets > acked_before
+                && (disabled || path.sent_plpmtud_probes > 0)
+            {
+                return path;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed out waiting for loopback echo, ACK or MTU discovery");
+    if disabled {
+        assert_eq!(path.sent_plpmtud_probes, 0);
+        assert_eq!(path.current_mtu, 1200);
+    }
+}
+
 #[test]
 fn test_registry_default_handlers() {
     let registry = ProxyRegistry::default_resolver().unwrap();

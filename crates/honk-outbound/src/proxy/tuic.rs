@@ -481,8 +481,8 @@ impl TuicHandler {
             keep_alive: Some(HEARTBEAT_INTERVAL),
             stream_receive_window: Some(tuic.init_stream_recv_window.unwrap_or(8 << 20)),
             conn_receive_window: Some(tuic.init_conn_recv_window.unwrap_or(8 << 20)),
+            disable_mtu_discovery: tuic.quic.disable_mtu_discovery,
             max_udp_payload_size: tuic.quic.mtu,
-            ..Default::default()
         };
         let config = crate::quic::client_config(node, &alpn, options).await?;
         Ok(Arc::new(TuicClient {
