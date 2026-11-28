@@ -282,9 +282,12 @@ Supported spelling aliases normalize before node identity is derived.
 | Protocol | Imported options |
 | --- | --- |
 | Hysteria2 | `password`/`auth`; `obfs: salamander` with `obfs-password`; upload/download bandwidth; `ports`/`mport`/`port-hopping`/`port_hopping` hopping ranges; `hop-interval`/`mhop`; receive windows; MTU and MTU-discovery settings. |
-| TUIC | UUID/password, congestion control, ALPN, receive windows, MTU. |
+| TUIC | UUID/password, congestion control, ALPN, receive windows, MTU, and path MTU discovery. |
+| Juicity | UUID/password, MTU, and path MTU discovery. |
 | AnyTLS | `idle-session-check-interval`, `idle-session-timeout`, `min-idle-session`. |
 | VMess | `udp-over-tcp` or `udp_over_tcp`: `true` or `{enabled: true, version: 2}` enables UoT v2. The version may be omitted or set to `0` or `2`. Active packet-encoding, packet-address and multiplex wrappers reject the entry. |
+
+Hysteria2, TUIC, and Juicity accept `disable-mtu-discovery`, `disable_mtu_discovery`, `disable-path-mtu-discovery`, `disable_path_mtu_discovery`, and `disablePathMTUDiscovery`. Set the option to `true` to disable path MTU discovery. Clash ignores `null` and requires all other supplied aliases to have matching boolean values. For other protocols, an active value rejects the entry with `unsupported-subscription-entry`. Inactive values such as `false`, `null`, `0`, and `""` are ignored.
 
 Explicit disabled feature blocks are treated as disabled, not as unsupported active features. On VMess, `udp: true` alone keeps the TCP-only default. `udp: false` disables UDP even when UoT v2 is enabled. An explicit UDP restriction is rejected where the node model cannot preserve it.
 
@@ -396,6 +399,7 @@ sing-box TLS is off when `tls` or `tls.enabled` is absent, so Trojan, Hysteria2,
 | VLESS without an enabled H2MUX/UoT wrapper or explicit `packet_encoding` selecting another path | Single XUDP with UDP permitted. This is a sing-box import default, not the global meaning of Auto. |
 | Empty or omitted gRPC service name | Retain sing-box's empty service, not honk's `GunService` default. |
 | Hysteria2 `server_ports` without `server_port` | Use the first hopping port as the nominal endpoint. |
+| Hysteria2, TUIC, or Juicity `disable_path_mtu_discovery` / `disable_mtu_discovery` | Supply one boolean key. `true` disables path MTU discovery. Supplying both keys, even with equal values, or a non-boolean value such as `null` skips the entry. |
 | Per-node uTLS fingerprint hint | Does not override honk's process-wide TLS selection. |
 
 Unsupported chaining, wire features, and authentication requirements are not silently discarded.
@@ -415,6 +419,8 @@ The importer accepts named comma-separated records from Surge/Surfboard/Loon and
 Explicit credential and cipher aliases must agree before conversion. In named records, positional credentials are used only when the corresponding named claim is absent. A different positional value does not conflict with a valid explicit claim. Quantumult X has no positional fallback. Empty explicit credentials participate in alias comparison rather than selecting a fallback.
 
 Permitted optional record credentials retain empty strings and quoted whitespace byte for byte: SOCKS username/password, Hysteria2 authentication, and TUIC password. An explicit empty value still overrides a positional fallback. Protocols requiring nonempty credentials continue to reject it.
+
+Records for `hysteria2`, `tuic`, and `juicity` accept the [five Clash MTU discovery aliases](#protocol-specific-options). Names and values are case-insensitive. `1`, `true`, `yes`, and `on` disable discovery. `0`, `false`, `no`, and `off` leave it enabled. honk skips the record if any value is empty or invalid, or if repeated values disagree after conversion.
 
 Record `transport`/`network` stream claims are compared before assignment, including repeated keys. Empty text and `tcp` have the same raw-TCP meaning. Conflicting or unsupported stream claims reject the entry.
 

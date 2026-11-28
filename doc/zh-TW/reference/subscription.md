@@ -289,9 +289,12 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 | 協定 | 匯入的選項 |
 | --- | --- |
 | Hysteria2 | `password`/`auth`，以及 `obfs: salamander` 與 `obfs-password`。支援上傳/下載頻寬、`ports`/`mport`/`port-hopping`/`port_hopping` 跳躍埠範圍、`hop-interval`/`mhop`、接收視窗、MTU 與 MTU 探索設定。 |
-| TUIC | UUID/密碼、擁塞控制、ALPN、接收視窗、MTU。 |
+| TUIC | UUID 與密碼、壅塞控制、ALPN、接收視窗、MTU 與路徑 MTU 探索。 |
+| Juicity | UUID 與密碼、MTU 與路徑 MTU 探索。 |
 | AnyTLS | `idle-session-check-interval`、`idle-session-timeout`、`min-idle-session`。 |
 | VMess | `udp-over-tcp` 與 `udp_over_tcp` 都接受布林值或物件。`true` 或 `{enabled: true, version: 2}` 會啟用 UoT v2，版本可省略或設為 `0`、`2`。啟用其他封包編碼、逐包位址封裝或多工會使條目遭拒。 |
+
+Hysteria2、TUIC 和 Juicity 接受 `disable-mtu-discovery`、`disable_mtu_discovery`、`disable-path-mtu-discovery`、`disable_path_mtu_discovery` 和 `disablePathMTUDiscovery`。設為 `true` 即可停用路徑 MTU 探索。Clash 會忽略 `null`，其餘已設定的別名須使用相同的布林值。其他協定若帶有生效的值，該項目會以 `unsupported-subscription-entry` 遭拒。`false`、`null`、`0` 和 `""` 等未生效的值會被忽略。
 
 明確關閉的 feature block 按停用處理，honk 不會把它當成已啟用的不支援的 feature。VMess 單獨設定 `udp: true` 時仍只啟用 TCP。即使已啟用 UoT v2，`udp: false` 仍會停用 UDP。節點模型保留不了明確 UDP 限制時，honk 拒絕匯入。
 
@@ -403,6 +406,7 @@ TLS/SNI、REALITY、WebSocket/gRPC 升級 header、VLESS 封包選項，以及�
 | VLESS 未啟用 H2MUX/UoT 封裝，且沒有明確 `packet_encoding` 選擇其他路徑 | 使用 Single XUDP 並允許 UDP。這是 sing-box 匯入的預設值，不是 Auto 的全域意義。 |
 | gRPC 服務名為空或省略 | 保留 sing-box 的空服務名，不使用 honk 的 `GunService` 預設值。 |
 | Hysteria2 提供 `server_ports`，未提供 `server_port` | 以第一個跳躍埠作為名義 endpoint。 |
+| Hysteria2、TUIC 或 Juicity 的 `disable_path_mtu_discovery` / `disable_mtu_discovery` | 任選一個鍵並填入布林值。`true` 會停用路徑 MTU 探索。同時提供兩個鍵（即使值相同），或填入 `null` 等非布林值時，honk 會略過該項目。 |
 | 節點級 uTLS 指紋提示 | 不覆寫 honk 的行程級 TLS 選擇。 |
 
 不支援的鏈式代理、wire feature 或認證要求，honk 會報錯，不會直接忽略。
@@ -422,6 +426,8 @@ TLS/SNI、REALITY、WebSocket/gRPC 升級 header、VLESS 封包選項，以及�
 明確憑據和加密方法別名在轉換前必須一致。具名記錄只有在對應的具名值缺失時，才使用位置參數；有效的明確值不會因為位置參數不同而衝突。Quantumult X 不用位置參數回退。明確空憑據也參與別名比較，不會觸發回退。
 
 允許為空的可選記錄憑據會逐位元組保留空字串和帶引號的空白，包括 SOCKS 使用者名稱和密碼、Hysteria2 認證值、TUIC 密碼。明確空值仍優先於位置參數；要求非空憑據的協定仍然拒絕空值。
+
+`hysteria2`、`tuic` 和 `juicity` 文字記錄接受 [Clash 的五個 MTU 探索別名](#協定專屬選項)，參數名稱與值均不區分大小寫。`1`、`true`、`yes`、`on` 會停用探索，`0`、`false`、`no`、`off` 則維持啟用。任一值為空或無效，或重複設定的值轉換後不一致時，honk 會略過該筆記錄。
 
 honk 在賦值前比較記錄裡的 `transport`/`network` 流傳輸宣告；重複 key 也比。空字串和 `tcp` 都表示裸 TCP。宣告衝突或含不支援的傳輸方式時，honk 拒絕該條目。
 
